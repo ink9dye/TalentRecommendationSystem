@@ -1,0 +1,55 @@
+# --- 前端依赖与构建 (Node.js/Vue) ---
+node_modules/
+dist/
+dist-ssr/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# --- Python 环境与依赖 ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+
+# --- 数据库与本地存储 ---
+# 注意：毕业设计中通常不上传庞大的本地数据库
+*.db
+*.sqlite3
+neo4j/data/
+neo4j/logs/
+faiss/*.index
+
+# --- 模型权重与大数据文件 ---
+# 避免上传数 GB 的预训练模型或爬取的原始数据
+models/*.pth
+models/*.bin
+data/raw/
+data/processed/
+
+# --- 操作系统与 IDE ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
