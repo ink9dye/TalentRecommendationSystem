@@ -1,9 +1,8 @@
-import sqlite3
 import pandas as pd
 import os
 import logging
 # 保持原有的导入路径
-from src.infrastructure.database.use_openalex.database import DatabaseManager
+from src.infrastructure.crawler.use_openalex.database import DatabaseManager
 
 logger = logging.getLogger(__name__)
 

@@ -3,15 +3,15 @@ from neo4j import GraphDatabase
 from tqdm import tqdm
 import os
 import time
+from config import (
+    NEO4J_URI, NEO4J_USER,
+    NEO4J_PASSWORD, NEO4J_DATABASE,
+    COLLAB_DB_PATH  # 新增导入
+)
 
-# --- 基础配置信息 ---
-NEO4J_URI = "bolt://127.0.0.1:7687"
-NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "Aa1278389701"
-NEO4J_DATABASE = "talent-graph"
 
 # 协作相似度索引存放路径
-INDEX_PATH = r"E:\PythonProject\TalentRecommendationSystem\data\build_index\scholar_collaboration.db"
+COLLAB_DB_PATH = r"E:\PythonProject\TalentRecommendationSystem\data\build_index\scholar_collaboration.db"
 
 class ScholarSimilarityIndexer:
     """
@@ -24,8 +24,8 @@ class ScholarSimilarityIndexer:
 
     def _init_sqlite(self):
         """初始化本地索引库"""
-        os.makedirs(os.path.dirname(INDEX_PATH), exist_ok=True)
-        self.conn = sqlite3.connect(INDEX_PATH)
+        os.makedirs(os.path.dirname(COLLAB_DB_PATH), exist_ok=True)
+        self.conn = sqlite3.connect(COLLAB_DB_PATH)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("DROP TABLE IF EXISTS scholar_collaboration")
         self.conn.execute("""
@@ -112,7 +112,7 @@ class ScholarSimilarityIndexer:
 
         print("正在建立 SQLite 索引...")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_aid1 ON scholar_collaboration(aid1)")
-        print(f"--- 构建完成，索引存储于: {INDEX_PATH} ---")
+        print(f"--- 构建完成，索引存储于: {COLLAB_DB_PATH} ---")
 
     def _save_batch(self, batch):
         self.conn.executemany("INSERT OR REPLACE INTO scholar_collaboration VALUES (?, ?, ?)", batch)

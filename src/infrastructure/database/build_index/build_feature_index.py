@@ -5,14 +5,12 @@ import os
 import gc
 
 # --- 配置区 ---
-DB_PATH = r"E:\PythonProject\TalentRecommendationSystem\data\academic_dataset_v5.db"
-OUTPUT_PATH = r"E:\PythonProject\TalentRecommendationSystem\data\build_index\feature_index.json"
-
+from config import DB_PATH, FEATURE_INDEX_PATH
 
 class FeatureIndexBuilder:
-    def __init__(self, db_path, output_path):
+    def __init__(self, db_path, FEATURE_INDEX_PATH):
         self.db_path = db_path
-        self.output_path = output_path
+        self.FEATURE_INDEX_PATH = FEATURE_INDEX_PATH
 
     def _normalize(self, df, columns):
         """归一化特征到 0-1 之间"""
@@ -60,16 +58,16 @@ class FeatureIndexBuilder:
             feature_bundle = {"author": author_features, "institution": inst_features}
 
             # 确保目录存在
-            os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
+            os.makedirs(os.path.dirname(self.FEATURE_INDEX_PATH), exist_ok=True)
 
-            print(f"正在写入文件: {self.output_path}")
-            with open(self.output_path, 'w', encoding='utf-8') as f:
+            print(f"正在写入文件: {self.FEATURE_INDEX_PATH}")
+            with open(self.FEATURE_INDEX_PATH, 'w', encoding='utf-8') as f:
                 json.dump(feature_bundle, f)
                 f.flush()
                 os.fsync(f.fileno())
 
-            if os.path.exists(self.output_path):
-                print(f"SUCCESS: 特征索引已保存。大小: {os.path.getsize(self.output_path) / 1024:.2f} KB")
+            if os.path.exists(self.FEATURE_INDEX_PATH):
+                print(f"SUCCESS: 特征索引已保存。大小: {os.path.getsize(self.FEATURE_INDEX_PATH) / 1024:.2f} KB")
 
         except Exception as e:
             print(f"ERROR: 特征索引构建失败: {e}")
@@ -80,5 +78,5 @@ class FeatureIndexBuilder:
 
 # --- 独立运行入口 ---
 if __name__ == "__main__":
-    builder = FeatureIndexBuilder(DB_PATH, OUTPUT_PATH)
+    builder = FeatureIndexBuilder(DB_PATH, FEATURE_INDEX_PATH)
     builder.build()

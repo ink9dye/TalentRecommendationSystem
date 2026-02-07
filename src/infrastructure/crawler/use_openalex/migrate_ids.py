@@ -1,9 +1,8 @@
 import sqlite3
 import logging
 import time
-import argparse
 from api_client import APIClient
-from config import DB_PATH
+from src.infrastructure.crawler.use_openalex.config import DB_PATH
 
 logging.basicConfig(
     level=logging.INFO,

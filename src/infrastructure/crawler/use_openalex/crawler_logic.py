@@ -2,8 +2,6 @@ import logging
 from api_client import APIClient
 from processor import DataProcessor
 from utils import safe_get, clean_id
-from config import EMAIL, BATCH_SIZE_AUTHORS, MAX_WORKERS
-from collections import defaultdict
 from datetime import datetime
 
 logger = logging.getLogger(__name__)

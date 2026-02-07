@@ -4,7 +4,7 @@ import logging
 import time
 from contextlib import contextmanager
 from typing import List, Tuple
-from src.infrastructure.database.use_openalex.config import DB_PATH
+from src.infrastructure.crawler.use_openalex.config import DB_PATH
 from datetime import datetime
 
 
