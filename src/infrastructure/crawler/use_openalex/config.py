@@ -1,7 +1,7 @@
 import os
 
 # 1. 基础身份配置
-EMAIL = "2022337621072@mails.zstu.edu.cn"
+EMAIL = "1278389701@qq.com"
 
 # 2. 路径配置
 # 获取当前 config.py 所在的目录 (即 .../use_openalex/)

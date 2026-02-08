@@ -34,6 +34,25 @@ class SyncStateManager:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("INSERT OR REPLACE INTO sync_metadata VALUES (?, ?)", (task, str(marker)))
 
+    def run_incremental_sync(self, task_name, sync_logic_callback):
+        """
+        [新增] 增量同步管理逻辑：
+        1. 自动获取旧断点 (Marker)
+        2. 执行传入的业务代码 (Callback)
+        3. 如果执行成功且有进度更新，自动保存新断点
+        """
+        # 1. 自动读取断点
+        last_marker = self.get_marker(task_name)
+
+        # 2. 执行业务逻辑，业务逻辑需返回最新的 marker 值
+        # 这里把 last_marker 传给 builder 里的具体函数
+        new_marker = sync_logic_callback(last_marker)
+
+        # 3. 如果任务执行完毕且返回了有效的新断点，则持久化保存
+        if new_marker is not None and str(new_marker) > str(last_marker):
+            self.update_marker(task_name, new_marker)
+            logging.info(f"Task [{task_name}] sync completed. Marker updated: {last_marker} -> {new_marker}")
+
 class Monitor:
     def __init__(self):
         self.stats = {}
