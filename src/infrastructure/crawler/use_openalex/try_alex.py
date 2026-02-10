@@ -2,7 +2,7 @@ import logging
 import json
 from api_client import APIClient
 from utils import clean_id
-from src.infrastructure.crawler.use_openalex.config import EMAIL
+from src.infrastructure.crawler.use_openalex.db_config import EMAIL
 
 # 将日志级别设为 DEBUG 以观察 APIClient 的底层动作
 logging.basicConfig(level=logging.INFO)
@@ -85,5 +85,5 @@ def _print_doi_info(work):
 
 if __name__ == "__main__":
     # --- 请在此处替换一个在并发脚本中失败(Err)的 DOI ---
-    test_doi = "https://doi.org/10.36227/techrxiv.176611774.47340823/v2"
+    test_doi = "https://doi.org/10.3760/cma.j.cn112137-20250725-01852"
     diagnostic_doi(test_doi)

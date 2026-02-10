@@ -2,7 +2,7 @@ import argparse
 import logging
 import time
 import os
-from src.infrastructure.crawler.use_openalex.config import FIELDS, DB_PATH, DATA_DIR # 确保导入了 DATA_DIR
+from src.infrastructure.crawler.use_openalex.db_config import FIELDS, DB_PATH, DATA_DIR # 确保导入了 DATA_DIR
 from database import DatabaseManager
 from crawler_logic import fetch_phase4,fetch_phase5
 

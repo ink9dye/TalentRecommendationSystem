@@ -4,7 +4,7 @@ import logging
 import os
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
-from src.infrastructure.crawler.use_openalex.config import EMAIL, BASE_DELAY
+from src.infrastructure.crawler.use_openalex.db_config import EMAIL, BASE_DELAY
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +13,7 @@ class APIClient:
     def __init__(self):
         # --- 改进 1: 强制校验 ---
         if not EMAIL or "@" not in EMAIL:
-            raise ValueError("❌ 错误：EMAIL 未正确加载或格式不正确，请检查 config.py")
+            raise ValueError("❌ 错误：EMAIL 未正确加载或格式不正确，请检查 db_config.py")
 
         self.email = EMAIL.strip()
         self.session = requests.Session()

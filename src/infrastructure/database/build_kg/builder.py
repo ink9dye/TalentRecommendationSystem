@@ -1,5 +1,6 @@
 import math
 import os
+import re
 import json
 import faiss
 import sqlite3
@@ -90,67 +91,135 @@ class KGBuilder:
     def build_semantic_bridge(self):
         """
         构建语义桥接（跨领域词汇关联）。
-        利用 Faiss 向量索引在不同类型的实体（如领域标签、技能）之间建立 SIMILAR_TO 关系。
-        这是系统实现“隐式召回”的关键步骤。
+        方案 A：自适应 K 值搜索，确保跨类型关联的达成率。
         """
         idx_path = self.config['VOCAB_INDEX_PATH']
         map_path = self.config['VOCAB_MAP_PATH']
 
-        # 检查向量索引文件是否存在，不存在则跳过语义对齐
         if not (os.path.exists(idx_path) and os.path.exists(map_path)):
             return
 
-        # 加载向量索引及 ID 映射
         index = faiss.read_index(idx_path)
         with open(map_path, 'r', encoding='utf-8') as f:
             all_ids = json.load(f)
 
         with sqlite3.connect(self.config['DB_PATH']) as conn:
             conn.row_factory = sqlite3.Row
-
-            # 【性能与内存优化】
-            # 1. 预先加载词汇实体的类型映射 (entity_type)，用于在建立相似关系时过滤掉相同类型的实体
-            # 例如：只在“技能”和“学科”之间建连，不在“技能”和“技能”之间建连，以保持图谱稀疏度。
+            # 预加载类型映射
             vocab_meta = {str(r[0]): r[1] for r in
-                          conn.execute("SELECT id, entity_type FROM vocabulary_table").fetchall()}
+                          conn.execute("SELECT id, entity_type FROM vocabulary").fetchall()}
 
-            # 2. 使用迭代器分批读取 SQLite 数据，避免大规模词库撑爆内存
             cursor = conn.execute(SQL_QUERIES["GET_ALL_VOCAB"])
-
             batch = []
-            for v in tqdm(cursor, desc="Building Semantic Bridge"):
+
+            for v in tqdm(cursor, desc="Building Semantic Bridge (Adaptive)"):
                 source_id, source_type = str(v['id']), v['entity_type']
                 if source_id not in all_ids: continue
 
-                # 获取词汇对应的向量索引位置并检索
                 try:
-                    # 提示：如果 all_ids 很大，此处建议先转字典，否则 .index() 是 O(N) 复杂度
                     vec_idx = all_ids.index(source_id)
-                    # 重构向量并进行近邻搜索 (Top 50)
                     vec = index.reconstruct(vec_idx).reshape(1, -1)
-                    scores, indices = index.search(vec, 50)
-                except:
+
+                    links = 0
+                    # --- 方案 A 核心：阶梯式扩大搜索范围 ---
+                    # 初始搜索 1000，若没找够 3 条异类边，最高扩容搜索至 5000 个近邻
+                    for k_step in [1000, 3000, 5000]:
+                        scores, indices = index.search(vec, k_step)
+
+                        # 每次搜索后，清空并重新寻找（因为 indices 包含了之前的部分）
+                        # 或者你可以从上一次的偏移量开始，但直接遍历 scores 更简洁
+                        current_links = []
+                        for score, n_idx in zip(scores[0], indices[0]):
+                            if n_idx == -1: continue
+                            neighbor_id = all_ids[n_idx]
+
+                            # 过滤规则：非自身且类型不同
+                            if neighbor_id != source_id and vocab_meta.get(neighbor_id) != source_type:
+                                current_links.append({"f": int(source_id), "t": int(neighbor_id), "s": float(score)})
+                                if len(current_links) >= 3:
+                                    break
+
+                        # 如果找够了，更新 links 状态并退出当前实体的 k_step 循环
+                        if len(current_links) >= 3:
+                            batch.extend(current_links)
+                            links = len(current_links)
+                            break
+                        # 如果直到 5000 还没找够，则有多少存多少，保证不落空
+                        elif k_step == 5000:
+                            batch.extend(current_links)
+                            links = len(current_links)
+
+                except Exception as e:
                     continue
-
-                links = 0
-                for score, n_idx in zip(scores[0], indices[0]):
-                    if n_idx == -1: continue  # Faiss 空返回处理
-                    neighbor_id = all_ids[n_idx]
-
-                    # 语义过滤策略：
-                    # 1. 排除自身
-                    # 2. 类型不同（如：将 Work 关键词关联到 Job 技能标签上）
-                    if neighbor_id != source_id and vocab_meta.get(neighbor_id) != source_type:
-                        batch.append({"f": int(source_id), "t": int(neighbor_id), "s": float(score)})
-                        links += 1
-                        # 限制每个实体最多建立 3 条语义桥接，防止关系爆炸，保证核心召回准确性
-                        if links >= 3: break
 
                 # 达到批次大小后写入 Neo4j
                 if len(batch) >= 500:
                     self.state.engine.send_batch(CYPHER_TEMPLATES["LINK_SIMILAR"], batch)
                     batch = []
 
-            # 处理余下的批次
             if batch:
                 self.state.engine.send_batch(CYPHER_TEMPLATES["LINK_SIMILAR"], batch)
+
+    def build_work_semantic_links(self):
+        """
+        建立论文与词汇节点的关联边 (Work)-[:HAS_TOPIC]->(Vocabulary)
+        """
+        sql = "SELECT work_id as wid, concepts_text, keywords_text FROM works"
+
+        with sqlite3.connect(self.config['DB_PATH']) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(sql)
+
+            batch = []
+            for row in tqdm(cursor, desc="Linking Works to Knowledge Nodes"):
+                # 1. 使用正则支持 |,; 和换行符拆分
+                raw_text = f"{row['concepts_text'] or ''}|{row['keywords_text'] or ''}"
+                # 拆分并过滤掉空字符、转小写去重
+                terms = set([t.strip().lower() for t in re.split(r'[|;,]', raw_text) if t.strip()])
+
+                for term in terms:
+                    batch.append({
+                        "wid": row['wid'],
+                        "term": term
+                    })
+
+                    if len(batch) >= 1000:
+                        # 建议在执行前确保 Neo4j 索引已建
+                        self.state.engine.send_batch(CYPHER_TEMPLATES["LINK_WORK_VOCAB"], batch)
+                        batch = []
+
+            if batch:
+                self.state.engine.send_batch(CYPHER_TEMPLATES["LINK_WORK_VOCAB"], batch)
+
+    def build_job_skill_links(self):
+        """
+        建立岗位与技能词汇的关联边 (Job)-[:REQUIRE_SKILL]->(Vocabulary)
+        """
+        sql = SQL_QUERIES["SYNC_JOB_SKILLS"]
+
+        with sqlite3.connect(self.config['DB_PATH']) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(sql)
+
+            batch = []
+            for row in tqdm(cursor, desc="Linking Jobs to Skills"):
+                # 针对你提到的格式进行解析
+                # 使用正则拆分：支持中英文逗号、分号以及常见的“/”分隔
+                raw_skills = row['skills']
+                if not raw_skills: continue
+
+                # 拆分并清洗：转小写、去除前后空格
+                skills = set([s.strip().lower() for s in re.split(r'[,，;；]', raw_skills) if s.strip()])
+
+                for skill in skills:
+                    batch.append({
+                        "jid": row['jid'],
+                        "term": skill
+                    })
+
+                    if len(batch) >= 1000:
+                        self.state.engine.send_batch(CYPHER_TEMPLATES["LINK_JOB_VOCAB"], batch)
+                        batch = []
+
+            if batch:
+                self.state.engine.send_batch(CYPHER_TEMPLATES["LINK_JOB_VOCAB"], batch)

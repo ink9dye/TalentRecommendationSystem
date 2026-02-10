@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 # 直接从你的 config 导入
-from src.infrastructure.crawler.use_openalex.config import EMAIL, DB_PATH, MAX_WORKERS
+from src.infrastructure.crawler.use_openalex.db_config import EMAIL, DB_PATH, MAX_WORKERS
 from api_client import APIClient
 from database import DatabaseManager
 from utils import clean_id

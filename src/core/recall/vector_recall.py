@@ -3,68 +3,77 @@ import numpy as np
 import json
 import os
 import sqlite3
+import time
 from sentence_transformers import SentenceTransformer
 
-# --- 路径动态初始化 ---
-# 获取当前脚本文件的绝对路径 (src/core/recall/vector_recall.py)
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-# 向上追溯三级目录到达项目根目录 (TalentRecommendationSystem)
-PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", ".."))
-
-# 所有的相对路径现在都基于 PROJECT_ROOT
-MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "sbert_models", "paraphrase-multilingual-MiniLM-L12-v2")
-FAISS_INDEX_PATH = os.path.join(PROJECT_ROOT, "data", "faiss", "abstract_vector.index")
-MAPPING_PATH = os.path.join(PROJECT_ROOT, "data", "faiss", "abstract_mapping.json")
-SQLITE_DB_PATH = os.path.join(PROJECT_ROOT, "data", "sqlite", "academic_dataset_v5.db")
+# 导入全局配置
+# 确保项目根目录在 PYTHONPATH 中，或者使用相对导入
+from config import CONFIG_DICT, ABSTRACT_INDEX_PATH, ABSTRACT_MAP_PATH, SBERT_DIR, DB_PATH
 
 
 class VectorRecallPath:
     """
-    向量路召回：基于 SBERT + Faiss 的语义召回 [cite: 1]
+    向量路召回：基于 SBERT + Faiss 的语义召回
     职责：实现从需求文本到候选作者 ID 的高效转换
     """
 
-    def __init__(self, top_k=300):
-        # 1. 加载 SBERT 模型 (README 提到的 384 维映射) [cite: 2, 3]
-        self.model = SentenceTransformer(MODEL_PATH)
-        self.top_k = top_k
+    def __init__(self, top_k=None):
+        # 1. 从配置字典获取全局参数
+        self.config = CONFIG_DICT
+        self.top_k = top_k or self.config.get("BATCH_SIZE", 300)  # 默认回退到 300
 
-        # 2. 加载 Faiss 离线索引
-        if not os.path.exists(FAISS_INDEX_PATH):
-            raise FileNotFoundError(f"未找到摘要向量索引，请检查路径: {FAISS_INDEX_PATH}")
+        # 2. 加载本地 SBERT 模型 (384 维映射)
+        if not os.path.exists(SBERT_DIR):
+            raise FileNotFoundError(f"SBERT 模型路径不存在: {SBERT_DIR}")
+        self.model = SentenceTransformer(SBERT_DIR)
 
-        self.index = faiss.read_index(FAISS_INDEX_PATH)
+        # 3. 加载 Faiss 离线索引
+        if not os.path.exists(ABSTRACT_INDEX_PATH):
+            raise FileNotFoundError(f"未找到摘要向量索引: {ABSTRACT_INDEX_PATH}")
+        self.index = faiss.read_index(ABSTRACT_INDEX_PATH)
 
-        # 3. 加载 WorkID 映射表
-        with open(MAPPING_PATH, 'r', encoding='utf-8') as f:
+        # 4. 加载 WorkID 映射表
+        if not os.path.exists(ABSTRACT_MAP_PATH):
+            raise FileNotFoundError(f"未找到 ID 映射文件: {ABSTRACT_MAP_PATH}")
+        with open(ABSTRACT_MAP_PATH, 'r', encoding='utf-8') as f:
             self.id_map = json.load(f)
 
-    def _get_authors_by_works(self, work_ids):
-        """通过论文 ID 从 SQLite 中查询对应的作者 ID [cite: 2, 3]"""
-        conn = sqlite3.connect(SQLITE_DB_PATH)
-        cursor = conn.cursor()
+    def _get_authors_by_works(self, work_ids, deadline):
+        """分批查询作者，并在到达截止时间时中断"""
+        if not work_ids: return []
 
-        # 对应架构中通过作品关联作者的步骤 [cite: 1]
-        placeholders = ','.join(['?'] * len(work_ids))
-        query = f"SELECT DISTINCT author_id FROM authorships WHERE work_id IN ({placeholders})"
+        conn = sqlite3.connect(DB_PATH)
+        author_ids = set()
+        batch_size = 50  # 每次查询 50 个作品
 
-        cursor.execute(query, work_ids)
-        author_ids = [row[0] for row in cursor.fetchall()]
+        for i in range(0, len(work_ids), batch_size):
+            # 检查是否超时
+            if time.time() > deadline:
+                break
+
+            batch = work_ids[i:i + batch_size]
+            placeholders = ','.join(['?'] * len(batch))
+            query = f"SELECT DISTINCT author_id FROM authorships WHERE work_id IN ({placeholders})"
+
+            cursor = conn.execute(query, batch)
+            author_ids.update([row[0] for row in cursor.fetchall()])
+
         conn.close()
-        return author_ids
+        return list(author_ids)
 
-    def recall(self, query_text):
-        """执行召回流程 """
-        # A. 语义编码
+    def recall(self, query_text, timeout=0.5):
+        start_time = time.time()
+        deadline = start_time + timeout
+
+        # A. 语义编码 (SBERT)
         query_vector = self.model.encode([query_text]).astype('float32')
 
-        # B. 向量检索
+        # B. 向量检索 (Faiss)
         _, indices = self.index.search(query_vector, self.top_k)
-
-        # C. ID 转换
         candidate_work_ids = [self.id_map[str(idx)] for idx in indices[0] if idx != -1]
 
-        # D. 关系映射
-        candidate_author_ids = self._get_authors_by_works(candidate_work_ids)
+        # C. 关系映射 (带超时检查的增量查询)
+        # 即使只查了一半的作品，也会返回这一半对应的作者
+        candidate_author_ids = self._get_authors_by_works(candidate_work_ids, deadline)
 
         return candidate_author_ids[:self.top_k]

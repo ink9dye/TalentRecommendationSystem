@@ -33,9 +33,10 @@ class SyncStateManager:
     def get_marker(self, task: str) -> str:
         with sqlite3.connect(self.db_path) as conn:
             row = conn.execute("SELECT last_marker FROM sync_metadata WHERE task_name=?", (task,)).fetchone()
-            # 拓扑同步或包含 ID 的任务默认从 "0" 开始，日期任务默认纪元时间
+            # 增加对 "vocab" 和 "work" 的判定，确保它们默认起始值为 "0" (整数模式)
             return row[0] if row else (
-                "0" if any(x in task.lower() for x in ["topology", "sync_id", "id"]) else "1970-01-01 00:00:00")
+                "0" if any(x in task.lower() for x in ["topology", "sync_id", "id", "vocab", "work"])
+                else "1970-01-01 00:00:00")
 
     def update_marker(self, task: str, marker: str):
         with sqlite3.connect(self.db_path) as conn:
