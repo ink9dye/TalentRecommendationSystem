@@ -135,3 +135,8 @@ CONFIG_DICT = {
     "BATCH_SIZE": 2000,
     "SBERT_DIR": SBERT_DIR
 }
+
+# 11 KGATAX 训练数据的存放路径
+KGATAX_TRAIN_DATA_DIR = os.path.join(BASE_DIR, "kgatax_train_data")
+if not os.path.exists(KGATAX_TRAIN_DATA_DIR):
+    os.makedirs(KGATAX_TRAIN_DATA_DIR)

@@ -82,17 +82,36 @@ class KGAT(nn.Module):
         self.A_in.requires_grad = False
 
     def holographic_fusion(self, entity_embed, aux_info):
-        """全息嵌入融合逻辑 """
+        """
+        全息嵌入融合：将归一化后的 H-index 等指标注入实体表示
+        """
+        # 1. 映射辅助信息到嵌入空间并激活
+        # tanh 将辅助向量限制在 (-1, 1)，作为拓扑特征的“调节权重” [cite: 18]
         aux_vector = torch.tanh(self.aux_embed_layer(aux_info))
-        return torch.mul(entity_embed, aux_vector)
+
+        # 2. 执行 Hadamard 积 (元素级乘法)
+        # 建议：如果某些实体（如 Vocabulary）没有 AX 特征，
+        # 请确保 aux_info 对应行为 0，此时 tanh(0)=0 会导致特征消失。
+        # 改进方案：使用 (1 + aux_vector) 实现残差式增强
+        return torch.mul(entity_embed, 1 + aux_vector)
 
     def calc_cf_embeddings(self, aux_info_all):
-        """带 AX 增强的消息传递 """
+        """
+        带 AX 增强的消息传递层 [cite: 79, 492]
+        """
+        # 1. 初始节点增强：将全图学术指标注入初始 Embedding 表
         ego_embed = self.holographic_fusion(self.entity_user_embed.weight, aux_info_all)
         all_embed = [ego_embed]
+
+        # 2. 递归消息传递
         for layer in self.aggregator_layers:
+            # 在 A_in 中进行注意力加权的邻居聚合
             ego_embed = layer(ego_embed, self.A_in)
+
+            # 3. 每一层传播后进行 L2 归一化，防止 Embedding 爆炸
             all_embed.append(F.normalize(ego_embed, p=2, dim=1))
+
+        # 4. 聚合所有层的表示 (Jump Knowledge 思想)
         return torch.cat(all_embed, dim=1)
 
     def calc_cf_loss(self, user_ids, item_pos_ids, item_neg_ids, aux_info_all):
@@ -125,6 +144,7 @@ class KGAT(nn.Module):
         if mode == 'train_cf': return self.calc_cf_loss(*input)
         if mode == 'train_kg': return self.calc_kg_loss(*input)
         if mode == 'predict': return self.calc_score(*input)
+        if mode == 'update_att': return self.update_attention_batch(*input)
 
     def calc_score(self, user_ids, item_ids, aux_info_all):
         all_embed = self.calc_cf_embeddings(aux_info_all)
