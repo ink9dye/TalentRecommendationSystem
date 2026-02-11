@@ -1,4 +1,3 @@
-# algorithms/kgat_ax/dataloader.py
 import os
 import random
 import collections

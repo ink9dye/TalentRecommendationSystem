@@ -91,98 +91,83 @@ class TrainingDataGenerator:
 
     def generate_kg_data(self):
         """
-        从 SQLite 导出三元组并转换为整数 ID (kg_final.txt)。
-        完整补全了：
-        1. 拓扑路: Author-Work, Work-Institution, Work-Source
-        2. 语义路: Work-Vocabulary (HAS_TOPIC)
-        3. 需求路: Job-Vocabulary (REQUIRE_SKILL)
-        4. 关联路: Vocabulary-Vocabulary (SIMILAR_TO)
+        核心优化版：生成千万级知识图谱三元组数据
         """
-        import re
-        print("\n>>> 任务 2: 生成知识图谱三元组数据")
+        print("\n>>> 任务 2: 生成知识图谱三元组数据 (二进制优化版)")
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
-        kg_lines = []
-
-        # 定义关系 ID 映射，严格对齐 KG 构建逻辑
+        # 1. 关系映射定义
         rel_map = {
-            "authored": 2,  # Author -> Work
-            "produced_by": 3,  # Work -> Institution
-            "published_in": 4,  # Work -> Source
-            "has_topic": 5,  # Work -> Vocabulary
-            "similar_to": 6,  # Vocabulary -> Vocabulary
-            "require_skill": 7  # Job -> Vocabulary (补全岗位需求链路)
+            "authored": 2, "produced_by": 3,
+            "published_in": 4, "has_topic": 5,
+            "similar_to": 6, "require_skill": 7
         }
         self.relation_to_int.update(rel_map)
 
-        # 1. 基础拓扑：解析作者、作品、机构、渠道间的关系
-        print("[*] 正在解析作者、作品、机构、渠道间的拓扑关系...")
-        rows = cursor.execute("""
-                              SELECT author_id, work_id, inst_id, source_id
-                              FROM authorships
-                              """).fetchall()
+        # 使用 numpy 数组的高效存储
+        kg_triplets = []
 
+        # --- 1. 拓扑路 ---
+        print("[*] 解析拓扑关系 (Author/Work/Inst/Source)...")
+        rows = cursor.execute("SELECT author_id, work_id, inst_id, source_id FROM authorships").fetchall()
         for r in rows:
             h_auth = self.get_int_id(r['author_id'])
             t_work = self.get_int_id(r['work_id'])
-            # (Author)-[authored]->(Work)
-            kg_lines.append(f"{h_auth} {rel_map['authored']} {t_work}")
-
-            # (Work)-[produced_by]->(Institution)
+            kg_triplets.append((h_auth, rel_map['authored'], t_work))
             if r['inst_id']:
-                t_inst = self.get_int_id(r['inst_id'])
-                kg_lines.append(f"{t_work} {rel_map['produced_by']} {t_inst}")
-
-            # (Work)-[published_in]->(Source)
+                kg_triplets.append((t_work, rel_map['produced_by'], self.get_int_id(r['inst_id'])))
             if r['source_id']:
-                t_src = self.get_int_id(r['source_id'])
-                kg_lines.append(f"{t_work} {rel_map['published_in']} {t_src}")
+                kg_triplets.append((t_work, rel_map['published_in'], self.get_int_id(r['source_id'])))
 
-        # 2. 语义桥接：解析论文与词汇关联 (Work)-[has_topic]->(Vocabulary)
-        print("[*] 正在解析作品关键词与语义词汇关联...")
+        # --- 2. 语义路 ---
+        print("[*] 解析语义桥接 (Work-Vocabulary)...")
         work_rows = cursor.execute("SELECT work_id, concepts_text, keywords_text FROM works").fetchall()
         for row in work_rows:
-            # 采用与 build_work_semantic_links 一致的正则拆分逻辑
             raw_text = f"{row['concepts_text'] or ''}|{row['keywords_text'] or ''}"
             terms = set([t.strip().lower() for t in re.split(r'[|;,]', raw_text) if t.strip()])
-
             h_work = self.get_int_id(row['work_id'])
             for term in terms:
-                t_vocab = self.get_int_id(f"vocab_{term}")
-                kg_lines.append(f"{h_work} {rel_map['has_topic']} {t_vocab}")
+                kg_triplets.append((h_work, rel_map['has_topic'], self.get_int_id(f"vocab_{term}")))
 
-        # 3. 需求对齐：解析岗位与技能关联 (Job)-[require_skill]->(Vocabulary)
-        print("[*] 正在解析岗位需求与技能词汇关联...")
-        # 对应 SYNC_JOB_SKILLS 逻辑
+        # --- 3. 需求路 ---
+        print("[*] 解析需求对齐 (Job-Vocabulary)...")
         job_rows = cursor.execute("SELECT securityId, skills FROM jobs WHERE skills IS NOT NULL").fetchall()
         for row in job_rows:
-            # 采用与 build_job_skill_links 一致的正则拆分逻辑
             skills = set([s.strip().lower() for s in re.split(r'[,，;；]', row['skills']) if s.strip()])
-
             h_job = self.get_int_id(row['securityId'])
             for skill in skills:
-                t_vocab = self.get_int_id(f"vocab_{skill}")
-                kg_lines.append(f"{h_job} {rel_map['require_skill']} {t_vocab}")
+                kg_triplets.append((h_job, rel_map['require_skill'], self.get_int_id(f"vocab_{skill}")))
 
-        # 4. 词汇增强：解析词汇相似度关联 (Vocabulary)-[similar_to]->(Vocabulary)
-        print("[*] 正在解析词汇间的语义相似度关系...")
+        # --- 4. 关联路 ---
+        print("[*] 解析词汇增强 (Vocab-Vocab)...")
         try:
             sim_rows = cursor.execute("SELECT from_id, to_id FROM vocabulary_similarity").fetchall()
             for r in sim_rows:
-                h_v = self.get_int_id(f"vocab_id_{r['from_id']}")
-                t_v = self.get_int_id(f"vocab_id_{r['to_id']}")
-                kg_lines.append(f"{h_v} {rel_map['similar_to']} {t_v}")
+                kg_triplets.append((self.get_int_id(f"vocab_id_{r['from_id']}"),
+                                    rel_map['similar_to'],
+                                    self.get_int_id(f"vocab_id_{r['to_id']}")))
         except sqlite3.OperationalError:
-            print("提示: SQLite 中未发现相似度关联表，将跳过相似度三元组导出。")
+            print("提示: 未发现词汇相似度表。")
 
-        # 写入训练用的 kg_final.txt
-        with open(os.path.join(self.output_dir, "kg_final.txt"), "w", encoding='utf-8') as f:
-            f.write("\n".join(kg_lines))
+        # --- 关键：二进制转换与存储 ---
+        print(f"[*] 正在转换 {len(kg_triplets)} 条边为二进制张量...")
+        kg_np = np.array(kg_triplets, dtype=np.int32)
+
+        # 释放内存
+        del kg_triplets
+        gc.collect()
+
+        # 保存 .pt 文件供 DataLoaderKGAT 加载
+        torch.save(torch.from_numpy(kg_np), os.path.join(self.output_dir, "kg_final.pt"))
+
+        # 兼容性空文件
+        with open(os.path.join(self.output_dir, "kg_final.txt"), "w") as f:
+            f.write("Binary format saved in kg_final.pt")
 
         conn.close()
-        print(f"[成功] kg_final.txt 已生成，共包含 {len(kg_lines)} 条结构化三元组。")
+        print(f"[成功] 二进制三元组已保存。实体总数: {len(self.entity_to_int)}")
 
     def save_id_mapping(self):
         """保存 ID 映射表供推理阶段使用"""
