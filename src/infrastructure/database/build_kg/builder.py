@@ -92,12 +92,17 @@ class KGBuilder:
         """
         构建语义桥接（跨领域词汇关联）。
         方案 A：自适应 K 值搜索，确保跨类型关联的达成率。
+        已修复：增加了增量位点 (Marker) 绑定，解决 sqlite3.ProgrammingError。
         """
         idx_path = self.config['VOCAB_INDEX_PATH']
         map_path = self.config['VOCAB_MAP_PATH']
 
         if not (os.path.exists(idx_path) and os.path.exists(map_path)):
             return
+
+        # 1. 获取增量标记 (Marker)
+        task_name = "semantic_bridge_sync"
+        marker = self.state.get_marker(task_name)
 
         index = faiss.read_index(idx_path)
         with open(map_path, 'r', encoding='utf-8') as f:
@@ -109,7 +114,8 @@ class KGBuilder:
             vocab_meta = {str(r[0]): r[1] for r in
                           conn.execute("SELECT id, entity_type FROM vocabulary").fetchall()}
 
-            cursor = conn.execute(SQL_QUERIES["GET_ALL_VOCAB"])
+            # 2. 核心修复点：传入 (marker,) 参数
+            cursor = conn.execute(SQL_QUERIES["GET_ALL_VOCAB"], (marker,))
             batch = []
 
             for v in tqdm(cursor, desc="Building Semantic Bridge (Adaptive)"):
@@ -120,14 +126,9 @@ class KGBuilder:
                     vec_idx = all_ids.index(source_id)
                     vec = index.reconstruct(vec_idx).reshape(1, -1)
 
-                    links = 0
                     # --- 方案 A 核心：阶梯式扩大搜索范围 ---
-                    # 初始搜索 1000，若没找够 3 条异类边，最高扩容搜索至 5000 个近邻
                     for k_step in [1000, 3000, 5000]:
                         scores, indices = index.search(vec, k_step)
-
-                        # 每次搜索后，清空并重新寻找（因为 indices 包含了之前的部分）
-                        # 或者你可以从上一次的偏移量开始，但直接遍历 scores 更简洁
                         current_links = []
                         for score, n_idx in zip(scores[0], indices[0]):
                             if n_idx == -1: continue
@@ -139,26 +140,22 @@ class KGBuilder:
                                 if len(current_links) >= 3:
                                     break
 
-                        # 如果找够了，更新 links 状态并退出当前实体的 k_step 循环
-                        if len(current_links) >= 3:
+                        if len(current_links) >= 3 or k_step == 5000:
                             batch.extend(current_links)
-                            links = len(current_links)
                             break
-                        # 如果直到 5000 还没找够，则有多少存多少，保证不落空
-                        elif k_step == 5000:
-                            batch.extend(current_links)
-                            links = len(current_links)
 
-                except Exception as e:
+                except Exception:
                     continue
 
-                # 达到批次大小后写入 Neo4j
+                # 3. 达到批次大小后写入 Neo4j 并更新位点
                 if len(batch) >= 500:
                     self.state.engine.send_batch(CYPHER_TEMPLATES["LINK_SIMILAR"], batch)
+                    self.state.update_marker(task_name, str(v['id']))
                     batch = []
 
             if batch:
                 self.state.engine.send_batch(CYPHER_TEMPLATES["LINK_SIMILAR"], batch)
+                self.state.update_marker(task_name, str(v['id']))
 
     def build_work_semantic_links(self):
         """
@@ -194,22 +191,28 @@ class KGBuilder:
     def build_job_skill_links(self):
         """
         建立岗位与技能词汇的关联边 (Job)-[:REQUIRE_SKILL]->(Vocabulary)
+        增加了增量标记 (Marker) 处理，修复 Incorrect number of bindings 错误。
         """
         sql = SQL_QUERIES["SYNC_JOB_SKILLS"]
 
+        # 1. 获取当前任务的增量起始点
+        task_name = "job_skill_sync"
+        marker = self.state.get_marker(task_name)
+
         with sqlite3.connect(self.config['DB_PATH']) as conn:
             conn.row_factory = sqlite3.Row
-            cursor = conn.execute(sql)
+            # 2. 传入 marker 参数，修复 bindings 缺失问题
+            cursor = conn.execute(sql, (marker,))
 
             batch = []
+            last_row_time = marker
+
             for row in tqdm(cursor, desc="Linking Jobs to Skills"):
-                # 针对你提到的格式进行解析
-                # 使用正则拆分：支持中英文逗号、分号以及常见的“/”分隔
                 raw_skills = row['skills']
                 if not raw_skills: continue
 
-                # 拆分并清洗：转小写、去除前后空格
-                skills = set([s.strip().lower() for s in re.split(r'[,，;；]', raw_skills) if s.strip()])
+                # 拆分并清洗：支持中英文逗号、分号及斜杠
+                skills = set([s.strip().lower() for s in re.split(r'[,，;；/]', raw_skills) if s.strip()])
 
                 for skill in skills:
                     batch.append({
@@ -219,7 +222,12 @@ class KGBuilder:
 
                     if len(batch) >= 1000:
                         self.state.engine.send_batch(CYPHER_TEMPLATES["LINK_JOB_VOCAB"], batch)
+                        # 3. 批次成功后更新标记
+                        last_row_time = str(row['crawl_time'])
+                        self.state.update_marker(task_name, last_row_time)
                         batch = []
 
             if batch:
                 self.state.engine.send_batch(CYPHER_TEMPLATES["LINK_JOB_VOCAB"], batch)
+                # 更新最后一条记录的标记
+                self.state.update_marker(task_name, str(row['crawl_time']))

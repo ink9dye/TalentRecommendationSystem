@@ -2,6 +2,7 @@ import logging
 from kg_utils import GraphEngine, SyncStateManager, Monitor
 from builder import KGBuilder
 from config import CONFIG_DICT
+import sqlite3 # 别忘了导入这个
 
 def run_pipeline(config):
     monitor = Monitor()
@@ -10,15 +11,20 @@ def run_pipeline(config):
     builder = KGBuilder(config, state)
 
     try:
-        # --- 0. 自动建立索引 (关键步骤) ---
+        # --- 0. 自动建立索引 (在这里改) ---
         with monitor.track("Ensuring Constraints and Indexes"):
+            # A. 执行 Neo4j 地基
+            from config import CYPHER_TEMPLATES, SQL_INIT_SCRIPTS
+            for cypher in CYPHER_TEMPLATES["INIT_SCHEMA"]:
+                # 改成这个方法，它不要求带参数，也不会被 if not data 拦截
+                engine.execute_query(cypher)
 
-            # 为 Vocabulary 的 term 建立索引，支撑 build_work_semantic_links
-            engine.send_batch("CREATE INDEX vocab_term_idx IF NOT EXISTS FOR (v:Vocabulary) ON (v.term)", [])
-            # 为 Work 和 Job 的 ID 建立索引，支撑关系建立
-            engine.send_batch("CREATE CONSTRAINT work_id_unique IF NOT EXISTS FOR (w:Work) REQUIRE w.id IS UNIQUE", [])
-            engine.send_batch("CREATE CONSTRAINT job_id_unique IF NOT EXISTS FOR (j:Job) REQUIRE j.id IS UNIQUE", [])
-
+            # B. 执行 SQLite 地基 (通过标准 sqlite3 库)
+            with sqlite3.connect(config['DB_PATH']) as conn:
+                for sql in SQL_INIT_SCRIPTS:
+                    conn.execute(sql)
+                conn.commit()
+            logging.info("SQLite indexes verified.")
         # --- 1. 节点同步任务 ---
         node_tasks = [
             ("vocab_sync", "GET_ALL_VOCAB", "MERGE_VOCAB", "id"),

@@ -80,13 +80,20 @@ SQL_QUERIES = {
 
 # 9. Neo4j Cypher 模板
 CYPHER_TEMPLATES = {
-    "INIT_SCHEMA":[
-        "CREATE CONSTRAINT IF NOT EXISTS FOR (a:Author) REQUIRE a.id IS UNIQUE",
-        "CREATE CONSTRAINT IF NOT EXISTS FOR (w:Work) REQUIRE w.id IS UNIQUE",
-        "CREATE CONSTRAINT IF NOT EXISTS FOR (v:Vocabulary) REQUIRE v.id IS UNIQUE",
-        "CREATE INDEX IF NOT EXISTS FOR (v:Vocabulary) ON (v.term)", # 支撑 LINK_WORK_VOCAB
-        "CREATE INDEX IF NOT EXISTS FOR (j:Job) ON (j.id)"
-    ],
+    "INIT_SCHEMA": [
+    # 唯一约束：MERGE 成功的关键，极大提升写入速度
+    "CREATE CONSTRAINT IF NOT EXISTS FOR (a:Author) REQUIRE a.id IS UNIQUE",
+    "CREATE CONSTRAINT IF NOT EXISTS FOR (w:Work) REQUIRE w.id IS UNIQUE",
+    "CREATE CONSTRAINT IF NOT EXISTS FOR (v:Vocabulary) REQUIRE v.id IS UNIQUE",
+    "CREATE CONSTRAINT IF NOT EXISTS FOR (i:Institution) REQUIRE i.id IS UNIQUE",
+    "CREATE CONSTRAINT IF NOT EXISTS FOR (s:Source) REQUIRE s.id IS UNIQUE",
+    "CREATE CONSTRAINT IF NOT EXISTS FOR (j:Job) REQUIRE j.id IS UNIQUE",
+
+    # 范围索引：支撑 WHERE/ORDER BY 和属性匹配加速
+    "CREATE INDEX IF NOT EXISTS FOR (v:Vocabulary) ON (v.term)",         # 支撑 LINK_WORK_VOCAB
+    "CREATE INDEX IF NOT EXISTS FOR (a:Author) ON (a.last_updated)",     # 支撑增量同步查询
+    "CREATE INDEX IF NOT EXISTS FOR (w:Work) ON (w.year)"                # 支撑 SYNC_WORKS 的增量查找
+],
     "MERGE_WORK": "UNWIND $data AS row MERGE (n:Work {id: row.id}) SET n.wid = row.wid, n.title = row.title, n.name = row.name, n.year = row.year, n.citations = row.citations",
     "MERGE_AUTHOR": "UNWIND $data AS row MERGE (n:Author {id: row.id}) SET n.aid = row.aid, n.name = row.name, n.h_index = row.h_index, n.works_count = row.works_count, n.citations = row.citations",
     "MERGE_INSTITUTION": "UNWIND $data AS row MERGE (i:Institution {id: row.id}) SET i.iid = row.iid, i.name = row.name, i.works_count = row.works_count, i.citations = row.citations",
@@ -132,11 +139,19 @@ CONFIG_DICT = {
     "NEO4J_USER": NEO4J_USER,
     "NEO4J_PASSWORD": NEO4J_PASSWORD,
     "NEO4J_DATABASE": NEO4J_DATABASE,
-    "BATCH_SIZE": 2000,
+    "BATCH_SIZE": 5000,
     "SBERT_DIR": SBERT_DIR
 }
-
-# 11 KGATAX 训练数据的存放路径
+# 11 sqlite索引语句
+SQL_INIT_SCRIPTS = [
+    "CREATE INDEX IF NOT EXISTS idx_author_updated ON authors(last_updated)",
+    "CREATE INDEX IF NOT EXISTS idx_work_year ON works(year)",
+    "CREATE INDEX IF NOT EXISTS idx_inst_updated ON institutions(last_updated)",
+    "CREATE INDEX IF NOT EXISTS idx_source_updated ON sources(last_updated)",
+    "CREATE INDEX IF NOT EXISTS idx_job_crawl ON jobs(crawl_time)",
+    "CREATE INDEX IF NOT EXISTS idx_aship_id ON authorships(id)"
+]
+# 12 KGATAX 训练数据的存放路径
 KGATAX_TRAIN_DATA_DIR = os.path.join(BASE_DIR, "kgatax_train_data")
 if not os.path.exists(KGATAX_TRAIN_DATA_DIR):
     os.makedirs(KGATAX_TRAIN_DATA_DIR)

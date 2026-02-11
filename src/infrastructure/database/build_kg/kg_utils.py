@@ -13,6 +13,11 @@ class GraphEngine:
         self.driver = GraphDatabase.driver(config['NEO4J_URI'], auth=(config['NEO4J_USER'], config['NEO4J_PASSWORD']))
         self.db_name = config['NEO4J_DATABASE']
 
+    def execute_query(self, query: str):
+        """专门用于执行不带参数的 Schema 指令（如创建索引）"""
+        with self.driver.session(database=self.db_name) as session:
+            session.run(query)
+
     def send_batch(self, query: str, data: List[Dict]):
         if not data: return
         with self.driver.session(database=self.db_name) as session:
