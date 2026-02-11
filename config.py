@@ -51,6 +51,8 @@ SQL_QUERIES = {
 
     "SYNC_SOURCES": "SELECT source_id as id, source_id as sid, display_name as name, type, works_count, cited_by_count as citations, last_updated FROM sources WHERE last_updated > ? ORDER BY last_updated ASC",
 
+    "SYNC_WORKS": "SELECT work_id as id, work_id as wid, title as name, title, year, citation_count as citations, concepts_text, keywords_text FROM works WHERE year > ? ORDER BY year ASC",
+
     "SYNC_JOBS": "SELECT securityId as id, securityId as jid, job_name as name, skills, description, crawl_time FROM jobs WHERE crawl_time > ? ORDER BY crawl_time ASC",
 
     # Vocab 通常按 ID 增量同步即可
@@ -90,7 +92,7 @@ CYPHER_TEMPLATES = {
     "MERGE_INSTITUTION": "UNWIND $data AS row MERGE (i:Institution {id: row.id}) SET i.iid = row.iid, i.name = row.name, i.works_count = row.works_count, i.citations = row.citations",
     "MERGE_SOURCE": "UNWIND $data AS row MERGE (s:Source {id: row.id}) SET s.sid = row.sid, s.name = row.name, s.type = row.type, s.works_count = row.works_count, s.citations = row.citations",
     "MERGE_JOB": "UNWIND $data AS row MERGE (j:Job {id: row.id}) SET j.jid = row.jid, j.name = row.name, j.skills = row.skills, j.description = row.description",
-    "MERGE_VOCAB": "UNWIND $data AS row MERGE (v:Vocabulary {id: row.id}) SET v.vid = row.vid,v.term = toLower(row.term), v.type = row.entity_type",
+    "MERGE_VOCAB": "UNWIND $data AS row MERGE (v:Vocabulary {id: row.id}) SET v.vid = row.vid, v.term = toLower(row.term), v.type = row.entity_type",
     "LINK_AUTHORED_COMPLEX": """
         UNWIND $data AS row
         MATCH (a:Author {id: row.aid}), (w:Work {id: row.wid})

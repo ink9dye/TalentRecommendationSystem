@@ -12,6 +12,7 @@ def run_pipeline(config):
     try:
         # --- 0. 自动建立索引 (关键步骤) ---
         with monitor.track("Ensuring Constraints and Indexes"):
+
             # 为 Vocabulary 的 term 建立索引，支撑 build_work_semantic_links
             engine.send_batch("CREATE INDEX vocab_term_idx IF NOT EXISTS FOR (v:Vocabulary) ON (v.term)", [])
             # 为 Work 和 Job 的 ID 建立索引，支撑关系建立
@@ -29,9 +30,10 @@ def run_pipeline(config):
         ]
 
         with monitor.track("Syncing All Entities"):
-            # 警告：只有在需要彻底重构词库时才取消下面两行的注释
-            # engine.send_batch("MATCH (n:Vocabulary) DETACH DELETE n", [])
+            # 警告：只有在需要彻底重构词库时才取消下面的注释
             # state.reset_marker("vocab_sync")
+            # state.reset_marker("author_sync")
+            # state.reset_marker("work_sync")
 
             for task, sql, cypher, t_field in node_tasks:
                 builder.sync_nodes_task(task, sql, cypher, t_field)
