@@ -1,5 +1,7 @@
 import os
 import re
+import gc
+import torch
 import json
 import sqlite3
 import faiss
@@ -7,11 +9,13 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-# 导入你的统一配置
+# 导入统一配置
 from config import (
     DB_PATH, INDEX_DIR,
     JOB_INDEX_PATH, JOB_MAP_PATH,
-    ABSTRACT_INDEX_PATH, ABSTRACT_MAP_PATH,KGATAX_TRAIN_DATA_DIR
+    ABSTRACT_INDEX_PATH, ABSTRACT_MAP_PATH,
+    VOCAB_INDEX_PATH, VOCAB_MAP_PATH,  # 新增：词汇索引路径
+    KGATAX_TRAIN_DATA_DIR
 )
 
 
@@ -25,15 +29,18 @@ class TrainingDataGenerator:
         print("[*] 正在加载向量索引...")
         self.job_index = faiss.read_index(JOB_INDEX_PATH)
         self.abs_index = faiss.read_index(ABSTRACT_INDEX_PATH)
+        self.vocab_index = faiss.read_index(VOCAB_INDEX_PATH)  # 加载词汇索引
 
         with open(JOB_MAP_PATH, 'r', encoding='utf-8') as f:
             self.job_raw_ids = json.load(f)
         with open(ABSTRACT_MAP_PATH, 'r', encoding='utf-8') as f:
             self.abs_work_ids = json.load(f)
+        with open(VOCAB_MAP_PATH, 'r', encoding='utf-8') as f:
+            self.vocab_raw_ids = json.load(f)  # 加载词汇映射
 
-        # 2. 建立全局 ID 映射表 (模型只认 0, 1, 2...)
+        # 2. 建立全局 ID 映射表
         self.entity_to_int = {}
-        self.relation_to_int = {"interact": 0, "out_interact": 1}  # 预留交互关系 [cite: 413]
+        self.relation_to_int = {"interact": 0, "out_interact": 1}
         self.int_counter = 0
 
     def get_int_id(self, raw_id):
@@ -46,7 +53,6 @@ class TrainingDataGenerator:
         """建立 Work_ID 到 Author_ID 的映射"""
         print("[*] 正在建立作品-作者映射...")
         cursor = conn.cursor()
-        # 这里的映射逻辑决定了 CF 交互的目标
         rows = cursor.execute("SELECT work_id, author_id FROM authorships").fetchall()
         mapping = {}
         for r in rows:
@@ -60,7 +66,6 @@ class TrainingDataGenerator:
         work_to_author = self._map_work_to_author(conn)
 
         # 检索每个 Job 最相似的 20 篇论文摘要
-        # 向量路初步筛选，作为模型训练的“正样本”参考
         D, I = self.abs_index.search(self.job_index.reconstruct_n(0, len(self.job_raw_ids)), 20)
 
         train_lines = []
@@ -68,7 +73,6 @@ class TrainingDataGenerator:
             job_raw_id = self.job_raw_ids[i]
             job_int_id = self.get_int_id(job_raw_id)
 
-            # 找到对应的作者 ID
             matched_authors = []
             for work_idx in neighbors:
                 work_raw_id = self.abs_work_ids[work_idx]
@@ -77,36 +81,29 @@ class TrainingDataGenerator:
                     matched_authors.append(str(self.get_int_id(author_raw_id)))
 
             if matched_authors:
-                # 格式: User_ID Item_ID1 Item_ID2...
                 train_lines.append(f"{job_int_id} " + " ".join(matched_authors))
 
         with open(os.path.join(self.output_dir, "train.txt"), "w") as f:
             f.write("\n".join(train_lines))
 
-        # 简单处理 test.txt：取最后 10% 作为测试集
         with open(os.path.join(self.output_dir, "test.txt"), "w") as f:
             f.write("\n".join(train_lines[-int(len(train_lines) * 0.1):]))
 
         conn.close()
 
     def generate_kg_data(self):
-        """
-        核心优化版：生成千万级知识图谱三元组数据
-        """
-        print("\n>>> 任务 2: 生成知识图谱三元组数据 (二进制优化版)")
+        """生成知识图谱三元组数据 (包含动态词汇相似度)"""
+        print("\n>>> 任务 2: 生成知识图谱三元组数据")
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
-        # 1. 关系映射定义
         rel_map = {
             "authored": 2, "produced_by": 3,
             "published_in": 4, "has_topic": 5,
             "similar_to": 6, "require_skill": 7
         }
         self.relation_to_int.update(rel_map)
-
-        # 使用 numpy 数组的高效存储
         kg_triplets = []
 
         # --- 1. 拓扑路 ---
@@ -140,29 +137,34 @@ class TrainingDataGenerator:
             for skill in skills:
                 kg_triplets.append((h_job, rel_map['require_skill'], self.get_int_id(f"vocab_{skill}")))
 
-        # --- 4. 关联路 ---
-        print("[*] 解析词汇增强 (Vocab-Vocab)...")
-        try:
-            sim_rows = cursor.execute("SELECT from_id, to_id FROM vocabulary_similarity").fetchall()
-            for r in sim_rows:
-                kg_triplets.append((self.get_int_id(f"vocab_id_{r['from_id']}"),
-                                    rel_map['similar_to'],
-                                    self.get_int_id(f"vocab_id_{r['to_id']}")))
-        except sqlite3.OperationalError:
-            print("提示: 未发现词汇相似度表。")
+        # --- 4. 关联路：利用 vocabulary.faiss 动态检索替代数据库查询 ---
+        print("[*] 正在利用 Faiss 动态生成词汇关联 (Vocab-Vocab)...")
+        # 提取所有词向量并检索相似词 (取 Top 6，排除第一个自己)
+        k_neighbors = 6
+        vocab_vectors = self.vocab_index.reconstruct_n(0, len(self.vocab_raw_ids))
+        D, I = self.vocab_index.search(vocab_vectors, k_neighbors)
+
+        for i, neighbors in enumerate(tqdm(I, desc="Calculating Vocab Similarities")):
+            h_vocab_raw = self.vocab_raw_ids[i]
+            h_id = self.get_int_id(f"vocab_{h_vocab_raw}")  # 注意：保持 ID 命名规则一致
+
+            for nb_idx in neighbors:
+                # 跳过自己 (索引 i) 或无效结果 (-1)
+                if nb_idx == i or nb_idx == -1:
+                    continue
+
+                t_vocab_raw = self.vocab_raw_ids[nb_idx]
+                t_id = self.get_int_id(f"vocab_{t_vocab_raw}")
+                kg_triplets.append((h_id, rel_map['similar_to'], t_id))
 
         # --- 关键：二进制转换与存储 ---
         print(f"[*] 正在转换 {len(kg_triplets)} 条边为二进制张量...")
         kg_np = np.array(kg_triplets, dtype=np.int32)
 
-        # 释放内存
         del kg_triplets
         gc.collect()
 
-        # 保存 .pt 文件供 DataLoaderKGAT 加载
         torch.save(torch.from_numpy(kg_np), os.path.join(self.output_dir, "kg_final.pt"))
-
-        # 兼容性空文件
         with open(os.path.join(self.output_dir, "kg_final.txt"), "w") as f:
             f.write("Binary format saved in kg_final.pt")
 

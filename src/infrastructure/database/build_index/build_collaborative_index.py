@@ -1,132 +1,262 @@
 import sqlite3
-from neo4j import GraphDatabase
-from tqdm import tqdm
+import math
 import os
-import time
-from config import (
-    NEO4J_URI, NEO4J_USER,
-    NEO4J_PASSWORD, NEO4J_DATABASE,
-    COLLAB_DB_PATH  # 新增导入
-)
+import gc
+from tqdm import tqdm
+from datetime import datetime
+from config import DB_PATH, COLLAB_DB_PATH
 
 
-# 协作相似度索引存放路径
-COLLAB_DB_PATH = r"E:\PythonProject\TalentRecommendationSystem\data\build_index\scholar_collaboration.db"
-
-class ScholarSimilarityIndexer:
+class WeightStrategy:
     """
-    学者协作相似度索引构建器
-    优化策略：移除分数阈值，依靠 [0..100] 剪枝确保每个学者尽可能获得 100 名候选人。
+    人才推荐系统权重计算策略类。
+    W = (Base + Bonus) * e^(-0.1 * Δt)
     """
-    def __init__(self):
-        self.driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-        self._init_sqlite()
 
-    def _init_sqlite(self):
-        """初始化本地索引库"""
-        os.makedirs(os.path.dirname(COLLAB_DB_PATH), exist_ok=True)
-        self.conn = sqlite3.connect(COLLAB_DB_PATH)
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("DROP TABLE IF EXISTS scholar_collaboration")
-        self.conn.execute("""
-                          CREATE TABLE scholar_collaboration
-                          (
-                              aid1  TEXT,
-                              aid2  TEXT,
-                              score REAL,
-                              PRIMARY KEY (aid1, aid2)
-                          )
-                          """)
+    @staticmethod
+    def calculate(pos_index: int, is_corr: int, is_alpha: int, pub_year: int) -> float:
+        current_year = datetime.now().year
+        delta_t = max(0, current_year - (pub_year or 2000))
+        # 指数时间衰减
+        time_weight = math.exp(-0.1 * delta_t)
+        # 贡献度基数计算：考虑作者排名与通讯作者加成
+        contribution = 1.0 + (0.2 if is_alpha == 0 and pos_index == 1 else 0) + (0.2 if is_corr == 1 else 0)
+        return round(contribution * time_weight, 4)
 
-    def build_index(self):
-        """执行全量协作挖掘"""
-        print("--- 启动：学者协作相似度索引构建 (全量召回优化版) ---")
 
-        # 1. 获取所有学者 ID
-        with self.driver.session(database=NEO4J_DATABASE) as session:
-            author_ids = [record["id"] for record in session.run("MATCH (a:Author) RETURN a.id as id")]
+class LocalSimilarityIndexer:
+    def __init__(self, db_path, collab_db_path):
+        self.db_path = db_path
+        self.collab_db_path = collab_db_path
+        self._prepare_db()
 
-        print(f"[*] 监测到 {len(author_ids)} 名学者，正在构建深度协作网络...")
+    def _prepare_db(self):
+        """初始化协作索引数据库结构并配置磁盘存储策略"""
+        db_dir = os.path.dirname(os.path.abspath(self.collab_db_path))
+        if not os.path.exists(db_dir):
+            os.makedirs(db_dir)
 
-        # 2. 分批处理
-        INNER_BATCH = 80
-        batch_to_sqlite = []
+        self.conn = sqlite3.connect(self.collab_db_path)
 
-        # 【Cypher 逻辑变更】
-        # 移除了 WHERE direct_score > 0.2，改为纯排序截断
-        # 确保只要有合作关系，就会被记录在案（最多 100 人）
-        # 【算法升级：双边对称归一化版】
-        # 1. 计算一跳分数并执行双边归一化: Score / (sqrt(d1)*sqrt(d2))
-        # 2. 计算二跳分数并执行路径规范化: (Score1*Score2) / (d_bridge * sqrt(d1)*sqrt(d2))
-        # 3. 最终融合权重 alpha = 0.3
-        query = """
-                        MATCH (a1:Author)-[r1:AUTHORED]->(w:Work)<-[r2:AUTHORED]-(a2:Author)
-                        WHERE a1.id IN $id_list AND a1.id < a2.id
+        # 核心优化参数
+        self.conn.executescript(f"""
+            PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=OFF;
+            PRAGMA cache_size=200000; -- 约 200MB 缓存
+            PRAGMA temp_store = MEMORY; 
 
-                        WITH a1, a2, 
-                             sum(r1.weight * r2.weight * log(w.citations + 2.71828)) AS raw_direct
+            -- 阶段1结果：单人贡献权重缓存
+            DROP TABLE IF EXISTS weighted_authorships;
+            CREATE TABLE weighted_authorships (
+                work_id TEXT, 
+                author_id TEXT, 
+                weight REAL, 
+                h_index INTEGER
+            );
 
-                        WITH a1, a2, 
-                             raw_direct / (sqrt(a1.h_index + 1) * sqrt(a2.h_index + 1)) AS normalized_direct
+            -- 阶段2结果：直接协作分 (S_direct)
+            DROP TABLE IF EXISTS direct_scores;
+            CREATE TABLE direct_scores (
+                aid1 TEXT, 
+                aid2 TEXT, 
+                s_val REAL, 
+                h1 INTEGER, 
+                h2 INTEGER,
+                PRIMARY KEY (aid1, aid2)
+            ) WITHOUT ROWID;
 
-                        // 仅对最有潜力的前 100 名候选人执行昂贵的二跳计算
-                        ORDER BY normalized_direct DESC
-                        WITH a1, collect({a2: a2, nd: normalized_direct})[0..100] AS top_candidates
-                        UNWIND top_candidates AS candidate
-                        WITH a1, candidate.a2 AS a2, candidate.nd AS normalized_direct
+            -- 阶段3结果：最终合成索引 (S_total)
+            DROP TABLE IF EXISTS scholar_collaboration;
+            CREATE TABLE scholar_collaboration (
+                aid1 TEXT, 
+                aid2 TEXT, 
+                score REAL,
+                PRIMARY KEY (aid1, aid2)
+            ) WITHOUT ROWID;
+        """)
 
-                        OPTIONAL MATCH (a1)-[r_a1b:AUTHORED]->(w1:Work)<-[r_ba1:AUTHORED]-(bridge:Author)-[r_ba2:AUTHORED]->(w2:Work)<-[r_a2b:AUTHORED]-(a2)
-                        WHERE bridge <> a1 AND bridge <> a2
+    def step1_precompute_weights(self):
+        """阶段 1: 计算权重。将引用因子提前融合进权重值。"""
+        print("--- Step 1/3: 计算单体贡献权重 (预处理引用因子) ---")
+        src_conn = sqlite3.connect(self.db_path)
+        sql = """
+              SELECT a.work_id, \
+                     a.author_id, \
+                     a.pos_index, \
+                     a.is_corresponding,
+                     a.is_alphabetical, \
+                     w.year, \
+                     au.h_index, \
+                     w.citation_count
+              FROM authorships a
+                       JOIN works w ON a.work_id = w.work_id
+                       JOIN authors au ON a.author_id = au.author_id
+              """
+        cursor = src_conn.execute(sql)
 
-                        WITH a1, a2, normalized_direct, bridge,
-                             (r_a1b.weight * r_ba1.weight * log(w1.citations + 2.71828)) AS s1,
-                             (r_ba2.weight * r_a2b.weight * log(w2.citations + 2.71828)) AS s2
+        batch = []
+        for row in tqdm(cursor, desc="Processing Individual Weights"):
+            base_w = WeightStrategy.calculate(row[2], row[3], row[4], row[5])
+            # 将引用因子融合进权重：sqrt(log(cite + e))
+            cite_factor = math.sqrt(math.log((row[7] or 0) + 2.71828))
+            composite_weight = base_w * cite_factor
 
-                        WITH a1, a2, normalized_direct,
-                             sum((s1 * s2) / ((bridge.h_index + 1) * sqrt(a1.h_index + 1) * sqrt(a2.h_index + 1))) AS normalized_indirect
+            batch.append((row[0], row[1], composite_weight, row[6]))
+            if len(batch) >= 50000:
+                self.conn.executemany("INSERT INTO weighted_authorships VALUES (?,?,?,?)", batch)
+                batch = []
 
-                        RETURN a1.id AS aid1, a2.id AS aid2, 
-                               (normalized_direct + 0.3 * coalesce(normalized_indirect, 0)) AS final_score
-                        """
-
-        for i in tqdm(range(0, len(author_ids), INNER_BATCH), desc="全局协作挖掘"):
-            current_ids = author_ids[i: i + INNER_BATCH]
-
-            try:
-                with self.driver.session(database=NEO4J_DATABASE) as session:
-                    result = session.run(query, id_list=current_ids)
-                    for record in result:
-                        batch_to_sqlite.append((record['aid1'], record['aid2'], record['final_score']))
-                        batch_to_sqlite.append((record['aid2'], record['aid1'], record['final_score']))
-            except Exception as e:
-                with open("indexing_errors.log", "a") as f:
-                    f.write(f"Batch {i} failed: {str(e)}\n")
-                continue
-
-            if len(batch_to_sqlite) >= 2000:
-                self._save_batch(batch_to_sqlite)
-                batch_to_sqlite = []
-
-        if batch_to_sqlite:
-            self._save_batch(batch_to_sqlite)
-
-        print("正在建立 SQLite 索引...")
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_aid1 ON scholar_collaboration(aid1)")
-        print(f"--- 构建完成，索引存储于: {COLLAB_DB_PATH} ---")
-
-    def _save_batch(self, batch):
-        self.conn.executemany("INSERT OR REPLACE INTO scholar_collaboration VALUES (?, ?, ?)", batch)
+        if batch:
+            self.conn.executemany("INSERT INTO weighted_authorships VALUES (?,?,?,?)", batch)
         self.conn.commit()
 
+        print("-> 正在建立索引...")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_wa_work ON weighted_authorships(work_id)")
+        src_conn.close()
+
+    def step2_compute_direct_scores(self):
+        """
+        阶段 2: 计算协作分。
+        核心修改：改用 Python 内存迭代 + 限制巨型论文作者数，防止内存爆炸。
+        """
+        print("--- Step 2/3: 分批计算直接协作分 (内存保护模式) ---")
+
+        # 过滤掉作者数 > 100 的巨型项目，这些通常是导致卡死的罪魁祸首
+        print("-> 正在分析作品作者分布...")
+        work_stats = self.conn.execute("""
+                                       SELECT work_id, COUNT(author_id) as cnt
+                                       FROM weighted_authorships
+                                       GROUP BY work_id
+                                       HAVING cnt > 1
+                                          AND cnt < 100
+                                       """).fetchall()
+
+        all_works = [r[0] for r in work_stats]
+        pbar = tqdm(total=len(all_works), desc="Computing Direct Scores")
+
+        batch_data = []
+        for i, wid in enumerate(all_works):
+            # 获取该作品的所有作者及权重
+            authors = self.conn.execute(
+                "SELECT author_id, weight, h_index FROM weighted_authorships WHERE work_id = ?",
+                (wid,)
+            ).fetchall()
+
+            num_authors = len(authors)
+            # 在 Python 层面进行两两配对，规避 SQL JOIN 的笛卡尔积内存爆炸
+            for idx1 in range(num_authors):
+                for idx2 in range(idx1 + 1, num_authors):
+                    a1, w1, h1 = authors[idx1]
+                    a2, w2, h2 = authors[idx2]
+
+                    # 保证 aid1 < aid2 满足主键约束
+                    if a1 > a2:
+                        a1, a2, h1, h2, w1, w2 = a2, a1, h2, h1, w2, w1
+
+                    score = w1 * w2
+                    if score > 0.05:  # 剪枝
+                        batch_data.append((a1, a2, score, h1, h2))
+
+            # 定期批量写入并执行 Checkpoint
+            if len(batch_data) >= 15000:
+                self.conn.executemany("""
+                                      INSERT INTO direct_scores (aid1, aid2, s_val, h1, h2)
+                                      VALUES (?, ?, ?, ?, ?) ON CONFLICT(aid1, aid2) DO
+                                      UPDATE SET s_val = s_val + excluded.s_val
+                                      """, batch_data)
+                self.conn.commit()
+                batch_data = []
+
+            if i % 10000 == 0:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                self.conn.execute("PRAGMA shrink_memory;")
+                gc.collect()
+
+            pbar.update(1)
+
+        if batch_data:
+            self.conn.executemany("""
+                                  INSERT INTO direct_scores (aid1, aid2, s_val, h1, h2)
+                                  VALUES (?, ?, ?, ?, ?) ON CONFLICT(aid1, aid2) DO
+                                  UPDATE SET s_val = s_val + excluded.s_val
+                                  """, batch_data)
+            self.conn.commit()
+
+        pbar.close()
+        self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        print("-> 执行中间态空间回收 (VACUUM)...")
+        self.conn.execute("VACUUM;")
+
+    def step3_compute_final_scores(self):
+        """阶段 3: 合成最终索引 (S_total)"""
+        print("--- Step 3/3: 合成最终索引 (S_total) ---")
+
+        print("-> 3a: 写入直接协作分基数...")
+        self.conn.execute("INSERT INTO scholar_collaboration SELECT aid1, aid2, s_val FROM direct_scores")
+        self.conn.commit()
+
+        print("-> 3b: 累加间接协作分 (Bridge)...")
+        # 仅针对有直接协作的作者计算二阶关联
+        all_aids = [r[0] for r in self.conn.execute("SELECT DISTINCT aid1 FROM direct_scores").fetchall()]
+        batch_size = 800
+
+        pbar = tqdm(total=len(all_aids), desc="Synthesizing Indirect")
+        for i in range(0, len(all_aids), batch_size):
+            batch_aids = all_aids[i:i + batch_size]
+            placeholders = ','.join(['?'] * len(batch_aids))
+
+            sql = f"""
+                INSERT INTO scholar_collaboration (aid1, aid2, score)
+                SELECT d1.aid1, d2.aid2,
+                       0.3 * SUM((d1.s_val * d2.s_val) / ((d1.h2 + 1) * SQRT(d1.h1 + 1) * SQRT(d2.h2 + 1)))
+                FROM direct_scores d1
+                JOIN direct_scores d2 ON d1.aid2 = d2.aid1
+                WHERE d1.aid1 IN ({placeholders}) AND d1.aid1 != d2.aid2
+                GROUP BY d1.aid1, d2.aid2
+                HAVING SUM((d1.s_val * d2.s_val)) > 0.01
+                ON CONFLICT(aid1, aid2) DO UPDATE SET score = score + excluded.score
+            """
+            self.conn.execute(sql, batch_aids)
+            self.conn.commit()
+
+            if (i // batch_size) % 10 == 0:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            pbar.update(len(batch_aids))
+        pbar.close()
+
+        print("-> 3c: 执行 Top-100 裁剪与整理...")
+        self.conn.executescript("""
+                                CREATE TABLE scholar_collaboration_tmp AS
+                                SELECT aid1, aid2, score
+                                FROM (SELECT aid1,
+                                             aid2,
+                                             score,
+                                             ROW_NUMBER() OVER (PARTITION BY aid1 ORDER BY score DESC) as rank
+                                      FROM scholar_collaboration)
+                                WHERE rank <= 100;
+
+                                DROP TABLE scholar_collaboration;
+                                ALTER TABLE scholar_collaboration_tmp RENAME TO scholar_collaboration;
+                                CREATE UNIQUE INDEX idx_final_pair ON scholar_collaboration (aid1, aid2);
+                                CREATE INDEX idx_final_aid1 ON scholar_collaboration (aid1);
+                                PRAGMA
+                                wal_checkpoint(TRUNCATE);
+            VACUUM;
+            ANALYZE;
+                                """)
+        print("--- 协作索引构建完成 ---")
+
     def close(self):
-        self.driver.close()
         self.conn.close()
 
+
 if __name__ == "__main__":
-    indexer = ScholarSimilarityIndexer()
+    indexer = LocalSimilarityIndexer(DB_PATH, COLLAB_DB_PATH)
     try:
-        start_time = time.time()
-        indexer.build_index()
-        print(f"总耗时: {(time.time() - start_time)/3600:.2f} 小时")
+        start_time = datetime.now()
+        indexer.step1_precompute_weights()
+        indexer.step2_compute_direct_scores()
+        indexer.step3_compute_final_scores()
+        print(f"--- 耗时合计: {datetime.now() - start_time} ---")
     finally:
         indexer.close()

@@ -92,7 +92,10 @@ CYPHER_TEMPLATES = {
     # 范围索引：支撑 WHERE/ORDER BY 和属性匹配加速
     "CREATE INDEX IF NOT EXISTS FOR (v:Vocabulary) ON (v.term)",         # 支撑 LINK_WORK_VOCAB
     "CREATE INDEX IF NOT EXISTS FOR (a:Author) ON (a.last_updated)",     # 支撑增量同步查询
-    "CREATE INDEX IF NOT EXISTS FOR (w:Work) ON (w.year)"                # 支撑 SYNC_WORKS 的增量查找
+    "CREATE INDEX IF NOT EXISTS FOR (w:Work) ON (w.year)",                # 支撑 SYNC_WORKS 的增量查找
+    "CREATE INDEX IF NOT EXISTS FOR (a:Author) ON (a.h_index)",                # 支撑二跳中的精英排序
+    "CREATE INDEX IF NOT EXISTS FOR (a:Author) ON (a.aid)",                # 支撑 direct_query 的属性查找
+    "CREATE INDEX IF NOT EXISTS FOR ()-[r:AUTHORED]-() ON (r.pos_weight)"                # 支撑 AUTHORED 关系的属性过滤
 ],
     "MERGE_WORK": "UNWIND $data AS row MERGE (n:Work {id: row.id}) SET n.wid = row.wid, n.title = row.title, n.name = row.name, n.year = row.year, n.citations = row.citations",
     "MERGE_AUTHOR": "UNWIND $data AS row MERGE (n:Author {id: row.id}) SET n.aid = row.aid, n.name = row.name, n.h_index = row.h_index, n.works_count = row.works_count, n.citations = row.citations",
@@ -152,6 +155,6 @@ SQL_INIT_SCRIPTS = [
     "CREATE INDEX IF NOT EXISTS idx_aship_id ON authorships(id)"
 ]
 # 12 KGATAX 训练数据的存放路径
-KGATAX_TRAIN_DATA_DIR = os.path.join(BASE_DIR, "kgatax_train_data")
+KGATAX_TRAIN_DATA_DIR = os.path.join(DATA_DIR, "kgatax_train_data")
 if not os.path.exists(KGATAX_TRAIN_DATA_DIR):
     os.makedirs(KGATAX_TRAIN_DATA_DIR)
