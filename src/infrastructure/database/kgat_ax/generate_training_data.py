@@ -14,7 +14,7 @@ from config import (
     DB_PATH, INDEX_DIR,
     JOB_INDEX_PATH, JOB_MAP_PATH,
     ABSTRACT_INDEX_PATH, ABSTRACT_MAP_PATH,
-    VOCAB_INDEX_PATH, VOCAB_MAP_PATH,  # 新增：词汇索引路径
+    VOCAB_INDEX_PATH, VOCAB_MAP_PATH,
     KGATAX_TRAIN_DATA_DIR
 )
 
@@ -29,17 +29,18 @@ class TrainingDataGenerator:
         print("[*] 正在加载向量索引...")
         self.job_index = faiss.read_index(JOB_INDEX_PATH)
         self.abs_index = faiss.read_index(ABSTRACT_INDEX_PATH)
-        self.vocab_index = faiss.read_index(VOCAB_INDEX_PATH)  # 加载词汇索引
+        self.vocab_index = faiss.read_index(VOCAB_INDEX_PATH)
 
         with open(JOB_MAP_PATH, 'r', encoding='utf-8') as f:
             self.job_raw_ids = json.load(f)
         with open(ABSTRACT_MAP_PATH, 'r', encoding='utf-8') as f:
             self.abs_work_ids = json.load(f)
         with open(VOCAB_MAP_PATH, 'r', encoding='utf-8') as f:
-            self.vocab_raw_ids = json.load(f)  # 加载词汇映射
+            self.vocab_raw_ids = json.load(f)
 
         # 2. 建立全局 ID 映射表
         self.entity_to_int = {}
+        # 预留 0 和 1 给交互关系，符合 KGAT 拓扑注入逻辑
         self.relation_to_int = {"interact": 0, "out_interact": 1}
         self.int_counter = 0
 
@@ -60,12 +61,11 @@ class TrainingDataGenerator:
         return mapping
 
     def generate_cf_data(self):
-        """利用向量相似度生成 CF 交互数据 (train.txt)"""
+        """利用向量相似度生成协同过滤交互数据 (train.txt)"""
         print("\n>>> 任务 1: 生成协同过滤交互数据 (Job-Author)")
         conn = sqlite3.connect(DB_PATH)
         work_to_author = self._map_work_to_author(conn)
 
-        # 检索每个 Job 最相似的 20 篇论文摘要
         D, I = self.abs_index.search(self.job_index.reconstruct_n(0, len(self.job_raw_ids)), 20)
 
         train_lines = []
@@ -81,6 +81,7 @@ class TrainingDataGenerator:
                     matched_authors.append(str(self.get_int_id(author_raw_id)))
 
             if matched_authors:
+                # 存储格式：用户ID 物品ID1 物品ID2 ...
                 train_lines.append(f"{job_int_id} " + " ".join(matched_authors))
 
         with open(os.path.join(self.output_dir, "train.txt"), "w") as f:
@@ -98,6 +99,7 @@ class TrainingDataGenerator:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
+        # 定义关系映射
         rel_map = {
             "authored": 2, "produced_by": 3,
             "published_in": 4, "has_topic": 5,
@@ -137,42 +139,39 @@ class TrainingDataGenerator:
             for skill in skills:
                 kg_triplets.append((h_job, rel_map['require_skill'], self.get_int_id(f"vocab_{skill}")))
 
-        # --- 4. 关联路：利用 vocabulary.faiss 动态检索替代数据库查询 ---
+        # --- 4. 关联路：利用 Faiss 检索 Vocab-Vocab 关系 ---
         print("[*] 正在利用 Faiss 动态生成词汇关联 (Vocab-Vocab)...")
-        # 提取所有词向量并检索相似词 (取 Top 6，排除第一个自己)
         k_neighbors = 6
         vocab_vectors = self.vocab_index.reconstruct_n(0, len(self.vocab_raw_ids))
         D, I = self.vocab_index.search(vocab_vectors, k_neighbors)
 
         for i, neighbors in enumerate(tqdm(I, desc="Calculating Vocab Similarities")):
             h_vocab_raw = self.vocab_raw_ids[i]
-            h_id = self.get_int_id(f"vocab_{h_vocab_raw}")  # 注意：保持 ID 命名规则一致
+            h_id = self.get_int_id(f"vocab_{h_vocab_raw}")
 
             for nb_idx in neighbors:
-                # 跳过自己 (索引 i) 或无效结果 (-1)
                 if nb_idx == i or nb_idx == -1:
                     continue
-
                 t_vocab_raw = self.vocab_raw_ids[nb_idx]
                 t_id = self.get_int_id(f"vocab_{t_vocab_raw}")
                 kg_triplets.append((h_id, rel_map['similar_to'], t_id))
 
-        # --- 关键：二进制转换与存储 ---
-        print(f"[*] 正在转换 {len(kg_triplets)} 条边为二进制张量...")
+        # --- 核心修改：保存为模型可读的文本格式 ---
+        print(f"[*] 正在将 {len(kg_triplets)} 条三元组边保存为文本格式...")
+        with open(os.path.join(self.output_dir, "kg_final.txt"), "w", encoding='utf-8') as f:
+            for h, r, t in kg_triplets:
+                # 格式：h r t (空格分隔)，供 DataLoader.load_kg 直接使用
+                f.write(f"{h} {r} {t}\n")
+
+        # 备份一份二进制张量
         kg_np = np.array(kg_triplets, dtype=np.int32)
-
-        del kg_triplets
-        gc.collect()
-
         torch.save(torch.from_numpy(kg_np), os.path.join(self.output_dir, "kg_final.pt"))
-        with open(os.path.join(self.output_dir, "kg_final.txt"), "w") as f:
-            f.write("Binary format saved in kg_final.pt")
 
         conn.close()
-        print(f"[成功] 二进制三元组已保存。实体总数: {len(self.entity_to_int)}")
+        print(f"[成功] 知识图谱已保存。实体总数: {len(self.entity_to_int)}")
 
     def save_id_mapping(self):
-        """保存 ID 映射表供推理阶段使用"""
+        """保存 ID 映射表供训练及推理阶段执行全息融合 (AX) 使用"""
         mapping = {"entity": self.entity_to_int, "relation": self.relation_to_int}
         with open(os.path.join(self.output_dir, "id_map.json"), "w", encoding='utf-8') as f:
             json.dump(mapping, f, ensure_ascii=False, indent=4)

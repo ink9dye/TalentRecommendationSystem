@@ -1,4 +1,5 @@
 import os
+import gc
 import random
 import collections
 import torch
@@ -26,24 +27,23 @@ class DataLoaderBase(object):
         self.load_auxiliary_info()
 
     def load_auxiliary_info(self):
-        """修正版：从全局 ID 映射加载指标，并为非学术节点执行零填充"""
-        # 1. 加载全局 ID 映射表
+        """最终修正版：确保特征矩阵大小与全局映射完全对齐，并适应 16GB 共享内存"""
         map_path = os.path.join(self.data_dir, "id_map.json")
         with open(map_path, 'r', encoding='utf-8') as f:
             mapping = json.load(f)
         entity_to_int = mapping['entity']
 
-        # 2. 初始化全零特征矩阵 [n_users_entities, 3]
-        # 这样做确保了所有 Vocabulary, Job, Work 等节点初始指标均为 [0.0, 0.0, 0.0]
-        features = np.zeros((self.n_users_entities, self.args.n_aux_features), dtype=np.float32)
+        num_total_entities = len(entity_to_int)
+        # [cite_start]强制使用 float32 节省空间 [cite: 173]
+        features = np.zeros((num_total_entities, self.args.n_aux_features), dtype=np.float32)
 
-        # 3. 从 SQLite 加载真实数据
         conn = sqlite3.connect(self.args.db_path)
+        # [cite_start]只提取需要的列，减少内存占用 [cite: 156]
         authors_df = pd.read_sql("SELECT author_id, h_index, cited_by_count, works_count FROM authors", conn)
         insts_df = pd.read_sql("SELECT inst_id, cited_by_count, works_count FROM institutions", conn)
         conn.close()
 
-        # 4. 执行归一化 (保持原有逻辑)
+        # [cite_start]执行归一化 [cite: 157]
         for df in [authors_df, insts_df]:
             for col in ['cited_by_count', 'works_count']:
                 if col in df.columns:
@@ -51,20 +51,25 @@ class DataLoaderBase(object):
         authors_df['h_index'] = (authors_df['h_index'] - authors_df['h_index'].min()) / \
                                 (authors_df['h_index'].max() - authors_df['h_index'].min() + 1e-9)
 
-        # 5. 精准填充：利用 entity_to_int 找到模型内部索引
-        # 作者特征填充 [H-index, Citations, Works]
+        # [cite_start]填充特征：实现 Holographic Embedding 的基础属性注入 [cite: 10, 157]
         for _, row in authors_df.iterrows():
-            if row['author_id'] in entity_to_int:
-                idx = entity_to_int[row['author_id']]
+            if str(row['author_id']) in entity_to_int:
+                idx = entity_to_int[str(row['author_id'])]
                 features[idx] = [row['h_index'], row['cited_by_count'], row['works_count']]
 
-        # 机构特征填充 (H-index 补 0)
         for _, row in insts_df.iterrows():
-            if row['inst_id'] in entity_to_int:
-                idx = entity_to_int[row['inst_id']]
-                features[idx] = [0, row['cited_by_count'], row['works_count']]
+            if str(row['inst_id']) in entity_to_int:
+                idx = entity_to_int[str(row['inst_id'])]
+                features[idx] = [0.0, row['cited_by_count'], row['works_count']]
 
         self.aux_info_all = torch.from_numpy(features)
+        # [cite_start]关键：更新此值以确保与 construct_data 中的矩阵维度一致 [cite: 421]
+        self.n_users_entities = num_total_entities
+
+        # 显式清理
+        del authors_df, insts_df, mapping
+
+        gc.collect()
 
     def load_cf(self, filename):
         user_ids, item_ids = [], []
@@ -204,6 +209,8 @@ class DataLoaderKGAT(DataLoaderBase):
         self.h_list = torch.LongTensor(h_list)
         self.t_list = torch.LongTensor(t_list)
         self.r_list = torch.LongTensor(r_list)
+        # === 核心对齐补丁：确保图拓扑维度与 AX 特征矩阵维度严格相等 ===
+        self.n_users_entities = self.aux_info_all.shape[0]
 
     def convert_coo2tensor(self, coo):
         indices = np.vstack((coo.row, coo.col))
