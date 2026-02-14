@@ -28,7 +28,7 @@ def parse_kgat_args():
                         help='CF batch size.')
     parser.add_argument('--kg_batch_size', type=int, default=2048,
                         help='KG batch size.')
-    parser.add_argument('--test_batch_size', type=int, default=1024,
+    parser.add_argument('--test_batch_size', type=int, default=256,
                         help='Test batch size.')
 
     # 4. 模型超参数
@@ -73,7 +73,7 @@ def parse_kgat_args():
     parser.add_argument('--kg_print_every', type=int, default=1,
                         help='Iter interval of printing KG loss.')
     # 考虑到 CPU 训练评估较慢，建议设为 5 或 10
-    parser.add_argument('--evaluate_every', type=int, default=5,
+    parser.add_argument('--evaluate_every', type=int, default=20,
                         help='Epoch interval of evaluating recall@K and ndcg@K.')
     parser.add_argument('--Ks', nargs='?', default='[20, 40, 60, 80, 100]',
                         help='Calculate metric@K when evaluating.')

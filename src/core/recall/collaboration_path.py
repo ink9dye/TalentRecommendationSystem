@@ -13,7 +13,7 @@ class CollaborativeRecallPath:
     职责：从种子作者出发，发现协作关系最紧密的合作伙伴
     """
 
-    def __init__(self, recall_limit=100):
+    def __init__(self, recall_limit=200):
         self.collab_db_path = COLLAB_DB_PATH
         self.recall_limit = recall_limit
 
@@ -74,7 +74,7 @@ class CollaborativeRecallPath:
 
 
 if __name__ == "__main__":
-    c_path = CollaborativeRecallPath(recall_limit=100)
+    c_path = CollaborativeRecallPath(recall_limit=200)
 
     print("\n" + "=" * 60)
     print("🤝 协同路 (Collaborative Network) 双段输入独立测试")

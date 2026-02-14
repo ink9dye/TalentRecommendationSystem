@@ -3,10 +3,10 @@ import json
 import numpy as np
 import faiss
 from concurrent.futures import ThreadPoolExecutor
-from input_to_vector import QueryEncoder
-from vector_path import VectorPath
-from label_path import LabelRecallPath
-from collaboration_path import CollaborativeRecallPath
+from src.core.recall.input_to_vector import QueryEncoder
+from src.core.recall.vector_path import VectorPath
+from src.core.recall.label_path import LabelRecallPath
+from src.core.recall.collaboration_path import CollaborativeRecallPath
 
 
 class TotalRecallSystem:
@@ -19,9 +19,9 @@ class TotalRecallSystem:
         print("[*] 正在初始化全量召回系统，请稍候...", flush=True)
         # 1. 初始化各路组件
         self.encoder = QueryEncoder()
-        self.v_path = VectorPath(recall_limit=200)  # 向量路，扩大池子以备精排
-        self.l_path = LabelRecallPath(recall_limit=200)  # 标签路
-        self.c_path = CollaborativeRecallPath(recall_limit=100)  # 协同路
+        self.v_path = VectorPath(recall_limit=300)  # 向量路，扩大池子以备精排
+        self.l_path = LabelRecallPath(recall_limit=300)  # 标签路
+        self.c_path = CollaborativeRecallPath(recall_limit=200)  # 协同路
 
         # 2. 初始化并行执行器
         self.executor = ThreadPoolExecutor(max_workers=2)

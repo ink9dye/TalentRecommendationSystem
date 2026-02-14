@@ -66,7 +66,7 @@ class KGAT(nn.Module):
         self.aux_embed_layer = nn.Linear(self.n_aux_features, self.embed_dim)
         nn.init.xavier_uniform_(self.aux_embed_layer.weight)
 
-        self.entity_user_embed = nn.Embedding(self.n_entities + self.n_users, self.embed_dim)
+        self.entity_user_embed = nn.Embedding(n_entities, self.embed_dim)
         self.relation_embed = nn.Embedding(self.n_relations, self.relation_dim)
         self.trans_M = nn.Parameter(torch.Tensor(self.n_relations, self.embed_dim, self.relation_dim))
 
@@ -92,9 +92,10 @@ class KGAT(nn.Module):
         self.A_in.requires_grad = False
 
     def holographic_fusion(self, entity_embed, aux_info):
-        """全息嵌入融合：将归一化后的 H-index 等指标注入实体表示"""
-        aux_vector = torch.tanh(self.aux_embed_layer(aux_info))
-        return torch.mul(entity_embed, 1 + aux_vector)
+        # 使用 tanh 将偏移量映射到 (-1, 1)，然后加 1 形成 (0, 2) 的缩放系数
+        # 这样原始图谱特征得以保留，学术大牛的特征被放大，普通人被略微缩小
+        res_weight = torch.tanh(self.aux_embed_layer(aux_info)) + 1.0
+        return entity_embed * res_weight
 
     def calc_cf_embeddings(self, aux_info_all):
         """带 AX 增强的消息传递层"""
