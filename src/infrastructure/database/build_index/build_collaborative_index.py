@@ -38,7 +38,7 @@ class LocalSimilarityIndexer:
 
         self.conn = sqlite3.connect(self.collab_db_path)
 
-        # 核心优化参数
+        # 核心优化参数：增加缓存并启用 WAL
         self.conn.executescript(f"""
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=OFF;
@@ -80,13 +80,13 @@ class LocalSimilarityIndexer:
         print("--- Step 1/3: 计算单体贡献权重 (预处理引用因子) ---")
         src_conn = sqlite3.connect(self.db_path)
         sql = """
-              SELECT a.work_id, \
-                     a.author_id, \
-                     a.pos_index, \
+              SELECT a.work_id,
+                     a.author_id,
+                     a.pos_index,
                      a.is_corresponding,
-                     a.is_alphabetical, \
-                     w.year, \
-                     au.h_index, \
+                     a.is_alphabetical,
+                     w.year,
+                     au.h_index,
                      w.citation_count
               FROM authorships a
                        JOIN works w ON a.work_id = w.work_id
@@ -115,13 +115,9 @@ class LocalSimilarityIndexer:
         src_conn.close()
 
     def step2_compute_direct_scores(self):
-        """
-        阶段 2: 计算协作分。
-        核心修改：改用 Python 内存迭代 + 限制巨型论文作者数，防止内存爆炸。
-        """
+        """阶段 2: 计算协作分。使用内存迭代规避笛卡尔积开销。"""
         print("--- Step 2/3: 分批计算直接协作分 (内存保护模式) ---")
 
-        # 过滤掉作者数 > 100 的巨型项目，这些通常是导致卡死的罪魁祸首
         print("-> 正在分析作品作者分布...")
         work_stats = self.conn.execute("""
                                        SELECT work_id, COUNT(author_id) as cnt
@@ -136,28 +132,23 @@ class LocalSimilarityIndexer:
 
         batch_data = []
         for i, wid in enumerate(all_works):
-            # 获取该作品的所有作者及权重
             authors = self.conn.execute(
                 "SELECT author_id, weight, h_index FROM weighted_authorships WHERE work_id = ?",
                 (wid,)
             ).fetchall()
 
             num_authors = len(authors)
-            # 在 Python 层面进行两两配对，规避 SQL JOIN 的笛卡尔积内存爆炸
             for idx1 in range(num_authors):
                 for idx2 in range(idx1 + 1, num_authors):
                     a1, w1, h1 = authors[idx1]
                     a2, w2, h2 = authors[idx2]
 
-                    # 保证 aid1 < aid2 满足主键约束
-                    if a1 > a2:
-                        a1, a2, h1, h2, w1, w2 = a2, a1, h2, h1, w2, w1
+                    if a1 > a2: a1, a2, h1, h2, w1, w2 = a2, a1, h2, h1, w2, w1
 
                     score = w1 * w2
-                    if score > 0.05:  # 剪枝
+                    if score > 0.05:
                         batch_data.append((a1, a2, score, h1, h2))
 
-            # 定期批量写入并执行 Checkpoint
             if len(batch_data) >= 15000:
                 self.conn.executemany("""
                                       INSERT INTO direct_scores (aid1, aid2, s_val, h1, h2)
@@ -169,26 +160,21 @@ class LocalSimilarityIndexer:
 
             if i % 10000 == 0:
                 self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                self.conn.execute("PRAGMA shrink_memory;")
                 gc.collect()
 
             pbar.update(1)
 
         if batch_data:
-            self.conn.executemany("""
-                                  INSERT INTO direct_scores (aid1, aid2, s_val, h1, h2)
-                                  VALUES (?, ?, ?, ?, ?) ON CONFLICT(aid1, aid2) DO
-                                  UPDATE SET s_val = s_val + excluded.s_val
-                                  """, batch_data)
+            self.conn.executemany(
+                "INSERT INTO direct_scores VALUES (?,?,?,?,?) ON CONFLICT(aid1, aid2) DO UPDATE SET s_val = s_val + excluded.s_val",
+                batch_data)
             self.conn.commit()
 
         pbar.close()
-        self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-        print("-> 执行中间态空间回收 (VACUUM)...")
         self.conn.execute("VACUUM;")
 
     def step3_compute_final_scores(self):
-        """阶段 3: 合成最终索引 (S_total)"""
+        """阶段 3: 合成最终索引并注入双向覆盖索引"""
         print("--- Step 3/3: 合成最终索引 (S_total) ---")
 
         print("-> 3a: 写入直接协作分基数...")
@@ -196,7 +182,6 @@ class LocalSimilarityIndexer:
         self.conn.commit()
 
         print("-> 3b: 累加间接协作分 (Bridge)...")
-        # 仅针对有直接协作的作者计算二阶关联
         all_aids = [r[0] for r in self.conn.execute("SELECT DISTINCT aid1 FROM direct_scores").fetchall()]
         batch_size = 800
 
@@ -218,13 +203,10 @@ class LocalSimilarityIndexer:
             """
             self.conn.execute(sql, batch_aids)
             self.conn.commit()
-
-            if (i // batch_size) % 10 == 0:
-                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
             pbar.update(len(batch_aids))
         pbar.close()
 
-        print("-> 3c: 执行 Top-100 裁剪与整理...")
+        print("-> 3c: 执行 Top-100 裁剪与全链路覆盖索引优化...")
         self.conn.executescript("""
                                 CREATE TABLE scholar_collaboration_tmp AS
                                 SELECT aid1, aid2, score
@@ -237,12 +219,16 @@ class LocalSimilarityIndexer:
 
                                 DROP TABLE scholar_collaboration;
                                 ALTER TABLE scholar_collaboration_tmp RENAME TO scholar_collaboration;
-                                CREATE UNIQUE INDEX idx_final_pair ON scholar_collaboration (aid1, aid2);
-                                CREATE INDEX idx_final_aid1 ON scholar_collaboration (aid1);
+
+                                -- 核心优化：建立双向覆盖索引，解决 UNION ALL 查询全表扫描问题
+                                -- 直接包含 score，查询时无需读取数据行 (Index Only Scan)
+                                CREATE UNIQUE INDEX IF NOT EXISTS idx_collab_covering_1 ON scholar_collaboration (aid1, aid2, score);
+                                CREATE INDEX IF NOT EXISTS idx_collab_covering_2 ON scholar_collaboration (aid2, aid1, score);
+
                                 PRAGMA
                                 wal_checkpoint(TRUNCATE);
-            VACUUM;
-            ANALYZE;
+                                VACUUM;
+                                ANALYZE; -- 更新统计信息，使规划器正确命中覆盖索引
                                 """)
         print("--- 协作索引构建完成 ---")
 

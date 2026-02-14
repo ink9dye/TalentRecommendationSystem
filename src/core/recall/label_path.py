@@ -1,7 +1,6 @@
 import faiss
 import json
 import time
-import sqlite3
 import numpy as np
 from py2neo import Graph
 from config import (
@@ -12,13 +11,15 @@ from config import (
 
 class LabelRecallPath:
     """
-    标签路召回极速版 (性能优化目标 < 500ms)
-    逻辑：锚定岗位 -> 提取核心词 -> 向量预取 -> 三维评分排名
+    标签路召回极限优化版
+    核心修改：
+    1. 移除 Pandas：使用 Neo4j 原生 Cursor 迭代，消除 DataFrame 序列化开销。
+    2. 两段式评分：仅对前 100 名执行高能耗向量内聚度计算，余下执行快速路径。
+    3. 预载入优化：维持向量内存矩阵以确保 Index-Only 级别的计算速度。
     """
 
     def __init__(self, recall_limit=200):
         self.recall_limit = recall_limit
-        # 增加一个 verbose 开关，默认关闭以提速
         self.verbose = False
         try:
             self.graph = Graph(
@@ -29,6 +30,7 @@ class LabelRecallPath:
         except Exception as e:
             pass
 
+        # 加载索引
         self.job_index = faiss.read_index(JOB_INDEX_PATH)
         with open(JOB_MAP_PATH, 'r', encoding='utf-8') as f:
             self.job_id_map = json.load(f)
@@ -38,104 +40,112 @@ class LabelRecallPath:
             self.vocab_id_map = json.load(f)
             self.vocab_to_idx = {str(vid): i for i, vid in enumerate(self.vocab_id_map)}
 
+        # 向量预载入矩阵
+        print("[*] 正在预载入词汇向量矩阵以消除 I/O 瓶颈...", flush=True)
+        ntotal = self.vocab_index.ntotal
+        self.all_vocab_vectors = self.vocab_index.reconstruct_n(0, ntotal).astype('float32')
+        print(f"[OK] 预载入 {ntotal} 个词汇向量完成")
+
     def _get_skills_from_jobs(self, query_vector, top_n=5):
+        """原生 Cursor 模式获取核心词"""
         _, indices = self.job_index.search(query_vector, top_n)
         job_ids = [self.job_id_map[idx] for idx in indices[0] if 0 <= idx < len(self.job_id_map)]
 
         cypher = """
         MATCH (j:Job) WHERE j.id IN $j_ids
         MATCH (j)-[:REQUIRE_SKILL]->(v:Vocabulary)
-        RETURN v.id AS vid, v.term AS term
+        RETURN DISTINCT v.id AS vid
         """
-        res = self.graph.run(cypher, j_ids=job_ids).to_data_frame()
-        if res.empty: return []
+        # 使用 run().to_table() 或直接迭代比 to_data_frame() 快
+        cursor = self.graph.run(cypher, j_ids=job_ids)
+        return [int(record['vid']) for record in cursor]
 
-        # 仅在 verbose 开启时打印
-        if self.verbose:
-            print(f" [链路跟踪] 提取核心学术词: {res['term'].unique().tolist()[:5]}")
-
-        return [int(v) for v in res['vid'].unique().tolist()]
+    def _calculate_proximity_fast(self, hit_ids):
+        """内聚度极速计算"""
+        if len(hit_ids) < 2:
+            return 0.5
+        idxs = [self.vocab_to_idx[str(vid)] for vid in hit_ids if str(vid) in self.vocab_to_idx]
+        if len(idxs) < 2:
+            return 0.5
+        vecs = self.all_vocab_vectors[idxs]
+        sim_matrix = np.dot(vecs, vecs.T)
+        n = sim_matrix.shape[0]
+        upper_tri = sim_matrix[np.triu_indices(n, k=1)]
+        return float(np.mean(upper_tri))
 
     def recall(self, query_vector):
         if self.graph is None: return [], 0
         start_t = time.time()
 
-        # 1. 获取核心学术词
+        # 1. 获取核心词
         core_ids = self._get_skills_from_jobs(query_vector)
         if not core_ids: return [], 0
+        core_ids_set = set(core_ids)
 
-        # 2. 联想词扩展
+        # 2. 拓扑扩展 (原生迭代)
         expand_cypher = """
         MATCH (v:Vocabulary) WHERE v.id IN $v_ids
         OPTIONAL MATCH (v)-[:SIMILAR_TO]-(v_rel:Vocabulary)
         WITH v_rel LIMIT 100
         RETURN DISTINCT v_rel.id AS vid
         """
-        expanded_res = self.graph.run(expand_cypher, v_ids=core_ids).to_data_frame()
-        ext_ids = [int(v) for v in expanded_res['vid'].tolist() if v is not None and int(v) not in core_ids]
+        ext_cursor = self.graph.run(expand_cypher, v_ids=core_ids)
+        all_ids = list(core_ids_set | {int(rec['vid']) for rec in ext_cursor if rec['vid'] is not None})
 
-        all_ids = list(set(core_ids + ext_ids))
-
-        # 缓存向量
-        vocab_vec_cache = {}
-        for vid in all_ids:
-            s_vid = str(vid)
-            if s_vid in self.vocab_to_idx:
-                vocab_vec_cache[vid] = self.vocab_index.reconstruct(self.vocab_to_idx[s_vid])
-
-        # 3. Neo4j 召回
+        # 3. Neo4j 召回 (使用原生 Cursor 避免 DataFrame 开销)
+        # 增加按照基础权重初步排序，方便后续执行两段式评分
         final_cypher = """
         MATCH (v:Vocabulary) 
         USING INDEX v:Vocabulary(id)
         WHERE v.id IN $all_v_ids
         MATCH (v)<-[:HAS_TOPIC]-(w:Work)
-        WITH w, collect(DISTINCT v.id) AS hit_ids LIMIT 2000
+        WITH w, collect(DISTINCT v.id) AS hit_ids LIMIT 300 
         MATCH (w)<-[auth_r:AUTHORED]-(a:Author)
         RETURN a.id AS aid, 
                sum(auth_r.pos_weight) AS auth_w, 
-               collect(DISTINCT {wid: w.id, title: w.title, hits: hit_ids}) AS papers
+               collect({wid: w.id, hits: hit_ids}) AS papers
+        ORDER BY auth_w DESC
         """
-        res = self.graph.run(final_cypher, all_v_ids=all_ids).to_data_frame()
-        if res.empty: return [], (time.time() - start_t) * 1000
 
-        # 4. 内存内排名计算
+        cursor = self.graph.run(final_cypher, all_v_ids=all_ids)
+
+        # 4. 内存内分级评分排名
         scored_authors = []
-        for _, row in res.iterrows():
-            author_score = 0.0
-            best_hits = 0
-            best_prox = 0.5
+        processed_count = 0
 
-            for paper in row['papers']:
+        # 直接迭代原生结果集
+        for record in cursor:
+            processed_count += 1
+            author_total_score = 0.0
+
+            # --- 优化点：两段式计算策略 ---
+            # 仅对前 100 名高权重的作者执行矩阵运算，后续执行快速路径
+            is_fast_path = processed_count > 100
+
+            papers = record['papers']
+            for paper in papers:
                 h_ids = paper['hits']
                 h_count = len(h_ids)
-                rank_score = sum([100 if vid in core_ids else 20 for vid in h_ids])
+                rank_score = sum([100 if vid in core_ids_set else 20 for vid in h_ids])
 
-                proximity = 0.5
-                if h_count >= 2:
-                    paper_vecs = [vocab_vec_cache[vid] for vid in h_ids if vid in vocab_vec_cache]
-                    if len(paper_vecs) >= 2:
-                        sims = np.dot(paper_vecs, np.array(paper_vecs).T)
-                        proximity = float(np.mean(sims[np.triu_indices(len(paper_vecs), k=1)]))
+                if is_fast_path:
+                    proximity = 0.5  # 快速路径默认值
+                else:
+                    proximity = self._calculate_proximity_fast(h_ids)  # 精排路计算
 
-                paper_score = (rank_score + h_count ** 2) * (1 + proximity)
-                author_score += paper_score
-                best_hits = max(best_hits, h_count)
-                best_prox = max(best_prox, proximity)
+                author_total_score += (rank_score + h_count ** 2) * (1 + proximity)
 
             scored_authors.append({
-                'aid': row['aid'],
-                'score': row['auth_w'] * author_score,
-                'hits': best_hits,
-                'prox': best_prox,
-                'title': row['papers'][0]['title']
+                'aid': record['aid'],
+                'score': record['auth_w'] * author_total_score
             })
 
+        # 最终排序
         scored_authors.sort(key=lambda x: x['score'], reverse=True)
         duration = (time.time() - start_t) * 1000
 
-        # 只有在 verbose 为 True 时才打印报告（训练数据生成时会自动保持安静）
         if self.verbose:
-            print(f"\n[综合三维排名报告 - TOP 5]")
+            print(f"\n[原生迭代+两段式评分报告 - TOP 5]")
             for i, auth in enumerate(scored_authors[:5]):
                 print(f" {i + 1}. 作者: {auth['aid']} | 得分: {auth['score']:.2f}")
 
@@ -144,22 +154,24 @@ class LabelRecallPath:
 
 if __name__ == "__main__":
     l_path = LabelRecallPath(recall_limit=200)
-    l_path.verbose = True  # 测试模式开启打印
+    l_path.verbose = True
 
     try:
         while True:
-            raw_input = input("\n请粘贴稠密向量:\n>> ").strip()
+            raw_input = input("\n请输入稠密向量 (JSON 格式):\n>> ").strip()
             if not raw_input or raw_input.lower() == 'q': break
             try:
+                import json
+
                 vector_list = json.loads(raw_input)
                 query_vec = np.array([vector_list]).astype('float32')
                 faiss.normalize_L2(query_vec)
 
                 top_ids, search_time = l_path.recall(query_vec)
 
-                print(f"\n[结果报告]")
-                print(f"- 耗时: {search_time:.2f} ms")
-                print(f"- 召回候选人数量: {len(top_ids)}")
+                print(f"\n[性能反馈]")
+                print(f"- 标签路(原生加速版)耗时: {search_time:.2f} ms")
+                print(f"- 召回候选人数: {len(top_ids)}")
                 print("-" * 30)
             except Exception as e:
                 import traceback

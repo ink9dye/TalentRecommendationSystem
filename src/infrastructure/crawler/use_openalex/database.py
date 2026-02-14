@@ -279,46 +279,56 @@ class DatabaseManager:
                               )
                 )''')
 
-            # --- 11. 执行索引初始化脚本 ---
-            # 包含你之前手动添加的索引以及 config.py 中新增的覆盖索引
-            print("[*] 正在执行 SQLite 覆盖索引初始化")
+            # --- 11. 执行高性能索引初始化 ---
+            print("[*] 正在执行 SQLite 覆盖索引初始化...")
 
-            # 合并你原有的零散索引到 SQL_INIT_SCRIPTS 执行逻辑中
-            # 注意：这里会通过 CREATE INDEX IF NOT EXISTS 确保幂等性
+            # A. 遍历执行 config.py 中定义的通用索引脚本
             for sql in SQL_INIT_SCRIPTS:
                 try:
                     cursor.execute(sql)
                 except Exception as e:
-                    # 记录失败但继续执行，防止因单个索引语法问题中断初始化
-                    print(f"[!] 索引构建提示: {e}")
+                    print(f"[!] 基础索引构建提示: {e}")
 
-                    # B. 针对【向量路召回】的深度优化
-                    # 解决从 Work ID 反查 Author ID 的瓶颈，确保召回在 500ms 内完成
-                    cursor.execute(
-                        'CREATE INDEX IF NOT EXISTS idx_aship_work_lookup ON authorships(work_id, author_id)')
+            # B. 针对【向量路召回】的深度优化：解决 Work ID 反查 Author ID 瓶颈
+            try:
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_aship_work_lookup ON authorships(work_id, author_id)')
+            except Exception as e:
+                print(f"[!] 向量路索引构建提示: {e}")
 
-                    # C. 针对【协同路召回】与【协作索引构建】的优化
-                    # 提高挖掘合作伙伴的速度，支持二跳路径扩展
-                    cursor.execute(
-                        'CREATE INDEX IF NOT EXISTS idx_aship_author_lookup ON authorships(author_id, work_id)')
+            # C. 针对【协同路召回】的优化：支持二跳路径快速扩展
+            try:
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_aship_author_lookup ON authorships(author_id, work_id)')
+            except Exception as e:
+                print(f"[!] 协同路索引构建提示: {e}")
 
-                    # D. 针对【模型训练 (DataLoader)】与【AX 特征融合】的优化
-                    # 在 KGAT-AX 训练时，快速提取作者的 h_index 和引用量，避免磁盘 I/O 阻塞
-                    cursor.execute('''CREATE INDEX IF NOT EXISTS idx_author_metrics_covering
-                        ON authors(author_id, h_index, cited_by_count, works_count)''')
+            # D. 针对【模型训练与 AX 融合】的覆盖索引：避免磁盘 I/O 阻塞
+            try:
+                cursor.execute('''CREATE INDEX IF NOT EXISTS idx_author_metrics_covering
+                    ON authors(author_id, h_index, cited_by_count, works_count)''')
+            except Exception as e:
+                print(f"[!] 特征覆盖索引构建提示: {e}")
 
-                    # E. 针对【精排数据准备】的优化
-                    # 确保在融合各路召回结果时，能瞬时拉取所有候选人的详细画像
-                    cursor.execute('CREATE INDEX IF NOT EXISTS idx_works_year_citations ON works(year, citation_count)')
+            # E. 针对【精排数据准备】的优化：瞬时拉取候选人画像
+            try:
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_works_year_citations ON works(year, citation_count)')
+            except Exception as e:
+                print(f"[!] 精排优化索引构建提示: {e}")
 
-                    # F. 原有业务逻辑索引补充
-                    cursor.execute('CREATE INDEX IF NOT EXISTS idx_authorships_source ON authorships(source_id)')
-                    cursor.execute('''CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_rel
-                        ON authorships (work_id, author_id, inst_id, pos_index)''')
-                    cursor.execute('CREATE INDEX IF NOT EXISTS idx_authors_inst ON authors(last_known_institution_id)')
+            # F. 原有业务逻辑索引补充
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_authorships_source ON authorships(source_id)')
+            cursor.execute('''CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_rel
+                ON authorships (work_id, author_id, inst_id, pos_index)''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_authors_inst ON authors(last_known_institution_id)')
 
-                    conn.commit()
-                print("全链路高性能索引初始化完成。")
+            # --- 关键：提交并分析 ---
+            conn.commit()
+
+            print("[OK] 索引写入完成，正在执行 ANALYZE 更新统计信息...")
+            # 必须在 commit 之后执行 ANALYZE，规划器才能正确识别索引威力
+            cursor.execute("ANALYZE")
+
+        print("全链路高性能索引初始化完成。")
+
     def upgrade_schema_for_incremental(self):
         """
         专门为增量更新设计的表结构升级函数。
