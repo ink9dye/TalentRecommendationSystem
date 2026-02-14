@@ -28,7 +28,7 @@ def parse_kgat_args():
                         help='CF batch size.')
     parser.add_argument('--kg_batch_size', type=int, default=2048,
                         help='KG batch size.')
-    parser.add_argument('--test_batch_size', type=int, default=256,
+    parser.add_argument('--test_batch_size', type=int, default=512,
                         help='Test batch size.')
 
     # 4. 模型超参数
