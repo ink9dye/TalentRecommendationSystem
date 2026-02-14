@@ -206,7 +206,65 @@ class DataLoaderKGAT(object):
         return (np.array(u), np.array(i)), udict
 
     def load_kg(self, filename):
-        return pd.read_csv(filename, sep=' ', names=['h', 'r', 't'])
+        self.logging.info(f"[*] 正在从 3200万条边中执行【强力连通】采样...")
+
+        # 1. 核心种子：确保训练集里的 Job 和人必须在图中
+        seeds = set(self.cf_train_data[0].tolist()) | set(self.cf_train_data[1].tolist())
+
+        # 2. 第一次遍历：提取所有一阶关联（1-hop）
+        temp_1hop = []
+        hop1_nodes = set()
+
+        # 使用流式读取，不占用大内存
+        for chunk in pd.read_csv(filename, sep=' ', names=['h', 'r', 't'],
+                                 engine='c', chunksize=2000000):
+            # 只要有一端在种子里的边都要
+            mask = chunk['h'].isin(seeds) | chunk['t'].isin(seeds)
+            matches = chunk[mask]
+            if not matches.empty:
+                temp_1hop.append(matches)
+                hop1_nodes.update(matches['h'].unique())
+                hop1_nodes.update(matches['t'].unique())
+
+        edges_1hop_df = pd.concat(temp_1hop)
+        self.logging.info(f"[*] 一阶提取完成：得到 {len(edges_1hop_df)} 条边，覆盖节点 {len(hop1_nodes)}")
+
+        # 3. 第二次遍历：提取二阶辐射（2-hop）
+        # 此时不再限制 t.isin，只要头节点在一阶圈子里，所有外延关系都要
+        temp_2hop = []
+        max_total_edges = 1800000  # 32GB 内存的安全上限
+
+        for chunk in pd.read_csv(filename, sep=' ', names=['h', 'r', 't'],
+                                 engine='c', chunksize=2000000):
+            # 只要头节点是一阶邻居，就把这条路接通
+            mask = chunk['h'].isin(hop1_nodes)
+            matches = chunk[mask]
+            if not matches.empty:
+                temp_2hop.append(matches)
+
+            # 实时计数，防止超量
+            current_total = len(edges_1hop_df) + sum(len(x) for x in temp_2hop)
+            if current_total > max_total_edges:
+                break
+
+        # 4. 合并与去重
+        all_kg_df = pd.concat([edges_1hop_df] + temp_2hop).drop_duplicates()
+
+        # 5. 最终自检：如果采样后依然很少，强制随机补全（防止模型无法收敛）
+        if len(all_kg_df) < 100000:
+            self.logging.warning(f"[!] 采样连通性过低 ({len(all_kg_df)} 条)，正在注入全局随机边...")
+            # 随机读取一部分数据作为补充
+            random_chunk = pd.read_csv(filename, sep=' ', names=['h', 'r', 't'],
+                                       engine='c', nrows=200000)
+            all_kg_df = pd.concat([all_kg_df, random_chunk]).drop_duplicates()
+
+        self.all_kg_data = all_kg_df.values
+        self.n_kg_train = len(self.all_kg_data)
+        self.logging.info(f"[*] 最终采样边数: {self.n_kg_train}")
+
+        del temp_1hop, temp_2hop;
+        gc.collect()
+        return all_kg_df
 
     def sanity_check(self):
         """深度数据质量校验：防止模型在第一轮就因为低级错误崩溃"""

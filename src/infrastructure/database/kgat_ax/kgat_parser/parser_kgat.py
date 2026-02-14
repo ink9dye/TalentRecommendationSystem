@@ -24,11 +24,11 @@ def parse_kgat_args():
 
     # 3. 训练 Batch 大小 (针对 16GB 共享内存优化)
     # 在 CPU 训练模式下，较大的 Batch 可以减少迭代次数，但需注意内存压力
-    parser.add_argument('--cf_batch_size', type=int, default=1024,
+    parser.add_argument('--cf_batch_size', type=int, default=4096,
                         help='CF batch size.')
     parser.add_argument('--kg_batch_size', type=int, default=2048,
                         help='KG batch size.')
-    parser.add_argument('--test_batch_size', type=int, default=512,
+    parser.add_argument('--test_batch_size', type=int, default=1024,
                         help='Test batch size.')
 
     # 4. 模型超参数
@@ -41,9 +41,12 @@ def parse_kgat_args():
     parser.add_argument('--aggregation_type', type=str, default='bi-interaction',
                         help='Specify the type of the aggregation layer {gcn, graphsage, bi-interaction}.')
     # 三层传播：第一层聚合 1-hop，最后一层捕获 3-order connectivity
-    parser.add_argument('--conv_dim_list', nargs='?', default='[64, 32, 16]',
+    # 修改后：将 [64, 32, 16] 缩减为 [64, 32]
+    parser.add_argument('--conv_dim_list', nargs='?', default='[64, 32]',
                         help='Output sizes of every aggregation layer.')
-    parser.add_argument('--mess_dropout', nargs='?', default='[0.1, 0.1, 0.1]',
+
+    # 修改后：Dropout 列表长度必须与 conv_dim_list 保持一致
+    parser.add_argument('--mess_dropout', nargs='?', default='[0.1, 0.1]',
                         help='Dropout probability.')
 
     # 5. 核心 AX (Academic Metrics) 插件参数
@@ -62,9 +65,9 @@ def parse_kgat_args():
                         help='Lambda when calculating CF l2 loss.')
     parser.add_argument('--lr', type=float, default=0.0001,
                         help='Learning rate.')
-    parser.add_argument('--n_epoch', type=int, default=1000,
+    parser.add_argument('--n_epoch', type=int, default=20,
                         help='Number of epoch.')
-    parser.add_argument('--stopping_steps', type=int, default=10,
+    parser.add_argument('--stopping_steps', type=int, default=5,
                         help='Number of epoch for early stopping.')
 
     # 7. 日志与评估配置
@@ -73,9 +76,9 @@ def parse_kgat_args():
     parser.add_argument('--kg_print_every', type=int, default=1,
                         help='Iter interval of printing KG loss.')
     # 考虑到 CPU 训练评估较慢，建议设为 5 或 10
-    parser.add_argument('--evaluate_every', type=int, default=20,
+    parser.add_argument('--evaluate_every', type=int, default=5,
                         help='Epoch interval of evaluating recall@K and ndcg@K.')
-    parser.add_argument('--Ks', nargs='?', default='[20, 40, 60, 80, 100]',
+    parser.add_argument('--Ks', nargs='?', default='[20,50]',
                         help='Calculate metric@K when evaluating.')
 
     args = parser.parse_args()
