@@ -23,36 +23,27 @@ class VectorPath:
             self.id_map = json.load(f)
 
     def recall(self, query_vector):
-        """
-        执行召回并返回 ID 列表
-        """
+        start_t = time.time()  # 新增：开始计时
         # 1. Faiss 检索
         _, indices = self.index.search(query_vector, self.search_k)
 
-        # 2. 映射 Work IDs (基于行号索引)
-        work_ids = [
-            self.id_map[idx]
-            for idx in indices[0]
-            if 0 <= idx < len(self.id_map)
-        ]
-
+        # 2. 映射 Work IDs
+        work_ids = [self.id_map[idx] for idx in indices[0] if 0 <= idx < len(self.id_map)]
         if not work_ids:
-            return []
+            return [], (time.time() - start_t) * 1000
 
-        # 3. SQLite 关联映射
+        # 3. SQLite 映射
         conn = sqlite3.connect(DB_PATH)
         try:
             placeholders = ','.join(['?'] * len(work_ids))
-            # 使用 DISTINCT 确保 ID 不重复
             query = f"SELECT DISTINCT author_id FROM authorships WHERE work_id IN ({placeholders})"
             cursor = conn.execute(query, work_ids)
-            # 提取第一列 ID
             author_ids = [row[0] for row in cursor.fetchall()]
         finally:
             conn.close()
 
-        # 4. 返回精确长度的 ID 列表
-        return author_ids[:self.recall_limit]
+        duration = (time.time() - start_t) * 1000  # 新增：计算毫秒数
+        return author_ids[:self.recall_limit], duration  # 修改：返回两个值
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
+
 class DataLoaderBase(object):
     def __init__(self, args, logging):
         self.args = args
@@ -26,23 +27,23 @@ class DataLoaderBase(object):
         self.load_auxiliary_info()
 
     def load_auxiliary_info(self):
-        """最终修正版：确保特征矩阵大小与全局映射完全对齐，并适配大内存数据读取"""
+        """确保特征矩阵大小与全局映射完全对齐"""
         map_path = os.path.join(self.data_dir, "id_map.json")
         with open(map_path, 'r', encoding='utf-8') as f:
             mapping = json.load(f)
         entity_to_int = mapping['entity']
 
-        # [cite_start]以映射表长度为准初始化矩阵，彻底解决 IndexError [cite: 149]
+        # 以映射表长度为准初始化矩阵
         num_total_entities = len(entity_to_int)
         features = np.zeros((num_total_entities, self.args.n_aux_features), dtype=np.float32)
 
-        # [cite_start]从 SQLite 加载真实学术指标 [cite: 156]
+        # 从 SQLite 加载真实学术指标
         conn = sqlite3.connect(self.args.db_path)
         authors_df = pd.read_sql("SELECT author_id, h_index, cited_by_count, works_count FROM authors", conn)
         insts_df = pd.read_sql("SELECT inst_id, cited_by_count, works_count FROM institutions", conn)
         conn.close()
 
-        # [cite_start]执行归一化 [cite: 157]
+        # 执行归一化
         for df in [authors_df, insts_df]:
             for col in ['cited_by_count', 'works_count']:
                 if col in df.columns:
@@ -50,7 +51,7 @@ class DataLoaderBase(object):
         authors_df['h_index'] = (authors_df['h_index'] - authors_df['h_index'].min()) / \
                                 (authors_df['h_index'].max() - authors_df['h_index'].min() + 1e-9)
 
-        # [cite_start]填充特征：利用 entity_to_int 找到模型内部索引执行全息增强 [cite: 157]
+        # 填充特征
         for _, row in authors_df.iterrows():
             aid_str = str(row['author_id'])
             if aid_str in entity_to_int:
@@ -64,10 +65,8 @@ class DataLoaderBase(object):
                 features[idx] = [0.0, row['cited_by_count'], row['works_count']]
 
         self.aux_info_all = torch.from_numpy(features)
-        # 更新类属性，确保后续逻辑同步
         self.n_users_entities = num_total_entities
 
-        # [cite_start]显式清理大数据对象，释放 RAM [cite: 151]
         del authors_df, insts_df, mapping
         gc.collect()
 
@@ -89,14 +88,15 @@ class DataLoaderBase(object):
         return (np.array(user_ids), np.array(item_ids)), user_dict
 
     def statistic_cf(self):
+        # 统计原始数据中的用户和项目数
         self.n_users = max(self.cf_train_data[0]) + 1
         self.n_items = max(self.cf_train_data[1]) + 1
         self.n_cf_train = len(self.cf_train_data[0])
         self.n_cf_test = len(self.cf_test_data[0])
+        # 注意：此处暂时设为两项之和，但在 construct_data 中会根据 id_map 最终对齐
         self.n_users_entities = self.n_users + self.n_items
 
     def load_kg(self, filename):
-        # [cite_start]使用空格作为分隔符读取文本三元组 [cite: 358]
         kg_data = pd.read_csv(filename, sep=' ', names=['h', 'r', 't'], engine='python', on_bad_lines='skip')
         return kg_data.drop_duplicates()
 
@@ -112,8 +112,8 @@ class DataLoaderBase(object):
             r_ids.append(r)
             pos_t_ids.append(t)
 
-            # 负采样逻辑
             while True:
+                # 在全图范围内负采样
                 neg_t = random.randint(0, highest_neg_idx - 1)
                 if neg_t not in [x[0] for x in kg_dict[h]]:
                     break
@@ -122,7 +122,6 @@ class DataLoaderBase(object):
         h_ids, r_ids = torch.LongTensor(h_ids), torch.LongTensor(r_ids)
         pos_t_ids, neg_t_ids = torch.LongTensor(pos_t_ids), torch.LongTensor(neg_t_ids)
 
-        # [cite_start]提取对应的 AX 指标特征 [cite: 10]
         h_aux = self.aux_info_all[h_ids]
         pos_t_aux = self.aux_info_all[pos_t_ids]
         neg_t_aux = self.aux_info_all[neg_t_ids]
@@ -139,7 +138,8 @@ class DataLoaderBase(object):
             pos_items = user_dict[u]
             batch_pos_item.append(random.choice(pos_items))
             while True:
-                neg_item = random.randint(0, self.n_items - 1)
+                # 【重要修正】在统一 ID 模式下，负采样范围必须覆盖全图实体索引
+                neg_item = random.randint(0, self.n_users_entities - 1)
                 if neg_item not in pos_items:
                     break
             batch_neg_item.append(neg_item)
@@ -164,33 +164,25 @@ class DataLoaderKGAT(DataLoaderBase):
 
     def construct_data(self, kg_data):
         """
-        显式处理 ID 偏移并严格对齐全息增强所需的矩阵边界
-        [cite_start]遵循 KGAT-AX 标准，集成协同过滤交互与知识图谱结构 [cite: 7, 339, 403]
+        全息增强版构造器：移除冗余偏移，严格对齐维度
         """
-        # [cite_start]1. 构建逆向三元组增加图稠密度 [cite: 358]
+        # 1. 构建逆向三元组
         n_relations = max(kg_data['r']) + 1
         inverse_kg_data = kg_data.copy()
         inverse_kg_data = inverse_kg_data.rename({'h': 't', 't': 'h'}, axis='columns')
         inverse_kg_data['r'] += n_relations
         kg_data = pd.concat([kg_data, inverse_kg_data], axis=0, ignore_index=True)
 
-        # [cite_start]2. 重新映射 ID 以区分 User 和 Entity [cite: 405]
-        # 为 interact 交互关系预留关系 ID 0 和 1
+        # 2. 关系 ID 偏移（保留，用于区分交互关系）
         kg_data['r'] += 2
         self.n_relations = max(kg_data['r']) + 1
 
-        # --- 维度对齐核心修复 ---
-        # 基础实体数取目前 KG 数据中的最大编号 + 1
-        self.n_entities = max(kg_data['h'].max(), kg_data['t'].max()) + 1
+        # --- 核心对齐逻辑 ---
+        # 彻底移除 + self.n_entities，因为 generate_training_data 已经完成了全局映射
+        self.train_user_dict = {k: np.unique(v).astype(np.int32) for k, v in self.train_user_dict.items()}
+        self.test_user_dict = {k: np.unique(v).astype(np.int32) for k, v in self.test_user_dict.items()}
 
-        # [cite_start]映射交互数据，为 User ID 增加偏移量 (Offset) 以集成 CKG [cite: 339, 404]
-        # [cite_start]偏移量通常设为 n_entities，使用户 ID 紧随实体 ID 之后 [cite: 405]
-        self.train_user_dict = {k + self.n_entities: np.unique(v).astype(np.int32) for k, v in
-                                self.train_user_dict.items()}
-        self.test_user_dict = {k + self.n_entities: np.unique(v).astype(np.int32) for k, v in
-                               self.test_user_dict.items()}
-
-        # [cite_start]3. 将 CF 交互边作为特殊关系注入协作知识图谱 (CKG) [cite: 339, 403]
+        # 3. 将交互边注入 CKG
         cf_h = list(self.train_user_dict.keys())
         cf_t = [random.choice(self.train_user_dict[u]) for u in cf_h]
         cf_r = [0] * len(cf_h)
@@ -199,25 +191,30 @@ class DataLoaderKGAT(DataLoaderBase):
         self.kg_train_data = pd.concat([kg_data, cf_df], ignore_index=True)
         self.n_kg_train = len(self.kg_train_data)
 
-        # === 核心对齐补丁：确保模型 Embedding 层与 AX 特征矩阵维度严格相等 ===
-        # [cite_start]必须取特征矩阵 aux_info_all 的实际行数作为最终总节点数 [cite: 157]
-        # [cite_start]这防止了 holographic_fusion 执行 Hadamard 积时出现维度不匹配错误 [cite: 10, 96]
+        # === 终极维度对齐：既不越界，又能让模型找到用户 ===
+        # 1. 锁定总矩阵维度 = 特征矩阵行数
         self.n_users_entities = self.aux_info_all.shape[0]
-        # [cite_start]反向推算 n_entities，确保 trainer.py 初始化模型时分配正确的 Embedding 大小 [cite: 421, 70]
+
+        # 2. 重新统计训练集中真实的用户 ID 上限（用于 CF 负采样和训练遍历）
+        self.n_users = max(self.train_user_dict.keys()) + 1
+
+        # 3. 计算 n_entities，确保两者相加等于总维度。
+        # 这样 KGAT 初始化时 nn.Embedding(n_users + n_entities) 的总数完美等于 id_map 长度。
         self.n_entities = self.n_users_entities - self.n_users
 
-        # [cite_start]构造字典用于递归消息传递与注意力计算 [cite: 71, 358]
+        # 4. 构造字典用于递归消息传递
         self.train_kg_dict = collections.defaultdict(list)
         self.train_relation_dict = collections.defaultdict(list)
         h_list, t_list, r_list = [], [], []
 
         for row in self.kg_train_data.itertuples():
             h, r, t = row.h, row.r, row.t
-            h_list.append(h); t_list.append(t); r_list.append(r)
+            h_list.append(h);
+            t_list.append(t);
+            r_list.append(r)
             self.train_kg_dict[h].append((t, r))
             self.train_relation_dict[r].append((h, t))
 
-        # [cite_start]转换为 LongTensor 供模型更新注意力权重模式 (update_att) 使用 [cite: 359, 451]
         self.h_list = torch.LongTensor(h_list)
         self.t_list = torch.LongTensor(t_list)
         self.r_list = torch.LongTensor(r_list)
@@ -227,30 +224,26 @@ class DataLoaderKGAT(DataLoaderBase):
         return torch.sparse_coo_tensor(torch.LongTensor(indices), torch.FloatTensor(coo.data), torch.Size(coo.shape))
 
     def create_adjacency_dict(self):
-
         self.adjacency_dict = {}
         for r, ht_list in self.train_relation_dict.items():
             rows = [e[0] for e in ht_list]
             cols = [e[1] for e in ht_list]
             vals = [1.0] * len(rows)
-            # 使用修正后的 n_users_entities 确保不越界
             adj = sp.coo_matrix((vals, (rows, cols)), shape=(self.n_users_entities, self.n_users_entities))
             self.adjacency_dict[r] = adj
 
     def create_laplacian_dict(self):
-
         def random_walk_norm_lap(adj):
             rowsum = np.array(adj.sum(axis=1))
+            # 解决孤立点（Degree=0）导致的 divide by zero 警告
             d_inv = np.power(rowsum, -1.0).flatten()
-            d_inv[np.isinf(d_inv)] = 0
+            d_inv[np.isinf(d_inv)] = 0.
             return sp.diags(d_inv).dot(adj).tocoo()
 
-        # 计算并叠加归一化矩阵
         self.laplacian_dict = {r: random_walk_norm_lap(adj) for r, adj in self.adjacency_dict.items()}
         A_in = sum(self.laplacian_dict.values())
         self.A_in = self.convert_coo2tensor(A_in.tocoo())
 
-        # [cite_start]内存防御：计算完 A_in 后清理原始邻接矩阵 [cite: 151]
         self.adjacency_dict.clear()
         self.laplacian_dict.clear()
         gc.collect()

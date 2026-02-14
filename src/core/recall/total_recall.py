@@ -1,133 +1,107 @@
 import time
-import logging
-import sys
-import io
-import traceback
-import faiss  # 导入用于归一化
+import json
+import numpy as np
+import faiss
 from concurrent.futures import ThreadPoolExecutor
-from vector_path import VectorRecallPath
+from input_to_vector import QueryEncoder
+from vector_path import VectorPath
 from label_path import LabelRecallPath
 from collaboration_path import CollaborativeRecallPath
 
-if sys.platform.startswith('win'):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
+class TotalRecallSystem:
+    """
+    全量召回调度调度系统
+    核心架构：向量路 + 标签路 并行执行 -> 协同路补充 -> RRF 融合输出 Top 500
+    """
 
-class TotalRecall:
     def __init__(self):
         print("[*] 正在初始化全量召回系统，请稍候...", flush=True)
+        # 1. 初始化各路组件
+        self.encoder = QueryEncoder()
+        self.v_path = VectorPath(recall_limit=200)  # 向量路，扩大池子以备精排
+        self.l_path = LabelRecallPath(recall_limit=200)  # 标签路
+        self.c_path = CollaborativeRecallPath(recall_limit=100)  # 协同路
 
-        try:
-            self.v_path = VectorRecallPath()
-            print("[OK] 向量路组件加载成功")
-        except Exception as e:
-            logging.error(f"向量路加载失败: {e}")
-            self.v_path = None
-
-        try:
-            self.l_path = LabelRecallPath()
-            print("[OK] 标签路组件加载成功")
-        except Exception as e:
-            logging.warning(f"标签路加载失败: {e}")
-            self.l_path = None
-
-        try:
-            self.c_path = CollaborativeRecallPath()
-            print("[OK] 协同路组件加载成功")
-        except Exception as e:
-            logging.error(f"协同路加载失败: {e}")
-            self.c_path = None
-
-        self.executor = ThreadPoolExecutor(max_workers=3)
+        # 2. 初始化并行执行器
+        self.executor = ThreadPoolExecutor(max_workers=2)
 
     def execute(self, query_text):
-        """
-        全量召回执行逻辑
-        优化：单次编码 + 向量分发，解决 TimeoutError
-        """
         start_time = time.time()
-        v_res, l_res, c_res = [], [], []
 
-        try:
-            # 1. 核心优化：在主线程进行单次语义编码，避免多线程竞争 GIL
-            print(f"[*] 正在生成语义向量...", flush=True)
-            query_vector = self.v_path.model.encode([query_text]).astype('float32')
-            faiss.normalize_L2(query_vector)
+        # 1. 编码
+        query_vec, encode_duration = self.encoder.encode(query_text)
+        faiss.normalize_L2(query_vec)
 
-            # 2. 语义锚定：获取标签 ID (复用向量)
-            top_vocab_ids = self.v_path.get_top_vocab(query_vector=query_vector)
-            print(f"[*] 锚定标签 ID: {top_vocab_ids}")
+        # 2. 并行执行向量路与标签路
+        future_v = self.executor.submit(self.v_path.recall, query_vec)
+        future_l = self.executor.submit(self.l_path.recall, query_vec)
 
-            # 3. 并行执行向量路与标签路 (放宽超时至 2.0s 确保稳定)
-            # 传递 query_vector 避免 v_path.recall 再次编码
-            future_v = self.executor.submit(self.v_path.recall, query_vector=query_vector)
-            future_l = self.executor.submit(self.l_path.recall_by_vocab_ids, top_vocab_ids)
+        v_list, v_cost = future_v.result()
+        l_list, l_cost = future_l.result()
 
-            try:
-                v_res = future_v.result(timeout=2.0)
-            except Exception:
-                print("Vector Path Error Detail:")
-                traceback.print_exc()
+        # 3. 协同路扩展
+        seeds = list(set(v_list + l_list))
+        # 确保 collaboration_path.py 的 recall 也是返回 (ids, cost)
+        c_list, c_cost = self.c_path.recall(seeds)
 
-            try:
-                l_res = future_l.result(timeout=2.0)
-            except Exception:
-                print("Label Path Error Detail:")
-                traceback.print_exc()
-
-            # 4. 协同路扩展
-            seeds = list(set(v_res + l_res))
-            if seeds and self.c_path:
-                c_res = self.c_path.recall(seeds)
-
-        except Exception as e:
-            logging.error(f"Execution failed: {e}")
-            traceback.print_exc()
-
-        final_candidates, _ = self._fuse_results(l_res, v_res, c_res)
+        # 4. 融合
+        final_list, _ = self._fuse_results(v_list, l_list, c_list)
 
         return {
-            "final": final_candidates,
-            "details": {"vector": v_res, "label": l_res, "collab": c_res},
-            "time": time.time() - start_time
+            "final_top_500": final_list,
+            "total_ms": (time.time() - start_time) * 1000,
+            "details": {"v_cost": v_cost, "l_cost": l_cost, "c_cost": c_cost}
         }
 
-    def _fuse_results(self, label_list, vector_list, collab_list):
-        rrf_k = 60
+    def _fuse_results(self, v_res, l_res, c_res):
+        """
+        Reciprocal Rank Fusion (RRF) 结果融合
+        通过各路顺位倒数之和进行重排
+        """
+        rrf_k = 60  # RRF 常数
         scores = {}
-        weights = {"label": 1.0, "vector": 1.0, "collab": 0.5}
 
-        for path_name, res_list in [("label", label_list), ("vector", vector_list), ("collab", collab_list)]:
+        # 权重分配：向量与标签 1.0，协同作为补充设为 0.8
+        weights = {"vector": 1.0, "label": 1.0, "collab": 0.5}
+
+        for path_name, res_list in [("vector", v_res), ("label", l_res), ("collab", c_res)]:
             w = weights[path_name]
             for rank, aid in enumerate(res_list):
+                # RRF 公式：score = sum( w / (k + rank) )
                 score = w * (1.0 / (rrf_k + rank + 1))
                 scores[aid] = scores.get(aid, 0) + score
 
+        # 按融合分倒序排列
         sorted_candidates = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         return [item[0] for item in sorted_candidates[:500]], scores
 
 
 if __name__ == "__main__":
-    tr = TotalRecall()
+    system = TotalRecallSystem()
+
     print("\n" + "=" * 60)
-    print(f"🚀 人才推荐系统 - 全量召回调试控制台")
+    print("🚀 人才推荐系统 - 三路并行召回控制台")
+    print("输入招聘需求（如：Java开发、云计算架构师）执行端到端召回")
     print("=" * 60)
 
     try:
         while True:
-            user_input = input("\n请输入搜索关键词 (或输入 'q' 退出):\n>> ").strip()
-            if user_input.lower() == 'q': break
-            if not user_input: continue
+            user_input = input("\n请输入搜索关键词 (或输入 'q' 退出): \n>> ").strip()
+            if not user_input or user_input.lower() == 'q': break
 
-            print(f"[*] 正在执行召回逻辑...")
-            results = tr.execute(user_input)
+            print(f"[*] 正在为需求执行多路召回策略...")
+            results = system.execute(user_input)
 
-            for path_name in ["label", "vector", "collab"]:
-                ids = results["details"][path_name]
-                print(f"[{path_name.upper()} 路径] 找到: {len(ids)} 个候选人")
+            print(f"\n[召回任务完成]")
+            print(f"- 总响应时间: {results['total_ms']:.2f} ms")
+            print(f"- 最终融合候选池: {len(results['final_top_500'])} 人")
 
-            print(f"\n[最终融合候选人] 总计: {len(results['final'])}")
-            print(f"总耗时: {results['time']:.4f}s")
-            print("=" * 60)
+            # 打印融合后的前 10 名
+            print("-" * 30)
+            print("【精排候选人 Top 10 预览】:")
+            print(results['final_top_500'][:10])
+            print("-" * 30)
+
     except KeyboardInterrupt:
-        print("\n正在关闭...")
+        print("\n系统已关闭")

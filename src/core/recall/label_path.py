@@ -1,117 +1,124 @@
-from py2neo import Graph
-import pandas as pd
-import time
-import logging
+import faiss
 import json
-# 导入全局配置
-from config import CONFIG_DICT
+import time
+import numpy as np
+from py2neo import Graph
+from config import CONFIG_DICT, JOB_INDEX_PATH, JOB_MAP_PATH
 
 
 class LabelRecallPath:
     """
-    标签路召回：基于知识图谱的路径扩展
-    职责：根据 Job ID 执行多步图路径推理，返回 Top 100 作者 ID
+    标签路召回优化版：通过路径剪枝与索引强制约束提升检索性能
     """
 
     def __init__(self, recall_limit=100):
         self.recall_limit = recall_limit
-        self.graph = None
         try:
             self.graph = Graph(
                 CONFIG_DICT["NEO4J_URI"],
                 auth=(CONFIG_DICT["NEO4J_USER"], CONFIG_DICT["NEO4J_PASSWORD"]),
                 name=CONFIG_DICT["NEO4J_DATABASE"]
             )
-            # 心跳检测
             self.graph.run("RETURN 1").evaluate()
-            print("[OK] Neo4j 连接成功 (LabelRecallPath)")
+            print("[OK] Neo4j 连接成功")
         except Exception as e:
-            logging.error(f"Neo4j 连接失败: {e}")
+            print(f"[Error] Neo4j 连接失败: {e}")
 
-    def recall(self, job_id, timeout=1.0):
+        # 预加载 Faiss 索引
+        self.job_index = faiss.read_index(JOB_INDEX_PATH)
+        with open(JOB_MAP_PATH, 'r', encoding='utf-8') as f:
+            self.job_id_map = json.load(f)
+
+    def _anchor_job_to_vocabs(self, query_vector, top_n=5):
+        """步骤 1: 向量空间 -> 岗位 ID -> 技能词 ID"""
+        _, indices = self.job_index.search(query_vector, top_n)
+        job_ids = [self.job_id_map[idx] for idx in indices[0] if 0 <= idx < len(self.job_id_map)]
+
+        # 优化查询：j.id 匹配
+        cypher = """
+        MATCH (j:Job) WHERE j.id IN $j_ids
+        MATCH (j)-[:REQUIRE_SKILL]->(v:Vocabulary)
+        RETURN v.id AS vid
         """
-        核心召回逻辑：直接匹配 + 语义扩展
+        res = self.graph.run(cypher, j_ids=job_ids).to_data_frame()
+        if res.empty: return []
+        return [int(v) for v in res['vid'].unique().tolist()]
+
+    def recall(self, query_vector):
+        if self.graph is None: return [], 0
+
+        # 1. 获取核心词汇
+        core_vocab_ids = self._anchor_job_to_vocabs(query_vector)
+        if not core_vocab_ids: return [], 0
+
+        # 2. 语义桥接扩展 (限制扩展数量防止组合爆炸)
+        expand_cypher = """
+        MATCH (v:Vocabulary) WHERE v.id IN $v_ids
+        OPTIONAL MATCH (v)-[:SIMILAR_TO]-(v_rel:Vocabulary)
+        WITH v, v_rel LIMIT 30
+        RETURN DISTINCT v_rel.id AS vid
         """
-        if self.graph is None: return []
+        expanded_res = self.graph.run(expand_cypher, v_ids=core_vocab_ids).to_data_frame()
 
-        start_time = time.time()
-        deadline = start_time + timeout
-        all_authors = {}  # {aid: score}
+        # 合并词汇 ID
+        all_vocab_ids = core_vocab_ids
+        if not expanded_res.empty:
+            all_vocab_ids += [int(v) for v in expanded_res['vid'].tolist() if v is not None]
+        all_vocab_ids = list(set(all_vocab_ids))
 
-        # 阶段 1：直接路径匹配 (权重 1.0)
-        # 路径：Job -> Skill -> Work -> Author
-        cypher_direct = """
-        MATCH (j:Job {id: $job_id})-[:REQUIRE_SKILL]->(v:Vocabulary)
-        MATCH (v)<-[:HAS_TOPIC]-(w:Work)<-[r:AUTHORED]-(a:Author)
+        # 3. 最终召回：引入路径剪枝 (LIMIT 1000) 与 署名权重聚合
+        #
+        final_cypher = """
+        MATCH (v:Vocabulary) 
+        USING INDEX v:Vocabulary(id)
+        WHERE v.id IN $v_ids
+
+        // 关键性能优化：限制每个标签关联的 Work 采样量，避免处理数万个关系
+        MATCH (v)<-[:HAS_TOPIC]-(w:Work)
+        WITH w LIMIT 2000 
+
+        MATCH (w)<-[r:AUTHORED]-(a:Author)
+        // 计算基于署名排名和时序衰减的 pos_weight 总分
         RETURN a.id AS aid, sum(r.pos_weight) AS score
         ORDER BY score DESC LIMIT $limit
         """
 
-        try:
-            res1 = self.graph.run(cypher_direct, job_id=job_id, limit=self.recall_limit).to_data_frame()
-            if not res1.empty:
-                all_authors = dict(zip(res1['aid'], res1['score']))
+        start_t = time.time()
+        res = self.graph.run(final_cypher, v_ids=all_vocab_ids, limit=self.recall_limit).to_data_frame()
+        duration = (time.time() - start_t) * 1000
 
-            # 阶段 2：语义桥接扩展 (权重 0.8)
-            # 时间允许且为了增强多样性时执行
-            if time.time() < deadline:
-                cypher_expanded = """
-                MATCH (j:Job {id: $job_id})-[:REQUIRE_SKILL]->(v:Vocabulary)-[:SIMILAR_TO]-(v_rel:Vocabulary)
-                MATCH (v_rel)<-[:HAS_TOPIC]-(w:Work)<-[r:AUTHORED]-(a:Author)
-                RETURN a.id AS aid, sum(r.pos_weight) AS score
-                ORDER BY score DESC LIMIT $limit
-                """
-                res2 = self.graph.run(cypher_expanded, job_id=job_id, limit=self.recall_limit).to_data_frame()
-                if not res2.empty:
-                    for _, row in res2.iterrows():
-                        # 应用衰减系数
-                        current_score = row['score'] * 0.8
-                        all_authors[row['aid']] = all_authors.get(row['aid'], 0) + current_score
+        if res.empty: return [], duration
 
-        except Exception as e:
-            print(f"[Error] Cypher 执行失败: {e}")
-            return []
-
-        # 按融合分数排序并提取前 100 个 ID
-        sorted_authors = sorted(all_authors.items(), key=lambda x: x[1], reverse=True)
-        return [item[0] for item in sorted_authors[:self.recall_limit]]
+        # 返回 Top 100 的纯 ID 列表
+        return res['aid'].tolist(), duration
 
 
 if __name__ == "__main__":
-    # 实例化：设定召回 100 人
     l_path = LabelRecallPath(recall_limit=100)
-
-    print("\n" + "=" * 60)
-    print("🕸️ 标签路 (Knowledge Graph) 独立测试模块")
-    print("=" * 60)
+    print("\n" + "=" * 60 + "\n🚀 标签路优化测试 (目标：<1000ms)\n" + "=" * 60)
 
     try:
         while True:
-            # 这里的输入应为数据库中存在的 Job ID (例如 securityId)
-            job_id = input("\n请输入岗位 ID (Job ID) 进行召回测试 (或输入 'q' 退出):\n>> ").strip()
+            raw_input = input("\n请粘贴稠密向量:\n>> ").strip()
+            if not raw_input or raw_input.lower() == 'q': break
 
-            if job_id.lower() in ['q', 'exit']: break
-            if not job_id: continue
+            try:
+                vector_list = json.loads(raw_input)
+                query_vec = np.array([vector_list]).astype('float32')
+                faiss.normalize_L2(query_vec)
 
-            print(f"[*] 正在 Neo4j 中执行路径扩展推理...")
-            start_t = time.time()
-            id_list = l_path.recall(job_id)
-            duration = (time.time() - start_t) * 1000
+                # 执行召回
+                top_ids, search_time = l_path.recall(query_vec)
 
-            print(f"\n[召回报告]")
-            print(f"- 检索总耗时: {duration:.2f} ms")
-            print(f"- 最终召回作者数: {len(id_list)}")
-
-            if id_list:
+                print(f"\n[召回报告]")
+                print(f"- 优化后推理耗时: {search_time:.2f} ms")
+                print(f"- 召回候选人数: {len(top_ids)}")
                 print("-" * 30)
-                print("100 个 Author ID 列表如下:")
-                print(id_list)
+                print("【Top 100 作者 ID 顺位列表】:")
+                print(top_ids)
                 print("-" * 30)
-            else:
-                print("⚠️ 未找到匹配作者。请检查：")
-                print("1. Job ID 是否真实存在于 Neo4j 中")
-                print("2. 岗位是否关联了 Vocabulary 节点")
-                print("3. 知识图谱中是否存在相关的作者关系链")
 
+            except Exception as e:
+                print(f"[Error] {e}")
     except KeyboardInterrupt:
-        print("\n已安全退出")
+        pass

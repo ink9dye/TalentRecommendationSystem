@@ -2,8 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 def _L2_loss_mean(x):
     return torch.mean(torch.sum(torch.pow(x, 2), dim=1, keepdim=False) / 2.)
+
 
 class Aggregator(nn.Module):
     def __init__(self, in_dim, out_dim, dropout, aggregator_type):
@@ -43,9 +45,9 @@ class Aggregator(nn.Module):
             embeddings = bi_embeddings + sum_embeddings
         return self.message_dropout(embeddings)
 
+
 class KGAT(nn.Module):
-    def __init__(self, args, n_users, n_entities, n_relations, A_in=None,
-                 user_pre_embed=None, item_pre_embed=None):
+    def __init__(self, args, n_users, n_entities, n_relations, A_in=None):
         super(KGAT, self).__init__()
         self.n_users = n_users
         self.n_entities = n_entities
@@ -68,50 +70,41 @@ class KGAT(nn.Module):
         self.relation_embed = nn.Embedding(self.n_relations, self.relation_dim)
         self.trans_M = nn.Parameter(torch.Tensor(self.n_relations, self.embed_dim, self.relation_dim))
 
+        # 初始化注意力向量
+        self.W_a = nn.Parameter(torch.Tensor(self.relation_dim, 1))
+
         nn.init.xavier_uniform_(self.entity_user_embed.weight)
         nn.init.xavier_uniform_(self.relation_embed.weight)
         nn.init.xavier_uniform_(self.trans_M)
+        nn.init.xavier_uniform_(self.W_a)
 
         self.aggregator_layers = nn.ModuleList([
-            Aggregator(self.conv_dim_list[k], self.conv_dim_list[k+1], self.mess_dropout[k], self.aggregation_type)
+            Aggregator(self.conv_dim_list[k], self.conv_dim_list[k + 1], self.mess_dropout[k], self.aggregation_type)
             for k in range(self.n_layers)
         ])
 
-        self.A_in = nn.Parameter(torch.sparse.FloatTensor(self.n_users + self.n_entities, self.n_users + self.n_entities))
+        # 适配新版 Sparse Tensor
+        self.A_in = nn.Parameter(torch.sparse_coo_tensor(
+            size=(self.n_users + self.n_entities, self.n_users + self.n_entities),
+            dtype=torch.float32
+        ))
         if A_in is not None: self.A_in.data = A_in
         self.A_in.requires_grad = False
 
     def holographic_fusion(self, entity_embed, aux_info):
-        """
-        全息嵌入融合：将归一化后的 H-index 等指标注入实体表示
-        """
-        # 1. 映射辅助信息到嵌入空间并激活
-        # tanh 将辅助向量限制在 (-1, 1)，作为拓扑特征的“调节权重” [cite: 18]
+        """全息嵌入融合：将归一化后的 H-index 等指标注入实体表示"""
         aux_vector = torch.tanh(self.aux_embed_layer(aux_info))
-
-        # 2. 执行 Hadamard 积 (元素级乘法)
-        # 建议：如果某些实体（如 Vocabulary）没有 AX 特征，
-        # 请确保 aux_info 对应行为 0，此时 tanh(0)=0 会导致特征消失。
-        # 改进方案：使用 (1 + aux_vector) 实现残差式增强
         return torch.mul(entity_embed, 1 + aux_vector)
 
     def calc_cf_embeddings(self, aux_info_all):
-        """
-        带 AX 增强的消息传递层 [cite: 79, 492]
-        """
-        # 1. 初始节点增强：将全图学术指标注入初始 Embedding 表
+        """带 AX 增强的消息传递层"""
         ego_embed = self.holographic_fusion(self.entity_user_embed.weight, aux_info_all)
         all_embed = [ego_embed]
 
-        # 2. 递归消息传递
         for layer in self.aggregator_layers:
-            # 在 A_in 中进行注意力加权的邻居聚合
             ego_embed = layer(ego_embed, self.A_in)
-
-            # 3. 每一层传播后进行 L2 归一化，防止 Embedding 爆炸
             all_embed.append(F.normalize(ego_embed, p=2, dim=1))
 
-        # 4. 聚合所有层的表示 (Jump Knowledge 思想)
         return torch.cat(all_embed, dim=1)
 
     def calc_cf_loss(self, user_ids, item_pos_ids, item_neg_ids, aux_info_all):
@@ -123,7 +116,7 @@ class KGAT(nn.Module):
         return cf_loss + self.cf_l2loss_lambda * l2_loss
 
     def calc_kg_loss(self, h, r, pos_t, neg_t, h_aux, pos_t_aux, neg_t_aux):
-        """全息增强三元组损失 [cite: 14, 163]"""
+        """全息增强三元组损失"""
         h_e, p_t_e, n_t_e = self.entity_user_embed(h), self.entity_user_embed(pos_t), self.entity_user_embed(neg_t)
         h_e = self.holographic_fusion(h_e, h_aux)
         p_t_e = self.holographic_fusion(p_t_e, pos_t_aux)
@@ -139,6 +132,20 @@ class KGAT(nn.Module):
         kg_loss = torch.mean((-1.0) * F.logsigmoid(neg_score - pos_score))
         l2_loss = _L2_loss_mean(r_h) + _L2_loss_mean(r_e) + _L2_loss_mean(r_p) + _L2_loss_mean(r_n)
         return kg_loss + self.kg_l2loss_lambda * l2_loss
+
+    def update_attention_batch(self, h_list, t_list, r_list):
+        """计算注意力得分，用于更新邻接矩阵权重"""
+        h_e = self.entity_user_embed(h_list)
+        t_e = self.entity_user_embed(t_list)
+        r_e = self.relation_embed(r_list)
+        W_r = self.trans_M[r_list]
+
+        h_e = torch.bmm(h_e.unsqueeze(1), W_r).squeeze(1)
+        t_e = torch.bmm(t_e.unsqueeze(1), W_r).squeeze(1)
+
+        att_score = torch.sum((h_e + r_e) * torch.tanh(t_e), dim=1, keepdim=True)
+        att_score = torch.sigmoid(torch.matmul(att_score, self.W_a.mean(0, keepdim=True).T))
+        return att_score
 
     def forward(self, *input, mode):
         if mode == 'train_cf': return self.calc_cf_loss(*input)
