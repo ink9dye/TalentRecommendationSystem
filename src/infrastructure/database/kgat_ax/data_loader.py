@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 from tqdm import tqdm
+from config import KGATAX_TRAIN_DATA_DIR
 
 
 class DataLoaderKGAT(object):
@@ -206,64 +207,82 @@ class DataLoaderKGAT(object):
         return (np.array(u), np.array(i)), udict
 
     def load_kg(self, filename):
-        self.logging.info(f"[*] 正在从 3200万条边中执行【强力连通】采样...")
+        """
+        利用外部 SQLite 索引执行秒级子图采样。
+        职责：从 3200万条边中精准提取与当前训练集(Job/User)相关的 1-hop 和 2-hop 拓扑。
+        """
+        # 直接引用 config 中的路径，保持全局一致性
 
-        # 1. 核心种子：确保训练集里的 Job 和人必须在图中
-        seeds = set(self.cf_train_data[0].tolist()) | set(self.cf_train_data[1].tolist())
+        db_path = os.path.join(KGATAX_TRAIN_DATA_DIR, "kg_index.db")
 
-        # 2. 第一次遍历：提取所有一阶关联（1-hop）
-        temp_1hop = []
-        hop1_nodes = set()
+        if not os.path.exists(db_path):
+            self.logging.error(f"[!] 未发现索引库: {db_path}，请先运行 build_kg_index.py")
+            return
 
-        # 使用流式读取，不占用大内存
-        for chunk in pd.read_csv(filename, sep=' ', names=['h', 'r', 't'],
-                                 engine='c', chunksize=2000000):
-            # 只要有一端在种子里的边都要
-            mask = chunk['h'].isin(seeds) | chunk['t'].isin(seeds)
-            matches = chunk[mask]
-            if not matches.empty:
-                temp_1hop.append(matches)
-                hop1_nodes.update(matches['h'].unique())
-                hop1_nodes.update(matches['t'].unique())
+        self.logging.info(f"[*] 正在执行索引驱动采样，目标库: {db_path}")
 
-        edges_1hop_df = pd.concat(temp_1hop)
-        self.logging.info(f"[*] 一阶提取完成：得到 {len(edges_1hop_df)} 条边，覆盖节点 {len(hop1_nodes)}")
+        # 1. 确定核心种子节点 (训练集涉及的 Job 和人)
+        seeds = list(set(self.cf_train_data[0].tolist()) | set(self.cf_train_data[1].tolist()))
+        conn = sqlite3.connect(db_path)
 
-        # 3. 第二次遍历：提取二阶辐射（2-hop）
-        # 此时不再限制 t.isin，只要头节点在一阶圈子里，所有外延关系都要
-        temp_2hop = []
-        max_total_edges = 1800000  # 32GB 内存的安全上限
+        try:
+            # 2. 提取一阶关联 (1-hop)：双向命中种子
+            self.logging.info(f"[*] 正在提取一阶邻居 (种子数: {len(seeds)})...")
+            hop1_edges = []
+            chunk_size = 500  # 避免 SQL 占位符超限
 
-        for chunk in pd.read_csv(filename, sep=' ', names=['h', 'r', 't'],
-                                 engine='c', chunksize=2000000):
-            # 只要头节点是一阶邻居，就把这条路接通
-            mask = chunk['h'].isin(hop1_nodes)
-            matches = chunk[mask]
-            if not matches.empty:
-                temp_2hop.append(matches)
+            for i in range(0, len(seeds), chunk_size):
+                batch_seeds = seeds[i:i + chunk_size]
+                placeholders = ','.join(['?'] * len(batch_seeds))
 
-            # 实时计数，防止超量
-            current_total = len(edges_1hop_df) + sum(len(x) for x in temp_2hop)
-            if current_total > max_total_edges:
-                break
+                # 利用 idx_h_lookup 和 idx_t_lookup 覆盖索引进行 Index-Only Scan
+                sql = f"SELECT h, r, t FROM kg_triplets WHERE h IN ({placeholders}) OR t IN ({placeholders})"
+                hop1_edges.extend(conn.execute(sql, batch_seeds + batch_seeds).fetchall())
 
-        # 4. 合并与去重
-        all_kg_df = pd.concat([edges_1hop_df] + temp_2hop).drop_duplicates()
+            # 提取一阶涉及的所有节点，准备二阶扩展
+            hop1_nodes = set()
+            for h, r, t in hop1_edges:
+                hop1_nodes.add(h)
+                hop1_nodes.add(t)
 
-        # 5. 最终自检：如果采样后依然很少，强制随机补全（防止模型无法收敛）
-        if len(all_kg_df) < 100000:
-            self.logging.warning(f"[!] 采样连通性过低 ({len(all_kg_df)} 条)，正在注入全局随机边...")
-            # 随机读取一部分数据作为补充
-            random_chunk = pd.read_csv(filename, sep=' ', names=['h', 'r', 't'],
-                                       engine='c', nrows=200000)
-            all_kg_df = pd.concat([all_kg_df, random_chunk]).drop_duplicates()
+            self.logging.info(f"[*] 一阶提取完成：得到 {len(hop1_edges)} 条边")
 
-        self.all_kg_data = all_kg_df.values
-        self.n_kg_train = len(self.all_kg_data)
-        self.logging.info(f"[*] 最终采样边数: {self.n_kg_train}")
+            # 3. 提取二阶辐射 (2-hop)：贪婪外延
+            self.logging.info(f"[*] 正在执行二阶贪婪外延...")
+            hop2_edges = []
+            max_limit = 1800000 - len(hop1_edges)  # 32GB 内存安全阈值
 
-        del temp_1hop, temp_2hop;
-        gc.collect()
+            hop1_nodes_list = list(hop1_nodes)
+            for i in range(0, len(hop1_nodes_list), chunk_size):
+                if len(hop2_edges) > max_limit:
+                    break
+
+                batch_nodes = hop1_nodes_list[i:i + chunk_size]
+                placeholders = ','.join(['?'] * len(batch_nodes))
+
+                # 只查询头节点在圈内的边，捕捉所有外延学术背景
+                sql = f"SELECT h, r, t FROM kg_triplets WHERE h IN ({placeholders})"
+                hop2_edges.extend(conn.execute(sql, batch_nodes).fetchall())
+
+            # 4. 结果整合与去重
+            all_edges = hop1_edges + hop2_edges
+            all_kg_df = pd.DataFrame(all_edges, columns=['h', 'r', 't']).drop_duplicates()
+
+            # 5. 最终自检与兜底：若子图过于稀疏则补全随机边
+            if len(all_kg_df) < 100000:
+                self.logging.warning(f"[!] 连通性不足 ({len(all_kg_df)}条)，注入全局随机采样作为环境噪音...")
+                random_edges = conn.execute("SELECT h, r, t FROM kg_triplets LIMIT 200000").fetchall()
+                all_kg_df = pd.concat(
+                    [all_kg_df, pd.DataFrame(random_edges, columns=['h', 'r', 't'])]).drop_duplicates()
+
+            self.all_kg_data = all_kg_df.values
+            self.n_kg_train = len(self.all_kg_data)
+            self.logging.info(f"[*] 最终 KG 训练规模: {self.n_kg_train} 条边")
+
+        finally:
+            conn.close()
+            gc.collect()  # 显式回收 SQL 结果集占用的内存
+
         return all_kg_df
 
     def sanity_check(self):

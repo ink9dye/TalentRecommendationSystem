@@ -46,8 +46,7 @@ def check_args_and_env(args):
 
 def evaluate(model, dataloader, Ks, device):
     """
-    高性能评估函数
-    重构逻辑：预计算 Embedding + 批量点积，彻底消除重复的图聚合计算
+    高性能评估函数：已修正物理维度对齐问题
     """
     model.eval()
     test_user_dict = dataloader.test_user_dict
@@ -57,27 +56,30 @@ def evaluate(model, dataloader, Ks, device):
     aux_info_all = dataloader.aux_info_all.to(device)
 
     # 2. 核心加速：预计算所有节点的最终 Embedding
-    # 不再在下方的 tqdm 循环里调用 model(...)，因为 model 内部包含耗时的图卷积
     with torch.no_grad():
         all_embed = model.calc_cf_embeddings(aux_info_all)
 
-        # 3. 分批计算 User-Item 评分
-    # 将 User 分批以防止 scores 矩阵 (Batch_U x All_Items) 撑爆显存
+    # 3. 分批计算 User-Item 评分
     batch_size = dataloader.test_batch_size
     user_batches = [user_ids[i:i + batch_size] for i in range(0, len(user_ids), batch_size)]
 
     metrics = {k: {'recall': [], 'ndcg': []} for k in Ks}
-    item_ids_vec = np.arange(dataloader.n_users_entities)
+
+    # 【核心修改点 1】：
+    # 必须使用 model.global_max_id (约为 284万)，而不是 dataloader.n_users_entities (约为 184万)
+    # 这样 item_ids_vec 的长度才能匹配 all_embed 的宽度
+    n_items_to_test = model.global_max_id
+    item_ids_vec = np.arange(n_items_to_test)
 
     for batch_u in tqdm(user_batches, desc='Eval', leave=False):
         batch_u_gpu = torch.LongTensor(batch_u).to(device)
 
         with torch.no_grad():
-            # 极速矩阵点积计算得分
-            # scores 形状: [len(batch_u), n_users_entities]
+            # 这里的 scores 矩阵宽度现在会是 284万
             scores = torch.matmul(all_embed[batch_u_gpu], all_embed.transpose(0, 1)).cpu()
 
-        # 计算 Top-K 指标
+        # 【核心修改点 2】：
+        # 此时 scores 和 item_ids_vec 的长度均已对齐为 284万，不再触发 IndexError
         batch_m = calc_metrics_at_k(scores, dataloader.train_user_dict, test_user_dict,
                                     np.array(batch_u), item_ids_vec, Ks)
 
@@ -86,7 +88,6 @@ def evaluate(model, dataloader, Ks, device):
             metrics[k]['ndcg'].append(batch_m[k]['ndcg'])
 
     return {k: {m: np.mean(v) for m, v in val.items()} for k, val in metrics.items()}
-
 
 def train(args):
     # 初始化路径与环境
