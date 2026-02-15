@@ -50,60 +50,85 @@ class DataLoaderKGAT(object):
         self.sanity_check()
 
     def load_id_mapping(self):
-        """从 JSON 加载全局 ID 映射，确保 User(Job) 与 Entity 边界严谨"""
+        """从 JSON 加载全局 ID 映射，支持动态压缩 ID 空间"""
         map_path = os.path.join(self.data_dir, "id_map.json")
         if not os.path.exists(map_path):
-            raise FileNotFoundError(f"未发现映射文件: {map_path}，请先运行数据生成脚本。")
+            raise FileNotFoundError(f"未发现映射文件: {map_path}，请先运行 generate_training_data.py。")
 
         with open(map_path, 'r', encoding='utf-8') as f:
             mapping = json.load(f)
 
         self.entity_to_int = mapping['entity']
-        self.n_users_entities = len(self.entity_to_int)
-        # 必须是 Job 节点的数量，用于区分 CF 和 KG 空间
+        # 【修复】：直接从映射文件获取总节点数，不再通过 len(entity_to_int) 推算
+        self.n_users_entities = mapping.get("total_nodes", len(self.entity_to_int))
         self.n_users = mapping.get("user_count", 0)
-        self.n_entities = self.n_users_entities - self.n_users
-        # 获取实体起始偏移量
+        self.n_entities = mapping.get("entity_count", 0)
         self.ENTITY_OFFSET = mapping.get("offset", 0)
+
+        self.logging.info(
+            f"[*] ID 空间映射成功: User(0-{self.ENTITY_OFFSET - 1}), Entity({self.ENTITY_OFFSET}-{self.n_users_entities - 1})")
 
     def load_auxiliary_info(self):
         """
-        提取特征：利用覆盖索引提取特征。
-        修正物理维度：解决由 ENTITY_OFFSET 导致的索引越界问题。
+        提取特征：直接加载预计算好的特征索引文件。
+        适配：build_feature_index.py 生成的对数平滑归一化特征。
         """
-        # 【核心修复】：物理矩阵的大小必须能装下最大的物理索引
-        # 你的实体 ID 范围是 [OFFSET, OFFSET + n_entities)
+        import json
+        # 【核心逻辑】：物理矩阵的大小必须能装下最大的物理索引
         global_max_id = self.ENTITY_OFFSET + self.n_entities
         features = np.zeros((global_max_id, self.args.n_aux_features), dtype=np.float32)
 
-        conn = sqlite3.connect(self.args.db_path)
-        # 增加缓存，加速大规模读取
-        conn.execute("PRAGMA cache_size = -100000")
+        # 1. 加载预计算好的特征索引 (由 build_feature_index.py 生成)
+        # 路径通常在 config 中定义，这里假设通过 args 传入
+        feature_index_path = getattr(self.args, 'feature_index_path', 'data/feature_index.json')
 
-        # 提取作者特征: 严格对应 database.py 索引顺序 (author_id, h_index, cited_by_count, works_count)
-        author_query = "SELECT author_id, h_index, cited_by_count, works_count FROM authors INDEXED BY idx_author_metrics_covering"
+        if not os.path.exists(feature_index_path):
+            self.logging.error(f"[!] 未发现特征索引文件: {feature_index_path}，请先运行 build_feature_index.py")
+            # 兜底逻辑：保持全零特征，防止程序崩溃
+            self.aux_info_all = torch.from_numpy(features)
+            return
 
-        # 使用 chunk 避免内存溢出
-        for chunk in pd.read_sql(author_query, conn, chunksize=100000):
-            for row in chunk.itertuples(index=False):
-                aid_str = str(row.author_id)
-                # 【关键修复】：只处理在 id_map.json 中定义的实体（即参与训练/测试的 ID）
-                if aid_str in self.entity_to_int:
-                    idx = self.entity_to_int[aid_str]
-                    # 安全边界检查：确保 idx 落在刚才开辟的 [0, global_max_id) 空间内
-                    if idx < global_max_id:
-                        features[idx] = [
-                            np.log1p(row.h_index or 0),
-                            np.log1p(row.cited_by_count or 0),
-                            np.log1p(row.works_count or 0)
-                        ]
-        conn.close()
+        with open(feature_index_path, 'r', encoding='utf-8') as f:
+            feature_bundle = json.load(f)
 
-        # 归一化：将特征缩放到 [0, 1] 区间，防止训练时梯度爆炸
-        f_min, f_max = features.min(axis=0), features.max(axis=0)
-        self.aux_info_all = torch.from_numpy((features - f_min) / (f_max - f_min + 1e-9))
+        author_features = feature_bundle.get('author', {})
+        inst_features = feature_bundle.get('institution', {})
 
-        self.logging.info(f"[*] AX 特征提取完成，物理矩阵维度已对齐至: {global_max_id}")
+        self.logging.info(f"[*] 正在从 JSON 映射特征到物理矩阵...")
+
+        # 2. 映射作者特征
+        # 注意：id_map.json 中的 entity_to_int 存储的是压缩后的 ID
+        for raw_aid, feat_dict in author_features.items():
+            if raw_aid in self.entity_to_int:
+                idx = self.entity_to_int[raw_aid]
+                if idx < global_max_id:
+                    # 直接使用索引中预处理好的：h_index, cited_by_count, works_count
+                    features[idx] = [
+                        feat_dict.get('h_index', 0.0),
+                        feat_dict.get('cited_by_count', 0.0),
+                        feat_dict.get('works_count', 0.0)
+                    ]
+
+        # 3. 映射机构特征 (如果你的 KG 包含机构节点，也需对齐)
+        for raw_iid, feat_dict in inst_features.items():
+            if raw_iid in self.entity_to_int:
+                idx = self.entity_to_int[raw_iid]
+                if idx < global_max_id:
+                    # 机构特征通常只有发文和引用
+                    features[idx] = [
+                        0.0,  # h_index 占位
+                        feat_dict.get('cited_by_count', 0.0),
+                        feat_dict.get('works_count', 0.0)
+                    ]
+
+        # 4. 转换为 Tensor
+        # 【重要】：不再进行二次归一化，直接使用预计算好的 0-1 值
+        self.aux_info_all = torch.from_numpy(features)
+
+        self.logging.info(f"[*] AX 特征提取完成。来源: {feature_index_path}")
+        self.logging.info(f"[*] 特征矩阵均值: {features.mean():.4f}, 最大值: {features.max():.4f}")
+
+        del feature_bundle
         gc.collect()
 
     def create_laplacian_dict(self):
@@ -165,11 +190,18 @@ class DataLoaderKGAT(object):
         self.n_kg_train = len(kg_data)
 
     def generate_cf_batch(self, user_dict, batch_size):
-        """CF 训练批次生成：(User, Pos_Item, Neg_Item)"""
-        u = np.random.choice(list(user_dict.keys()), batch_size)
+        """优化后的负采样：确保完全锁定在人才/实体空间"""
+        valid_users = [u for u, items in user_dict.items() if len(items) > 0]
+        if not valid_users:
+            return None
+
+        u = np.random.choice(valid_users, batch_size)
         p = [random.choice(user_dict[usr]) for usr in u]
-        # 负采样范围为全实体空间
-        n = np.random.randint(0, self.n_users_entities, batch_size)
+
+        # 【关键】：负采样范围必须是 [ENTITY_OFFSET, n_users_entities)
+        # 这确保了岗位永远不会被当做推荐结果，从而强化 Type Embedding 的效果
+        n = np.random.randint(self.ENTITY_OFFSET, self.n_users_entities, batch_size)
+
         return torch.LongTensor(u), torch.LongTensor(p), torch.LongTensor(n)
 
     def generate_kg_batch(self, kg_dict, batch_size, highest_neg_idx):
