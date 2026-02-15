@@ -33,55 +33,62 @@ def check_args_and_env(args):
 
 def evaluate(model, dataloader, Ks, device):
     """
-    高性能评估函数：
-    1. 适配索引更新：确保使用归一化后的 AX 特征进行 Embedding 推演。
-    2. 物理隔离：严格区分岗位（User）与人才（Entity），解决候选集污染。
-    3. 维度校验：增加对 ENTITY_OFFSET 的安全检查。
+    针对 CPU 内存优化的评估函数：
+    1. Top-K 截断：仅保留前 500 个高分候选人，防止指标计算时内存爆炸。
+    2. 内存回收：显式删除中间变量并调用垃圾回收。
     """
+    import gc  # 导入垃圾回收
     model.eval()
     test_user_dict = dataloader.test_user_dict
     user_ids = list(test_user_dict.keys())
 
-    # 确保加载的是经过 build_feature_index.py 处理后的归一化特征
+    # 1. 加载归一化特征并预计算 Embedding
     aux_info_all = dataloader.aux_info_all.to(device)
-
-    # 1. 预计算所有节点的 Embedding
     with torch.no_grad():
-        # 这里会经过 model 中的 holographic_fusion，
-        # 归一化后的 aux_info_all 能有效防止此处出现梯度爆炸或数值溢出
         all_embed = model.calc_cf_embeddings(aux_info_all)
 
-    # 2. 【核心隔离】提取人才（实体）部分的 Embedding 空间
-    # 索引更新后，offset 之后的节点全部为人才实体
+    # 2. 提取人才（实体）空间
     offset = dataloader.ENTITY_OFFSET
     global_max_id = dataloader.ENTITY_OFFSET + dataloader.n_entities
 
-    # 安全检查：防止切片越界
     if offset >= all_embed.shape[0]:
         raise IndexError(f"ENTITY_OFFSET ({offset}) 超过了 Embedding 矩阵大小 ({all_embed.shape[0]})")
 
     item_embeds = all_embed[offset:global_max_id]
-
-    # 3. 构建候选实体 ID 向量（用于 calc_metrics_at_k 内部过滤掉训练集交互）
     item_ids_vec = np.arange(offset, global_max_id)
 
+    # 3. 分批次评估 (建议 test_batch_size 设置为 50-100)
     batch_size = dataloader.test_batch_size
     user_batches = [user_ids[i:i + batch_size] for i in range(0, len(user_ids), batch_size)]
     metrics = {k: {'recall': [], 'ndcg': []} for k in Ks}
 
     for batch_u in tqdm(user_batches, desc='Eval', leave=False):
-        batch_u_gpu = torch.LongTensor(batch_u).to(device)
+        batch_u_tensor = torch.LongTensor(batch_u).to(device)
 
         with torch.no_grad():
-            # 计算当前 Batch 岗位对所有人才候选人的匹配得分
-            # 归一化特征会让 score 的分布更加平滑，有助于 Top-K 排序的稳定性
-            curr_user_embeds = all_embed[batch_u_gpu]
-            scores = torch.matmul(curr_user_embeds, item_embeds.transpose(0, 1)).cpu()
+            curr_user_embeds = all_embed[batch_u_tensor]
+            # 计算全量得分：[batch_size, 180w]
+            # 虽然 100 * 180w 的 float32 矩阵只有约 700MB，但后续操作会成倍放大
+            all_scores = torch.matmul(curr_user_embeds, item_embeds.transpose(0, 1))
+
+            # --- 核心优化：Top-K 截断 ---
+            # 只取前 500 名，后续指标计算只在这 500 人中进行
+            # 这能确保 calc_metrics_at_k 内部不会产生 7GB 的掩码矩阵
+            top_k_val = 500
+            top_scores, top_indices = torch.topk(all_scores, k=min(top_k_val, item_embeds.shape[0]), dim=1)
+
+            # 构造一个“瘦身版”得分矩阵：
+            # 先填充极小值，再将 Top-K 的真实分数填回去
+            # 这样 calc_metrics_at_k 拿到的虽然还是 180w 列，但非 Top-K 的部分会被完全忽略且不触发内存高压
+            reduced_scores = torch.full_like(all_scores, -1e10)
+            reduced_scores.scatter_(1, top_indices, top_scores)
+
+            # 转换为 numpy 供指标函数使用
+            final_scores_cpu = reduced_scores.cpu().numpy()
 
         # 4. 指标计算
-        # 传入 item_ids_vec 确保在评估时剔除掉该岗位在训练集中已经“见过”的人才
         batch_m = calc_metrics_at_k(
-            scores,
+            final_scores_cpu,
             dataloader.train_user_dict,
             test_user_dict,
             np.array(batch_u),
@@ -93,12 +100,16 @@ def evaluate(model, dataloader, Ks, device):
             metrics[k]['recall'].append(batch_m[k]['recall'])
             metrics[k]['ndcg'].append(batch_m[k]['ndcg'])
 
-    # 释放显存，防止在接下来的训练 Epoch 中发生 OOM
+        # 及时清理当前 Batch 的内存碎片
+        del all_scores, reduced_scores, final_scores_cpu
+        gc.collect()
+
+    # 5. 最终清理
     del all_embed, item_embeds
     if device.type == 'cuda':
         torch.cuda.empty_cache()
+    gc.collect()
 
-    # 返回各指标的平均值
     return {k: {m: np.mean(v) for m, v in val.items()} for k, val in metrics.items()}
 def train(args):
     args.save_dir = KGATAX_TRAIN_DATA_DIR

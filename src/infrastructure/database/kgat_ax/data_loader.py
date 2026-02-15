@@ -3,13 +3,14 @@ import gc
 import random
 import collections
 import torch
+import json
 import sqlite3
 import json
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 from tqdm import tqdm
-from config import KGATAX_TRAIN_DATA_DIR
+from config import KGATAX_TRAIN_DATA_DIR,FEATURE_INDEX_PATH
 
 
 class DataLoaderKGAT(object):
@@ -71,20 +72,19 @@ class DataLoaderKGAT(object):
     def load_auxiliary_info(self):
         """
         提取特征：直接加载预计算好的特征索引文件。
-        适配：build_feature_index.py 生成的对数平滑归一化特征。
+        优化点：增加内存回收逻辑，在映射完成后立即销毁 ID 映射字典与 JSON 原始对象。
         """
-        import json
+        import gc
+
         # 【核心逻辑】：物理矩阵的大小必须能装下最大的物理索引
         global_max_id = self.ENTITY_OFFSET + self.n_entities
         features = np.zeros((global_max_id, self.args.n_aux_features), dtype=np.float32)
 
-        # 1. 加载预计算好的特征索引 (由 build_feature_index.py 生成)
-        # 路径通常在 config 中定义，这里假设通过 args 传入
-        feature_index_path = getattr(self.args, 'feature_index_path', 'data/feature_index.json')
+        # 1. 加载预计算好的特征索引
+        feature_index_path = FEATURE_INDEX_PATH
 
         if not os.path.exists(feature_index_path):
-            self.logging.error(f"[!] 未发现特征索引文件: {feature_index_path}，请先运行 build_feature_index.py")
-            # 兜底逻辑：保持全零特征，防止程序崩溃
+            self.logging.error(f"[!] 未发现特征索引文件: {feature_index_path}")
             self.aux_info_all = torch.from_numpy(features)
             return
 
@@ -97,39 +97,50 @@ class DataLoaderKGAT(object):
         self.logging.info(f"[*] 正在从 JSON 映射特征到物理矩阵...")
 
         # 2. 映射作者特征
-        # 注意：id_map.json 中的 entity_to_int 存储的是压缩后的 ID
+        # 局部变量引用 self.entity_to_int 以加快查找速度
+        e2i = self.entity_to_int
         for raw_aid, feat_dict in author_features.items():
-            if raw_aid in self.entity_to_int:
-                idx = self.entity_to_int[raw_aid]
+            if raw_aid in e2i:
+                idx = e2i[raw_aid]
                 if idx < global_max_id:
-                    # 直接使用索引中预处理好的：h_index, cited_by_count, works_count
                     features[idx] = [
                         feat_dict.get('h_index', 0.0),
                         feat_dict.get('cited_by_count', 0.0),
                         feat_dict.get('works_count', 0.0)
                     ]
 
-        # 3. 映射机构特征 (如果你的 KG 包含机构节点，也需对齐)
+        # 3. 映射机构特征
         for raw_iid, feat_dict in inst_features.items():
-            if raw_iid in self.entity_to_int:
-                idx = self.entity_to_int[raw_iid]
+            if raw_iid in e2i:
+                idx = e2i[raw_iid]
                 if idx < global_max_id:
-                    # 机构特征通常只有发文和引用
                     features[idx] = [
-                        0.0,  # h_index 占位
+                        0.0,
                         feat_dict.get('cited_by_count', 0.0),
                         feat_dict.get('works_count', 0.0)
                     ]
 
         # 4. 转换为 Tensor
-        # 【重要】：不再进行二次归一化，直接使用预计算好的 0-1 值
         self.aux_info_all = torch.from_numpy(features)
 
-        self.logging.info(f"[*] AX 特征提取完成。来源: {feature_index_path}")
+        self.logging.info(f"[*] AX 特征提取完成。")
         self.logging.info(f"[*] 特征矩阵均值: {features.mean():.4f}, 最大值: {features.max():.4f}")
 
+        # --- 核心内存清理 ---
+        # 1. 销毁庞大的 JSON 数据包
         del feature_bundle
+        del author_features
+        del inst_features
+
+        # 2. 销毁不再需要的 ID 映射字典 (包含 185w 条记录)
+        # 训练阶段将只使用已经构建好的矩阵、Tensor 和邻接表
+        self.logging.info(f"[*] 正在销毁 ID 映射字典以释放内存...")
+        del self.entity_to_int
+        del e2i  # 销毁局部变量引用
+
+        # 3. 强制垃圾回收
         gc.collect()
+        self.logging.info(f"[*] 内存清理完成。")
 
     def create_laplacian_dict(self):
         """构建归一化邻接矩阵：修正维度逻辑以兼容 OFFSET 分区"""

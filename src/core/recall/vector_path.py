@@ -11,7 +11,7 @@ class VectorPath:
     向量路召回：实现基于 SBERT 的语义召回
     """
 
-    def __init__(self, recall_limit=200):
+    def __init__(self, recall_limit=300):
         self.search_k = 500  # 检索深度
         self.recall_limit = recall_limit
 
@@ -86,6 +86,63 @@ class VectorPath:
 
 
 if __name__ == "__main__":
-    # 测试模式下可以开启 verbose=True
-    v_path = VectorPath(recall_limit=200)
-    # ... 剩下的测试代码调用时改为 v_path.recall(query_vec, verbose=True)
+    # 实例化向量路召回组件，设置召回上限为300
+    v_path = VectorPath(recall_limit=300)
+
+    print("\n" + "=" * 60)
+    print("🚀 向量路召回独立测试控制台")
+    print("请输入查询向量 (JSON列表格式) 进行语义召回")
+    print("=" * 60)
+
+    try:
+        while True:
+            raw_input = input("\n请粘贴稠密向量 (输入 'q' 退出):\n>> ").strip()
+
+            # 检查退出条件
+            if not raw_input or raw_input.lower() == 'q':
+                print("退出测试模式")
+                break
+
+            try:
+                # 解析JSON格式的向量列表
+                vector_list = json.loads(raw_input)
+
+                # 转换为numpy数组并调整维度
+                query_vec = np.array([vector_list]).astype('float32')
+
+                # 执行L2归一化以适应Faiss的内积索引
+                faiss.normalize_L2(query_vec)
+
+                # 执行召回，开启verbose模式显示中间过程
+                print("\n[执行召回中...]")
+                author_ids, duration = v_path.recall(query_vec, verbose=True)
+
+                # 输出结果
+                print(f"\n[召回结果报告]")
+                print(f"- 召回耗时: {duration:.2f} ms")
+                print(f"- 召回作者数量: {len(author_ids)}")
+
+                if author_ids:
+                    print(f"- 前5位作者ID: {author_ids[:5]}")
+                    print(f"- 全部作者ID列表:")
+                    # 每行显示10个ID，提高可读性
+                    for i in range(0, len(author_ids), 10):
+                        print(f"  {author_ids[i:i + 10]}")
+                else:
+                    print("- 未找到相关作者")
+
+                print("-" * 30)
+
+            except json.JSONDecodeError:
+                print("[错误] JSON格式解析失败，请确保输入的是有效的JSON列表格式")
+                print("示例: [0.1, -0.2, 0.3, ...]")
+            except Exception as e:
+                print(f"[错误] 召回过程发生异常: {str(e)}")
+                import traceback
+
+                traceback.print_exc()
+
+    except KeyboardInterrupt:
+        print("\n\n[!] 测试被用户中断")
+
+    print("[*] 向量路召回测试结束")
