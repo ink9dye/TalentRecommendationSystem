@@ -5,18 +5,17 @@ import collections
 import torch
 import json
 import sqlite3
-import json
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 from tqdm import tqdm
-from config import KGATAX_TRAIN_DATA_DIR,FEATURE_INDEX_PATH
+from config import KGATAX_TRAIN_DATA_DIR, FEATURE_INDEX_PATH
 
 
 class DataLoaderKGAT(object):
     """
-    针对 KGAT-AX 架构优化的数据加载器
-    职责：ID映射加载、三元组构建、邻接矩阵生成（含缓存）及学术特征提取
+    适配四级梯度精排逻辑的 KGAT-AX 数据加载器。
+    职责：解析分层训练集、加载归一化学术特征 (AX)、执行索引驱动的子图采样 。
     """
 
     def __init__(self, args, logging):
@@ -26,32 +25,33 @@ class DataLoaderKGAT(object):
         # 路径初始化
         self.data_dir = os.path.join(args.data_dir, args.data_name)
         self.train_file = os.path.join(self.data_dir, 'train.txt')
+        self.test_file = os.path.join(self.data_dir, 'test.txt')
         self.kg_file = os.path.join(self.data_dir, "kg_final.txt")
         self.test_batch_size = getattr(args, 'test_batch_size', 1024)
 
-        # 1. 载入全局映射与分区信息（核心：奠定 ID 空间基础）
+        # 1. 载入全局映射与分区信息（奠定 ID 空间基础）
         self.load_id_mapping()
 
-        # 2. 载入协同过滤交互数据
+        # 2. 载入协同过滤交互数据 (支持四级梯度解析)
         self.cf_train_data, self.train_user_dict = self.load_cf(self.train_file)
         self.n_cf_train = len(self.cf_train_data[0])
-        self.cf_test_data, self.test_user_dict = self.load_cf(os.path.join(self.data_dir, 'test.txt'))
+        self.cf_test_data, self.test_user_dict = self.load_cf(self.test_file)
 
-        # 3. 提取学术增强特征 (AX) - 适配 database.py 的覆盖索引
+        # 3. 提取学术增强特征 (AX) - 直接对接 build_feature_index.py 的产物
         self.load_auxiliary_info()
 
-        # 4. 构建图结构
+        # 4. 构建图结构 - 利用 build_kg_index.py 建立的 SQLite 索引执行子图采样
         kg_data = self.load_kg(self.kg_file)
         self.construct_data(kg_data)
 
-        # 5. 构建拉普拉斯矩阵 (含自动缓存逻辑，避免重复计算耗时)
+        # 5. 构建拉普拉斯矩阵 (含自动缓存逻辑)
         self.create_laplacian_dict()
 
-        # 6. 最终自检（杜绝 ID 冲突导致的训练崩溃）
+        # 6. 最终自检
         self.sanity_check()
 
     def load_id_mapping(self):
-        """从 JSON 加载全局 ID 映射，支持动态压缩 ID 空间"""
+        """加载 ID 压缩映射，确立 User 与 Entity 的物理边界"""
         map_path = os.path.join(self.data_dir, "id_map.json")
         if not os.path.exists(map_path):
             raise FileNotFoundError(f"未发现映射文件: {map_path}，请先运行 generate_training_data.py。")
@@ -59,9 +59,7 @@ class DataLoaderKGAT(object):
         with open(map_path, 'r', encoding='utf-8') as f:
             mapping = json.load(f)
 
-        self.entity_to_int = mapping['entity']
-        # 【修复】：直接从映射文件获取总节点数，不再通过 len(entity_to_int) 推算
-        self.n_users_entities = mapping.get("total_nodes", len(self.entity_to_int))
+        self.n_users_entities = mapping.get("total_nodes")
         self.n_users = mapping.get("user_count", 0)
         self.n_entities = mapping.get("entity_count", 0)
         self.ENTITY_OFFSET = mapping.get("offset", 0)
@@ -69,36 +67,95 @@ class DataLoaderKGAT(object):
         self.logging.info(
             f"[*] ID 空间映射成功: User(0-{self.ENTITY_OFFSET - 1}), Entity({self.ENTITY_OFFSET}-{self.n_users_entities - 1})")
 
-    def load_auxiliary_info(self):
+    def load_cf(self, filename):
         """
-        提取特征：直接加载预计算好的特征索引文件。
-        优化点：增加内存回收逻辑，在映射完成后立即销毁 ID 映射字典与 JSON 原始对象。
+        解析四级梯度格式
+        格式: uid;pos_ids;fair_ids;neutral_ids;easy_ids
         """
-        import gc
+        u, i = [], []
+        if not hasattr(self, 'tiered_cf_dict'):
+            self.tiered_cf_dict = {}
 
-        # 【核心逻辑】：物理矩阵的大小必须能装下最大的物理索引
-        global_max_id = self.ENTITY_OFFSET + self.n_entities
+        user_pos_dict = collections.defaultdict(list)
+        count = 0
+
+        with open(filename, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                parts = line.split(';')
+                if len(parts) < 5: continue
+
+                uid = int(parts[0])
+                # 解析各级分档列表
+                pos_ids = [int(x) for x in parts[1].split(',') if x]
+                fair_ids = [int(x) for x in parts[2].split(',') if x]
+                neutral_ids = [int(x) for x in parts[3].split(',') if x]
+                easy_ids = [int(x) for x in parts[4].split(',') if x]
+
+                user_pos_dict[uid] = pos_ids
+                for iid in pos_ids:
+                    u.append(uid)
+                    i.append(iid)
+
+                # 存入采样字典，供训练时执行阶梯博弈
+                self.tiered_cf_dict[uid] = {
+                    'fair': fair_ids,
+                    'neutral': neutral_ids,
+                    'easy': easy_ids
+                }
+                count += 1
+
+        self.logging.info(f"[*] 已载入 {count} 个岗位的分层训练样本带。")
+        return (np.array(u), np.array(i)), user_pos_dict
+
+    def generate_cf_batch(self, user_dict, batch_size):
+        """
+        实现阶梯负采样策略：强化模型对混合排名中后 400 名“近义负样本”的分辨力。
+        """
+        valid_users = list(user_dict.keys())
+        if not valid_users: return None
+
+        u = np.random.choice(valid_users, batch_size)
+        p = [random.choice(user_dict[usr]) for usr in u]
+
+        n = []
+        for usr in u:
+            tiers = self.tiered_cf_dict.get(usr, {})
+            rand = random.random()
+
+            # 采样权重：40% 尚可, 40% 中性(硬负), 20% 无关(易负)
+            if rand < 0.4 and tiers.get('fair'):
+                n.append(random.choice(tiers['fair']))
+            elif rand < 0.8 and tiers.get('neutral'):
+                n.append(random.choice(tiers['neutral']))
+            elif tiers.get('easy'):
+                n.append(random.choice(tiers['easy']))
+            else:
+                n.append(random.randint(self.ENTITY_OFFSET, self.n_users_entities - 1))
+
+        return torch.LongTensor(u), torch.LongTensor(p), torch.LongTensor(n)
+
+    def load_auxiliary_info(self):
+        """加载经 build_feature_index.py 处理后的归一化特征 """
+        global_max_id = self.n_users_entities
+        # 默认三维特征：h_index, cited_by, works_count
         features = np.zeros((global_max_id, self.args.n_aux_features), dtype=np.float32)
 
-        # 1. 加载预计算好的特征索引
-        feature_index_path = FEATURE_INDEX_PATH
-
-        if not os.path.exists(feature_index_path):
-            self.logging.error(f"[!] 未发现特征索引文件: {feature_index_path}")
+        if not os.path.exists(FEATURE_INDEX_PATH):
+            self.logging.error(f"[!] 未发现特征索引: {FEATURE_INDEX_PATH}")
             self.aux_info_all = torch.from_numpy(features)
             return
 
-        with open(feature_index_path, 'r', encoding='utf-8') as f:
+        with open(FEATURE_INDEX_PATH, 'r', encoding='utf-8') as f:
             feature_bundle = json.load(f)
 
+        map_path = os.path.join(self.data_dir, "id_map.json")
+        with open(map_path, 'r', encoding='utf-8') as f_map:
+            mapping = json.load(f_map)
+        e2i = mapping['entity']
+
         author_features = feature_bundle.get('author', {})
-        inst_features = feature_bundle.get('institution', {})
-
-        self.logging.info(f"[*] 正在从 JSON 映射特征到物理矩阵...")
-
-        # 2. 映射作者特征
-        # 局部变量引用 self.entity_to_int 以加快查找速度
-        e2i = self.entity_to_int
         for raw_aid, feat_dict in author_features.items():
             if raw_aid in e2i:
                 idx = e2i[raw_aid]
@@ -109,79 +166,39 @@ class DataLoaderKGAT(object):
                         feat_dict.get('works_count', 0.0)
                     ]
 
-        # 3. 映射机构特征
-        for raw_iid, feat_dict in inst_features.items():
-            if raw_iid in e2i:
-                idx = e2i[raw_iid]
-                if idx < global_max_id:
-                    features[idx] = [
-                        0.0,
-                        feat_dict.get('cited_by_count', 0.0),
-                        feat_dict.get('works_count', 0.0)
-                    ]
-
-        # 4. 转换为 Tensor
         self.aux_info_all = torch.from_numpy(features)
-
-        self.logging.info(f"[*] AX 特征提取完成。")
-        self.logging.info(f"[*] 特征矩阵均值: {features.mean():.4f}, 最大值: {features.max():.4f}")
-
-        # --- 核心内存清理 ---
-        # 1. 销毁庞大的 JSON 数据包
-        del feature_bundle
-        del author_features
-        del inst_features
-
-        # 2. 销毁不再需要的 ID 映射字典 (包含 185w 条记录)
-        # 训练阶段将只使用已经构建好的矩阵、Tensor 和邻接表
-        self.logging.info(f"[*] 正在销毁 ID 映射字典以释放内存...")
-        del self.entity_to_int
-        del e2i  # 销毁局部变量引用
-
-        # 3. 强制垃圾回收
+        self.logging.info(f"[*] AX 归一化特征加载完成。")
+        del feature_bundle, e2i
         gc.collect()
-        self.logging.info(f"[*] 内存清理完成。")
 
-    def create_laplacian_dict(self):
-        """构建归一化邻接矩阵：修正维度逻辑以兼容 OFFSET 分区"""
-        cache_file = os.path.join(self.data_dir, 'adj_matrix_cache.npz')
-        if os.path.exists(cache_file):
-            self.logging.info(f"[*] 发现矩阵缓存，正在秒速加载...")
-            adj = sp.load_npz(cache_file)
-            self.A_in = self.convert_coo2tensor(adj)
-            return
+    def load_kg(self, filename):
+        """索引驱动子图采样：利用 build_kg_index.py 生成的离线数据库加速 """
+        db_path = os.path.join(self.data_dir, "kg_index.db")
+        if not os.path.exists(db_path):
+            self.logging.error(f"[!] 未发现 KG 索引库: {db_path}，请先运行 build_kg_index.py")
+            return pd.DataFrame(columns=['h', 'r', 't'])
 
-        self.logging.info("[*] 正在构建邻接矩阵...")
-        rows, cols, datas = [], [], []
-        for r, ht in self.train_relation_dict.items():
-            for h, t in ht:
-                rows.append(h)
-                cols.append(t)
-                datas.append(1.0)
+        self.logging.info(f"[*] 正在执行索引驱动采样...")
+        seeds = list(set(self.cf_train_data[0].tolist()) | set(self.cf_train_data[1].tolist()))
+        conn = sqlite3.connect(db_path)
 
-        # 【核心修复】：矩阵维度必须覆盖最大物理索引
-        # 你的最大索引是 ENTITY_OFFSET + n_entities，约为 2839682
-        global_max_id = self.ENTITY_OFFSET + self.n_entities
+        all_edges = []
+        chunk_size = 500
+        for i in range(0, len(seeds), chunk_size):
+            batch = seeds[i:i + chunk_size]
+            placeholders = ','.join(['?'] * len(batch))
+            # 1-hop 采样：提取当前训练任务相关的局部拓扑
+            sql = f"SELECT h, r, t FROM kg_triplets WHERE h IN ({placeholders}) OR t IN ({placeholders})"
+            all_edges.extend(conn.execute(sql, batch + batch).fetchall())
 
-        # 1. 声明足够大的矩阵尺寸
-        adj = sp.coo_matrix(
-            (datas, (rows, cols)),
-            shape=(global_max_id, global_max_id)
-        )
-
-        # 2. 拉普拉斯归一化: D^-1 * A
-        rowsum = np.array(adj.sum(axis=1))
-        d_inv = np.power(rowsum, -1.0).flatten()
-        d_inv[np.isinf(d_inv)] = 0.
-        norm_adj = sp.diags(d_inv).dot(adj).astype(np.float32).tocoo()
-
-        self.logging.info(f"[*] 正在保存缓存...")
-        sp.save_npz(cache_file, norm_adj)
-        self.A_in = self.convert_coo2tensor(norm_adj)
+        conn.close()
+        df = pd.DataFrame(all_edges, columns=['h', 'r', 't']).drop_duplicates()
+        self.logging.info(f"[*] 采样获得子图边数: {len(df)}")
+        return df
 
     def construct_data(self, kg_data):
-        """对齐 KG 三元组并添加逆关系边"""
-        # 添加逆关系 (h, r, t) -> (t, r + n_rel, h)
+        """构建正向与反向关系，建立 TransR 空间映射基础 """
+        if kg_data.empty: return
         n_rel = max(kg_data['r']) + 1
         inv_kg = kg_data.copy().rename({'h': 't', 't': 'h'}, axis=1)
         inv_kg['r'] += n_rel
@@ -200,198 +217,52 @@ class DataLoaderKGAT(object):
         self.r_list = torch.LongTensor(kg_data['r'].values)
         self.n_kg_train = len(kg_data)
 
-    def generate_cf_batch(self, user_dict, batch_size):
-        """优化后的负采样：优先从硬负样本池中挑选"""
-        valid_users = [u for u, items in user_dict.items() if len(items) > 0]
-        if not valid_users:
-            return None
+    def create_laplacian_dict(self):
+        """生成归一化拉普拉斯矩阵，用于图卷积聚合消息传递"""
+        cache_file = os.path.join(self.data_dir, 'adj_matrix_cache.npz')
+        if os.path.exists(cache_file):
+            adj = sp.load_npz(cache_file)
+            self.A_in = self.convert_coo2tensor(adj)
+            return
 
-        u = np.random.choice(valid_users, batch_size)
-        p = [random.choice(user_dict[usr]) for usr in u]
+        rows, cols, datas = [], [], []
+        for r, ht in self.train_relation_dict.items():
+            for h, t in ht:
+                rows.append(h);
+                cols.append(t);
+                datas.append(1.0)
 
-        n = []
-        for usr in u:
-            # 80% 的概率选择你预先找好的“硬负样本” (400-500名)
-            if usr in self.hard_neg_dict and random.random() < 0.8:
-                n.append(random.choice(self.hard_neg_dict[usr]))
-            else:
-                # 20% 的概率保持全局随机采样，维持泛化能力
-                n.append(random.randint(self.ENTITY_OFFSET, self.n_users_entities - 1))
-
-        return torch.LongTensor(u), torch.LongTensor(p), torch.LongTensor(n)
+        adj = sp.coo_matrix((datas, (rows, cols)), shape=(self.n_users_entities, self.n_users_entities))
+        rowsum = np.array(adj.sum(axis=1))
+        d_inv = np.power(rowsum, -1.0).flatten()
+        d_inv[np.isinf(d_inv)] = 0.
+        norm_adj = sp.diags(d_inv).dot(adj).tocoo()
+        sp.save_npz(cache_file, norm_adj)
+        self.A_in = self.convert_coo2tensor(norm_adj)
 
     def generate_kg_batch(self, kg_dict, batch_size, highest_neg_idx):
-        """
-        KG 训练批次生成：引入 30% 硬负采样逻辑，防止 KG Loss 快速跳水。
-        """
+        """执行知识图谱三元组采样，用于 TransR 损失计算"""
         h_batch = np.random.choice(list(kg_dict.keys()), batch_size)
         h, r, p, n = [], [], [], []
         for head in h_batch:
             t, rel = random.choice(kg_dict[head])
-            h.append(head)
-            r.append(rel)
+            h.append(head);
+            r.append(rel);
             p.append(t)
-
-            # --- 核心改进：混合负采样策略 ---
-            if random.random() < 0.3:  # 30% 几率进行硬负采样
-                # 从当前头节点的邻居中找一个节点作为负样本（题目更难）
-                all_neighbors = [neighbor for neighbor, _ in kg_dict[head]]
-                neg_node = random.choice(all_neighbors)
-                # 如果撞车了，回退到全局随机
-                if neg_node == t:
-                    neg_node = random.randint(self.ENTITY_OFFSET, self.n_users_entities - 1)
-            else:
-                # 70% 几率保持随机，维持全局对比
-                neg_node = random.randint(self.ENTITY_OFFSET, self.n_users_entities - 1)
-
-            n.append(neg_node)
-
+            n.append(random.randint(self.ENTITY_OFFSET, self.n_users_entities - 1))
         return torch.LongTensor(h), torch.LongTensor(r), torch.LongTensor(p), torch.LongTensor(n), \
             self.aux_info_all[h], self.aux_info_all[p], self.aux_info_all[n]
+
     def convert_coo2tensor(self, coo):
-        """Scipy COO 转换为 PyTorch Sparse Tensor"""
         idx = torch.LongTensor(np.vstack((coo.row, coo.col)))
         return torch.sparse_coo_tensor(idx, torch.FloatTensor(coo.data), torch.Size(coo.shape))
 
-    def load_cf(self, filename):
-        u, i = [], []
-        # 新增：用于存储每行自带的硬负样本池，供训练时精准采样
-        self.hard_neg_dict = collections.defaultdict(list)
-
-        with open(filename, 'r') as f:
-            for line in f:
-                parts = line.strip().split(' ')
-                if len(parts) < 2: continue
-
-                uid = int(parts[0])
-                # 根据 generate_training_data.py 的定义：
-                # parts[1:16] 是正样本 (15个)
-                # parts[16:] 是硬负样本 (100个)
-
-                # 1. 提取正样本
-                pos_ids = [int(x) for x in parts[1:16]]
-                for iid in pos_ids:
-                    u.append(uid)
-                    i.append(iid)
-
-                # 2. 提取并存储硬负样本 (用于后续 generate_cf_batch)
-                if len(parts) > 16:
-                    neg_ids = [int(x) for x in parts[16:]]
-                    self.hard_neg_dict[uid] = neg_ids
-
-        udict = collections.defaultdict(list)
-        for user, item in zip(u, i):
-            udict[user].append(item)
-
-        return (np.array(u), np.array(i)), udict
-
-    def load_kg(self, filename):
-        """
-        利用外部 SQLite 索引执行秒级子图采样。
-        职责：从 3200万条边中精准提取与当前训练集(Job/User)相关的 1-hop 和 2-hop 拓扑。
-        """
-        # 直接引用 config 中的路径，保持全局一致性
-
-        db_path = os.path.join(KGATAX_TRAIN_DATA_DIR, "kg_index.db")
-
-        if not os.path.exists(db_path):
-            self.logging.error(f"[!] 未发现索引库: {db_path}，请先运行 build_kg_index.py")
-            return
-
-        self.logging.info(f"[*] 正在执行索引驱动采样，目标库: {db_path}")
-
-        # 1. 确定核心种子节点 (训练集涉及的 Job 和人)
-        seeds = list(set(self.cf_train_data[0].tolist()) | set(self.cf_train_data[1].tolist()))
-        conn = sqlite3.connect(db_path)
-
-        try:
-            # 2. 提取一阶关联 (1-hop)：双向命中种子
-            self.logging.info(f"[*] 正在提取一阶邻居 (种子数: {len(seeds)})...")
-            hop1_edges = []
-            chunk_size = 500  # 避免 SQL 占位符超限
-
-            for i in range(0, len(seeds), chunk_size):
-                batch_seeds = seeds[i:i + chunk_size]
-                placeholders = ','.join(['?'] * len(batch_seeds))
-
-                # 利用 idx_h_lookup 和 idx_t_lookup 覆盖索引进行 Index-Only Scan
-                sql = f"SELECT h, r, t FROM kg_triplets WHERE h IN ({placeholders}) OR t IN ({placeholders})"
-                hop1_edges.extend(conn.execute(sql, batch_seeds + batch_seeds).fetchall())
-
-            # 提取一阶涉及的所有节点，准备二阶扩展
-            hop1_nodes = set()
-            for h, r, t in hop1_edges:
-                hop1_nodes.add(h)
-                hop1_nodes.add(t)
-
-            self.logging.info(f"[*] 一阶提取完成：得到 {len(hop1_edges)} 条边")
-
-            # 3. 提取二阶辐射 (2-hop)：贪婪外延
-            self.logging.info(f"[*] 正在执行二阶贪婪外延...")
-            hop2_edges = []
-            max_limit = 1800000 - len(hop1_edges)  # 32GB 内存安全阈值
-
-            hop1_nodes_list = list(hop1_nodes)
-            for i in range(0, len(hop1_nodes_list), chunk_size):
-                if len(hop2_edges) > max_limit:
-                    break
-
-                batch_nodes = hop1_nodes_list[i:i + chunk_size]
-                placeholders = ','.join(['?'] * len(batch_nodes))
-
-                # 只查询头节点在圈内的边，捕捉所有外延学术背景
-                sql = f"SELECT h, r, t FROM kg_triplets WHERE h IN ({placeholders})"
-                hop2_edges.extend(conn.execute(sql, batch_nodes).fetchall())
-
-            # 4. 结果整合与去重
-            all_edges = hop1_edges + hop2_edges
-            all_kg_df = pd.DataFrame(all_edges, columns=['h', 'r', 't']).drop_duplicates()
-
-            # 5. 最终自检与兜底：若子图过于稀疏则补全随机边
-            if len(all_kg_df) < 100000:
-                self.logging.warning(f"[!] 连通性不足 ({len(all_kg_df)}条)，注入全局随机采样作为环境噪音...")
-                random_edges = conn.execute("SELECT h, r, t FROM kg_triplets LIMIT 200000").fetchall()
-                all_kg_df = pd.concat(
-                    [all_kg_df, pd.DataFrame(random_edges, columns=['h', 'r', 't'])]).drop_duplicates()
-
-            self.all_kg_data = all_kg_df.values
-            self.n_kg_train = len(self.all_kg_data)
-            self.logging.info(f"[*] 最终 KG 训练规模: {self.n_kg_train} 条边")
-
-        finally:
-            conn.close()
-            gc.collect()  # 显式回收 SQL 结果集占用的内存
-
-        return all_kg_df
-
     def sanity_check(self):
-        """深度数据质量校验：防止模型在第一轮就因为低级错误崩溃"""
+        """数据质量诊断：防止 ID 越界或分区冲突"""
         self.logging.info(f"\n{'=' * 20} DATA SANITY CHECK {'=' * 20}")
-
-        # 1. 范围校验：防止 Embedding 越界
-        # A_in._indices() 拿到的是 Sparse Tensor 的坐标映射
-        max_id_in_adj = self.A_in._indices().max().item()
-        global_max_id = self.ENTITY_OFFSET + self.n_entities
-
-        if max_id_in_adj >= global_max_id:
-            raise ValueError(f"ID 越界: 邻接矩阵最大 ID({max_id_in_adj}) >= 预设最大 ID({global_max_id})")
-
-        # 2. 空间分区校验
-        if self.ENTITY_OFFSET < self.n_users:
-            raise ValueError(f"分区重叠: ENTITY_OFFSET({self.ENTITY_OFFSET}) 必须大于 UserCount({self.n_users})")
-
-        # 3. 特征值校验
-        if torch.isnan(self.aux_info_all).any():
-            raise ValueError("特征矩阵中包含 NaN！请检查数据库中的学术指标是否有非数值项。")
-
-        # 4. 交互数据（训练集）合法性校验
-        # 确保 train.txt 里的所有 item_id 都在实体空间 [OFFSET, global_max_id)
-        train_items = self.cf_train_data[1]
-        if train_items.min() < self.ENTITY_OFFSET:
-            raise ValueError(f"交互数据错误: 发现 Item ID {train_items.min()} 小于偏移量 {self.ENTITY_OFFSET}")
-
-        self.logging.info(f"节点总空间: {global_max_id}")
+        if self.A_in._indices().max().item() >= self.n_users_entities:
+            raise ValueError("ID 越界！请检查 ENTITY_OFFSET。")
+        self.logging.info(f"节点总空间: {self.n_users_entities}")
         self.logging.info(f"交互边数量: {self.n_cf_train}")
         self.logging.info(f"KG 三元组数量: {self.n_kg_train}")
         self.logging.info("[Success] 静态数据校验通过！")
-        self.logging.info(f"{'=' * 50}\n")

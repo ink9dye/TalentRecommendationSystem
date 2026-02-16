@@ -35,26 +35,24 @@ def run_command(command, description):
 
 
 def main():
-    # 1. 环境准备
     logging.info("开始执行 KGATAX 全流程流水线...")
 
-    # 2. 步骤一：生成训练数据
-    # 职责：ID压缩映射、岗位/人才交互对提取、构建物理分区
-    run_command("generate_training_data.py", "训练数据生成 (Generate)")
 
-    # 3. 步骤二：构建 KG 索引
-    # 职责：将生成的 kg_final.txt 结构化为 SQLite，建立高效率覆盖索引
-    # 这是 DataLoaderKGAT 进行秒级子图采样的前置条件
-    run_command("build_kg_index.py", "KG 离线索引构建 (Indexing)")
+    # 步骤 1：生成训练数据
+    # 职责：执行 500 人召回 -> RRF 融合重排 -> 四级梯度持久化
+    run_command("generate_training_data.py", "四级梯度训练数据生成")
 
-    # 4. 步骤三：启动模型训练
-    # 职责：加载数据、执行 CF+KG 联合训练、模型评估
-    # 注意：这里你可以根据需要添加特定的命令行参数，如 --n_epoch 100
-    run_command("trainer.py", "KGAT-AX 模型训练 (Training)")
+    # 步骤 2：构建 KG 索引
+    # 职责：为 3200 万条边构建 SQLite 覆盖索引，支持秒级子图采样
+    run_command("build_kg_index.py", "KG 离线索引构建")
+
+    # 步骤 3：启动训练
+    # 职责：执行 CF + KG 联合训练，并利用阶梯采样学习排序逻辑
+    # 建议增加参数控制，例如训练 50 轮，每 5 轮评估一次
+    run_command("trainer.py --n_epoch 50 --evaluate_every 5", "KGAT-AX 阶梯对比训练")
 
     logging.info("=" * 50)
     logging.info("所有流水线任务已成功执行完毕！")
-    logging.info("=" * 50)
 
 
 if __name__ == "__main__":

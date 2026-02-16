@@ -69,8 +69,7 @@ class KGAT(nn.Module):
         self.aux_embed_layer = nn.Linear(self.n_aux_features, self.embed_dim)
         nn.init.xavier_uniform_(self.aux_embed_layer.weight)
 
-        # 2. 类型偏置层 (Type Embedding)：解决节点类型分不清的核心插件
-        # 0: User (Job/岗位), 1: Entity (Author/Work/人才等)
+        # 2. 类型偏置层 (Type Embedding)：区分岗位(0)与人才(1)
         self.type_embed = nn.Embedding(2, self.embed_dim)
         nn.init.xavier_uniform_(self.type_embed.weight)
 
@@ -103,24 +102,17 @@ class KGAT(nn.Module):
 
     def holographic_fusion(self, entity_embed, aux_info, node_ids=None):
         """
-        全息融合层：利用归一化学术特征作为缩放门控。
-        适配更新：针对 build_feature_index.py 产生的对数平滑特征进行非线性对齐。
+        全息融合层：增强学术特征的基础权重。
         """
-        # 1. 应用学术特征缩放 (AX 增强)
-        # 索引更新后，aux_info 已经是 [0, 1] 的归一化数值。
-        # 使用 tanh 将其映射到语义空间，并通过 +1.0 偏置确保基础特征不被抹除。
-        # 这样，学术表现优异（特征趋近1）的节点会在 Embedding 空间获得显著增强。
-        res_weight = torch.tanh(self.aux_embed_layer(aux_info)) + 1.0
+        # --- 核心修改：增加学术特征的基础权重偏置 ---
+        # 通过将基础偏置从 1.0 提升至 1.5，确保即学术特征较弱的节点也拥有稳定的激活，
+        # 同时学术表现优异的节点（feat趋近1）能获得更强的特征溢出效应。
+        res_weight = torch.tanh(self.aux_embed_layer(aux_info)) + 1.5
         fused_embed = entity_embed * res_weight
 
         # 2. 注入类型偏置 (Type Bias)
-        # 索引更新明确了 ID 分区：[0, OFFSET) 为岗位，[OFFSET, MAX) 为实体。
         if node_ids is not None:
-            # 动态生成类型 ID：岗位(Job)为 0，人才/论文等(Entity)为 1
-            # 这一步能打破岗位节点与候选人节点在图谱结构上的语义对称性。
             type_labels = (node_ids >= self.ENTITY_OFFSET).long()
-
-            # 注入身份 Embedding，帮助模型显式学习“推荐方向” (Job -> Author)
             fused_embed += self.type_embed(type_labels)
 
         return fused_embed
@@ -158,7 +150,7 @@ class KGAT(nn.Module):
         return cf_loss + self.cf_l2loss_lambda * l2_loss
 
     def calc_kg_loss(self, h, r, pos_t, neg_t, h_aux, pos_t_aux, neg_t_aux):
-        """KG 损失：同样注入类型偏置以保持特征一致性"""
+        """KG 损失：注入类型偏置以保持特征一致性"""
         h_e = self.entity_user_embed(h)
         p_t_e = self.entity_user_embed(pos_t)
         n_t_e = self.entity_user_embed(neg_t)
@@ -187,8 +179,6 @@ class KGAT(nn.Module):
         r_e = self.relation_embed(r_list)
         W_r = self.trans_M[r_list]
 
-        # 注意力计算中也需考虑节点身份
-        # 这里的身份信息已隐含在 entity_user_embed 的训练过程中
         h_e = torch.bmm(h_e.unsqueeze(1), W_r).squeeze(1)
         t_e = torch.bmm(t_e.unsqueeze(1), W_r).squeeze(1)
 
