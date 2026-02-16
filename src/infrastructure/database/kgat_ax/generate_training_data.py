@@ -208,20 +208,34 @@ class KGATAXTrainingGenerator:
         if os.path.exists(VOCAB_INDEX_PATH):
             print("[*] 正在通过 Faiss 索引构建语义桥接三元组...")
             v_index = faiss.read_index(VOCAB_INDEX_PATH)
+
+            # 重点：此时 v_map 必须存储词汇的文本内容（Term），而不是数据库 ID
             with open(VOCAB_MAP_PATH, 'r', encoding='utf-8') as f:
-                v_map = json.load(f)  # List of original IDs
+                v_map = json.load(f)
 
-            # 为了性能，这里只对出现在图谱中的词汇进行 Top-K 检索
-            # 模拟 builder.py 中的语义桥接逻辑
-            for idx, raw_v_id in enumerate(tqdm(v_map, desc="Vector Bridging")):
+                # 遍历向量库映射表
+            for idx, raw_v_term in enumerate(tqdm(v_map, desc="Vector Bridging")):
+                # 从 Faiss 索引中重建该词汇的向量
                 vec = v_index.reconstruct(idx).reshape(1, -1)
-                scores, indices = v_index.search(vec, 5)  # 找最相似的 5 个
+                # 检索最相似的 5 个邻居
+                scores, indices = v_index.search(vec, 5)
 
-                h_vocab = self.get_ent_id(f"v_{raw_v_id}")
+                # 修正点 1：统一使用 "v_" + "清洗后的文本" 作为 Key，对齐 Section B 和 C
+                clean_source_term = str(raw_v_term).strip().lower()
+                h_vocab = self.get_ent_id(f"v_{clean_source_term}")
+
                 for neighbor_idx in indices[0]:
-                    if neighbor_idx == -1 or neighbor_idx == idx: continue
-                    neighbor_raw_id = v_map[neighbor_idx]
-                    t_vocab = self.get_ent_id(f"v_{neighbor_raw_id}")
+                    # 过滤无效索引及自环
+                    if neighbor_idx == -1 or neighbor_idx == idx:
+                        continue
+
+                    # 修正点 2：邻居节点也使用文本内容生成 ID
+                    neighbor_raw_term = v_map[neighbor_idx]
+                    clean_neighbor_term = str(neighbor_raw_term).strip().lower()
+
+                    t_vocab = self.get_ent_id(f"v_{clean_neighbor_term}")
+
+                    # 建立 6 号关系：SIMILAR_TO
                     kg_triplets.append((h_vocab, 6, t_vocab))
 
         # --- E. 数据清洗与持久化 ---

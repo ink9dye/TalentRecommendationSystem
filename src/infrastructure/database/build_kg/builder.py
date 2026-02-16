@@ -112,14 +112,14 @@ class KGBuilder:
             conn.row_factory = sqlite3.Row
             # 预加载类型映射
             vocab_meta = {str(r[0]): r[1] for r in
-                          conn.execute("SELECT id, entity_type FROM vocabulary").fetchall()}
+                          conn.execute("SELECT voc_id, entity_type FROM vocabulary").fetchall()}
 
             # 2. 核心修复点：传入 (marker,) 参数
             cursor = conn.execute(SQL_QUERIES["GET_ALL_VOCAB"], (marker,))
             batch = []
 
             for v in tqdm(cursor, desc="Building Semantic Bridge (Adaptive)"):
-                source_id, source_type = str(v['id']), v['entity_type']
+                source_id, source_type = str(v['voc_id']), v['entity_type']
                 if source_id not in all_ids: continue
 
                 try:

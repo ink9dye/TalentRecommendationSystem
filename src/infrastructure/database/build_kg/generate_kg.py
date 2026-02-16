@@ -2,7 +2,7 @@ import logging
 from kg_utils import GraphEngine, SyncStateManager, Monitor
 from builder import KGBuilder
 from config import CONFIG_DICT
-import sqlite3 # 别忘了导入这个
+import sqlite3
 
 def run_pipeline(config):
     monitor = Monitor()
@@ -27,7 +27,7 @@ def run_pipeline(config):
             logging.info("SQLite indexes verified.")
         # --- 1. 节点同步任务 ---
         node_tasks = [
-            ("vocab_sync", "GET_ALL_VOCAB", "MERGE_VOCAB", "id"),
+            ("vocab_sync", "GET_ALL_VOCAB", "MERGE_VOCAB", "voc_id"),
             ("author_sync", "SYNC_AUTHORS", "MERGE_AUTHOR", "last_updated"),
             ("work_sync", "SYNC_WORKS", "MERGE_WORK", "year"),
             ("inst_sync", "SYNC_INSTITUTIONS", "MERGE_INSTITUTION", "last_updated"),

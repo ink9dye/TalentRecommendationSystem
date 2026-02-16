@@ -81,7 +81,7 @@ class DatabaseManager:
             # 3. 语义词汇表
             cursor.execute('''CREATE TABLE IF NOT EXISTS vocabulary
                               (
-                                  id
+                                  voc_id
                                   INTEGER
                                   PRIMARY
                                   KEY
@@ -146,7 +146,7 @@ class DatabaseManager:
             # 6. 人-作-所-刊关系表
             cursor.execute('''CREATE TABLE IF NOT EXISTS authorships
             (
-                id
+                ship_id
                 INTEGER
                 PRIMARY
                 KEY

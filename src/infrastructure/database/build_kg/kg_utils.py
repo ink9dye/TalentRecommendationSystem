@@ -36,12 +36,24 @@ class SyncStateManager:
             conn.execute("CREATE TABLE IF NOT EXISTS sync_metadata (task_name TEXT PRIMARY KEY, last_marker TEXT)")
 
     def get_marker(self, task: str) -> str:
+        """
+        获取同步位点标记。
+        针对不同的任务类型，如果位点不存在，则返回对应的初始默认值。
+        """
         with sqlite3.connect(self.db_path) as conn:
             row = conn.execute("SELECT last_marker FROM sync_metadata WHERE task_name=?", (task,)).fetchone()
-            # 增加对 "vocab" 和 "work" 的判定，确保它们默认起始值为 "0" (整数模式)
-            return row[0] if row else (
-                "0" if any(x in task.lower() for x in ["topology", "sync_id", "id", "vocab", "work"])
-                else "1970-01-01 00:00:00")
+
+            if row:
+                return row[0]
+
+            # 核心逻辑：判定该任务是否基于“整数 ID”进行排序
+            # 增加了 "voc_id" 和 "ship_id" 以适配新的数据库架构
+            is_numeric_id = any(x in task.lower() for x in [
+                "topology", "sync_id", "id", "vocab", "work", "voc_id", "ship_id"
+            ])
+
+            # 如果是基于 ID 的任务，初始位点为 "0"；如果是基于时间的任务，初始位点为 1970年
+            return "0" if is_numeric_id else "1970-01-01 00:00:00"
 
     def update_marker(self, task: str, marker: str):
         with sqlite3.connect(self.db_path) as conn:
