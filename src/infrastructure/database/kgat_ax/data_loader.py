@@ -201,7 +201,7 @@ class DataLoaderKGAT(object):
         self.n_kg_train = len(kg_data)
 
     def generate_cf_batch(self, user_dict, batch_size):
-        """优化后的负采样：确保完全锁定在人才/实体空间"""
+        """优化后的负采样：优先从硬负样本池中挑选"""
         valid_users = [u for u, items in user_dict.items() if len(items) > 0]
         if not valid_users:
             return None
@@ -209,27 +209,45 @@ class DataLoaderKGAT(object):
         u = np.random.choice(valid_users, batch_size)
         p = [random.choice(user_dict[usr]) for usr in u]
 
-        # 【关键】：负采样范围必须是 [ENTITY_OFFSET, n_users_entities)
-        # 这确保了岗位永远不会被当做推荐结果，从而强化 Type Embedding 的效果
-        n = np.random.randint(self.ENTITY_OFFSET, self.n_users_entities, batch_size)
+        n = []
+        for usr in u:
+            # 80% 的概率选择你预先找好的“硬负样本” (400-500名)
+            if usr in self.hard_neg_dict and random.random() < 0.8:
+                n.append(random.choice(self.hard_neg_dict[usr]))
+            else:
+                # 20% 的概率保持全局随机采样，维持泛化能力
+                n.append(random.randint(self.ENTITY_OFFSET, self.n_users_entities - 1))
 
         return torch.LongTensor(u), torch.LongTensor(p), torch.LongTensor(n)
 
     def generate_kg_batch(self, kg_dict, batch_size, highest_neg_idx):
-        """KG 训练批次生成：带 AX 辅助信息的分发"""
+        """
+        KG 训练批次生成：引入 30% 硬负采样逻辑，防止 KG Loss 快速跳水。
+        """
         h_batch = np.random.choice(list(kg_dict.keys()), batch_size)
         h, r, p, n = [], [], [], []
         for head in h_batch:
             t, rel = random.choice(kg_dict[head])
-            h.append(head);
-            r.append(rel);
+            h.append(head)
+            r.append(rel)
             p.append(t)
-            # 修正：负采样必须落在 Entity 空间，避开 User 节点
-            n.append(random.randint(self.ENTITY_OFFSET, self.n_users_entities - 1))
+
+            # --- 核心改进：混合负采样策略 ---
+            if random.random() < 0.3:  # 30% 几率进行硬负采样
+                # 从当前头节点的邻居中找一个节点作为负样本（题目更难）
+                all_neighbors = [neighbor for neighbor, _ in kg_dict[head]]
+                neg_node = random.choice(all_neighbors)
+                # 如果撞车了，回退到全局随机
+                if neg_node == t:
+                    neg_node = random.randint(self.ENTITY_OFFSET, self.n_users_entities - 1)
+            else:
+                # 70% 几率保持随机，维持全局对比
+                neg_node = random.randint(self.ENTITY_OFFSET, self.n_users_entities - 1)
+
+            n.append(neg_node)
 
         return torch.LongTensor(h), torch.LongTensor(r), torch.LongTensor(p), torch.LongTensor(n), \
             self.aux_info_all[h], self.aux_info_all[p], self.aux_info_all[n]
-
     def convert_coo2tensor(self, coo):
         """Scipy COO 转换为 PyTorch Sparse Tensor"""
         idx = torch.LongTensor(np.vstack((coo.row, coo.col)))
@@ -237,16 +255,34 @@ class DataLoaderKGAT(object):
 
     def load_cf(self, filename):
         u, i = [], []
+        # 新增：用于存储每行自带的硬负样本池，供训练时精准采样
+        self.hard_neg_dict = collections.defaultdict(list)
+
         with open(filename, 'r') as f:
             for line in f:
                 parts = line.strip().split(' ')
                 if len(parts) < 2: continue
+
                 uid = int(parts[0])
-                for iid in parts[1:]:
-                    u.append(uid);
-                    i.append(int(iid))
+                # 根据 generate_training_data.py 的定义：
+                # parts[1:16] 是正样本 (15个)
+                # parts[16:] 是硬负样本 (100个)
+
+                # 1. 提取正样本
+                pos_ids = [int(x) for x in parts[1:16]]
+                for iid in pos_ids:
+                    u.append(uid)
+                    i.append(iid)
+
+                # 2. 提取并存储硬负样本 (用于后续 generate_cf_batch)
+                if len(parts) > 16:
+                    neg_ids = [int(x) for x in parts[16:]]
+                    self.hard_neg_dict[uid] = neg_ids
+
         udict = collections.defaultdict(list)
-        for user, item in zip(u, i): udict[user].append(item)
+        for user, item in zip(u, i):
+            udict[user].append(item)
+
         return (np.array(u), np.array(i)), udict
 
     def load_kg(self, filename):

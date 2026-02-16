@@ -59,7 +59,7 @@ def parse_kgat_args():
                         help='SQLite 数据库的绝对路径，用于加载全息嵌入所需的辅助信息。')
 
     # 6. 损失函数与优化参数
-    parser.add_argument('--kg_l2loss_lambda', type=float, default=1e-5,
+    parser.add_argument('--kg_l2loss_lambda', type=float, default=1e-3,
                         help='Lambda when calculating KG l2 loss.')
     parser.add_argument('--cf_l2loss_lambda', type=float, default=1e-5,
                         help='Lambda when calculating CF l2 loss.')

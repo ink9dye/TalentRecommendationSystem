@@ -100,31 +100,41 @@ class KGATAXTrainingGenerator:
         return self.entity_to_int[raw_id] + self.ENTITY_OFFSET
 
     def _process_single_job(self, job, conn):
-        """利用内存字典执行极速精排"""
+        """
+        利用内存字典执行极速精排，并提取硬负样本。
+        修改逻辑：将召回列表排名靠后（400-500名）的候选人作为硬负样本。
+        """
         job_raw_id = str(job['securityId'])
         query_text = f"{job['job_name'] or ''} {job['description'] or ''}"
 
-        # 1. 执行召回系统 (向量+标签+协同)
         recall_results = self.recall_system.execute(query_text)
         candidates = recall_results.get('final_top_500', [])
 
-        if not candidates or len(candidates) < 20:
+        # 确保候选人数量足够提取硬负样本
+        if not candidates or len(candidates) < 450:
             return None
 
-        # 2. 从内存字典快速获取分值 (取代原有的 SQL 查询)
         scored_list = []
         for aid in candidates:
-            # O(1) 内存寻址，不再受磁盘 I/O 限制
             score = self.author_quality_map.get(str(aid), 0.0)
             scored_list.append((str(aid), score))
 
-        # 3. 根据分值重排并取前 15 名作为正样本
+        # 按质量分从高到低排序
         scored_list.sort(key=lambda x: x[1], reverse=True)
 
         try:
+            # 1. 正样本：取精排前 15 名
             pos_authors = [str(self.get_ent_id(a[0])) for a in scored_list[:15]]
+
+            # 2. 硬负样本：取召回列表末尾（第 400 到 500 名）
+            # 这些人能进 500 人名单说明技能相关，但排名靠后说明匹配度明显低于前 15 名
+            hard_neg_authors = [str(self.get_ent_id(a[0])) for a in scored_list[400:500]]
+
             u_id = self.get_user_id(job_raw_id)
-            return f"{u_id} " + " ".join(pos_authors)
+
+            # 返回格式：User_ID Pos_ID1 Pos_ID2... Neg_ID1 Neg_ID2...
+            # DataLoader 会根据这个字符串解析出正负交互
+            return f"{u_id} " + " ".join(pos_authors) + " " + " ".join(hard_neg_authors)
         except Exception:
             return None
 

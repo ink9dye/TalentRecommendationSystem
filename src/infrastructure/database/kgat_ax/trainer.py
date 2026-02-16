@@ -88,7 +88,7 @@ def evaluate(model, dataloader, Ks, device):
 
         # 4. 指标计算
         batch_m = calc_metrics_at_k(
-            final_scores_cpu,
+            torch.from_numpy(final_scores_cpu),  # 包装回 Tensor
             dataloader.train_user_dict,
             test_user_dict,
             np.array(batch_u),
@@ -111,6 +111,8 @@ def evaluate(model, dataloader, Ks, device):
     gc.collect()
 
     return {k: {m: np.mean(v) for m, v in val.items()} for k, val in metrics.items()}
+
+
 def train(args):
     args.save_dir = KGATAX_TRAIN_DATA_DIR
     args.data_dir = os.path.dirname(KGATAX_TRAIN_DATA_DIR)
@@ -131,18 +133,25 @@ def train(args):
     weight_path = os.path.join(args.save_dir, 'weights')
     if not os.path.exists(weight_path): os.makedirs(weight_path)
 
-    # 自动恢复最近进度
-    latest_models = sorted([f for f in os.listdir(weight_path) if f.endswith('.pth')])
+    # --- 1. 改进的断点续训加载逻辑 ---
+    # 按时间排序确保获取最新的 checkpoint
+    latest_models = sorted([f for f in os.listdir(weight_path) if f.endswith('.pth')],
+                           key=lambda x: os.path.getmtime(os.path.join(weight_path, x)))
+
     if latest_models:
         last_model = os.path.join(weight_path, latest_models[-1])
         try:
             checkpoint = torch.load(last_model, map_location=device)
-            model.load_state_dict(checkpoint)
-            # 尝试从文件名恢复 epoch，如 'model_epoch_5.pth'
-            start_epoch = int(latest_models[-1].split('_')[-1].split('.')[0]) + 1
-            print(f"成功加载权重并恢复至 Epoch {start_epoch}: {last_model}")
-        except:
-            print("权重加载失败，重头开始。")
+            # 恢复模型权重
+            model.load_state_dict(checkpoint['model_state_dict'])
+            # 恢复优化器状态，确保学习率与动量连续
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            # 恢复训练进度与指标记录
+            start_epoch = checkpoint['epoch'] + 1
+            best_recall = checkpoint.get('best_recall', 0)
+            print(f"成功恢复训练！接续 Epoch {start_epoch}, 历史最佳 Recall: {best_recall:.4f}")
+        except Exception as e:
+            print(f"权重加载失败或格式不兼容（{e}），将从 Epoch 1 开始训练。")
 
     Ks = eval(args.Ks)
 
@@ -150,28 +159,23 @@ def train(args):
         model.train()
         aux_all_cpu = data.aux_info_all.to(device)
 
-        # --- 1. CF 阶段 ---
+        # --- 2. CF 阶段 ---
         n_cf = data.n_cf_train // args.cf_batch_size + 1
         loss_cf = 0
         cf_pbar = tqdm(range(n_cf), desc=f'Epoch {epoch} [CF Phase]', leave=False)
         for _ in cf_pbar:
             batch = data.generate_cf_batch(data.train_user_dict, args.cf_batch_size)
-            if batch is None: continue  # 极端空样本预防
+            if batch is None: continue
             u, p, n = batch
-
             loss = model(u.to(device), p.to(device), n.to(device), aux_all_cpu, mode='train_cf')
-
             optimizer.zero_grad()
-            # 【核心修改】：放大 CF 信号权重（如 5.0），强制模型从 0 突破到 1
-            (loss * 5.0).backward()
+            (loss * 2.0).backward()  # 信号放大
             optimizer.step()
             loss_cf += loss.item()
             cf_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
-        # --- 2. KG 阶段 ---
-        n_kg = data.n_kg_train // args.kg_batch_size + 1
-        # 削弱 KG 训练频率：如果 KG Loss 太低，可以每轮只训练部分 batch
-        n_kg = n_kg // 2 + 1
+        # --- 3. KG 阶段 (降低频率与强度) ---
+        n_kg = data.n_cf_train // (args.kg_batch_size * 4) + 1
         loss_kg = 0
         kg_pbar = tqdm(range(n_kg), desc=f'Epoch {epoch} [KG Phase]', leave=False)
         for _ in kg_pbar:
@@ -180,7 +184,7 @@ def train(args):
                                                                data.n_users_entities)]
             loss = model(h, r, pt, nt, ha, pa, na, mode='train_kg')
             optimizer.zero_grad()
-            loss.backward()
+            (loss * 0.1).backward()  # 缩减 KG 信号强度
             optimizer.step()
             loss_kg += loss.item()
             kg_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
@@ -191,15 +195,28 @@ def train(args):
 
         logging.info(f'Epoch {epoch} | CF Loss: {loss_cf / n_cf:.4f} | KG Loss: {loss_kg / n_kg:.4f}')
 
+        # --- 4. 评估与全量 Checkpoint 保存 ---
         if epoch % args.evaluate_every == 0:
             res = evaluate(model, data, Ks, device)
             curr_recall = res[Ks[0]]['recall']
             logging.info(f"Eval @{Ks[0]}: Recall: {curr_recall:.4f}, NDCG: {res[Ks[0]]['ndcg']:.4f}")
             recall_list.append(curr_recall)
             _, stop = early_stopping(recall_list, args.stopping_steps)
+
+            # 仅在取得更好效果时保存完整状态
             if curr_recall > best_recall:
                 best_recall = curr_recall
-                save_model(model, weight_path, epoch)
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_recall': best_recall,
+                    'args': args
+                }
+                ckpt_path = os.path.join(weight_path, f"checkpoint_epoch_{epoch}.pth")
+                torch.save(checkpoint, ckpt_path)
+                print(f"[*] 发现更佳 Recall: {best_recall:.4f}, 已保存至 {ckpt_path}")
+
             if stop: break
 
 
