@@ -111,12 +111,19 @@ class DataLoaderKGAT(object):
 
     def generate_cf_batch(self, user_dict, batch_size):
         """
-        实现阶梯负采样策略：强化模型对混合排名中后 400 名“近义负样本”的分辨力。
+        实现阶梯负采样策略：修复 IndexError 并强化退避机制。
         """
-        valid_users = list(user_dict.keys())
-        if not valid_users: return None
+        # 1. 核心修复：只在确实有正样本的用户中选择，防止 random.choice 报错
+        valid_users = [u for u in user_dict.keys() if len(user_dict[u]) > 0]
 
+        if not valid_users:
+            self.logging.warning("所有用户均无正样本，无法生成 Batch")
+            return None
+
+        # 随机选择 batch_size 个用户
         u = np.random.choice(valid_users, batch_size)
+
+        # 2. 安全采样正样本
         p = [random.choice(user_dict[usr]) for usr in u]
 
         n = []
@@ -124,13 +131,24 @@ class DataLoaderKGAT(object):
             tiers = self.tiered_cf_dict.get(usr, {})
             rand = random.random()
 
-            # 采样权重：40% 尚可, 40% 中性(硬负), 20% 无关(易负)
-            if rand < 0.4 and tiers.get('fair'):
-                n.append(random.choice(tiers['fair']))
-            elif rand < 0.8 and tiers.get('neutral'):
-                n.append(random.choice(tiers['neutral']))
-            elif tiers.get('easy'):
-                n.append(random.choice(tiers['easy']))
+            # 3. 带有退避逻辑的阶梯采样 (4:4:2 比例)
+            # 优先采样分层负样本，若该层缺失则向下退避
+            if rand < 0.4:
+                # 尝试采样 'fair' (前 100-400 名)
+                target_list = tiers.get('fair', [])
+                if not target_list: target_list = tiers.get('neutral', [])
+                if not target_list: target_list = tiers.get('easy', [])
+            elif rand < 0.8:
+                # 尝试采样 'neutral' (前 400-500 名，硬负样本)
+                target_list = tiers.get('neutral', [])
+                if not target_list: target_list = tiers.get('easy', [])
+            else:
+                # 采样 'easy' (完全无关的人才)
+                target_list = tiers.get('easy', [])
+
+            # 4. 终极退避：如果分层字典里啥都没有，就在全局人才空间随机抓一个
+            if target_list:
+                n.append(random.choice(target_list))
             else:
                 n.append(random.randint(self.ENTITY_OFFSET, self.n_users_entities - 1))
 

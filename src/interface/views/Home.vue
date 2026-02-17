@@ -5,7 +5,34 @@
     :element-loading-text="loadingText"
     element-loading-background="rgba(255, 255, 255, 0.9)"
   >
-    </el-container>
+    <el-header height="80px">
+      <SearchBar @search="handleSearch" />
+    </el-header>
+
+    <el-main>
+      <el-row :gutter="20">
+        <el-col :span="8">
+          <div class="list-container">
+            <TalentCard
+              v-for="item in talentList"
+              :key="item.id"
+              :talent="item"
+              :isActive="selectedTalent?.id === item.id"
+              @click="selectTalent(item)"
+            />
+          </div>
+        </el-col>
+
+        <el-col :span="16">
+          <EvidenceGraph
+            v-if="currentGraphData"
+            :data="currentGraphData"
+          />
+          <el-empty v-else description="搜索并选择一位人才以查看推荐证据链" />
+        </el-col>
+      </el-row>
+    </el-main>
+  </el-container>
 </template>
 
 <script setup>
@@ -58,5 +85,21 @@ const selectTalent = (talent) => {
 </script>
 
 <style scoped>
-/* 保持原有样式 */
+.home-container {
+  height: 100vh;
+  padding: 20px;
+  background-color: #f5f7fa;
+}
+.el-header {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  background: white;
+  box-shadow: 0 2px 12px 0 rgba(0,0,0,0.1);
+  margin-bottom: 20px;
+}
+.list-container {
+  height: calc(100vh - 150px);
+  overflow-y: auto;
+}
 </style>

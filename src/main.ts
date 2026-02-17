@@ -1,10 +1,12 @@
-// src/main.ts
+// E:\PythonProject\TalentRecommendationSystem\src\main.ts
+
 import { createApp } from 'vue'
+// 注意路径：从当前目录进入 interface 文件夹找 App.vue
 import App from './interface/App.vue'
 
+import ElementPlus from 'element-plus'
+import 'element-plus/dist/index.css'
+
 const app = createApp(App)
-
-// 注意：这里删除了 ElementPlus 的全局引入和 app.use(ElementPlus)
-// 删除了 'element-plus/dist/index.css' 的引入
-
+app.use(ElementPlus)
 app.mount('#app')

@@ -33,75 +33,77 @@ def check_args_and_env(args):
 
 
 def evaluate(model, dataloader, Ks, device, use_test_set=False):
-    """
-    针对 500 人精排场景优化的评估函数。
-    支持拟合度自检（训练集）与泛化力评估（测试集）。
-    """
     import gc
     model.eval()
 
-    # 切换评估目标
-    if use_test_set:
-        eval_user_dict = dataloader.test_user_dict
-        mode_str = "Test Set (Generalization Capability)"
-    else:
-        eval_user_dict = dataloader.train_user_dict
-        mode_str = "Train Set (Fitting/Rule Reproduction)"
+    # 1. 确定评估目标
+    eval_user_dict = dataloader.test_user_dict if use_test_set else dataloader.train_user_dict
+    mode_str = "Test Set (Generalization)" if use_test_set else "Train Set (Fitting)"
 
     user_ids = list(eval_user_dict.keys())
-    # 抽样评估，防止全量 185w 节点检索导致内存溢出
     if len(user_ids) > 1000:
         user_ids = random.sample(user_ids, 1000)
 
-    # 核心：获取注入了 AX 特征的全量 Embedding
+    # 2. 获取全量 Embedding (含 AX 注入)
     aux_info_all = dataloader.aux_info_all.to(device)
     with torch.no_grad():
         all_embed = model.calc_cf_embeddings(aux_info_all)
-
-    offset = dataloader.ENTITY_OFFSET
-    global_max_id = dataloader.ENTITY_OFFSET + dataloader.n_entities
-    item_embeds = all_embed[offset:global_max_id]
-    item_ids_vec = np.arange(offset, global_max_id)
 
     batch_size = dataloader.test_batch_size
     user_batches = [user_ids[i:i + batch_size] for i in range(0, len(user_ids), batch_size)]
     metrics = {k: {'recall': [], 'ndcg': []} for k in Ks}
 
-    print(f"\n[*] 启动评估: {mode_str}")
+    print(f"\n[*] 启动精排场景评估: {mode_str}")
+
     for batch_u in tqdm(user_batches, desc='Evaluating', leave=False):
-        batch_u_tensor = torch.LongTensor(batch_u).to(device)
-        with torch.no_grad():
-            curr_user_embeds = all_embed[batch_u_tensor]
-            # 计算相似度矩阵
-            all_scores = torch.matmul(curr_user_embeds, item_embeds.transpose(0, 1))
+        # 针对 Batch 中的每个用户，构建其专属的候选池评分
+        for usr in batch_u:
+            # 获取该用户的候选人池 (包含正样本和分层负样本，共计约 500 人)
+            # 注意：这些 ID 必须是在 generate_training_data.py 中确定的那一组
+            pos_list = eval_user_dict[usr]
+            neg_info = dataloader.tiered_cf_dict.get(usr, {})
 
-            # 模拟精排池：仅保留 Top 500 的分数进入指标计算
-            top_k_val = 500
-            top_scores, top_indices = torch.topk(all_scores, k=min(top_k_val, item_embeds.shape[0]), dim=1)
-            reduced_scores = torch.full_like(all_scores, -1e10)
-            reduced_scores.scatter_(1, top_indices, top_scores)
-            final_scores_cpu = reduced_scores.cpu().numpy()
+            # 合并所有候选人：正样本 + 尚可 + 中性 + 易负
+            candidate_ids = list(set(
+                pos_list +
+                neg_info.get('fair', []) +
+                neg_info.get('neutral', []) +
+                neg_info.get('easy', [])
+            ))
 
-        # 计算 Recall 和 NDCG
-        batch_m = calc_metrics_at_k(
-            torch.from_numpy(final_scores_cpu),
-            dataloader.train_user_dict,
-            eval_user_dict,
-            np.array(batch_u),
-            item_ids_vec,
-            Ks
-        )
+            if not candidate_ids:
+                continue
 
-        for k in Ks:
-            metrics[k]['recall'].append(batch_m[k]['recall'])
-            metrics[k]['ndcg'].append(batch_m[k]['ndcg'])
+            # 提取 Embedding 并计算分数
+            u_e = all_embed[usr].unsqueeze(0)  # [1, dim]
+            c_e = all_embed[candidate_ids]  # [num_candidates, dim]
 
-        del all_scores, reduced_scores, final_scores_cpu
+            # 计算相似度得分 (内积)
+            scores = torch.matmul(u_e, c_e.transpose(0, 1)).squeeze(0)  # [num_candidates]
+
+            # 将分数映射回全局索引空间以便 calc_metrics_at_k 处理
+            # 构造一个极小的全量分值向量，仅在候选人位置填充真实分数
+            final_scores = torch.full((dataloader.n_users_entities,), -1e10).to(device)
+            final_scores[candidate_ids] = scores
+
+            # 计算指标
+            batch_m = calc_metrics_at_k(
+                final_scores.unsqueeze(0).cpu(),
+                dataloader.train_user_dict,
+                eval_user_dict,
+                np.array([usr]),
+                np.arange(dataloader.n_users_entities),  # 全量 ID 空间，但只有候选人有分
+                Ks
+            )
+
+            for k in Ks:
+                metrics[k]['recall'].append(batch_m[k]['recall'])
+                metrics[k]['ndcg'].append(batch_m[k]['ndcg'])
+
         gc.collect()
 
-    del all_embed, item_embeds
-    gc.collect()
-    return {k: {m: np.mean(v) for m, v in val.items()} for k, val in metrics.items()}
+    del all_embed
+    return {k: {m: np.mean(v) if v else 0.0 for m, v in val.items()} for k, val in metrics.items()}
 
 
 def save_checkpoint(model, optimizer, epoch, best_recall, args, path, is_best=False):
