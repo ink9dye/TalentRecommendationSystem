@@ -11,9 +11,7 @@
   <component name="TemplatesService">
     <option name="TEMPLATE_FOLDERS">
       <list>
-        <option value="$MODULE_DIR$/src/interface" />
         <option value="$MODULE_DIR$/src/interface/api" />
-        <option value="$MODULE_DIR$/src/interface/web" />
         <option value="$MODULE_DIR$/src/interface/views" />
         <option value="$MODULE_DIR$/src/interface/mock" />
         <option value="$MODULE_DIR$/src/interface/components" />

@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import random
 import numpy as np
 from tqdm import tqdm
@@ -36,63 +37,50 @@ def evaluate(model, dataloader, Ks, device, use_test_set=False):
     import gc
     model.eval()
 
-    # 1. 确定评估目标
     eval_user_dict = dataloader.test_user_dict if use_test_set else dataloader.train_user_dict
-    mode_str = "Test Set (Generalization)" if use_test_set else "Train Set (Fitting)"
-
     user_ids = list(eval_user_dict.keys())
+
+    # 抽样 1000 个用户进行评估以节省时间
     if len(user_ids) > 1000:
         user_ids = random.sample(user_ids, 1000)
 
-    # 2. 获取全量 Embedding (含 AX 注入)
+    # 1. 获取全量 Embedding
     aux_info_all = dataloader.aux_info_all.to(device)
     with torch.no_grad():
         all_embed = model.calc_cf_embeddings(aux_info_all)
 
-    batch_size = dataloader.test_batch_size
-    user_batches = [user_ids[i:i + batch_size] for i in range(0, len(user_ids), batch_size)]
+    # 2. 核心：构建全局“人才白名单”索引
+    # 如果 dataloader 没有预设 author_ids，则现场提取所有 a_ 前缀的 ID
+    if not hasattr(dataloader, 'author_ids'):
+        map_path = os.path.join(dataloader.data_dir, "id_map.json")
+        with open(map_path, 'r', encoding='utf-8') as f:
+            mapping = json.load(f)
+        dataloader.author_ids = [idx for rid, idx in mapping['entity'].items() if rid.startswith('a_')]
+
+    author_indices = torch.LongTensor(dataloader.author_ids).to(device)
+    author_embeds = all_embed[author_indices]  # 只提取人才的向量
+
     metrics = {k: {'recall': [], 'ndcg': []} for k in Ks}
 
-    print(f"\n[*] 启动精排场景评估: {mode_str}")
+    print(f"[*] 启动人才专项评估 (池大小: {len(author_indices)})")
 
-    for batch_u in tqdm(user_batches, desc='Evaluating', leave=False):
-        # 针对 Batch 中的每个用户，构建其专属的候选池评分
-        for usr in batch_u:
-            # 获取该用户的候选人池 (包含正样本和分层负样本，共计约 500 人)
-            # 注意：这些 ID 必须是在 generate_training_data.py 中确定的那一组
-            pos_list = eval_user_dict[usr]
-            neg_info = dataloader.tiered_cf_dict.get(usr, {})
-
-            # 合并所有候选人：正样本 + 尚可 + 中性 + 易负
-            candidate_ids = list(set(
-                pos_list +
-                neg_info.get('fair', []) +
-                neg_info.get('neutral', []) +
-                neg_info.get('easy', [])
-            ))
-
-            if not candidate_ids:
-                continue
-
-            # 提取 Embedding 并计算分数
+    for usr in tqdm(user_ids, desc='Evaluating', leave=False):
+        with torch.no_grad():
             u_e = all_embed[usr].unsqueeze(0)  # [1, dim]
-            c_e = all_embed[candidate_ids]  # [num_candidates, dim]
+            # 3. 只计算用户与“人才”之间的得分
+            scores = torch.matmul(u_e, author_embeds.transpose(0, 1)).squeeze(0)  # [num_authors]
 
-            # 计算相似度得分 (内积)
-            scores = torch.matmul(u_e, c_e.transpose(0, 1)).squeeze(0)  # [num_candidates]
-
-            # 将分数映射回全局索引空间以便 calc_metrics_at_k 处理
-            # 构造一个极小的全量分值向量，仅在候选人位置填充真实分数
+            # 4. 构造一个只有人才位置有分的伪全量向量，供指标函数计算
+            # 这样非人才节点分数为 -1e10，永远不会进入 Top-K
             final_scores = torch.full((dataloader.n_users_entities,), -1e10).to(device)
-            final_scores[candidate_ids] = scores
+            final_scores[author_indices] = scores
 
-            # 计算指标
             batch_m = calc_metrics_at_k(
                 final_scores.unsqueeze(0).cpu(),
                 dataloader.train_user_dict,
                 eval_user_dict,
                 np.array([usr]),
-                np.arange(dataloader.n_users_entities),  # 全量 ID 空间，但只有候选人有分
+                np.arange(dataloader.n_users_entities),
                 Ks
             )
 
@@ -100,11 +88,9 @@ def evaluate(model, dataloader, Ks, device, use_test_set=False):
                 metrics[k]['recall'].append(batch_m[k]['recall'])
                 metrics[k]['ndcg'].append(batch_m[k]['ndcg'])
 
-        gc.collect()
-
-    del all_embed
-    return {k: {m: np.mean(v) if v else 0.0 for m, v in val.items()} for k, val in metrics.items()}
-
+    del all_embed, author_embeds
+    gc.collect()
+    return {k: {m: np.mean(v) for m, v in val.items()} for k, val in metrics.items()}
 
 def save_checkpoint(model, optimizer, epoch, best_recall, args, path, is_best=False):
     """持久化 Checkpoint 机制，支持断点续传"""
