@@ -42,17 +42,17 @@ if not os.path.exists(SBERT_DIR):
 
 # --- 8. 知识图谱构建 SQL 语句 ---
 SQL_QUERIES = {
-    # 基础实体同步：确保包含通用的 id (用于 MERGE) 和业务特有的 aid, wid 等
-    "SYNC_AUTHORS": "SELECT author_id as id, author_id as aid, name, h_index, works_count, cited_by_count as citations, last_updated FROM authors WHERE last_updated > ? ORDER BY last_updated ASC",
-    "SYNC_INSTITUTIONS": "SELECT inst_id as id, inst_id as iid, name, works_count, cited_by_count as citations, last_updated FROM institutions WHERE last_updated > ? ORDER BY last_updated ASC",
-    "SYNC_SOURCES": "SELECT source_id as id, source_id as sid, display_name as name, type, works_count, cited_by_count as citations, last_updated FROM sources WHERE last_updated > ? ORDER BY last_updated ASC",
-    "SYNC_WORKS": "SELECT work_id as id, work_id as wid, title as name, title, year, citation_count as citations, concepts_text, keywords_text FROM works WHERE year > ? ORDER BY year ASC",
-    "SYNC_JOBS": "SELECT securityId as id, securityId as jid, job_name as name, skills, description, crawl_time FROM jobs WHERE crawl_time > ? ORDER BY crawl_time ASC",
+    # 基础实体同步
+    "SYNC_AUTHORS": "SELECT author_id as id, name, h_index, works_count, cited_by_count as citations, last_updated FROM authors WHERE last_updated > ? ORDER BY last_updated ASC",
+    "SYNC_INSTITUTIONS": "SELECT inst_id as id, name, works_count, cited_by_count as citations, last_updated FROM institutions WHERE last_updated > ? ORDER BY last_updated ASC",
+    "SYNC_SOURCES": "SELECT source_id as id,display_name as name, type, works_count, cited_by_count as citations, last_updated FROM sources WHERE last_updated > ? ORDER BY last_updated ASC",
+    "SYNC_WORKS": "SELECT work_id as id,title as name, title, year, citation_count as citations, concepts_text, keywords_text FROM works WHERE year > ? ORDER BY year ASC",
+    "SYNC_JOBS": "SELECT securityId as id, job_name as name, skills, description, crawl_time FROM jobs WHERE crawl_time > ? ORDER BY crawl_time ASC",
 
     # 修正：vocabulary 使用 voc_id 作为主键和游标
-    "GET_ALL_VOCAB": "SELECT voc_id as id, voc_id, voc_id as vid, term as name, term, entity_type FROM vocabulary WHERE voc_id > ? ORDER BY voc_id ASC",
+    "GET_ALL_VOCAB": "SELECT voc_id as id,term as name, term, entity_type FROM vocabulary WHERE voc_id > ? ORDER BY voc_id ASC",
 
-    "SYNC_JOB_SKILLS": "SELECT securityId as jid, skills, crawl_time FROM jobs WHERE crawl_time > ? AND skills IS NOT NULL ORDER BY crawl_time ASC",
+    "SYNC_JOB_SKILLS": "SELECT securityId as id, skills, crawl_time FROM jobs WHERE crawl_time > ? AND skills IS NOT NULL ORDER BY crawl_time ASC",
 
     # 修正：authorships 使用 ship_id 替代原本的 id 字段进行游标过滤
     "SYNC_AUTHORED_TOPOLOGY": """
@@ -84,26 +84,17 @@ CYPHER_TEMPLATES = {
         "CREATE CONSTRAINT IF NOT EXISTS FOR (j:Job) REQUIRE j.id IS UNIQUE",
 
         # 原生业务 ID 索引：支持跨库反查
-        "CREATE INDEX IF NOT EXISTS FOR (v:Vocabulary) ON (v.voc_id)",
-        "CREATE INDEX IF NOT EXISTS FOR (a:Author) ON (a.aid)",
-        "CREATE INDEX IF NOT EXISTS FOR (w:Work) ON (w.wid)",
-        "CREATE INDEX IF NOT EXISTS FOR (i:Institution) ON (i.iid)",
-        "CREATE INDEX IF NOT EXISTS FOR (s:Source) ON (s.sid)",
-        "CREATE INDEX IF NOT EXISTS FOR (j:Job) ON (j.jid)",
         "CREATE INDEX IF NOT EXISTS FOR (v:Vocabulary) ON (v.term)",
         "CREATE INDEX IF NOT EXISTS FOR (a:Author) ON (a.h_index)"
     ],
 
-    # 节点合并：确保原生 ID (wid, aid, voc_id 等) 被写入属性
-    "MERGE_WORK": "UNWIND $data AS row MERGE (n:Work {id: row.id}) SET n.wid = row.wid, n.title = row.title, n.name = row.name, n.year = row.year, n.citations = row.citations",
-    "MERGE_AUTHOR": "UNWIND $data AS row MERGE (n:Author {id: row.id}) SET n.aid = row.aid, n.name = row.name, n.h_index = row.h_index, n.works_count = row.works_count, n.citations = row.citations",
-    "MERGE_INSTITUTION": "UNWIND $data AS row MERGE (i:Institution {id: row.id}) SET i.iid = row.iid, i.name = row.name, i.works_count = row.works_count, i.citations = row.citations",
-    "MERGE_SOURCE": "UNWIND $data AS row MERGE (s:Source {id: row.id}) SET s.sid = row.sid, s.name = row.name, s.type = row.type, s.works_count = row.works_count, s.citations = row.citations",
-    "MERGE_JOB": "UNWIND $data AS row MERGE (j:Job {id: row.id}) SET j.jid = row.jid, j.name = row.name, j.skills = row.skills, j.description = row.description",
+    "MERGE_WORK": "UNWIND $data AS row MERGE (n:Work {id: row.id}) SET n.title = row.title, n.name = row.name, n.year = row.year, n.citations = row.citations",
+    "MERGE_AUTHOR": "UNWIND $data AS row MERGE (n:Author {id: row.id}) SET n.name = row.name, n.h_index = row.h_index, n.works_count = row.works_count, n.citations = row.citations",
+    "MERGE_INSTITUTION": "UNWIND $data AS row MERGE (i:Institution {id: row.id}) SET i.name = row.name, i.works_count = row.works_count, i.citations = row.citations",
+    "MERGE_SOURCE": "UNWIND $data AS row MERGE (s:Source {id: row.id}) SET s.name = row.name, s.type = row.type, s.works_count = row.works_count, s.citations = row.citations",
+    "MERGE_JOB": "UNWIND $data AS row MERGE (j:Job {id: row.id}) SET j.name = row.name, j.skills = row.skills, j.description = row.description",
 
-    # 存储 voc_id 原生属性
-    "MERGE_VOCAB": "UNWIND $data AS row MERGE (v:Vocabulary {id: row.id}) SET v.voc_id = row.voc_id, v.vid = row.vid, v.term = toLower(row.term), v.type = row.entity_type",
-
+    "MERGE_VOCAB": "UNWIND $data AS row MERGE (v:Vocabulary {id: row.id}) SET v.term = toLower(row.term), v.type = row.entity_type",
     # 复杂关系构建：对齐 pos_index 属性名
     "LINK_AUTHORED_COMPLEX": """
         UNWIND $data AS row
@@ -111,7 +102,8 @@ CYPHER_TEMPLATES = {
         MERGE (a)-[r:AUTHORED]->(w)
         SET r.pos_index = row.pos_index, 
             r.pub_year = row.year,
-            r.is_corresponding = row.is_corresponding
+            r.is_corresponding = row.is_corresponding,
+            r.pos_weight = row.pos_w
         WITH a, w, row
         WHERE row.iid IS NOT NULL
         MATCH (i:Institution {id: row.iid})
@@ -122,8 +114,8 @@ CYPHER_TEMPLATES = {
         MERGE (w)-[:PUBLISHED_IN]->(s)
     """,
     "LINK_SIMILAR": "UNWIND $data AS row MATCH (v1:Vocabulary {id: row.f}), (v2:Vocabulary {id: row.t}) MERGE (v1)-[r:SIMILAR_TO]->(v2) SET r.score = row.s",
-    "LINK_WORK_VOCAB": "UNWIND $data AS row MATCH (w:Work {id: row.wid}), (v:Vocabulary {term: row.term}) MERGE (w)-[:HAS_TOPIC]->(v)",
-    "LINK_JOB_VOCAB": "UNWIND $data AS row MATCH (j:Job {id: row.jid}), (v:Vocabulary {term: row.term}) MERGE (j)-[:REQUIRE_SKILL]->(v)"
+    "LINK_WORK_VOCAB": "UNWIND $data AS row MATCH (w:Work {id: row.id}), (v:Vocabulary {term: row.term}) MERGE (w)-[:HAS_TOPIC]->(v)",
+    "LINK_JOB_VOCAB": "UNWIND $data AS row MATCH (j:Job {id: row.id}), (v:Vocabulary {term: row.term}) MERGE (j)-[:REQUIRE_SKILL]->(v)"
 }
 
 # --- 10. 整合配置字典 ---

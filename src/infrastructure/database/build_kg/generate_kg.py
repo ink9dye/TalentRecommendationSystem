@@ -27,7 +27,7 @@ def run_pipeline(config):
             logging.info("SQLite indexes verified.")
         # --- 1. 节点同步任务 ---
         node_tasks = [
-            ("vocab_sync", "GET_ALL_VOCAB", "MERGE_VOCAB", "voc_id"),
+            ("vocab_sync", "GET_ALL_VOCAB", "MERGE_VOCAB", "id"),
             ("author_sync", "SYNC_AUTHORS", "MERGE_AUTHOR", "last_updated"),
             ("work_sync", "SYNC_WORKS", "MERGE_WORK", "year"),
             ("inst_sync", "SYNC_INSTITUTIONS", "MERGE_INSTITUTION", "last_updated"),
@@ -37,9 +37,18 @@ def run_pipeline(config):
 
         with monitor.track("Syncing All Entities"):
             # 警告：只有在需要彻底重构词库时才取消下面的注释
+            # --- 基础实体同步标记 ---
             # state.reset_marker("vocab_sync")
             # state.reset_marker("author_sync")
             # state.reset_marker("work_sync")
+            # state.reset_marker("inst_sync")  # 机构同步
+            # state.reset_marker("source_sync")  # 出版源同步
+            # state.reset_marker("job_sync")  # 岗位同步
+            #
+            # # --- 关系与语义标记 ---
+            # state.reset_marker("topology_sync")  # 专家-论文-机构拓扑关系
+            # state.reset_marker("job_skill_sync")  # 岗位-技能关联
+            # state.reset_marker("semantic_bridge_sync")  # 词库间的 Faiss 相似度关联
 
             for task, sql, cypher, t_field in node_tasks:
                 builder.sync_nodes_task(task, sql, cypher, t_field)

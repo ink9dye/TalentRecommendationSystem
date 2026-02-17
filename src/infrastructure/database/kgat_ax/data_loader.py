@@ -137,7 +137,10 @@ class DataLoaderKGAT(object):
         return torch.LongTensor(u), torch.LongTensor(p), torch.LongTensor(n)
 
     def load_auxiliary_info(self):
-        """加载经 build_feature_index.py 处理后的归一化特征 """
+        """
+        加载经 build_feature_index.py 处理后的归一化特征。
+        修改点：在查找映射表时，为原始作者 ID 添加 'a_' 前缀，以匹配 id_map.json 中的键名。
+        """
         global_max_id = self.n_users_entities
         # 默认三维特征：h_index, cited_by, works_count
         features = np.zeros((global_max_id, self.args.n_aux_features), dtype=np.float32)
@@ -153,12 +156,17 @@ class DataLoaderKGAT(object):
         map_path = os.path.join(self.data_dir, "id_map.json")
         with open(map_path, 'r', encoding='utf-8') as f_map:
             mapping = json.load(f_map)
+
+        # e2i 里的键现在是 "a_123", "w_456" 等格式
         e2i = mapping['entity']
 
         author_features = feature_bundle.get('author', {})
         for raw_aid, feat_dict in author_features.items():
-            if raw_aid in e2i:
-                idx = e2i[raw_aid]
+            # --- 核心修改：添加前缀以匹配 id_map.json 中的 entity 键 ---
+            prefixed_aid = f"a_{raw_aid}"
+
+            if prefixed_aid in e2i:
+                idx = e2i[prefixed_aid]
                 if idx < global_max_id:
                     features[idx] = [
                         feat_dict.get('h_index', 0.0),
@@ -167,7 +175,7 @@ class DataLoaderKGAT(object):
                     ]
 
         self.aux_info_all = torch.from_numpy(features)
-        self.logging.info(f"[*] AX 归一化特征加载完成。")
+        self.logging.info(f"[*] AX 归一化特征加载完成（已适配 a_ 前缀映射）。")
         del feature_bundle, e2i
         gc.collect()
 

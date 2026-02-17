@@ -73,7 +73,10 @@ class KGATAXTrainingGenerator:
         return self.entity_to_int[raw_id] + self.ENTITY_OFFSET
 
     def _process_single_job(self, job):
-        """核心精排逻辑：使用预计算向量进行极速召回"""
+        """
+        核心精排逻辑：使用预计算向量进行极速召回
+        修改点：为所有人才实体 ID 强制添加 'a_' 前缀，确保与全局拓扑 ID 空间对齐。
+        """
         job_raw_id = str(job['securityId'])
 
         # 优化：直接从 Faiss 获取该岗位的向量，跳过 SBERT 编码
@@ -81,7 +84,6 @@ class KGATAXTrainingGenerator:
             return None
 
         # 1. 执行召回 (利用已有的 recall_system 获取 500 名候选人)
-        # 注意：这里我们仍调用 execute，但 recall_system 内部应能识别向量输入或文本
         query_text = f"{job['job_name'] or ''} {job['description'] or ''} {job['skills'] or ''}"
         recall_results = self.recall_system.execute(query_text)
         candidates = recall_results.get('final_top_500', [])
@@ -101,17 +103,24 @@ class KGATAXTrainingGenerator:
         fused_scored.sort(key=lambda x: x[1])
 
         try:
-            # 3. 四级梯度抽样
-            pos_ids = [str(self.get_ent_id(a[0])) for a in fused_scored[:100]]
-            fair_ids = [str(self.get_ent_id(a[0])) for a in random.sample(fused_scored[100:400], 100)]
-            neutral_ids = [str(self.get_ent_id(a[0])) for a in fused_scored[400:500]]
+            # 3. 四级梯度抽样（关键修改：添加 'a_' 前缀）
+            # 这里 a[0] 是 aid_str
+            pos_ids = [str(self.get_ent_id(f"a_{a[0]}")) for a in fused_scored[:100]]
+            fair_ids = [str(self.get_ent_id(f"a_{a[0]}")) for a in random.sample(fused_scored[100:400], 100)]
+            neutral_ids = [str(self.get_ent_id(f"a_{a[0]}")) for a in fused_scored[400:500]]
 
+            # 处理易负样本（Easy Negatives）
             cand_set = set(str(aid) for aid in candidates)
             potential_pool = list(self.author_quality_map.keys())
             easy_neg_raw = random.sample([aid for aid in potential_pool if aid not in cand_set], 100)
-            easy_neg_ids = [str(self.get_ent_id(aid)) for aid in easy_neg_raw]
 
+            # 关键修改：同样添加 'a_' 前缀
+            easy_neg_ids = [str(self.get_ent_id(f"a_{aid}")) for aid in easy_neg_raw]
+
+            # 获取 Job 的 User ID（Job 作为 User 空间，通常不需要前缀）
             u_id = self.get_user_id(job_raw_id)
+
+            # 返回符合四级梯度格式的行数据
             return f"{u_id};{','.join(pos_ids)};{','.join(fair_ids)};{','.join(neutral_ids)};{','.join(easy_neg_ids)}"
         except Exception:
             return None

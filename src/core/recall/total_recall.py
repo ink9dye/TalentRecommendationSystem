@@ -24,9 +24,9 @@ class TotalRecallSystem:
         print("[*] 正在初始化全量召回系统，请稍候...", flush=True)
         # 1. 初始化各路组件
         self.encoder = QueryEncoder()
-        self.v_path = VectorPath(recall_limit=300)  # 向量路
-        self.l_path = LabelRecallPath(recall_limit=300)  # 标签路
-        self.c_path = CollaborativeRecallPath(recall_limit=200)  # 协同路
+        self.v_path = VectorPath(recall_limit=500)  # 向量路
+        self.l_path = LabelRecallPath(recall_limit=500)  # 标签路
+        self.c_path = CollaborativeRecallPath(recall_limit=500)  # 协同路
 
         # 2. 初始化并行执行器
         self.executor = ThreadPoolExecutor(max_workers=3)

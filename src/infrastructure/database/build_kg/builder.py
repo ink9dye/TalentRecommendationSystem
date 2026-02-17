@@ -119,7 +119,7 @@ class KGBuilder:
             batch = []
 
             for v in tqdm(cursor, desc="Building Semantic Bridge (Adaptive)"):
-                source_id, source_type = str(v['voc_id']), v['entity_type']
+                source_id, source_type = str(v['id']), v['entity_type']
                 if source_id not in all_ids: continue
 
                 try:
@@ -161,7 +161,7 @@ class KGBuilder:
         """
         建立论文与词汇节点的关联边 (Work)-[:HAS_TOPIC]->(Vocabulary)
         """
-        sql = "SELECT work_id as wid, concepts_text, keywords_text FROM works"
+        sql = "SELECT work_id as id, concepts_text, keywords_text FROM works"
 
         with sqlite3.connect(self.config['DB_PATH']) as conn:
             conn.row_factory = sqlite3.Row
@@ -176,7 +176,7 @@ class KGBuilder:
 
                 for term in terms:
                     batch.append({
-                        "wid": row['wid'],
+                        "id": row['id'],
                         "term": term
                     })
 
@@ -216,7 +216,7 @@ class KGBuilder:
 
                 for skill in skills:
                     batch.append({
-                        "jid": row['jid'],
+                        "id": row['id'],
                         "term": skill
                     })
 
