@@ -7,7 +7,7 @@ import faiss
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
-# 1. 解决控制台输出乱码 (针对 Windows)
+# 1. 解决控制台输出乱码
 if sys.platform.startswith('win'):
     import io
 
@@ -62,14 +62,10 @@ class VectorIndexGenerator:
         """1. 语义向量检索索引 (Vocabulary)"""
         print("\n>>> 任务 1: 构建词汇向量索引 (Vocabulary)")
         cursor = self.conn.cursor()
-        # 依然查这两个字段，voc_id 用于游标排序，term 用于生成映射
         rows = cursor.execute("SELECT voc_id, term FROM vocabulary").fetchall()
 
         texts = [row['term'] for row in rows]
-
-        # --- 核心修改：将映射 ID 从数字改为清洗后的文本 ---
-        # 这样 generate_training_data.py 读取这个映射时，拿到的直接就是单词
-        ids = [str(row['term']).strip().lower() for row in rows]
+        ids = [str(row['voc_id']) for row in rows]
 
         if not texts: return
 

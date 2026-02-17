@@ -45,7 +45,7 @@ def run_pipeline(config):
                 builder.sync_nodes_task(task, sql, cypher, t_field)
 
         # --- 2. 核心拓扑连接 (Author-Work-Inst) ---
-        with monitor.track("Building Topology (Author-Work-Inst)"):
+        with monitor.track("Building Topology (Author-Work-Inst/Source)"):
             builder.build_topology_incremental()
 
         # --- 3. 语义知识连接 (Work-Vocab & Job-Vocab) ---
