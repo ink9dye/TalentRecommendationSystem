@@ -1,5 +1,6 @@
 import sys
 import os
+import gc
 import json
 import random
 import numpy as np
@@ -7,14 +8,16 @@ from tqdm import tqdm
 import torch
 import torch.optim as optim
 import logging
+import argparse
 import scipy.sparse as sp
+torch.serialization.add_safe_globals([argparse.Namespace])
 
-from model import KGAT
-from data_loader import DataLoaderKGAT
-from kgat_utils.metrics import calc_metrics_at_k
-from kgat_utils.log_helper import create_log_id, logging_config
-from kgat_utils.model_helper import save_model, early_stopping
-from kgat_parser.parser_kgat import parse_kgat_args
+from src.infrastructure.database.kgat_ax.model import KGAT
+from src.infrastructure.database.kgat_ax.data_loader import DataLoaderKGAT
+from src.infrastructure.database.kgat_ax.kgat_utils.metrics import calc_metrics_at_k
+from src.infrastructure.database.kgat_ax.kgat_utils.log_helper import create_log_id, logging_config
+from src.infrastructure.database.kgat_ax.kgat_utils.model_helper import save_model, early_stopping
+from src.infrastructure.database.kgat_ax.kgat_parser.parser_kgat import parse_kgat_args
 from config import KGATAX_TRAIN_DATA_DIR, DB_PATH
 
 
@@ -33,51 +36,69 @@ def check_args_and_env(args):
     print("[System Check] 预检通过！\n")
 
 
+# src/infrastructure/database/kgat_ax/trainer.py
+
 def evaluate(model, dataloader, Ks, device, use_test_set=False):
-    import gc
+
     model.eval()
 
+    # 1. 确定当前评估的目标集（正确答案）
     eval_user_dict = dataloader.test_user_dict if use_test_set else dataloader.train_user_dict
     user_ids = list(eval_user_dict.keys())
 
-    # 抽样 1000 个用户进行评估以节省时间
+    # --- 核心修复点：修复 KeyError: np.int64(0) ---
+    if use_test_set:
+        # 测试模式：正常屏蔽训练集中的已见数据
+        exclude_user_dict = dataloader.train_user_dict
+    else:
+        # 拟合模式：创建一个包含所有用户但内容为空列表的字典
+        # 这确保了底层函数执行 train_user_dict[u] 时不会报错，同时也不屏蔽任何正确答案
+        exclude_user_dict = {u: [] for u in user_ids}
+
+    # 抽样评估以节省时间
     if len(user_ids) > 1000:
         user_ids = random.sample(user_ids, 1000)
 
-    # 1. 获取全量 Embedding
+    # 2. 获取全量节点 Embedding
     aux_info_all = dataloader.aux_info_all.to(device)
     with torch.no_grad():
         all_embed = model.calc_cf_embeddings(aux_info_all)
 
-    # 2. 核心：构建全局“人才白名单”索引
-    # 如果 dataloader 没有预设 author_ids，则现场提取所有 a_ 前缀的 ID
-    if not hasattr(dataloader, 'author_ids'):
-        map_path = os.path.join(dataloader.data_dir, "id_map.json")
-        with open(map_path, 'r', encoding='utf-8') as f:
-            mapping = json.load(f)
-        dataloader.author_ids = [idx for rid, idx in mapping['entity'].items() if rid.startswith('a_')]
-
-    author_indices = torch.LongTensor(dataloader.author_ids).to(device)
-    author_embeds = all_embed[author_indices]  # 只提取人才的向量
-
     metrics = {k: {'recall': [], 'ndcg': []} for k in Ks}
 
-    print(f"[*] 启动人才专项评估 (池大小: {len(author_indices)})")
+    mode_str = 'Test' if use_test_set else 'Train'
+    print(f"[*] 启动候选池精排评估 (池大小: ~500人, Mode: {mode_str}, 屏蔽集大小: {len(exclude_user_dict)})")
 
-    for usr in tqdm(user_ids, desc='Evaluating', leave=False):
+    for usr in tqdm(user_ids, desc='Ranking', leave=False):
+        # 动态构建当前岗位的 500 人候选池
+        tiers = dataloader.tiered_cf_dict.get(usr, {})
+        pos_ids = eval_user_dict[usr]
+
+        candidate_pool = list(set(pos_ids) |
+                              set(tiers.get('fair', [])) |
+                              set(tiers.get('neutral', [])) |
+                              set(tiers.get('easy', [])))
+
+        if not candidate_pool:
+            continue
+
+        candidate_indices = torch.LongTensor(candidate_pool).to(device)
+
         with torch.no_grad():
             u_e = all_embed[usr].unsqueeze(0)  # [1, dim]
-            # 3. 只计算用户与“人才”之间的得分
-            scores = torch.matmul(u_e, author_embeds.transpose(0, 1)).squeeze(0)  # [num_authors]
+            i_e = all_embed[candidate_indices]  # [num_candidates, dim]
 
-            # 4. 构造一个只有人才位置有分的伪全量向量，供指标函数计算
-            # 这样非人才节点分数为 -1e10，永远不会进入 Top-K
+            # 3. 计算 500 个候选人的得分
+            scores = torch.matmul(u_e, i_e.transpose(0, 1)).squeeze(0)
+
+            # 4. 构造评分向量，非候选成员设为极小值
             final_scores = torch.full((dataloader.n_users_entities,), -1e10).to(device)
-            final_scores[author_indices] = scores
+            final_scores[candidate_indices] = scores
 
+            # --- 传入修正后的动态屏蔽集 ---
             batch_m = calc_metrics_at_k(
                 final_scores.unsqueeze(0).cpu(),
-                dataloader.train_user_dict,
+                exclude_user_dict,  # 动态确定的屏蔽字典
                 eval_user_dict,
                 np.array([usr]),
                 np.arange(dataloader.n_users_entities),
@@ -88,10 +109,9 @@ def evaluate(model, dataloader, Ks, device, use_test_set=False):
                 metrics[k]['recall'].append(batch_m[k]['recall'])
                 metrics[k]['ndcg'].append(batch_m[k]['ndcg'])
 
-    del all_embed, author_embeds
+    del all_embed
     gc.collect()
     return {k: {m: np.mean(v) for m, v in val.items()} for k, val in metrics.items()}
-
 def save_checkpoint(model, optimizer, epoch, best_recall, args, path, is_best=False):
     """持久化 Checkpoint 机制，支持断点续传"""
     checkpoint = {
@@ -123,7 +143,7 @@ def train(args):
     args.ENTITY_OFFSET = data.ENTITY_OFFSET
 
     # 模型与优化器初始化
-    model = KGAT(args, data.n_users, data.n_entities, data.n_relations, data.A_in).to(device)
+    model = KGAT(args, data.n_users, data.n_users_entities, data.n_relations, data.A_in).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     start_epoch = 1
@@ -138,7 +158,7 @@ def train(args):
     if latest_models:
         last_model = os.path.join(weight_path, latest_models[-1])
         try:
-            checkpoint = torch.load(last_model, map_location=device)
+            checkpoint = torch.load(last_model, map_location=device, weights_only=False)
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             start_epoch = checkpoint['epoch'] + 1
@@ -200,26 +220,34 @@ def train(args):
         # 核心：评估前先保存，防御内存崩溃导致的数据丢失
         save_checkpoint(model, optimizer, epoch, best_recall, args, weight_path, is_best=False)
 
+        # src/infrastructure/database/kgat_ax/trainer.py
+
         # --- 3. 评估阶段 ---
         if epoch % args.evaluate_every == 0:
-            # 默认进行训练集拟合度校验
-            res = evaluate(model, data, Ks, device, use_test_set=False)
-            curr_recall = res[Ks[0]]['recall']
-            logging.info(f"Eval (Fitting) @{Ks[0]}: Recall: {curr_recall:.4f}, NDCG: {res[Ks[0]]['ndcg']:.4f}")
+            # A. 拟合度校验（仅作为日志记录，用于观察模型是否“复读机”）
+            res_fit = evaluate(model, data, Ks, device, use_test_set=False)
+            logging.info(
+                f"Eval (Fitting) @{Ks[0]}: Recall: {res_fit[Ks[0]]['recall']:.4f}, NDCG: {res_fit[Ks[0]]['ndcg']:.4f}")
 
-            # 选做：进行测试集泛化验证
+            # B. 【核心修改】泛化验证：这是衡量模型实力的真实指标
             res_test = evaluate(model, data, Ks, device, use_test_set=True)
-            logging.info(f"Eval (Generalization) @{Ks[0]}: Recall: {res_test[Ks[0]]['recall']:.4f}")
+            # 关键：将当前 Recall 锁定为测试集的结果
+            curr_recall = res_test[Ks[0]]['recall']
+            logging.info(f"Eval (Generalization) @{Ks[0]}: Recall: {curr_recall:.4f}")
 
-            recall_list.append(curr_recall)
+            # C. 决策逻辑：使用测试集指标决定早停与保存
+            recall_list.append(curr_recall)  # 记录测试集 Recall，避开 Fitting 的 nan 陷阱
             _, stop = early_stopping(recall_list, args.stopping_steps)
 
+            # 只有测试集表现更好时，才认为它是“最佳模型”
             if curr_recall > best_recall:
                 best_recall = curr_recall
+                # 保存时记录的是测试集的 Recall
                 save_checkpoint(model, optimizer, epoch, best_recall, args, weight_path, is_best=True)
+                logging.info(f"[*] 发现更优的泛化模型 (Test Recall: {best_recall:.4f})，已更新 Best Model。")
 
             if stop:
-                logging.info("达到早停条件，训练结束。")
+                logging.info(f"连续 {args.stopping_steps} 次评估未提升泛化性能，触发早停。")
                 break
 
 

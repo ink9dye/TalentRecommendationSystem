@@ -8,12 +8,18 @@ def _L2_loss_mean(x):
 
 
 class Aggregator(nn.Module):
+    """
+    轻量化的聚合器层，仅负责邻居信息聚合与非线性变换
+    """
+
     def __init__(self, in_dim, out_dim, dropout, aggregator_type):
+        # 修复点：super 必须指向当前类 Aggregator
         super(Aggregator, self).__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.dropout = dropout
         self.aggregator_type = aggregator_type
+
         self.message_dropout = nn.Dropout(dropout)
         self.activation = nn.LeakyReLU()
 
@@ -32,7 +38,9 @@ class Aggregator(nn.Module):
             raise NotImplementedError
 
     def forward(self, ego_embeddings, A_in):
-        side_embeddings = torch.matmul(A_in, ego_embeddings)
+        # 执行图卷积消息传递
+        side_embeddings = torch.sparse.mm(A_in, ego_embeddings)
+
         if self.aggregator_type == 'gcn':
             embeddings = ego_embeddings + side_embeddings
             embeddings = self.activation(self.linear(embeddings))
@@ -47,38 +55,95 @@ class Aggregator(nn.Module):
 
 
 class KGAT(nn.Module):
-    def __init__(self, args, n_users, n_entities, n_relations, A_in=None):
+    """
+    KGAT-AX 主模型：管理全局 Embedding 与 多层聚合
+    """
+
+    def __init__(self, args, n_users, n_total_nodes, n_relations, A_in=None):
         super(KGAT, self).__init__()
         self.n_users = n_users
-        self.n_entities = n_entities
         self.n_relations = n_relations
         self.embed_dim = args.embed_dim
         self.relation_dim = args.relation_dim
         self.aggregation_type = args.aggregation_type
-        self.ENTITY_OFFSET = args.ENTITY_OFFSET  # 关键偏移量
+        self.ENTITY_OFFSET = args.ENTITY_OFFSET
 
-        # 解析卷积层配置
         self.conv_dim_list = [args.embed_dim] + eval(args.conv_dim_list)
         self.mess_dropout = eval(args.mess_dropout)
         self.n_layers = len(eval(args.conv_dim_list))
         self.kg_l2loss_lambda = args.kg_l2loss_lambda
         self.cf_l2loss_lambda = args.cf_l2loss_lambda
 
-        # 1. 核心 AX 映射层：增强学术特征到语义空间的对齐能力
+        # 1. AX 特征融合层
         self.n_aux_features = getattr(args, 'n_aux_features', 3)
         self.aux_embed_layer = nn.Linear(self.n_aux_features, self.embed_dim)
         nn.init.xavier_uniform_(self.aux_embed_layer.weight)
 
-        # 2. 类型偏置层 (Type Embedding)：区分岗位(0)与人才(1)
+        # 2. 类型偏置层
         self.type_embed = nn.Embedding(2, self.embed_dim)
         nn.init.xavier_uniform_(self.type_embed.weight)
 
-        # 3. 核心 Embedding 空间
-        self.global_max_id = args.ENTITY_OFFSET + n_entities
+        # --- 核心修改点：维度对齐 ---
+        # 直接使用 data.n_users_entities (1,870,366)，不再手动计算
+        self.global_max_id = n_total_nodes
+        self.entity_user_embed = nn.Embedding(self.global_max_id, self.embed_dim)
+
+        self.relation_embed = nn.Embedding(self.n_relations, self.relation_dim)
+        self.trans_M = nn.Parameter(torch.Tensor(self.n_relations, self.embed_dim, self.relation_dim))
+        self.W_a = nn.Parameter(torch.Tensor(self.relation_dim, 1))
+
+        nn.init.xavier_uniform_(self.entity_user_embed.weight)
+        nn.init.xavier_uniform_(self.relation_embed.weight)
+        nn.init.xavier_uniform_(self.trans_M)
+        nn.init.xavier_uniform_(self.W_a)
+
+        # 4. 堆叠聚合器层
+        self.aggregator_layers = nn.ModuleList([
+            Aggregator(self.conv_dim_list[k], self.conv_dim_list[k + 1], self.mess_dropout[k], self.aggregation_type)
+            for k in range(self.n_layers)
+        ])
+
+        if A_in is not None:
+            # 校验邻接矩阵维度是否与 Embedding 层严格一致
+            if A_in.shape[0] != self.global_max_id:
+                raise ValueError(f"维度不匹配: 邻接矩阵({A_in.shape[0]}) != global_max_id({self.global_max_id})")
+            self.register_buffer('A_in', A_in)
+
+
+class KGAT(nn.Module):
+    def __init__(self, args, n_users, n_total_nodes, n_relations, A_in=None):
+        """
+        修正版构造函数：直接使用 n_total_nodes 对齐 Embedding 空间
+        """
+        super(KGAT, self).__init__()
+        self.n_users = n_users
+        self.n_relations = n_relations
+        self.embed_dim = args.embed_dim
+        self.relation_dim = args.relation_dim
+        self.aggregation_type = args.aggregation_type
+        self.ENTITY_OFFSET = args.ENTITY_OFFSET
+
+        # 解析层配置
+        self.conv_dim_list = [args.embed_dim] + eval(args.conv_dim_list)
+        self.mess_dropout = eval(args.mess_dropout)
+        self.n_layers = len(eval(args.conv_dim_list))
+        self.kg_l2loss_lambda = args.kg_l2loss_lambda
+        self.cf_l2loss_lambda = args.cf_l2loss_lambda
+
+        # 1. 核心 AX 映射层
+        self.n_aux_features = getattr(args, 'n_aux_features', 3)
+        self.aux_embed_layer = nn.Linear(self.n_aux_features, self.embed_dim)
+        nn.init.xavier_uniform_(self.aux_embed_layer.weight)
+
+        # 2. 类型偏置层
+        self.type_embed = nn.Embedding(2, self.embed_dim)
+        nn.init.xavier_uniform_(self.type_embed.weight)
+
+        # 3. 核心 Embedding 空间：直接使用传入的总节点数，防止维度漂移
+        self.global_max_id = n_total_nodes
         self.entity_user_embed = nn.Embedding(self.global_max_id, self.embed_dim)
         self.relation_embed = nn.Embedding(self.n_relations, self.relation_dim)
 
-        # TransR 空间投影矩阵
         self.trans_M = nn.Parameter(torch.Tensor(self.n_relations, self.embed_dim, self.relation_dim))
         self.W_a = nn.Parameter(torch.Tensor(self.relation_dim, 1))
 
@@ -94,6 +159,7 @@ class KGAT(nn.Module):
         ])
 
         if A_in is not None:
+            # 校验邻接矩阵维度是否与 Embedding 层严格匹配
             if A_in.shape[0] != self.global_max_id:
                 raise ValueError(f"维度不匹配: 邻接矩阵({A_in.shape[0]}) != global_max_id({self.global_max_id})")
             self.register_buffer('A_in', A_in)
@@ -102,15 +168,11 @@ class KGAT(nn.Module):
 
     def holographic_fusion(self, entity_embed, aux_info, node_ids=None):
         """
-        全息融合层：增强学术特征的基础权重。
+        全息融合层：增加学术特征权重偏置，增强激活稳定性
         """
-        # --- 核心修改：增加学术特征的基础权重偏置 ---
-        # 通过将基础偏置从 1.0 提升至 1.5，确保即学术特征较弱的节点也拥有稳定的激活，
-        # 同时学术表现优异的节点（feat趋近1）能获得更强的特征溢出效应。
         res_weight = torch.tanh(self.aux_embed_layer(aux_info)) + 1.5
         fused_embed = entity_embed * res_weight
 
-        # 2. 注入类型偏置 (Type Bias)
         if node_ids is not None:
             type_labels = (node_ids >= self.ENTITY_OFFSET).long()
             fused_embed += self.type_embed(type_labels)
@@ -122,11 +184,11 @@ class KGAT(nn.Module):
         device = self.entity_user_embed.weight.device
         all_ids = torch.arange(self.global_max_id).to(device)
 
-        # 第一步：基础 Embedding + 身份偏置 + 学术融合
+        # 基础 Embedding + 融合
         ego_embed = self.holographic_fusion(self.entity_user_embed.weight, aux_info_all, all_ids)
         all_embed = [ego_embed]
 
-        # 第二步：图卷积聚合
+        # 图卷积聚合
         for layer in self.aggregator_layers:
             ego_embed = layer(ego_embed, self.A_in)
             all_embed.append(F.normalize(ego_embed, p=2, dim=1))
@@ -134,30 +196,20 @@ class KGAT(nn.Module):
         return torch.cat(all_embed, dim=1)
 
     def calc_cf_loss(self, user_ids, item_pos_ids, item_neg_ids, aux_info_all):
-        """计算带健壮性校验的 BPR 损失"""
         all_embed = self.calc_cf_embeddings(aux_info_all)
-
-        u_e = all_embed[user_ids]
-        p_e = all_embed[item_pos_ids]
-        n_e = all_embed[item_neg_ids]
+        u_e, p_e, n_e = all_embed[user_ids], all_embed[item_pos_ids], all_embed[item_neg_ids]
 
         pos_score = torch.sum(u_e * p_e, 1)
         neg_score = torch.sum(u_e * n_e, 1)
 
         cf_loss = torch.mean(F.softplus(neg_score - pos_score))
         l2_loss = _L2_loss_mean(u_e) + _L2_loss_mean(p_e) + _L2_loss_mean(n_e)
-
         return cf_loss + self.cf_l2loss_lambda * l2_loss
 
     def calc_kg_loss(self, h, r, pos_t, neg_t, h_aux, pos_t_aux, neg_t_aux):
-        """KG 损失：注入类型偏置以保持特征一致性"""
-        h_e = self.entity_user_embed(h)
-        p_t_e = self.entity_user_embed(pos_t)
-        n_t_e = self.entity_user_embed(neg_t)
-
-        h_e = self.holographic_fusion(h_e, h_aux, h)
-        p_t_e = self.holographic_fusion(p_t_e, pos_t_aux, pos_t)
-        n_t_e = self.holographic_fusion(n_t_e, neg_t_aux, neg_t)
+        h_e = self.holographic_fusion(self.entity_user_embed(h), h_aux, h)
+        p_t_e = self.holographic_fusion(self.entity_user_embed(pos_t), pos_t_aux, pos_t)
+        n_t_e = self.holographic_fusion(self.entity_user_embed(neg_t), neg_t_aux, neg_t)
 
         r_e = self.relation_embed(r)
         W_r = self.trans_M[r]
@@ -174,9 +226,7 @@ class KGAT(nn.Module):
         return kg_loss + self.kg_l2loss_lambda * l2_loss
 
     def update_attention_batch(self, h_list, t_list, r_list):
-        h_e = self.entity_user_embed(h_list)
-        t_e = self.entity_user_embed(t_list)
-        r_e = self.relation_embed(r_list)
+        h_e, t_e, r_e = self.entity_user_embed(h_list), self.entity_user_embed(t_list), self.relation_embed(r_list)
         W_r = self.trans_M[r_list]
 
         h_e = torch.bmm(h_e.unsqueeze(1), W_r).squeeze(1)
@@ -187,17 +237,11 @@ class KGAT(nn.Module):
         return att_score
 
     def forward(self, *input, mode):
-        if mode == 'train_cf':
-            return self.calc_cf_loss(*input)
-        elif mode == 'train_kg':
-            return self.calc_kg_loss(*input)
-        elif mode == 'predict':
-            return self.calc_score(*input)
-        elif mode == 'update_att':
-            return self.update_attention_batch(*input)
+        if mode == 'train_cf': return self.calc_cf_loss(*input)
+        elif mode == 'train_kg': return self.calc_kg_loss(*input)
+        elif mode == 'predict': return self.calc_score(*input)
+        elif mode == 'update_att': return self.update_attention_batch(*input)
 
     def calc_score(self, user_ids, item_ids, aux_info_all):
         all_embed = self.calc_cf_embeddings(aux_info_all)
-        u_e = all_embed[user_ids]
-        i_e = all_embed[item_ids]
-        return torch.matmul(u_e, i_e.transpose(0, 1))
+        return torch.matmul(all_embed[user_ids], all_embed[item_ids].transpose(0, 1))

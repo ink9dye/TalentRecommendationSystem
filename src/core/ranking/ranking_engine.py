@@ -2,123 +2,177 @@ import torch
 import sqlite3
 import json
 import os
+import numpy as np
 from py2neo import Graph
 from typing import List, Dict
-from config import DB_PATH, KGATAX_TRAIN_DATA_DIR, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD
+from config import DB_PATH, KGATAX_TRAIN_DATA_DIR, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, NEO4J_DATABASE
 
 
 class RankingEngine:
     def __init__(self, model, dataloader):
         """
-        KGAT-AX 精排引擎：实现特征融合打分与图谱证据回溯
-        :param model: 训练好的 KGAT 模型，需包含 aux_embed_layer
-        :param dataloader: 数据加载器，提供 aux_info_all 特征矩阵
+        KGAT-AX 强化版精排引擎：融合模型注意力机制与图谱路径回溯
         """
         self.model = model
         self.dataloader = dataloader
-        self.device = torch.device("cpu")  # 推理建议使用 CPU 环境以匹配 32GB 内存
+        self.device = torch.device("cpu")
 
-        # 建立 Neo4j 连接：用于实时证据链回溯 [cite: 2]
-        self.graph = Graph(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+        # 1. 建立 Neo4j 连接
+        self.graph = Graph(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD), name=NEO4J_DATABASE)
 
-        # 载入 ID 映射表：实现模型 Int ID 与 业务 Raw ID 的双向转换
+        # 2. 载入 ID 映射
         self.id_map_path = os.path.join(KGATAX_TRAIN_DATA_DIR, "id_map.json")
         self._load_id_mapping()
+
+        # 3. 关系类型定义（需与 generate_training_data.py 一致）
+        self.REL_AUTHORED = 1
+        self.REL_HAS_TOPIC = 4
 
     def _load_id_mapping(self):
         with open(self.id_map_path, 'r', encoding='utf-8') as f:
             mapping = json.load(f)
-            # {整数ID: 原始字符串ID}
-            self.int_to_raw = {int(v): k for k, v in mapping['entity'].items()}
+        self.raw_to_int = mapping['entity']
+        self.int_to_raw = {int(v): k for k, v in mapping['entity'].items()}
+        self.raw_user_to_int = {k: v for k, v in mapping['entity'].items() if
+                                not k.startswith(('a_', 'w_', 'v_', 'i_', 's_'))}
 
-    def execute_rank(self, user_id: int, candidate_ids: List[int]) -> List[Dict]:
+    def execute_rank(self, job_raw_id: str, candidate_raw_ids: List[str]) -> List[Dict]:
         """
-        执行精排：打分(AX融合) -> 筛选(Top 100) -> 溯源(Neo4j)
+        精排核心流程
         """
         self.model.eval()
 
-        # 1. 执行 KGAT-AX 模型打分
-        # 模型内部通过 holographic_fusion 实现 e_enhanced = e_topo * e_attr
+        user_int_id = self.raw_user_to_int.get(job_raw_id, 0)
+        item_int_ids = [self.raw_to_int.get(f"a_{aid}", 0) for aid in candidate_raw_ids]
+
         with torch.no_grad():
-            u_tensor = torch.LongTensor([user_id]).to(self.device)
-            i_tensor = torch.LongTensor(candidate_ids).to(self.device)
-            # 计算融合了学术特征(AX)的预测分值 [cite: 1, 145]
-            scores = self.model.calc_score(u_tensor, i_tensor, self.dataloader.aux_info_all.to(self.device))
+            u_tensor = torch.LongTensor([user_int_id]).to(self.device)
+            i_tensor = torch.LongTensor(item_int_ids).to(self.device)
+            aux_info = self.dataloader.aux_info_all.to(self.device)
+
+            # 执行模型打分
+            scores = self.model.calc_score(u_tensor, i_tensor, aux_info)
             scores = scores.squeeze(0)
 
-        # 2. 选取 Top 100 人才
-        top_k = min(100, len(candidate_ids))
+        top_k = min(100, len(item_int_ids))
         top_val, top_idx = torch.topk(scores, top_k)
 
-        results = []
+        ranked_results = []
         for i in range(top_k):
             idx = top_idx[i].item()
-            auth_int_id = candidate_ids[idx]
-            raw_id_prefixed = self.int_to_raw.get(auth_int_id, "")
+            auth_raw_id = candidate_raw_ids[idx]
 
-            # 剥离前缀以便查询数据库 (例如 "a_A50637..." -> "A50637...")
-            raw_id = raw_id_prefixed.replace("a_", "") if raw_id_prefixed.startswith("a_") else raw_id_prefixed
+            stats = self._fetch_sqlite_stats(auth_raw_id)
+            # 调用模型驱动的证据回溯函数
+            evidence = self._get_kgat_driven_evidence(f"a_{auth_raw_id}", job_raw_id)
 
-            # 3. 挂载 SQLite 原始学术指标 (用于前端点击详情展示)
-            stats = self._fetch_sqlite_stats(raw_id)
-
-            # 4. 生成增强版证据链：利用 Neo4j 回溯协作与技能路径
-            evidence = self._get_graph_evidence(raw_id_prefixed, user_id)
-
-            results.append({
-                "author_id": raw_id,
+            ranked_results.append({
+                "rank": i + 1,
+                "author_id": auth_raw_id,
+                "name": stats['name'],
                 "score": round(float(top_val[i]), 4),
                 "metrics": stats,
-                "evidence": evidence
+                "evidence_chain": evidence
             })
 
-        return results
+        return ranked_results
 
-    def _get_graph_evidence(self, auth_raw_id: str, job_int_id: int) -> str:
+    def _get_kgat_driven_evidence(self, auth_prefixed_id: str, job_raw_id: str) -> dict:
         """
-        利用图谱拓扑结构回溯推荐理由，体现协作路与标签路的双重逻辑
+        核心升级：先查询 Neo4j 候选路径，再通过模型 Attention 进行权重筛选
         """
-        job_raw_id = self.int_to_raw.get(job_int_id, "")
-        evidence_list = []
+        author_id = auth_prefixed_id.replace("a_", "")
 
-        # 策略 A：技能路径回溯 (标签路逻辑)
-        # 匹配 (Job)-[:REQUIRE_SKILL]->(Vocab)<-[:HAS_TOPIC]-(Work)<-[:AUTHORED]-(Author)
-        semantic_cypher = """
+        # 1. 初始 Neo4j 查询：获取所有可能的“岗位-技能-作品-人才”链路
+        path_query = """
         MATCH (j:Job {id: $jid})-[:REQUIRE_SKILL]->(v:Vocabulary)<-[:HAS_TOPIC]-(w:Work)<-[:AUTHORED]-(a:Author {id: $aid})
-        RETURN v.term as skill, count(w) as work_count
-        ORDER BY work_count DESC LIMIT 1
+        RETURN v.term as skill, v.id as vid, w.title as title, w.id as wid
         """
-        sem_res = self.graph.run(semantic_cypher, jid=job_raw_id, aid=auth_raw_id).data()
-        if sem_res:
-            evidence_list.append(
-                f"【专业对齐】深耕“{sem_res[0]['skill']}”方向，有 {sem_res[0]['work_count']} 篇相关代表作。")
+        paths = self.graph.run(path_query, jid=job_raw_id, aid=author_id).data()
 
-        # 策略 B：协作影响力回溯 (协同路逻辑)
-        # 挖掘该学者与高影响力(H-index > 20)专家的合作记录
-        collab_cypher = """
+        evidence = {
+            "matched_skills": [],
+            "representative_works": [],
+            "notable_collaborators": [],
+            "summary": "多维学术特征深度匹配。"
+        }
+
+        if not paths:
+            return evidence
+
+        # 2. 转换 ID 并计算模型注意力
+        # 我们重点检查 (Author)-[AUTHORED]->(Work) 这一跳的权重
+        h_list, t_list, r_list = [], [], []
+        auth_int = self.raw_to_int.get(auth_prefixed_id, 0)
+
+        for p in paths:
+            work_int = self.raw_to_int.get(f"w_{p['wid']}", 0)
+            h_list.append(auth_int)
+            t_list.append(work_int)
+            r_list.append(self.REL_AUTHORED)
+
+        with torch.no_grad():
+            # 调用模型内部的注意力计算
+            # 这反映了模型对该人才名下各作品的“重视程度”
+            att_scores = self.model.update_attention_batch(
+                torch.LongTensor(h_list).to(self.device),
+                torch.LongTensor(t_list).to(self.device),
+                torch.LongTensor(r_list).to(self.device)
+            ).squeeze().cpu().numpy()
+
+        # 3. 结果融合：将注意力分值挂载回路径
+        # 若只有一条路径，att_scores 可能是标量，需处理
+        if np.isscalar(att_scores): att_scores = [att_scores]
+
+        for i, p in enumerate(paths):
+            p['att'] = float(att_scores[i])
+
+        # 4. 根据注意力分值进行精选排序
+        sorted_paths = sorted(paths, key=lambda x: x['att'], reverse=True)
+
+        # 仅取模型关注度最高的前 2 个技能和前 3 篇论文
+        top_skills = list(dict.fromkeys([p['skill'] for p in sorted_paths]))[:2]
+        top_works = [p['title'] for p in sorted_paths][:3]
+
+        evidence["matched_skills"] = top_skills
+        evidence["representative_works"] = top_works
+
+        # 5. 回溯高阶合作者（保持 Neo4j 辅助展示）
+        collab_query = """
         MATCH (a:Author {id: $aid})-[:AUTHORED]->(w:Work)<-[:AUTHORED]-(peer:Author)
-        WHERE peer.h_index > 20 AND a.id <> peer.id
-        RETURN peer.name as peer_name, w.title as work_title
-        ORDER BY w.citations DESC LIMIT 1
+        WHERE peer.h_index > 25 AND a.id <> peer.id
+        RETURN DISTINCT peer.name as peer_name, peer.h_index as ph ORDER BY ph DESC LIMIT 2
         """
-        collab_res = self.graph.run(collab_cypher, aid=auth_raw_id).data()
-        if collab_res:
-            evidence_list.append(
-                f"【学术圈层】曾与专家 {collab_res[0]['peer_name']} 合作发表高引论文《{collab_res[0]['work_title']}》。")
+        res_c = self.graph.run(collab_query, aid=author_id).data()
+        evidence["notable_collaborators"] = [f"{r['peer_name']}(H-{r['ph']})" for r in res_c]
 
-        return " | ".join(evidence_list) if evidence_list else "基于学术拓扑与多维特征的语义匹配推荐。"
+        # 6. 生成基于权重的总结
+        if top_skills:
+            evidence[
+                "summary"] = f"模型识别到其在“{top_skills[0]}”领域的学术贡献（Attention权重最大），共关联 {len(top_works)} 篇高权重代表作。"
+
+        return evidence
 
     def _fetch_sqlite_stats(self, raw_id: str) -> Dict:
-        """查询原始学术属性，补全人才画像 """
-        stats = {"name": "Unknown", "h_index": 0, "cited": 0, "works": 0}
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            query = "SELECT name, h_index, cited_by_count, works_count FROM authors WHERE author_id = ?"
-            row = cursor.execute(query, (raw_id,)).fetchone()
-            conn.close()
-            if row:
-                stats = {"name": row[0], "h_index": row[1], "cited": row[2], "works": row[3]}
-        except:
-            pass
-        return stats
+        """从 SQLite 获取学术指标"""
+        conn = sqlite3.connect(DB_PATH)
+        # 从数据库中查询作者的原始学术数据
+        row = conn.execute("SELECT name, h_index, cited_by_count, works_count FROM authors WHERE author_id=?",
+                           (raw_id,)).fetchone()
+        conn.close()
+
+        # --- 核心修复：将 'cited' 修改为 'citations' 以对齐 talent_app.py 的预期 ---
+        if row:
+            return {
+                "name": row[0],
+                "h_index": row[1],
+                "citations": row[2],  # 修改此处键名
+                "works": row[3]
+            }
+
+        return {
+            "name": "Unknown",
+            "h_index": 0,
+            "citations": 0,
+            "works": 0
+        }

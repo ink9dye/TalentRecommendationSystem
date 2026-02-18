@@ -1,6 +1,6 @@
 # algorithms/kgat_ax/__init__.py
-from .model import KGAT
-from .trainer import train as train_kgat_ax
+from src.infrastructure.database.kgat_ax.model import KGAT
+from src.infrastructure.database.kgat_ax.trainer import train as train_kgat_ax
 import torch
 
 class KGAT_AX_Predictor:

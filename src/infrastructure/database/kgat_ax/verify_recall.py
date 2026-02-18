@@ -40,7 +40,7 @@ def run_offline_verification():
     model = KGAT(
         args,
         dataloader.n_users,
-        dataloader.n_entities,
+        dataloader.n_users_entities,
         dataloader.n_relations,
         dataloader.A_in
     ).to(device)
@@ -99,7 +99,7 @@ def run_offline_verification():
             aux_all = dataloader.aux_info_all.to(device)
             all_embed = model.calc_cf_embeddings(aux_all)
             p_score = torch.matmul(all_embed[u_sample], all_embed[p_sample].reshape(-1, 1)).item()
-            n_score = torch.matmul(all_embed[u_sample], all_embed[n_sample].T).item()
+            n_score = torch.matmul(all_embed[u_sample], all_embed[n_sample]).item()
             print(f"[*] 抽样得分 (User {u_sample}): 正样本 {p_score:.4f} vs 随机人才负样本 {n_score:.4f}")
 
     print("=" * 50 + "\n")
