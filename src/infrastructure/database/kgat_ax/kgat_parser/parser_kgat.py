@@ -65,7 +65,7 @@ def parse_kgat_args():
                         help='Lambda when calculating CF l2 loss.')
     parser.add_argument('--lr', type=float, default=0.0001,
                         help='Learning rate.')
-    parser.add_argument('--n_epoch', type=int, default=50,
+    parser.add_argument('--n_epoch', type=int, default=100,
                         help='Number of epoch.')
     parser.add_argument('--stopping_steps', type=int, default=3,
                         help='Number of epoch for early stopping.')

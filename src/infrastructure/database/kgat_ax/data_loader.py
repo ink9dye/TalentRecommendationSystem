@@ -51,7 +51,10 @@ class DataLoaderKGAT(object):
         self.sanity_check()
 
     def load_id_mapping(self):
-        """加载 ID 压缩映射，确立 User 与 Entity 的物理边界"""
+        """
+        加载 ID 压缩映射，确立 User 与 Entity 的物理边界。
+        修改点：显式存储 entity_to_int 和 user_to_int 映射表。
+        """
         map_path = os.path.join(self.data_dir, "id_map.json")
         if not os.path.exists(map_path):
             raise FileNotFoundError(f"未发现映射文件: {map_path}，请先运行 generate_training_data.py。")
@@ -59,6 +62,20 @@ class DataLoaderKGAT(object):
         with open(map_path, 'r', encoding='utf-8') as f:
             mapping = json.load(f)
 
+        # --- 核心修改：持久化映射字典，供精排引擎（RankingEngine）使用 ---
+        # 1. 存储全量实体映射 (包含 a_, w_, v_ 等前缀的作者、作品、技能)
+        self.entity_to_int = mapping.get("entity", {})
+
+        # 2. 提取用户（岗位）映射
+        # 在 generate_training_data 中，岗位 ID 是直接以原始字符串存储的，没有 a_ 等前缀
+        self.user_to_int = {k: v for k, v in self.entity_to_int.items() if
+                            not k.startswith(('a_', 'w_', 'v_', 'i_', 's_'))}
+
+        # 为了兼容 RankScorer 的旧命名习惯，额外提供一个别名
+        self.raw_to_int = self.entity_to_int
+        self.raw_user_to_int = self.user_to_int
+
+        # 3. 基础统计信息提取
         self.n_users_entities = mapping.get("total_nodes")
         self.n_users = mapping.get("user_count", 0)
         self.n_entities = mapping.get("entity_count", 0)
@@ -66,7 +83,6 @@ class DataLoaderKGAT(object):
 
         self.logging.info(
             f"[*] ID 空间映射成功: User(0-{self.ENTITY_OFFSET - 1}), Entity({self.ENTITY_OFFSET}-{self.n_users_entities - 1})")
-
     def load_cf(self, filename):
         """
         解析四级梯度格式
@@ -157,7 +173,8 @@ class DataLoaderKGAT(object):
     def load_auxiliary_info(self):
         """
         加载经 build_feature_index.py 处理后的归一化特征。
-        修改点：在查找映射表时，为原始作者 ID 添加 'a_' 前缀，以匹配 id_map.json 中的键名。
+        职责：为作者节点注入 h-index 等学术质量指标。
+        修正点：加入 ID 归一化对齐与加载命中率监控。
         """
         global_max_id = self.n_users_entities
         # 默认三维特征：h_index, cited_by, works_count
@@ -171,17 +188,22 @@ class DataLoaderKGAT(object):
         with open(FEATURE_INDEX_PATH, 'r', encoding='utf-8') as f:
             feature_bundle = json.load(f)
 
+        # 从 id_map.json 加载 ID 空间定义
         map_path = os.path.join(self.data_dir, "id_map.json")
         with open(map_path, 'r', encoding='utf-8') as f_map:
             mapping = json.load(f_map)
 
-        # e2i 里的键现在是 "a_123", "w_456" 等格式
-        e2i = mapping['entity']
-
+        # e2i 里的键是 "a_123", "w_456" 等全小写格式
+        e2i = mapping.get('entity', {})
         author_features = feature_bundle.get('author', {})
+
+        match_count = 0
+        # 仅用于调试：记录前几个匹配失败的 ID
+        mismatch_samples = []
+
         for raw_aid, feat_dict in author_features.items():
-            # --- 核心修改：添加前缀以匹配 id_map.json 中的 entity 键 ---
-            prefixed_aid = f"a_{raw_aid}"
+            # --- 核心修复：添加前缀并执行小写化，严格对齐 generate_training_data 逻辑 ---
+            prefixed_aid = f"a_{str(raw_aid).strip().lower()}"
 
             if prefixed_aid in e2i:
                 idx = e2i[prefixed_aid]
@@ -191,9 +213,27 @@ class DataLoaderKGAT(object):
                         feat_dict.get('cited_by_count', 0.0),
                         feat_dict.get('works_count', 0.0)
                     ]
+                    match_count += 1
+            else:
+                if len(mismatch_samples) < 3:
+                    mismatch_samples.append(prefixed_aid)
 
         self.aux_info_all = torch.from_numpy(features)
-        self.logging.info(f"[*] AX 归一化特征加载完成（已适配 a_ 前缀映射）。")
+
+        # --- 增加调试日志 ---
+        self.logging.info(f"[*] AX 学术特征预载入完成:")
+        self.logging.info(f"    - 特征库作者数: {len(author_features)}")
+        self.logging.info(f"    - 成功映射人数: {match_count}")
+
+        if match_count == 0 and len(author_features) > 0:
+            self.logging.error(f"[关键错误] AX 特征完全匹配失败！")
+            self.logging.error(f"    - 尝试匹配的 ID 样例: {mismatch_samples}")
+            # 获取 id_map 中的样例进行对比
+            id_map_samples = list(e2i.keys())[:3]
+            self.logging.error(f"    - id_map.json 中的 ID 样例: {id_map_samples}")
+        elif match_count < len(author_features) * 0.1:
+            self.logging.warning(f"[警告] AX 特征匹配率极低 ({match_count}/{len(author_features)})，请检查 ID 格式。")
+
         del feature_bundle, e2i
         gc.collect()
 
