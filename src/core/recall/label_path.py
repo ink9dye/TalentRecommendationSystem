@@ -80,11 +80,16 @@ class LabelRecallPath:
         upper_tri = sim_matrix[np.triu_indices(n, k=1)]
         return float(np.mean(upper_tri))
 
-    def recall(self, query_vector):
+    def recall(self, query_vector, target_domains=None):
+        """
+        标签路召回：增加领域 ID 的可选过滤逻辑
+        :param query_vector: 输入向量
+        :param target_domains: 可选，领域 ID 列表，例如 ['1', '4']
+        """
         if self.graph is None: return [], 0
         start_t = time.time()
 
-        # 1. 锚定核心词并联想扩展
+        # 1. 锚定核心词并联想扩展 (保持原有逻辑)
         core_ids = self._get_skills_from_jobs(query_vector)
         if not core_ids: return [], 0
         core_ids_set = set(core_ids)
@@ -98,23 +103,31 @@ class LabelRecallPath:
         ext_cursor = self.graph.run(expand_cypher, v_ids=core_ids)
         all_ids = list(core_ids_set | {int(rec['vid']) for rec in ext_cursor if rec['vid'] is not None})
 
-        # 2. Neo4j 召回：带回每篇论文对应的作者具体 pos_weight
-        final_cypher = """
+        # --- 【核心修改】2. 构建带领域过滤的 Neo4j 召回逻辑 ---
+        # 如果提供了 target_domains，则在 Cypher 中加入集合交叉验证逻辑
+        domain_filter_clause = ""
+        if target_domains:
+            # 利用 any() 函数检查论文领域列表与岗位目标领域是否有交集
+            domain_filter_clause = "AND any(d IN split(w.domain_ids, '|') WHERE d IN $target_domains)"
+
+        final_cypher = f"""
         MATCH (v:Vocabulary) 
         USING INDEX v:Vocabulary(id)
         WHERE v.id IN $all_v_ids
         MATCH (v)<-[:HAS_TOPIC]-(w:Work)
+        WHERE 1=1 {domain_filter_clause}  // <--- 动态注入领域过滤子句
         WITH w, collect(DISTINCT v.id) AS hit_ids LIMIT 500 
         MATCH (w)<-[auth_r:AUTHORED]-(a:Author)
         RETURN a.id AS aid, 
                sum(auth_r.pos_weight) AS raw_rank, 
-               collect({wid: w.id, hits: hit_ids, weight: auth_r.pos_weight}) AS papers
+               collect({{wid: w.id, hits: hit_ids, weight: auth_r.pos_weight}}) AS papers
         ORDER BY raw_rank DESC
         """
 
-        cursor = self.graph.run(final_cypher, all_v_ids=all_ids)
+        # 执行查询，将 target_domains 传入 Cypher 参数
+        cursor = self.graph.run(final_cypher, all_v_ids=all_ids, target_domains=target_domains or [])
 
-        # 3. 内存内分级评分排名：执行作者贡献分摊逻辑
+        # 3. 内存内分级评分排名：执行作者贡献分摊逻辑 (保持原有逻辑)
         scored_authors = []
         processed_count = 0
 
@@ -122,16 +135,13 @@ class LabelRecallPath:
             processed_count += 1
             author_total_score = 0.0
 
-            # --- 优化点：两段式计算策略 ---
-            # 仅对前 100 名高权重的作者执行矩阵运算，后续执行快速路径
+            # --- 两段式计算策略优化 ---
             is_fast_path = processed_count > 100
-
             papers = record['papers']
+
             for paper in papers:
                 h_ids = paper['hits']
                 h_count = len(h_ids)
-
-                # 维度 A：关键词分级评分
                 rank_score = sum([100 if vid in core_ids_set else 20 for vid in h_ids])
 
                 if is_fast_path:
@@ -139,10 +149,7 @@ class LabelRecallPath:
                 else:
                     proximity = self._calculate_proximity_fast(h_ids)
 
-                # 单篇论文质量评分 = (分级分 + 数量平方奖励) * (1 + 内聚度)
                 work_quality = (rank_score + h_count ** 2) * (1 + proximity)
-
-                # 【逻辑修正】：得分 = Σ (论文质量 * 作者在该论文中的贡献权重)
                 author_total_score += (work_quality * paper['weight'])
 
             scored_authors.append({
@@ -150,14 +157,8 @@ class LabelRecallPath:
                 'score': author_total_score
             })
 
-        # 排序并取 Top
         scored_authors.sort(key=lambda x: x['score'], reverse=True)
         duration = (time.time() - start_t) * 1000
-
-        if self.verbose:
-            print(f"\n[原生迭代+贡献分摊评分报告 - TOP 5]")
-            for i, auth in enumerate(scored_authors[:5]):
-                print(f" {i + 1}. 作者: {auth['aid']} | 综合得分: {auth['score']:.2f}")
 
         return [a['aid'] for a in scored_authors[:self.recall_limit]], duration
 

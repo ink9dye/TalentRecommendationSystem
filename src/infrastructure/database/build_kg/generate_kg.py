@@ -40,10 +40,10 @@ def run_pipeline(config):
             # --- 基础实体同步标记 ---
             # state.reset_marker("vocab_sync")
             # state.reset_marker("author_sync")
-            # state.reset_marker("work_sync")
+            state.reset_marker("work_sync")
             # state.reset_marker("inst_sync")  # 机构同步
             # state.reset_marker("source_sync")  # 出版源同步
-            # state.reset_marker("job_sync")  # 岗位同步
+            state.reset_marker("job_sync")  # 岗位同步
             #
             # # --- 关系与语义标记 ---
             # state.reset_marker("topology_sync")  # 专家-论文-机构拓扑关系

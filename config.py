@@ -46,8 +46,8 @@ SQL_QUERIES = {
     "SYNC_AUTHORS": "SELECT author_id as id, name, h_index, works_count, cited_by_count as citations, last_updated FROM authors WHERE last_updated > ? ORDER BY last_updated ASC",
     "SYNC_INSTITUTIONS": "SELECT inst_id as id, name, works_count, cited_by_count as citations, last_updated FROM institutions WHERE last_updated > ? ORDER BY last_updated ASC",
     "SYNC_SOURCES": "SELECT source_id as id,display_name as name, type, works_count, cited_by_count as citations, last_updated FROM sources WHERE last_updated > ? ORDER BY last_updated ASC",
-    "SYNC_WORKS": "SELECT work_id as id,title as name, title, year, citation_count as citations, concepts_text, keywords_text FROM works WHERE year > ? ORDER BY year ASC",
-    "SYNC_JOBS": "SELECT securityId as id, job_name as name, skills, description, crawl_time FROM jobs WHERE crawl_time > ? ORDER BY crawl_time ASC",
+    "SYNC_WORKS": "SELECT work_id as id, title as name, title, year, citation_count as citations, concepts_text, keywords_text, domain_ids FROM works WHERE year > ? ORDER BY year ASC",
+    "SYNC_JOBS": "SELECT securityId as id, job_name as name, skills, description, crawl_time, domain_ids FROM jobs WHERE crawl_time > ? ORDER BY crawl_time ASC",
 
     # 修正：vocabulary 使用 voc_id 作为主键和游标
     "GET_ALL_VOCAB": "SELECT voc_id as id,term as name, term, entity_type FROM vocabulary WHERE voc_id > ? ORDER BY voc_id ASC",
@@ -84,15 +84,17 @@ CYPHER_TEMPLATES = {
         "CREATE CONSTRAINT IF NOT EXISTS FOR (j:Job) REQUIRE j.id IS UNIQUE",
 
         # 原生业务 ID 索引：支持跨库反查
+        "CREATE INDEX IF NOT EXISTS FOR (w:Work) ON (w.domain_ids)",
+        "CREATE INDEX IF NOT EXISTS FOR (j:Job) ON (j.domain_ids)",
         "CREATE INDEX IF NOT EXISTS FOR (v:Vocabulary) ON (v.term)",
         "CREATE INDEX IF NOT EXISTS FOR (a:Author) ON (a.h_index)"
     ],
 
-    "MERGE_WORK": "UNWIND $data AS row MERGE (n:Work {id: row.id}) SET n.title = row.title, n.name = row.name, n.year = row.year, n.citations = row.citations",
+    "MERGE_WORK": "UNWIND $data AS row MERGE (n:Work {id: row.id}) SET n.title = row.title, n.name = row.name, n.year = row.year, n.citations = row.citations, n.domain_ids = row.domain_ids",
     "MERGE_AUTHOR": "UNWIND $data AS row MERGE (n:Author {id: row.id}) SET n.name = row.name, n.h_index = row.h_index, n.works_count = row.works_count, n.citations = row.citations",
     "MERGE_INSTITUTION": "UNWIND $data AS row MERGE (i:Institution {id: row.id}) SET i.name = row.name, i.works_count = row.works_count, i.citations = row.citations",
     "MERGE_SOURCE": "UNWIND $data AS row MERGE (s:Source {id: row.id}) SET s.name = row.name, s.type = row.type, s.works_count = row.works_count, s.citations = row.citations",
-    "MERGE_JOB": "UNWIND $data AS row MERGE (j:Job {id: row.id}) SET j.name = row.name, j.skills = row.skills, j.description = row.description",
+    "MERGE_JOB": "UNWIND $data AS row MERGE (j:Job {id: row.id}) SET j.name = row.name, j.skills = row.skills, j.description = row.description, j.domain_ids = row.domain_ids",
 
     "MERGE_VOCAB": "UNWIND $data AS row MERGE (v:Vocabulary {id: row.id}) SET v.term = toLower(row.term), v.type = row.entity_type",
     # 复杂关系构建：对齐 pos_index 属性名

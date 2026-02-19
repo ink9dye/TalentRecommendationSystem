@@ -75,13 +75,15 @@ class KGATAXTrainingGenerator:
 
     def generate_refined_train_data(self, train_size=3000, test_size=300):
         """
-        任务 1：生成精排训练样本
+        任务 1：生成精排训练样本 (支持 75/25 领域混合策略)
         返回：被抽样用于训练的岗位 ID 列表 (锚点)
         """
         print(f"\n>>> 任务 1: 生成混合排名精排数据...")
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
-        all_jobs = conn.execute("SELECT securityId, job_name, description, skills FROM jobs").fetchall()
+
+        # 【修改点 1】SQL 增加 domain_ids 字段，这是执行硬过滤的物理依据
+        all_jobs = conn.execute("SELECT securityId, job_name, description, skills, domain_ids FROM jobs").fetchall()
 
         # 抽样 3300 个基准岗位
         sampled = random.sample(all_jobs, min(len(all_jobs), train_size + test_size))
@@ -92,6 +94,7 @@ class KGATAXTrainingGenerator:
         self.ENTITY_OFFSET = self.user_counter
 
         train_lines, test_lines = [], []
+        # 训练集和测试集都会遵循同样的 75/25 概率分布
         for job in tqdm(sampled[:train_size], desc="Generating Train"):
             line = self._process_single_job(job)
             if line: train_lines.append(line)
@@ -109,27 +112,45 @@ class KGATAXTrainingGenerator:
         conn.close()
 
         print(f"[OK] 任务 1 完成，共生成 {len(train_lines) + len(test_lines)} 条阶梯样本。")
-        return sampled_job_ids  # 返回锚点 ID 供下一步使用
+        return sampled_job_ids
 
     def _process_single_job(self, job):
+        """
+        处理单个岗位：实现 75/25 领域混合采样策略
+        """
         job_raw_id = str(job['securityId'])
         if job_raw_id not in self.job_id_to_idx: return None
 
+        # 1. 拼接查询文本
         query_text = f"{job['job_name'] or ''} {job['description'] or ''} {job['skills'] or ''}"
-        recall_results = self.recall_system.execute(query_text)
+
+        # --- 【核心修改】75% vs 25% 混合召回策略 ---
+        # 岗位节点的 domain_ids 是数据库中已有的确定信息
+        use_domain = random.random() < 0.75
+
+        # 逻辑：75% 概率传入领域 ID 触发硬过滤；25% 概率传入 None 触发全库搜索
+        target_domain = job['domain_ids'] if use_domain else None
+
+        # 执行召回：此时 recall_system.execute 内部会根据 target_domain 自动处理过滤
+        recall_results = self.recall_system.execute(query_text, domain_id=target_domain)
+        # ------------------------------------------
+
         candidates = recall_results.get('final_top_500', [])
+        # 如果召回结果不足 100 人，则该岗位不具备训练价值，直接跳过
         if len(candidates) < 100: return None
 
-        # 融合排序与抽样
+        # 2. 融合排序与抽样逻辑 (保持原有四级梯度逻辑)
         recall_ranks = {str(aid): i for i, aid in enumerate(candidates)}
         quality_list = sorted([(str(aid), self.author_quality_map.get(str(aid), 0.0)) for aid in candidates],
                               key=lambda x: x[1], reverse=True)
         quality_ranks = {aid: i for i, (aid, _) in enumerate(quality_list)}
 
+        # 综合考虑检索相关性与作者学术质量
         fused = sorted([(str(aid), 0.5 * recall_ranks[str(aid)] + 0.5 * quality_ranks[str(aid)]) for aid in candidates],
                        key=lambda x: x[1])
 
         num_cand = len(fused)
+        # 构建四级梯度样本：Pos (Top 100), Fair (100-400 随机), Neutral (400 以后), EasyNeg (全库随机)
         pos_ids = [str(self.get_ent_id(f"a_{a[0]}")) for a in fused[:min(100, num_cand)]]
         fair_ids = [str(self.get_ent_id(f"a_{a[0]}")) for a in
                     random.sample(fused[min(100, num_cand):min(400, num_cand)],
@@ -140,6 +161,7 @@ class KGATAXTrainingGenerator:
         easy_neg_ids = [str(self.get_ent_id(f"a_{aid}")) for aid in random.sample(potential_pool, 100)]
 
         u_id = self.get_user_id(job_raw_id)
+        # 返回格式化后的训练行
         return f"{u_id};{','.join(pos_ids)};{','.join(fair_ids)};{','.join(neutral_ids)};{','.join(easy_neg_ids)}"
 
     def generate_kg_topology(self, sampled_job_ids: list):

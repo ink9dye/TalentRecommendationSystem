@@ -49,42 +49,62 @@ class TotalRecallSystem:
 
     def execute(self, query_text, domain_id=None, is_training=False):
         """
-        执行多路召回
-        :param query_text: 原始业务需求描述
-        :param domain_id: 领域编号
-        :param is_training: 是否为训练模式。为 True 时禁用所有 Prompt 增强，保证模型训练纯度
+        执行多路召回：实现可选的领域并集筛选与差异化分发
+        :param query_text: 原始业务需求描述文本
+        :param domain_id: 可选，领域编号。支持单 ID (1)、列表 ([1, 4]) 或并集字符串 ("1|4")
+        :param is_training: 是否为训练模式
         """
         start_time = time.time()
 
-        # --- Query 处理策略：平衡原始意图与领域偏置 ---
+        # --- 1. 领域过滤项处理：实现“可选”与“并集”逻辑 ---
+        # 如果不输入 domain_id，则 target_domains 为空列表，各路不假设任何筛选项
+        target_domains = []
+
+        if domain_id:
+            if isinstance(domain_id, list):
+                target_domains = [str(d) for d in domain_id]
+            elif isinstance(domain_id, str):
+                # 支持 "1|4" 这种并集格式（OR 逻辑）
+                target_domains = [d.strip() for d in domain_id.split('|') if d.strip()]
+            else:
+                target_domains = [str(domain_id)]
+
+        # --- 2. Query 处理策略：平衡原始意图与领域偏置 (保持原有逻辑) ---
         final_query = query_text
-        if domain_id and not is_training and domain_id in self.DOMAIN_PROMPTS:
-            bias = self.DOMAIN_PROMPTS[domain_id]
-            # 强化策略：重复原始 Query 增加 Attention 权重，Area 词置于末尾作为滤镜
-            final_query = f"{query_text}, {query_text} | Area: {bias}"
-            # print(f"[*] 引导式检索已激活 (非训练模式)")
+        # 只有在明确存在领域约束且非训练模式下，才激活语义偏置增强
+        if target_domains and not is_training:
+            # 取并集中的第一个作为主要的语义偏置引导词
+            primary_d = target_domains[0]
+            if primary_d in self.DOMAIN_PROMPTS:
+                bias = self.DOMAIN_PROMPTS[primary_d]
+                final_query = f"{query_text}, {query_text} | Area: {bias}"
 
         # 向量编码
         query_vec, encode_duration = self.encoder.encode(final_query)
         faiss.normalize_L2(query_vec)
 
-        # 任务并行化
-        future_v = self.executor.submit(self.v_path.recall, query_vec)
-        future_l = self.executor.submit(self.l_path.recall, query_vec)
+        # --- 3. 差异化任务并行分发：按权重策略传递领域约束 ---
+        # 向量路 (v_path)：传递 target_domains，内部执行必然的 SQL 硬过滤
+        future_v = self.executor.submit(self.v_path.recall, query_vec, target_domains=target_domains)
+
+        # 标签路 (l_path)：传递 target_domains，内部执行必然的 Cypher 硬过滤
+        future_l = self.executor.submit(self.l_path.recall, query_vec, target_domains=target_domains)
 
         v_list, v_cost = future_v.result()
         l_list, l_cost = future_l.result()
 
-        # 社交路协同扩展
+        # --- 4. 社交路 (c_path)：不使用领域过滤，保持扩散性 ---
+        # 它仅基于前两路过滤后的种子作者进行扩展，不直接执行领域匹配逻辑
         seeds = list(set(v_list[:80] + l_list[:80]))
         c_list, c_cost = self.c_path.recall(seeds)
 
-        # RRF 结果融合
+        # 5. RRF 结果融合
         final_list, _ = self._fuse_results(v_list, l_list, c_list)
 
         return {
             "final_top_500": final_list,
             "total_ms": (time.time() - start_time) * 1000,
+            "applied_domains": target_domains,  # 用于调试显示实际生效的过滤项
             "details": {"v_cost": v_cost, "l_cost": l_cost, "c_cost": c_cost}
         }
 

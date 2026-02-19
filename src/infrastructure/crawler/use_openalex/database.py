@@ -55,7 +55,8 @@ class DatabaseManager:
                                   type
                                   TEXT,
                                   language
-                                  TEXT
+                                  TEXT,
+                                  domain_ids TEXT
                               )''')
 
             # 2. 摘要文本表
@@ -354,7 +355,7 @@ class DatabaseManager:
         with self.connection() as conn, self.lock:
             cursor = conn.cursor()
             # 修改：现在 works 表是 10 个字段（移除了 is_alphabetical）
-            cursor.execute("INSERT OR REPLACE INTO works VALUES (?,?,?,?,?,?,?,?,?,?)", work_row)  # 10个问号
+            cursor.execute("INSERT OR REPLACE INTO works VALUES (?,?,?,?,?,?,?,?,?,?,?)", work_row)  # 11个问号
             cursor.execute("INSERT OR REPLACE INTO abstracts VALUES (?,?,?)", abstract_row)
             cursor.executemany("INSERT OR IGNORE INTO vocabulary (term, entity_type) VALUES (?,?)", vocab_terms)
 
@@ -532,6 +533,35 @@ class DatabaseManager:
     def work_exists(self, work_id: str) -> bool:
         with self.connection() as conn:
             return conn.execute("SELECT 1 FROM works WHERE work_id = ?", (work_id,)).fetchone() is not None
+
+    def get_works_missing_concepts(self, limit=1000) -> List[str]:
+        """获取数据库中 concepts_text 为空的论文 ID"""
+        with self.connection() as conn:
+            # 查找 NULL 或空字符串的记录
+            query = "SELECT work_id FROM works WHERE concepts_text IS NULL OR concepts_text = '' LIMIT ?"
+            return [row[0] for row in conn.execute(query, (limit,)).fetchall()]
+
+    def update_work_concepts(self, work_id: str, concepts: str):
+        """仅更新单篇论文的领域标签"""
+        with self.connection() as conn, self.lock:
+            conn.execute(
+                "UPDATE works SET concepts_text = ? WHERE work_id = ?",
+                (concepts, work_id)
+            )
+
+    def save_work_bundle(self, work_row, abstract_row, vocab_terms: List[Tuple[str, str]]):
+        with self.connection() as conn, self.lock:
+            cursor = conn.cursor()
+            # 这里的问号增加到 11 个以匹配新增的 domain_ids 字段
+            cursor.execute("INSERT OR REPLACE INTO works VALUES (?,?,?,?,?,?,?,?,?,?,?)", work_row)
+            cursor.execute("INSERT OR REPLACE INTO abstracts VALUES (?,?,?)", abstract_row)
+            cursor.executemany("INSERT OR IGNORE INTO vocabulary (term, entity_type) VALUES (?,?)", vocab_terms)
+
+    def update_work_domain_ids(self, work_id: str, domain_ids: str):
+        """高效回填领域 ID"""
+        with self.connection() as conn, self.lock:
+            conn.execute("UPDATE works SET domain_ids = ? WHERE work_id = ?", (domain_ids, work_id))
+
 
 
 if __name__ == "__main__":
