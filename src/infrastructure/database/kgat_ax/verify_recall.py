@@ -4,12 +4,14 @@ import numpy as np
 import os
 import random
 import argparse
+import sqlite3
 from tqdm import tqdm
 from trainer import evaluate
 from data_loader import DataLoaderKGAT
 from model import KGAT
 from kgat_parser.parser_kgat import parse_kgat_args
-from config import KGATAX_TRAIN_DATA_DIR
+from config import KGATAX_TRAIN_DATA_DIR, DB_PATH
+from src.core.recall.total_recall import TotalRecallSystem  #
 
 
 class SimpleLogger:
@@ -27,13 +29,14 @@ def run_offline_verification():
     args.data_dir = os.path.dirname(KGATAX_TRAIN_DATA_DIR)
     args.data_name = os.path.basename(KGATAX_TRAIN_DATA_DIR)
 
-    device = torch.device("cpu")  # 评估建议使用 CPU 或大显存 GPU
+    device = torch.device("cpu")  # 评估建议使用 CPU
     weight_path = os.path.join(KGATAX_TRAIN_DATA_DIR, 'weights', 'latest_checkpoint.pth')
 
     if not os.path.exists(weight_path):
         print(f"[Error] 找不到权重文件: {weight_path}")
         return
 
+    # 1. 载入数据与模型
     dataloader = DataLoaderKGAT(args, SimpleLogger())
     args.ENTITY_OFFSET = dataloader.ENTITY_OFFSET
 
@@ -56,7 +59,7 @@ def run_offline_verification():
 
     print("\n" + "=" * 20 + " 深度诊断中 " + "=" * 20)
 
-    # A. 检查 ID 空间
+    # A. 检查 ID 空间 (确保正样本全部落在人才 a_ 空间)
     test_pos_ids = set()
     for ids in dataloader.test_user_dict.values():
         test_pos_ids.update(ids)
@@ -68,48 +71,82 @@ def run_offline_verification():
     else:
         print(f"[OK] ID 偏移校验通过。")
 
-    # B. 【关键修改】提取严格的人才候选池
+    # B. 提取严格的人才候选池 (用于模拟全库排序)
     map_path = os.path.join(KGATAX_TRAIN_DATA_DIR, "id_map.json")
     with open(map_path, 'r', encoding='utf-8') as f:
         mapping = json.load(f)
 
     entity_map = mapping['entity']
-    # 仅保留以 'a_' 开头的人才 ID，剔除 v_ (技能), w_ (作品) 等
     final_author_list = [int_id for raw_id, int_id in entity_map.items() if str(raw_id).startswith('a_')]
-
-    # 校验测试集正样本是否都在这个池子里
-    missing = test_pos_ids - set(final_author_list)
-    if missing:
-        print(f"[警告] 过滤逻辑遗漏了 {len(missing)} 个正样本，已强制补回。")
-        final_author_list = list(set(final_author_list) | missing)
-
-    print(f"[*] 最终评估池规模 (仅限人才): {len(final_author_list)} 人")
-    # 注入 dataloader 供 evaluate 函数使用
     dataloader.author_ids = final_author_list
+    print(f"[*] 全球人才总池规模: {len(final_author_list)} 人")
 
-    # C. 原始得分趋势检查
+    # --- C. 【核心新增】75/25 混合模式分拆评估 ---
+    # 目的：验证模型在“领域硬过滤”与“全库搜索”两种策略下的排序表现
+    print("\n" + "=" * 15 + " 75/25 策略分拆评估 " + "=" * 15)
+
+    # 初始化召回系统以模拟实时检索
+    recall_system = TotalRecallSystem()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+
     test_users = list(dataloader.test_user_dict.keys())
-    if test_users:
-        u_sample = random.choice(test_users)
-        p_sample = dataloader.test_user_dict[u_sample][0]
-        # 随机负样本也限制在人才池内
-        n_sample = random.choice(final_author_list)
+    sample_users = random.sample(test_users, min(len(test_users), 200))  # 抽样评估
 
-        with torch.no_grad():
-            aux_all = dataloader.aux_info_all.to(device)
-            all_embed = model.calc_cf_embeddings(aux_all)
-            p_score = torch.matmul(all_embed[u_sample], all_embed[p_sample].reshape(-1, 1)).item()
-            n_score = torch.matmul(all_embed[u_sample], all_embed[n_sample]).item()
-            print(f"[*] 抽样得分 (User {u_sample}): 正样本 {p_score:.4f} vs 随机人才负样本 {n_score:.4f}")
+    domain_aware_metrics = {'recall': [], 'ndcg': []}
+    general_metrics = {'recall': [], 'ndcg': []}
 
+    for u_int in tqdm(sample_users, desc="Split Mode Testing"):
+        # 反查 Job 的原始描述与 Domain IDs
+        raw_job_id = [k for k, v in dataloader.user_to_int.items() if v == u_int][0]
+        job = conn.execute("SELECT job_name, description, skills, domain_ids FROM jobs WHERE securityId=?",
+                           (raw_job_id,)).fetchone()
+        if not job: continue
+
+        query_text = f"{job['job_name']} {job['description']} {job['skills']}"
+        pos_ids = set(dataloader.test_user_dict[u_int])
+
+        # 模拟 75% 场景：带 Domain 过滤
+        res_d = recall_system.execute(query_text, domain_id=job['domain_ids'])
+        cand_d = [dataloader.entity_to_int.get(f"a_{aid}") for aid in res_d['final_top_500'] if
+                  f"a_{aid}" in dataloader.entity_to_int]
+
+        # 模拟 25% 场景：全库搜索 (domain_id=None)
+        res_g = recall_system.execute(query_text, domain_id=None)
+        cand_g = [dataloader.entity_to_int.get(f"a_{aid}") for aid in res_g['final_top_500'] if
+                  f"a_{aid}" in dataloader.entity_to_int]
+
+        # 评分对比逻辑 (利用本地简易 Rank 逻辑)
+        def score_and_eval(candidates):
+            if not candidates: return 0, 0
+            # 这里调用 model 内部的 calc_score
+            with torch.no_grad():
+                u_e = model.calc_cf_embeddings(dataloader.aux_info_all.to(device))[u_int].unsqueeze(0)
+                i_e = model.calc_cf_embeddings(dataloader.aux_info_all.to(device))[candidates]
+                scores = torch.matmul(u_e, i_e.transpose(0, 1)).squeeze(0)
+                top_idx = torch.argsort(scores, descending=True)[:100].cpu().numpy()
+                ranked_ids = [candidates[i] for i in top_idx]
+
+                # 计算命中率
+                hits = [1 if rid in pos_ids else 0 for rid in ranked_ids]
+                recall = sum(hits) / len(pos_ids) if pos_ids else 0
+                return recall, hits  # 简化版指标
+
+        rec_d, _ = score_and_eval(cand_d)
+        rec_g, _ = score_and_eval(cand_g)
+
+        domain_aware_metrics['recall'].append(rec_d)
+        general_metrics['recall'].append(rec_g)
+
+    conn.close()
+
+    print(f"\n[策略对比报告]")
+    print(f"- 精准模式 (Domain-Aware 75%): 平均 Recall@100: {np.mean(domain_aware_metrics['recall']):.4f}")
+    print(f"- 通用模式 (General Search 25%): 平均 Recall@100: {np.mean(general_metrics['recall']):.4f}")
     print("=" * 50 + "\n")
 
-    # --- 5. 执行评估 ---
-    print(">>> 开始执行精简池评估...")
-    res_train = evaluate(model, dataloader, [20, 100], device, use_test_set=False)
-    for k, v in res_train.items():
-        print(f"Train @{k:3d} | Recall: {v['recall']:.4f} | NDCG: {v['ndcg']:.4f}")
-
+    # --- 2. 标准静态评估 (基于生成的 test.txt) ---
+    print(">>> 开始执行 test.txt 混合池评估...")
     res_test = evaluate(model, dataloader, [20, 100], device, use_test_set=True)
     for k, v in res_test.items():
         print(f"Test  @{k:3d} | Recall: {v['recall']:.4f} | NDCG: {v['ndcg']:.4f}")

@@ -71,50 +71,42 @@ class TotalCore:
 
         return model
 
-    def suggest(self, text_query: str):
+    def suggest(self, text_query: str, manual_domain_id: str = None):
         """
-        核心工作流：语义导航 -> 多路召回 -> 深度精排 (KGATAX 主导版)
+        核心工作流：语义导航(仅精排锚定) -> 可选领域召回 -> 深度精排
+        :param text_query: 原始需求描述
+        :param manual_domain_id: 只有显式输入时，才会触发召回路径的硬过滤
         """
-        # --- Step 1: 语义导航 (Semantic Navigation) ---
-        # 目的：将非结构化描述映射到图谱中已有的“锚点岗位”
-        # 使用向量检索（FAISS）找到与当前描述最接近的 3 个历史岗位 ID
+        # --- Step 1: 语义导航 (仅用于确定精排阶段的坐标中心) ---
         query_vec, _ = self.recall_subsystem.encoder.encode(text_query)
         _, indices = self.recall_subsystem.v_path.job_index.search(query_vec, 3)
 
-        # 获取这 3 个岗位在数据库中的原始 ID (securityId)
+        # 这些锚点 ID 仅用于后续计算 Ranking Score，不用于生成 domain 滤镜
         real_job_ids = [self.recall_subsystem.v_path.job_id_map[idx] for idx in indices[0]]
 
         if not real_job_ids:
-            print("[Error] 语义导航未能锁定任何岗位锚点，请检查 job_index 是否完整。")
+            print("[Error] 语义导航未能锁定任何岗位锚点。")
             return []
 
-        print(f"[*] 语义导航完成，锁定 Top-3 Job 锚点: {real_job_ids}")
+        print(f"[*] 语义导航完成，锁定精排锚点: {real_job_ids}")
 
-        # --- Step 2: 多路召回 (Multi-channel Recall) ---
-        # 目的：快速从全量人才库中筛选出 500 个高潜力候选人
-        # 这里的 execute 通常包含了语义向量召回、标签召回和图谱关系召回的融合
-        recall_res = self.recall_subsystem.execute(text_query)
+        # --- Step 2: 多路召回 (严格遵循“无输入不假设”) ---
+        # 除非 manual_domain_id 有值，否则向量路将执行全库语义召回
+        # 标签路会根据自身逻辑锚定技能，但不会被强制施加领域硬过滤
+        recall_res = self.recall_subsystem.execute(text_query, domain_id=manual_domain_id)
         candidates = recall_res.get('final_top_500', [])
 
         if not candidates:
             print("[Warning] 召回阶段未获得候选人。")
             return []
 
-        # --- Step 3: 深度精排与证据链生成 (KGATAX Reranking) ---
-        # 目的：利用 KGAT 的全息 Embedding 进行多锚点均值融合评分，并生成证据路径
-        # 逻辑流程：
-        # 1. 提取 real_job_ids 的 Embedding 并计算均值中心
-        # 2. 计算 500 人相对于该中心的 KGATAX 匹配得分
-        # 3. 筛选 Top 100
-        # 4. 针对每个人，回溯其与锚点岗位之间的知识路径（证据链）
-
+        # --- Step 3: 深度精排与证据链生成 ---
+        # 利用锚点岗位的 Embedding 均值对 500 名候选人进行重排
         print(f"[*] 进入精排阶段，对 {len(candidates)} 名候选人执行拓扑评估...")
 
-        # 调用 RankingEngine 的执行方法
-        # 传入多锚点 ID 以平滑语义偏置，返回带证据链的 Top 100 结果
         final_results = self.ranking_engine.execute_rank(real_job_ids, candidates)
 
-        print(f"[OK] 流程结束。已生成 100 名候选人的精排列表及对应证据链。")
+        print(f"[OK] 流程结束。已生成 100 名候选人的精排列表。")
         return final_results
 
     def _get_silent_logger(self):

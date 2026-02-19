@@ -15,8 +15,9 @@ from config import DB_PATH
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
+
 class TotalRecallSystem:
-    # --- 全 17 领域精简语义锚点 (用于引导向量偏移，避免喧宾夺主) ---
+    # --- 全 17 领域精简语义锚点 ---
     DOMAIN_PROMPTS = {
         "1": "CS, IT, Software", "2": "Medicine, Biology", "3": "Politics, Law",
         "4": "Engineering, Manufacturing", "5": "Physics, Energy", "6": "Material Science",
@@ -34,7 +35,7 @@ class TotalRecallSystem:
         self.c_path = CollaborativeRecallPath(recall_limit=500)
         self.executor = ThreadPoolExecutor(max_workers=3)
 
-    def _get_author_works(self, author_id, top_n=3):
+    def _get_author_works(self, author_id, top_n=2):
         """利用知识图谱获取作者贡献度最高的代表作"""
         try:
             graph = self.l_path.graph
@@ -49,78 +50,77 @@ class TotalRecallSystem:
 
     def execute(self, query_text, domain_id=None, is_training=False):
         """
-        执行多路召回：实现可选的领域并集筛选与差异化分发
-        :param query_text: 原始业务需求描述文本
-        :param domain_id: 可选，领域编号。支持单 ID (1)、列表 ([1, 4]) 或并集字符串 ("1|4")
-        :param is_training: 是否为训练模式
+        执行多路召回
+        :param domain_id: 为 None 时，内部路径将跳过所有硬过滤逻辑
         """
         start_time = time.time()
 
-        # --- 1. 领域过滤项处理：实现“可选”与“并集”逻辑 ---
-        # 如果不输入 domain_id，则 target_domains 为空列表，各路不假设任何筛选项
+        # --- 1. 领域过滤项处理 ---
         target_domains = []
-
-        if domain_id:
+        if domain_id and str(domain_id).strip():
             if isinstance(domain_id, list):
                 target_domains = [str(d) for d in domain_id]
             elif isinstance(domain_id, str):
-                # 支持 "1|4" 这种并集格式（OR 逻辑）
                 target_domains = [d.strip() for d in domain_id.split('|') if d.strip()]
             else:
                 target_domains = [str(domain_id)]
 
-        # --- 2. Query 处理策略：平衡原始意图与领域偏置 (保持原有逻辑) ---
+        # --- 2. Query 处理策略 ---
         final_query = query_text
-        # 只有在明确存在领域约束且非训练模式下，才激活语义偏置增强
         if target_domains and not is_training:
-            # 取并集中的第一个作为主要的语义偏置引导词
             primary_d = target_domains[0]
             if primary_d in self.DOMAIN_PROMPTS:
                 bias = self.DOMAIN_PROMPTS[primary_d]
-                final_query = f"{query_text}, {query_text} | Area: {bias}"
+                final_query = f"{query_text} | Area: {bias}"
 
-        # 向量编码
-        query_vec, encode_duration = self.encoder.encode(final_query)
+        query_vec, _ = self.encoder.encode(final_query)
         faiss.normalize_L2(query_vec)
 
-        # --- 3. 差异化任务并行分发：按权重策略传递领域约束 ---
-        # 向量路 (v_path)：传递 target_domains，内部执行必然的 SQL 硬过滤
+        # --- 3. 并行分发 ---
+        # 注意：如果 target_domains 为空，路径内部应识别并跳过 SQL/Cypher 的 WHERE 过滤子句
         future_v = self.executor.submit(self.v_path.recall, query_vec, target_domains=target_domains)
-
-        # 标签路 (l_path)：传递 target_domains，内部执行必然的 Cypher 硬过滤
         future_l = self.executor.submit(self.l_path.recall, query_vec, target_domains=target_domains)
 
         v_list, v_cost = future_v.result()
         l_list, l_cost = future_l.result()
 
-        # --- 4. 社交路 (c_path)：不使用领域过滤，保持扩散性 ---
-        # 它仅基于前两路过滤后的种子作者进行扩展，不直接执行领域匹配逻辑
-        seeds = list(set(v_list[:80] + l_list[:80]))
+        # 协同路基于前两路 Top100 种子进行扩散
+        seeds = list(set(v_list[:100] + l_list[:100]))
         c_list, c_cost = self.c_path.recall(seeds)
 
-        # 5. RRF 结果融合
-        final_list, _ = self._fuse_results(v_list, l_list, c_list)
+        # --- 4. 融合并保留名次信息 ---
+        final_list, rank_map = self._fuse_results(v_list, l_list, c_list)
 
         return {
             "final_top_500": final_list,
+            "rank_map": rank_map,  # 包含每路名次的字典
             "total_ms": (time.time() - start_time) * 1000,
-            "applied_domains": target_domains,  # 用于调试显示实际生效的过滤项
-            "details": {"v_cost": v_cost, "l_cost": l_cost, "c_cost": c_cost}
+            "applied_domains": target_domains,
+            "details": {"v_cost": v_cost, "l_cost": l_cost, "cost_c": c_cost}
         }
 
     def _fuse_results(self, v_res, l_res, c_res):
-        """采用 Reciprocal Rank Fusion 进行多路融合"""
+        """RRF 融合，并记录原始路径名次"""
         rrf_k = 60
         scores = {}
-        # 向量路与标签路各占 1.0 权重，协同路作为社交补充占 0.5
-        weights = {"vector": 1.0, "label": 1.0, "collab": 0.5}
-        for path, res_list in [("vector", v_res), ("label", l_res), ("collab", c_res)]:
-            w = weights[path]
+        # 记录每个作者在各路的名次：{aid: {'v': rank, 'l': rank, 'c': rank}}
+        rank_map = {}
+
+        paths = [("v", v_res, 5), ("l", l_res, 4), ("c", c_res, 3)]
+
+        for p_tag, res_list, weight in paths:
             for rank, aid in enumerate(res_list):
-                score = w * (1.0 / (rrf_k + rank + 1))
+                # 累加 RRF 分数
+                score = weight * (1.0 / (rrf_k + rank + 1))
                 scores[aid] = scores.get(aid, 0) + score
+
+                # 记录名次（1-based）
+                if aid not in rank_map:
+                    rank_map[aid] = {'v': '-', 'l': '-', 'c': '-'}
+                rank_map[aid][p_tag] = rank + 1
+
         sorted_candidates = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        return [item[0] for item in sorted_candidates[:500]], scores
+        return [item[0] for item in sorted_candidates[:500]], rank_map
 
 
 if __name__ == "__main__":
@@ -132,44 +132,45 @@ if __name__ == "__main__":
         "16": "地质学", "17": "经济学"
     }
 
-    print("\n" + "=" * 85)
-    print("🚀 人才推荐系统 - 全量召回测试 (支持 17 领域解耦检索)")
-    print("-" * 85)
+    print("\n" + "=" * 115)
+    print("🚀 人才推荐系统 - 全量召回测试 (领域硬过滤开关模式)")
+    print("-" * 115)
     f_list = list(fields.items())
     for i in range(0, len(f_list), 6):
         print(" | ".join([f"{k}:{v}" for k, v in f_list[i:i + 6]]))
-    print("=" * 85)
+    print("=" * 115)
 
     try:
-        # 交互层：选择测试领域
         domain_choice = input("\n请选择领域编号 (直接回车则搜索【默认全领域】): ").strip()
         current_field = fields.get(domain_choice, "全领域")
-        print(f"[*] 当前锁定搜索上下文：{current_field}")
+        print(
+            f"[*] 当前锁定上下文：{current_field} {'(已禁用领域硬过滤)' if current_field == '全领域' else '(已激活硬过滤)'}")
 
         while True:
-            user_input = input(f"\n[{current_field}] 请输入业务需求关键词 (输入 'q' 退出): \n>> ").strip()
+            user_input = input(f"\n[{current_field}] 输入关键词 (q退出): ").strip()
             if not user_input or user_input.lower() == 'q': break
 
-            # 执行召回
-            results = system.execute(user_input, domain_id=domain_choice, is_training=False)
+            results = system.execute(user_input, domain_id=domain_choice)
             candidates = results['final_top_500']
+            rank_map = results['rank_map']
 
-            print(f"\n[任务概览] 总响应时间: {results['total_ms']:.2f} ms")
-            print("-" * 110)
-            print(f"{'排名':<4} | {'作者 ID':<12} | {'图谱代表作 (pos_weight)'}")
-            print("-" * 110)
+            print(
+                f"\n[任务概览] 总耗时: {results['total_ms']:.2f} ms | 向量路: {results['details']['v_cost']:.1f}ms | 标签路: {results['details']['l_cost']:.1f}ms")
+            print("-" * 115)
+            # 增加各路名次打印 (V:向量路, L:标签路, C:协同路)
+            print(f"{'综合排名':<6} | {'作者 ID':<10} | {'各路名次 (V/L/C)':<15} | {'图谱代表作 (权重)'}")
+            print("-" * 115)
 
-            # 打印 Top 20 及其高权重论文
             for rank, aid in enumerate(candidates[:20], 1):
-                works = system._get_author_works(aid, top_n=2)
-                if works:
-                    # 显示标题和计算出的贡献权重
-                    info = " / ".join([f"《{w['title'][:50]}...》({w['weight']:.3f})" for w in works])
-                else:
-                    info = "⚠️ 图谱无关联数据"
-                print(f"{rank:<4} | {aid:<12} | {info}")
+                rm = rank_map[aid]
+                path_ranks = f"V:{rm['v']:>3} L:{rm['l']:>3} C:{rm['c']:>3}"
 
-            print("-" * 110)
+                works = system._get_author_works(aid, top_n=1)
+                info = f"《{works[0]['title'][:50]}...》({works[0]['weight']:.3f})" if works else "无数据"
+
+                print(f"#{rank:<5} | {aid:<10} | {path_ranks:<15} | {info}")
+
+            print("-" * 115)
 
     except KeyboardInterrupt:
         print("\n系统已安全退出")
