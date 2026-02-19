@@ -144,56 +144,70 @@ class KGATAXTrainingGenerator:
 
     def generate_kg_topology(self, sampled_job_ids: list):
         """
-        任务 2：全量拓扑收割
-        1. 登记 Neo4j 中几万个岗位的 ID。
-        2. 导出 3300 个训练锚点用于精排语义代理。
+        任务 2：全量加权拓扑收割
+        修正点：提取 pos_weight 和 score，并将权重持久化到 kg_final.txt 中。
         """
-        print(f"\n>>> 任务 2: 执行全量 ID 登记与 12.8M 拓扑收割...")
+        print(f"\n>>> 任务 2: 执行全量 ID 登记与加权拓扑收割...")
 
-        # --- [关键修改：全量岗位 ID 登记] ---
-        # 扫描 Neo4j 全量几万个 Job 节点，确保它们都在 User ID 空间内
-        print("[*] 正在登记 Neo4j 中的全量岗位 ID 映射...")
+        # 1. 登记全量岗位 ID (保持原逻辑)
         all_job_res = self.graph.run("MATCH (j:Job) RETURN j.id as jid").data()
         for res in tqdm(all_job_res, desc="Registering All Jobs"):
             self.get_user_id(str(res['jid']))
 
-        # 锁定全量偏移量
         self.ENTITY_OFFSET = self.user_counter
-        print(f"[OK] 全量岗位登记完成。User 空间规模: {self.ENTITY_OFFSET}")
 
-        # --- [关键修改：持久化 3300 训练锚点] ---
+        # 2. 导出锚点 (保持原逻辑)
         anchor_path = os.path.join(self.output_dir, "trained_anchors.json")
         with open(anchor_path, "w", encoding='utf-8') as f:
             json.dump(sampled_job_ids, f, indent=4, ensure_ascii=False)
-        print(f"[OK] 已导出训练锚点名单至: {anchor_path}")
 
-        kg_triplets = []
+        kg_triplets = []  # 现在存储 (h, r, t, weight)
         rel_map = {"AUTHORED": 1, "PRODUCED_BY": 2, "PUBLISHED_IN": 3, "HAS_TOPIC": 4, "REQUIRE_SKILL": 5,
                    "SIMILAR_TO": 6}
 
         for rel_name, rel_id in rel_map.items():
-            print(f"[*] 正在收割关系: {rel_name} (ID: {rel_id})")
+            print(f"[*] 正在收割加权关系: {rel_name} (ID: {rel_id})")
             h_l, t_l = self._get_labels(rel_name)
             if not h_l: continue
 
-            res = self.graph.run(f"MATCH (n:{h_l})-[r:{rel_name}]->(m:{t_l}) RETURN n.id as hid, m.id as tid").data()
+            # --- 核心修改：增加对 weight (pos_weight) 和 score 的提取 ---
+            query = f"""
+            MATCH (n:{h_l})-[r:{rel_name}]->(m:{t_l}) 
+            RETURN n.id as hid, m.id as tid, r.pos_weight as weight, r.score as score
+            """
+            res = self.graph.run(query).data()
+
             for r in tqdm(res, desc=f"Mapping {rel_name}", leave=False):
                 h_raw, t_raw = str(r['hid']), str(r['tid'])
+
+                # 处理 ID 映射
                 if rel_id == 5:
                     h_int = self.get_user_id(h_raw)
                 else:
                     h_int = self.get_ent_id(f"{self._get_prefix_by_label(h_l)}{h_raw}")
                 t_int = self.get_ent_id(f"{self._get_prefix_by_label(t_l)}{t_raw}")
-                kg_triplets.append((h_int, rel_id, t_int))
 
-        # 持久化输出
-        df = pd.DataFrame(kg_triplets, columns=['h', 'r', 't']).drop_duplicates()
+                # --- 核心修改：确定该边的最终权重 ---
+                # 1. 如果是 AUTHORED，取 pos_weight (内含时序衰减)
+                # 2. 如果是 SIMILAR_TO，取 score
+                # 3. 其他默认 1.0
+                edge_w = r.get('weight') or r.get('score') or 1.0
+
+                kg_triplets.append((h_int, rel_id, t_int, round(float(edge_w), 4)))
+
+        # 3. 持久化输出加权三元组
+        print(f"[*] 正在写入加权拓扑文件 kg_final.txt...")
+        # 去重时保留权重
+        df = pd.DataFrame(kg_triplets, columns=['h', 'r', 't', 'w']).drop_duplicates(subset=['h', 'r', 't'])
         final_list = df[df['h'] != df['t']].values.tolist()
+
         with open(os.path.join(self.output_dir, "kg_final.txt"), "w", encoding='utf-8') as f:
-            for h, r, t in final_list: f.write(f"{h} {r} {t}\n")
+            for h, r, t, w in final_list:
+                # 格式改为: h r t w
+                f.write(f"{int(h)} {int(r)} {int(t)} {w}\n")
 
         self._save_mapping()
-        print(f"[OK] 拓扑构建完成，最终边数: {len(final_list)}")
+        print(f"[OK] 拓扑构建完成，包含权重信息。最终边数: {len(final_list)}")
 
     def _get_labels(self, rel):
         m = {"AUTHORED": ("Author", "Work"), "PRODUCED_BY": ("Work", "Institution"), "PUBLISHED_IN": ("Work", "Source"),
