@@ -12,9 +12,9 @@ from config import (
 
 class LabelRecallPath:
     """
-    标签路召回极限优化版 - 严格关联评分版
-    逻辑：描述向量 -> Top3岗位 -> 岗位Skill(工业词) -> SIMILAR_TO(学术词) -> 论文 -> 学者
-    评分：仅针对 工业词 和 其关联学术词 计分，其余词计0分
+    标签路召回极限优化版 - 领域增强过滤版
+    逻辑：描述向量 -> 领域限定岗位 -> 岗位Skill -> 知识扩展 -> 领域限定论文 -> 学者
+    针对 Domain ID 匹配逻辑：支持复合 ID (如 "1,14")，输入 "1" 可匹配 "1" 或 "1,14"，但不匹配 "14"
     """
 
     def __init__(self, recall_limit=200):
@@ -38,7 +38,6 @@ class LabelRecallPath:
         self.vocab_index = faiss.read_index(VOCAB_INDEX_PATH)
         with open(VOCAB_MAP_PATH, 'r', encoding='utf-8') as f:
             self.vocab_id_map = json.load(f)
-            # 统一使用字符串作为Key
             self.vocab_to_idx = {str(vid): i for i, vid in enumerate(self.vocab_id_map)}
 
         print("[*] 正在预载入词汇向量矩阵...")
@@ -46,20 +45,43 @@ class LabelRecallPath:
         self.all_vocab_vectors = self.vocab_index.reconstruct_n(0, ntotal).astype('float32')
         print(f"[OK] 预载入 {ntotal} 个词汇向量完成")
 
-    def _get_skills_from_top_jobs(self, query_vector, top_k=3):
-        """步骤 1 & 2: 向量 -> 岗位 -> 工业Skill"""
-        _, indices = self.job_index.search(query_vector, top_k)
-        job_ids = [self.job_id_map[idx] for idx in indices[0] if 0 <= idx < len(self.job_id_map)]
+    def _get_skills_from_top_jobs(self, query_vector, domain_ids=None, top_k=3):
+        """步骤 1 & 2: 向量 -> 岗位 -> 工业Skill (包含领域过滤)"""
+        # 初始检索范围稍大，以确保在过滤后仍能凑齐 top_k
+        search_k = 100 if domain_ids else top_k
+        _, indices = self.job_index.search(query_vector, search_k)
+        candidate_job_ids = [self.job_id_map[idx] for idx in indices[0] if 0 <= idx < len(self.job_id_map)]
 
-        cypher = """
+        if domain_ids and str(domain_ids) != "0":
+            # 匹配逻辑：使用正则确保 ID 是独立的数字。例如输入 "1"，匹配 "1" 或 "1,14" 或 "14,1"
+            # (?i) 代表不区分大小写, (^|,) 确保开头或逗号分隔
+            regex_pattern = f"(^|,){domain_ids}(,|$)"
+
+            cypher_filter = """
+            MATCH (j:Job) WHERE j.id IN $j_ids
+            AND j.domain_ids =~ $regex
+            RETURN j.id AS jid
+            LIMIT $top_k
+            """
+            cursor = self.graph.run(cypher_filter, j_ids=candidate_job_ids, regex=regex_pattern, top_k=top_k)
+            target_job_ids = [record['jid'] for record in cursor]
+
+            # 如果领域内岗位不足，从候选里按相关度补齐（不限领域）
+            if len(target_job_ids) < top_k:
+                for jid in candidate_job_ids:
+                    if jid not in target_job_ids:
+                        target_job_ids.append(jid)
+                    if len(target_job_ids) >= top_k: break
+        else:
+            target_job_ids = candidate_job_ids[:top_k]
+
+        cypher_skills = """
         MATCH (j:Job) WHERE j.id IN $j_ids
         MATCH (j)-[:REQUIRE_SKILL]->(v:Vocabulary)
         RETURN DISTINCT v.id AS vid, v.term AS term
         """
-        cursor = self.graph.run(cypher, j_ids=job_ids)
-        core_skills = {}
-        for record in cursor:
-            core_skills[str(record['vid'])] = record['term']
+        cursor = self.graph.run(cypher_skills, j_ids=target_job_ids)
+        core_skills = {str(record['vid']): record['term'] for record in cursor}
         return core_skills
 
     def _calculate_proximity_fast(self, hit_ids):
@@ -73,17 +95,17 @@ class LabelRecallPath:
         upper_tri = sim_matrix[np.triu_indices(n, k=1)]
         return float(np.mean(upper_tri))
 
-    def recall(self, query_vector):
+    def recall(self, query_vector, domain_ids=None):
         if self.graph is None: return [], 0
         start_t = time.time()
 
-        # 1. 获取核心工业词 (根据向量匹配到的前3个岗位)
-        core_skills_map = self._get_skills_from_top_jobs(query_vector, top_k=3)
+        # 1. 获取核心工业词
+        core_skills_map = self._get_skills_from_top_jobs(query_vector, domain_ids=domain_ids, top_k=3)
         if not core_skills_map: return [], 0
 
         core_vids = [int(vid) for vid in core_skills_map.keys()]
 
-        # 2. 知识图谱联想扩展 (工业词 -> 学术词)
+        # 2. 知识图谱联想扩展
         expand_cypher = """
         MATCH (v:Vocabulary) WHERE v.id IN $v_ids
         MATCH (v)-[:SIMILAR_TO]-(v_rel:Vocabulary)
@@ -91,37 +113,40 @@ class LabelRecallPath:
         """
         ext_cursor = self.graph.run(expand_cypher, v_ids=core_vids)
 
-        # 关键字典：存储所有“有资格”拿分的词
-        # 工业原词权重 100，关联学术词权重 60
         valid_score_map = {}
         vocab_term_map = {}
 
-        # 先存工业原词
         for vid, term in core_skills_map.items():
             valid_score_map[vid] = 100
             vocab_term_map[vid] = term
 
-        # 再存关联学术词
         for rec in ext_cursor:
             rel_id_s = str(rec['rel_id'])
-            # 如果学术词本身不是工业原词，则赋予学术分
             if rel_id_s not in valid_score_map:
                 valid_score_map[rel_id_s] = 60
                 vocab_term_map[rel_id_s] = rec['rel_term']
 
-        # 只有在 valid_score_map 里的词 ID 才是我们要搜索的
         all_eligible_vids = [int(vid) for vid in valid_score_map.keys()]
 
-        # 3. 执行最终召回：只找含有这些“有效词”的论文
-        final_cypher = """
+        # 3. 执行最终召回：增加论文 Domain 匹配逻辑
+        # 使用正则过滤 Work(论文) 的 domain_ids
+        domain_filter_clause = ""
+        params = {"all_v_ids": all_eligible_vids}
+
+        if domain_ids and str(domain_ids) != "0":
+            domain_filter_clause = "AND w.domain_ids =~ $regex"
+            params["regex"] = f"(^|,){domain_ids}(,|$)"
+
+        final_cypher = f"""
         MATCH (v:Vocabulary) WHERE v.id IN $all_v_ids
         MATCH (v)<-[:HAS_TOPIC]-(w:Work)
+        WHERE 1=1 {domain_filter_clause}
         WITH w, collect(DISTINCT v.id) AS hit_ids LIMIT 1000 
         MATCH (w)<-[auth_r:AUTHORED]-(a:Author)
         RETURN a.id AS aid, 
-               collect({wid: w.id, hits: hit_ids, weight: auth_r.pos_weight, title: w.title, year: w.year}) AS papers
+               collect({{wid: w.id, hits: hit_ids, weight: auth_r.pos_weight, title: w.title, year: w.year}}) AS papers
         """
-        cursor = self.graph.run(final_cypher, all_v_ids=all_eligible_vids)
+        cursor = self.graph.run(final_cypher, **params)
 
         scored_authors = []
         all_works_found = set()
@@ -134,28 +159,22 @@ class LabelRecallPath:
             for paper in papers:
                 all_works_found.add(paper['wid'])
                 h_ids = paper['hits']
-
                 rank_score = 0
                 hit_terms = []
-                valid_hids_for_prox = []  # 仅记录有分的词用于计算紧凑度
+                valid_hids_for_prox = []
 
                 for vid in h_ids:
                     s_vid = str(vid)
-                    # 严格判定：只有在 valid_score_map 中的词才给分
                     if s_vid in valid_score_map:
                         s = valid_score_map[s_vid]
                         rank_score += s
                         hit_terms.append(f"{vocab_term_map[s_vid]}({int(s)})")
                         valid_hids_for_prox.append(vid)
-                    # 否则 rank_score 不变 (即为 0 分)，也不计入命中列表
 
-                if rank_score == 0: continue  # 理论上 Cypher 已经过滤，此处做双重保险
+                if rank_score == 0: continue
 
                 proximity = self._calculate_proximity_fast(valid_hids_for_prox)
-                # 质量分 = 有效词分值总和 * (1 + 语义向心力)
                 work_quality = rank_score * (1 + proximity)
-
-                # 结合作者贡献权重 W
                 w_val = paper['weight'] if paper['weight'] > 0 else 0.001
                 contribution = work_quality * w_val
                 author_total_score += contribution
@@ -194,23 +213,29 @@ class LabelRecallPath:
 if __name__ == "__main__":
     l_path = LabelRecallPath(recall_limit=200)
     print("\n" + "=" * 80)
-    print("🚀 标签路 (LabelPath) - 严格关联评分模式")
+    print("🚀 标签路 (LabelPath) - 严格领域匹配模式 (正则过滤)")
     print("=" * 80)
 
     try:
         while True:
-            raw_input = input("\n请输入向量 JSON 或 'q' 退出: ").strip()
+            # 输入 domain_ids, 如 "1"
+            domain_ids = input("\n请输入 Domain ID (1-17, 0或回车跳过): ").strip()
+            if not domain_ids: domain_ids = "0"
+
+            raw_input = input("请输入向量 JSON 或 'q' 退出: ").strip()
             if not raw_input or raw_input.lower() == 'q': break
+
             try:
                 vector_list = json.loads(raw_input)
                 query_vec = np.array([vector_list]).astype('float32')
                 faiss.normalize_L2(query_vec)
-                top_ids, search_time = l_path.recall(query_vec)
+
+                top_ids, search_time = l_path.recall(query_vec, domain_ids=domain_ids)
                 db = l_path.last_debug_info
 
-                print(f"\n[分析报告]")
+                print(f"\n[分析报告 - 当前领域限制: {domain_ids}]")
                 print(f" > 匹配岗位核心词: {db.get('anchor_skills')}")
-                print(f" > 检索到论文: {db.get('work_count')} | 有效学者: {db.get('author_count')}")
+                print(f" > 检索到论文数: {db.get('work_count')} | 有效学者数: {db.get('author_count')}")
 
                 print(f"\n{'排名':<3} | {'作者 ID':<12} | {'总分':<8} | {'篇数':<4} | {'最高贡献论文明细'}")
                 print("-" * 120)

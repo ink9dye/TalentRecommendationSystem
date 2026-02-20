@@ -30,6 +30,7 @@ class TotalRecallSystem:
     def __init__(self):
         print("[*] 正在初始化全量召回系统 (Training-Safe Mode)...", flush=True)
         self.encoder = QueryEncoder()
+        # 增加召回上限，为后续精排留足空间
         self.v_path = VectorPath(recall_limit=500)
         self.l_path = LabelRecallPath(recall_limit=500)
         self.c_path = CollaborativeRecallPath(recall_limit=500)
@@ -51,70 +52,66 @@ class TotalRecallSystem:
     def execute(self, query_text, domain_id=None, is_training=False):
         """
         执行多路召回
-        :param domain_id: 为 None 时，内部路径将跳过所有硬过滤逻辑
+        :param domain_id: 输入 1-17 的字符串，若为 "0" 或 None 则视为全领域搜索
         """
         start_time = time.time()
 
-        # --- 1. 领域过滤项处理 ---
-        target_domains = []
-        if domain_id and str(domain_id).strip():
-            if isinstance(domain_id, list):
-                target_domains = [str(d) for d in domain_id]
-            elif isinstance(domain_id, str):
-                target_domains = [d.strip() for d in domain_id.split('|') if d.strip()]
-            else:
-                target_domains = [str(domain_id)]
+        # --- 1. 领域过滤逻辑预处理 ---
+        # 统一处理 domain_id：如果是 "0" 或 空字符串，设为 None 以触发各路径的“全召回”逻辑
+        processed_domain = None
+        if domain_id and str(domain_id).strip() not in ["0", ""]:
+            processed_domain = str(domain_id).strip()
 
-        # --- 2. Query 处理策略 ---
+        # --- 2. 语义增强 (Query Expansion) ---
         final_query = query_text
-        if target_domains and not is_training:
-            primary_d = target_domains[0]
-            if primary_d in self.DOMAIN_PROMPTS:
-                bias = self.DOMAIN_PROMPTS[primary_d]
+        if processed_domain and not is_training:
+            # 只有在指定了有效领域时，才在 Query 后面挂载语义锚点，增强向量路的准确性
+            if processed_domain in self.DOMAIN_PROMPTS:
+                bias = self.DOMAIN_PROMPTS[processed_domain]
                 final_query = f"{query_text} | Area: {bias}"
 
+        # 向量转换
         query_vec, _ = self.encoder.encode(final_query)
         faiss.normalize_L2(query_vec)
 
-        # --- 3. 并行分发 ---
-        # 注意：如果 target_domains 为空，路径内部应识别并跳过 SQL/Cypher 的 WHERE 过滤子句
-        future_v = self.executor.submit(self.v_path.recall, query_vec, target_domains=target_domains)
-        future_l = self.executor.submit(self.l_path.recall, query_vec, target_domains=target_domains)
+        # --- 3. 并行召回分发 ---
+        # 将 processed_domain 传递给底层，底层 LabelRecallPath 会据此拼接 Cypher
+        # 注意：这里参数名对齐为你修改后的 domain_ids
+        future_v = self.executor.submit(self.v_path.recall, query_vec, target_domains=processed_domain)
+        future_l = self.executor.submit(self.l_path.recall, query_vec, domain_ids=processed_domain)
 
         v_list, v_cost = future_v.result()
         l_list, l_cost = future_l.result()
 
-        # 协同路基于前两路 Top100 种子进行扩散
+        # --- 4. 协同路扩散 (基于向量路和标签路的最优种子) ---
         seeds = list(set(v_list[:100] + l_list[:100]))
         c_list, c_cost = self.c_path.recall(seeds)
 
-        # --- 4. 融合并保留名次信息 ---
+        # --- 5. RRF 结果融合 ---
         final_list, rank_map = self._fuse_results(v_list, l_list, c_list)
 
         return {
             "final_top_500": final_list,
-            "rank_map": rank_map,  # 包含每路名次的字典
+            "rank_map": rank_map,
             "total_ms": (time.time() - start_time) * 1000,
-            "applied_domains": target_domains,
+            "applied_domains": processed_domain if processed_domain else "All Fields",
             "details": {"v_cost": v_cost, "l_cost": l_cost, "cost_c": c_cost}
         }
 
     def _fuse_results(self, v_res, l_res, c_res):
-        """RRF 融合，并记录原始路径名次"""
+        """RRF (Reciprocal Rank Fusion) 融合"""
         rrf_k = 60
         scores = {}
-        # 记录每个作者在各路的名次：{aid: {'v': rank, 'l': rank, 'c': rank}}
         rank_map = {}
 
-        paths = [("v", v_res, 5), ("l", l_res, 4), ("c", c_res, 3)]
+        # 赋予不同召回路径不同的基础权重
+        paths = [("v", v_res, 1.2), ("l", l_res, 1.1), ("c", c_res, 0.6)]
 
         for p_tag, res_list, weight in paths:
             for rank, aid in enumerate(res_list):
-                # 累加 RRF 分数
                 score = weight * (1.0 / (rrf_k + rank + 1))
                 scores[aid] = scores.get(aid, 0) + score
 
-                # 记录名次（1-based）
                 if aid not in rank_map:
                     rank_map[aid] = {'v': '-', 'l': '-', 'c': '-'}
                 rank_map[aid][p_tag] = rank + 1
@@ -133,7 +130,7 @@ if __name__ == "__main__":
     }
 
     print("\n" + "=" * 115)
-    print("🚀 人才推荐系统 - 全量召回测试 (领域硬过滤开关模式)")
+    print("🚀 人才推荐系统 - 生产级全量召回集成版")
     print("-" * 115)
     f_list = list(fields.items())
     for i in range(0, len(f_list), 6):
@@ -141,36 +138,49 @@ if __name__ == "__main__":
     print("=" * 115)
 
     try:
-        domain_choice = input("\n请选择领域编号 (直接回车则搜索【默认全领域】): ").strip()
+        # 1. 领域选择（一次锁定，多次查询）
+        domain_choice = input("\n请选择领域编号 (1-17, 0或回车跳过): ").strip()
         current_field = fields.get(domain_choice, "全领域")
-        print(
-            f"[*] 当前锁定上下文：{current_field} {'(已禁用领域硬过滤)' if current_field == '全领域' else '(已激活硬过滤)'}")
+        print(f"[*] 当前系统环境：{current_field} {'(硬过滤已激活)' if domain_choice in fields else '(全领域广度搜索)'}")
 
         while True:
-            user_input = input(f"\n[{current_field}] 输入关键词 (q退出): ").strip()
-            if not user_input or user_input.lower() == 'q': break
+            # 2. 需求输入
+            user_input = input(f"\n[{current_field}] 请输入岗位需求或技术关键词 (q退出): ").strip()
+            if not user_input or user_input.lower() == 'q':
+                break
 
+            # 3. 执行系统召回
             results = system.execute(user_input, domain_id=domain_choice)
             candidates = results['final_top_500']
             rank_map = results['rank_map']
 
-            print(
-                f"\n[任务概览] 总耗时: {results['total_ms']:.2f} ms | 向量路: {results['details']['v_cost']:.1f}ms | 标签路: {results['details']['l_cost']:.1f}ms")
+            # 4. 打印报告
+            print(f"\n[召回报告] 耗时: {results['total_ms']:.2f}ms | 路径耗时: V={results['details']['v_cost']:.1f}ms, L={results['details']['l_cost']:.1f}ms, C={results['details']['cost_c']:.1f}ms")
             print("-" * 115)
-            # 增加各路名次打印 (V:向量路, L:标签路, C:协同路)
-            print(f"{'综合排名':<6} | {'作者 ID':<10} | {'各路名次 (V/L/C)':<15} | {'图谱代表作 (权重)'}")
+            print(f"{'综合排名':<6} | {'作者 ID':<10} | {'各路名次 (V/L/C)':<15} | {'知识图谱核心作 (权重)'}")
             print("-" * 115)
 
             for rank, aid in enumerate(candidates[:20], 1):
                 rm = rank_map[aid]
-                path_ranks = f"V:{rm['v']:>3} L:{rm['l']:>3} C:{rm['c']:>3}"
+                # 格式化各路名次显示
+                v_rank = f"{rm['v']}" if rm['v'] != '-' else "-"
+                l_rank = f"{rm['l']}" if rm['l'] != '-' else "-"
+                c_rank = f"{rm['c']}" if rm['c'] != '-' else "-"
+                path_ranks = f"V:{v_rank:>3} L:{l_rank:>3} C:{c_rank:>3}"
 
+                # 获取代表作信息
                 works = system._get_author_works(aid, top_n=1)
-                info = f"《{works[0]['title'][:50]}...》({works[0]['weight']:.3f})" if works else "无数据"
+                if works:
+                    work_title = works[0]['title']
+                    if len(work_title) > 60: work_title = work_title[:57] + "..."
+                    info = f"《{work_title}》({works[0]['weight']:.3f})"
+                else:
+                    info = "暂无图谱论文数据"
 
                 print(f"#{rank:<5} | {aid:<10} | {path_ranks:<15} | {info}")
 
             print("-" * 115)
+            print(f"[*] 已召回 {len(candidates)} 名候选人，上方显示前 20 名综合最优解。")
 
     except KeyboardInterrupt:
-        print("\n系统已安全退出")
+        print("\n[!] 系统安全退出。")

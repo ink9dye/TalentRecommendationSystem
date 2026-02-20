@@ -90,9 +90,6 @@ class KGATAXTrainingGenerator:
         # 记录基准岗位原始 ID
         sampled_job_ids = [str(j['securityId']) for j in sampled]
 
-        for j in sampled: self.get_user_id(j['securityId'])
-        self.ENTITY_OFFSET = self.user_counter
-
         train_lines, test_lines = [], []
         # 训练集和测试集都会遵循同样的 75/25 概率分布
         for job in tqdm(sampled[:train_size], desc="Generating Train"):
@@ -146,7 +143,7 @@ class KGATAXTrainingGenerator:
         quality_ranks = {aid: i for i, (aid, _) in enumerate(quality_list)}
 
         # 综合考虑检索相关性与作者学术质量
-        fused = sorted([(str(aid), 0.5 * recall_ranks[str(aid)] + 0.5 * quality_ranks[str(aid)]) for aid in candidates],
+        fused = sorted([(str(aid), 0.6 * recall_ranks[str(aid)] + 0.4 * quality_ranks[str(aid)]) for aid in candidates],
                        key=lambda x: x[1])
 
         num_cand = len(fused)
@@ -171,14 +168,9 @@ class KGATAXTrainingGenerator:
         """
         print(f"\n>>> 任务 2: 执行全量 ID 登记与加权拓扑收割...")
 
-        # 1. 登记全量岗位 ID (保持原逻辑)
-        all_job_res = self.graph.run("MATCH (j:Job) RETURN j.id as jid").data()
-        for res in tqdm(all_job_res, desc="Registering All Jobs"):
-            self.get_user_id(str(res['jid']))
 
-        self.ENTITY_OFFSET = self.user_counter
 
-        # 2. 导出锚点 (保持原逻辑)
+        #  导出锚点 (保持原逻辑)
         anchor_path = os.path.join(self.output_dir, "trained_anchors.json")
         with open(anchor_path, "w", encoding='utf-8') as f:
             json.dump(sampled_job_ids, f, indent=4, ensure_ascii=False)
@@ -254,7 +246,22 @@ class KGATAXTrainingGenerator:
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     gen = KGATAXTrainingGenerator()
-    # 1. 运行任务 1 并获取 3300 锚点 ID
+
+    # 第一步：锁定全局 ID 偏移量 (从 Neo4j 读取全量岗位)
+    print("\n[*] 正在从 Neo4j 锁定全局 ID 偏移量 (执行人口普查)...")
+    # 这里的查询必须覆盖所有可能的 Job 节点
+    all_job_res = gen.graph.run("MATCH (j:Job) RETURN j.id as jid").data()
+
+    for res in tqdm(all_job_res, desc="登记全量岗位 ID"):
+        # 强制将 Neo4j 里的所有 Job ID 映射到 User 空间 (0 ~ OFFSET-1)
+        gen.get_user_id(str(res['jid']))
+
+    # 核心锁：一旦赋值，后面绝不能再改 self.ENTITY_OFFSET
+    gen.ENTITY_OFFSET = gen.user_counter
+    print(f"[OK] ENTITY_OFFSET 已锁定为: {gen.ENTITY_OFFSET}")
+
+    # 第二步：生成精排样本 (此时使用已锁定的 OFFSET)
     trained_anchors = gen.generate_refined_train_data(train_size=3000, test_size=300)
-    # 2. 运行任务 2 执行全量映射与收割
+
+    # 第三步：执行全量拓扑收割
     gen.generate_kg_topology(sampled_job_ids=trained_anchors)

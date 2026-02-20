@@ -12,58 +12,52 @@ class RankScorer:
         self.dataloader = dataloader
         self.device = device
 
-
     def compute_scores(self, real_job_ids: list, candidate_raw_ids: list):
         """
-        执行深度精排评分，并集成全链路诊断逻辑。
+        【修复版】执行局部精排评分，仅针对 500 名候选人，杜绝内存溢出。
         """
         self.model.eval()
 
-        # 1. 岗位锚点 ID 转换诊断
-        # 统计有多少个锚点岗位在 ID 空间中找到了对应位置
+        # 1. 岗位锚点 ID 转换诊断 (Job Anchors)
         job_int_ids = [self.dataloader.user_to_int.get(str(jid).strip(), 0) for jid in real_job_ids]
         valid_jobs = len([x for x in job_int_ids if x > 0])
-        print(f"[Scorer Debug] 锚点映射: 有效={valid_jobs}/{len(real_job_ids)} (IDs: {job_int_ids})")
 
-        # 2. 人才候选人 ID 转换诊断
-        # 强制小写归一化
+        # 2. 人才候选人 ID 转换 (Candidate Authors)
         item_int_ids = []
         for aid in candidate_raw_ids:
+            # 确保对齐 DataLoader 中的 a_ 前缀和小写逻辑
             key = f"a_{str(aid).strip().lower()}"
             idx = self.dataloader.entity_to_int.get(key, 0)
             item_int_ids.append(idx)
 
-        valid_items = len([x for x in item_int_ids if x > 0])
-        print(f"[Scorer Debug] 人才映射: 有效={valid_items}/500")
+        # 3. 构造活跃节点子集 (Active Node Subset)
+        # 我们只计算这 500+3 个节点的 Embedding
+        all_active_ids = torch.LongTensor(job_int_ids + item_int_ids).to(self.device)
 
         with torch.no_grad():
-            # 3. 学术特征 (AX) 完整性自检
-            aux_info = self.dataloader.aux_info_all.to(self.device)
-            # 检查特征矩阵是否全是 0 (如果是 0，说明 DataLoader 的 lower() 没改对)
-            aux_sum = aux_info[item_int_ids].sum().item()
-            print(f"[Scorer Debug] AX 特征强度: 总和={aux_sum:.4f} (若为0则特征加载失败)")
+            # 4. 局部学术特征 (AX) 提取
+            # 关键：不再加载 187 万行的 aux_info，只切片出需要的 500 多行
+            aux_info_subset = self.dataloader.aux_info_all[all_active_ids].to(self.device)
 
-            # 4. 计算 KGATAX 全息 Embedding
-            all_embeds = self.model.calc_cf_embeddings(aux_info)
+            # 5. 调用模型新增的局部计算接口 calc_cf_embeddings_subset
+            # 注意：需确保 model.py 中已添加该方法
+            active_embeds = self.model.calc_cf_embeddings_subset(all_active_ids, aux_info_subset)
 
-            # 监控 Embedding 向量是否存在“坍缩” (Standard Deviation 过小)
-            print(f"[Scorer Debug] Embedding 状态: Mean={all_embeds.mean():.4f}, Std={all_embeds.std():.4f}")
+            # 6. 拆分岗位与人才的 Embedding 空间
+            n_jobs = len(job_int_ids)
+            job_embeds = active_embeds[:n_jobs]  # 前面是 Job 锚点
+            item_embeds = active_embeds[n_jobs:]  # 后面是候选人
 
-            # 5. 执行张量运算
-            job_indices = torch.LongTensor(job_int_ids).to(self.device)
-            item_indices = torch.LongTensor(item_int_ids).to(self.device)
+            # 7. 执行张量运算：多锚点均值融合
+            # 聚合 3 个锚点岗位的特征，形成一个统一的“理想人选”向量
+            u_e_avg = torch.mean(job_embeds, dim=0, keepdim=True)
 
-            # 多锚点均值融合
-            u_e_multi = all_embeds[job_indices]
-            u_e_avg = torch.mean(u_e_multi, dim=0, keepdim=True)
+            # 8. 计算点积得分
+            # 结果维度: [1, 500] -> squeeze -> [500]
+            scores = torch.matmul(u_e_avg, item_embeds.transpose(0, 1)).squeeze(0)
 
-            i_e = all_embeds[item_indices]
-
-            # 计算点积得分
-            scores = torch.matmul(u_e_avg, i_e.transpose(0, 1)).squeeze(0)
-
-            # 6. 分值区分度监控
-            # 如果 Max 与 Min 差距极小，说明模型没有辨别力
+            # 9. 诊断输出
+            print(f"[Scorer Debug] 局部计算完成 | 锚点:{valid_jobs} | 候选人:{len(item_int_ids)}")
             print(
                 f"[Scorer Debug] 分值区间: [{scores.min():.4f} ~ {scores.max():.4f}] | 极差={scores.max() - scores.min():.4f}")
 

@@ -166,13 +166,24 @@ class KGAT(nn.Module):
         else:
             self.A_in = None
 
+    # src/infrastructure/database/kgat_ax/model.py
+
     def holographic_fusion(self, entity_embed, aux_info, node_ids=None):
         """
-        全息融合层：增加学术特征权重偏置，增强激活稳定性
+        【深度修复版】非线性门控融合：增强高权重专家的区分度
         """
-        res_weight = torch.tanh(self.aux_embed_layer(aux_info)) + 1.5
-        fused_embed = entity_embed * res_weight
+        # 1. 使用 Sigmoid 门控：将学术特征映射为 [0.5, 1.5] 的缩放系数
+        # 学术指标越高，gate_weight 越接近 1.5；反之越接近 0.5
+        gate_weight = torch.sigmoid(self.aux_embed_layer(aux_info)) + 0.5
 
+        # 2. 采用乘法门控融合 (Multiplicative Gating)
+        # 这会直接放大/缩小语义向量的强度，让学术大牛在点积计算中占优
+        fused_embed = entity_embed * gate_weight
+
+        # 3. 强制执行 L2 归一化，保持向量空间稳定性
+        fused_embed = F.normalize(fused_embed, p=2, dim=-1)
+
+        # 4. 叠加身份标签（Job vs Author）
         if node_ids is not None:
             type_labels = (node_ids >= self.ENTITY_OFFSET).long()
             fused_embed += self.type_embed(type_labels)
@@ -245,3 +256,26 @@ class KGAT(nn.Module):
     def calc_score(self, user_ids, item_ids, aux_info_all):
         all_embed = self.calc_cf_embeddings(aux_info_all)
         return torch.matmul(all_embed[user_ids], all_embed[item_ids].transpose(0, 1))
+
+    def calc_cf_embeddings_subset(self, node_ids, aux_info_subset):
+        """
+        【核心修复】局部特征提取，解决 187万节点导致的内存溢出。
+        node_ids: 待计算的节点 ID 序列 (Job 锚点 + Author 候选人)
+        aux_info_subset: 对应这些节点的 AX 特征张量
+        """
+        # 1. 提取基础 Embedding
+        ego_embed = self.entity_user_embed(node_ids)
+
+        # 2. 执行全息融合 (残差加法 + 归一化)
+        # 这里的计算量仅为 node_ids 的长度，不再分配全量 187万 的内存
+        aux_bias = torch.tanh(self.aux_embed_layer(aux_info_subset))
+        fused_embed = ego_embed + aux_bias
+
+        # 3. 归一化处理，防止模长爆炸
+        fused_embed = F.normalize(fused_embed, p=2, dim=-1)
+
+        # 4. 叠加类型偏置
+        type_labels = (node_ids >= self.ENTITY_OFFSET).long()
+        fused_embed += self.type_embed(type_labels)
+
+        return fused_embed

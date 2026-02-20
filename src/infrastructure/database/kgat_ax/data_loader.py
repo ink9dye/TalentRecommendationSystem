@@ -137,27 +137,66 @@ class DataLoaderKGAT(object):
 
     def load_kg(self, filename):
         """
-        加权索引驱动采样。
-        核心修改：SQL 增加 w 字段，获取时序衰减权重。
+        加权索引驱动采样 (定向 2-Hop 语义增强版)
+        核心修改：在 1-Hop 基础上，提取 Vocab 节点并补全 SIMILAR_TO (r=6) 关系，确保关系总数对齐为 14。
         """
         db_path = os.path.join(self.data_dir, "kg_index.db")
         if not os.path.exists(db_path):
-            self.logging.error(f"[!] 找不到加权索引库: {db_path}");
+            self.logging.error(f"[!] 找不到加权索引库: {db_path}")
             return pd.DataFrame()
 
-        self.logging.info(f"[*] 执行加权子图采样...")
+        self.logging.info(f"[*] 执行加权子图采样 (正在织入语义桥梁)...")
+
+        # 种子节点包含训练集中的所有 User(Job) 和 Item(Author)
         seeds = list(set(self.cf_train_data[0].tolist()) | set(self.cf_train_data[1].tolist()))
         conn = sqlite3.connect(db_path)
         all_edges = []
+        vocab_nodes = set()  # 用于存储子图中出现的词汇/技能节点
         chunk_size = 500
+
+        # --- 阶段 1: 1-Hop 基础采样 ---
         for i in range(0, len(seeds), chunk_size):
             batch = seeds[i:i + chunk_size]
             placeholders = ','.join(['?'] * len(batch))
-            # 提取带权重 w 的三元组
+
+            # 提取带权重 w 的直接关联边
             sql = f"SELECT h, r, t, w FROM kg_triplets WHERE h IN ({placeholders}) OR t IN ({placeholders})"
-            all_edges.extend(conn.execute(sql, batch + batch).fetchall())
+            res = conn.execute(sql, batch + batch).fetchall()
+            all_edges.extend(res)
+
+            # 记录子图中遇到的词汇节点：r=4 (Work->Vocab), r=5 (Job->Vocab)
+            # 注意：在这些关系中，t 节点是 Vocabulary
+            for h, r, t, w in res:
+                if r in [4, 5]:
+                    vocab_nodes.add(t)
+
+        # --- 阶段 2: 定向 2-Hop 语义补全 (针对 SIMILAR_TO 关系) ---
+        if vocab_nodes:
+            self.logging.info(f"[*] 发现 {len(vocab_nodes)} 个词汇节点，正在注入 SIMILAR_TO 语义关系...")
+            v_list = list(vocab_nodes)
+
+            for i in range(0, len(v_list), chunk_size):
+                batch = v_list[i:i + chunk_size]
+                placeholders = ','.join(['?'] * len(batch))
+
+                # 关键：只拉取关系 ID 为 6 (SIMILAR_TO) 且两端都在子图中的边
+                # 这样既能补全语义，又不会导致子图规模爆炸
+                sql = f"SELECT h, r, t, w FROM kg_triplets WHERE r=6 AND h IN ({placeholders}) AND t IN ({placeholders})"
+                bridge_res = conn.execute(sql, batch + batch).fetchall()
+                all_edges.extend(bridge_res)
+
         conn.close()
-        return pd.DataFrame(all_edges, columns=['h', 'r', 't', 'w']).drop_duplicates()
+
+        # 转换为 DataFrame 并去重
+        df_final = pd.DataFrame(all_edges, columns=['h', 'r', 't', 'w']).drop_duplicates()
+
+        # 验证是否包含关系 6
+        if not df_final.empty and 6 in df_final['r'].unique():
+            self.logging.info(f"[OK] 语义桥梁注入成功，子图包含 SIMILAR_TO 关系。")
+        else:
+            self.logging.warning(f"[!] 警告：子图中仍未发现 SIMILAR_TO 关系，请检查 kg_final.txt 数据质量。")
+
+        return df_final
 
     def construct_data(self, kg_data):
         """
