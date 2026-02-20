@@ -54,7 +54,7 @@ class RankExplainer:
         """
         paths = self.graph.run(multi_hop_query, jids=job_raw_ids, aid=str(author_id)).data()
 
-        # 2. 语义保底 (Fuzzy Match)：支持技能描述词的文本级对齐
+        # 2. 语义保底 (Fuzzy Match)
         if not paths:
             fuzzy_query = """
             MATCH (j:Job) WHERE j.id IN $jids OR j.securityId IN $jids
@@ -90,19 +90,21 @@ class RankExplainer:
         # 5. 排序并选取最优路径
         best_path = sorted(paths, key=lambda x: (x['match_type'] == 'fallback', -x['att_weight']))[0]
 
-        # 6. 动态生成多样化总结文本
+        # 6. 动态生成多样化总结文本 (推荐理由)
         summary = self._build_dynamic_summary(best_path)
 
+        # 【核心修改点】整合 Work ID、OpenAlex 链接和推荐理由
         return {
             "matched_skill": best_path['req_skill'],
             "key_evidence_work": best_path['title'],
+            "work_id": best_path['wid'],  # 数据库中的 Work ID，如 W4205891338
+            "work_url": f"https://openalex.org/{best_path['wid']}",  # 拼接 OpenAlex 链接
             "source": best_path.get('source_name', "相关领域核心刊物"),
             "collaborators": best_path['co_authors'],
             "match_type": best_path['match_type'],
             "model_confidence": round(float(best_path['att_weight']), 4),
-            "summary": summary
+            "summary": summary  # 最终生成的推荐理由
         }
-
     def _build_dynamic_summary(self, path):
         """利用多句式模板降低文本重复度"""
         req = path['req_skill']

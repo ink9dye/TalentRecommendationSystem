@@ -41,54 +41,118 @@ class RankingEngine:
             dataloader=self.dataloader
         )
 
-    def execute_rank(self, real_job_ids, candidate_raw_ids):
+    def execute_rank(self, real_job_ids, candidate_raw_ids, filter_domain=None):
         """
-        执行精排与召回 1:1 权重融合重排逻辑。
+        【修改版】执行精排与召回 1:1 权重融合重排逻辑。
+        新增：整合代表论文 ID、预览链接及推荐理由输出。
         """
-        # 1. 批量获取精排模型原始得分 (基于 KGATAX 向量空间)
-        # 调用已优化为局部计算的 scorer.compute_scores，返回长度为 500 的 Tensor
-        kgat_scores = self.scorer.compute_scores(real_job_ids, candidate_raw_ids)
+        # --- 1. 领域并集预过滤 ---
+        active_candidates = candidate_raw_ids
+        if filter_domain:
+            active_candidates = self._filter_by_domain_union(candidate_raw_ids, filter_domain)
+            print(
+                f"[Ranking] 领域并集过滤完成: {len(candidate_raw_ids)} -> {len(active_candidates)} (Pattern: {filter_domain})")
 
-        # 2. 生成“召回顺序分” (Recall Rank Score)
-        # 逻辑：召回列表中第 1 名(index 0) 得 1.0 分，最后一名得 0.0 分
-        recall_len = len(candidate_raw_ids)
+        if not active_candidates:
+            print("[Warning] 领域过滤后无可匹配候选人，精排流程提前终止。")
+            return []
+
+        # --- 2. 批量获取精排模型得分 ---
+        kgat_scores = self.scorer.compute_scores(real_job_ids, active_candidates)
+
+        # --- 3. 生成“召回顺序分” (Recall Rank Score) ---
+        recall_len = len(active_candidates)
         recall_scores = torch.linspace(1.0, 0.0, steps=recall_len).to(kgat_scores.device)
 
-        # 3. 对精排原始分进行归一化 (Min-Max Normalization)
-        # 确保 KGAT 分数区间被压缩到 [0, 1]，使其能与召回顺序分在同一量级对等融合
+        # --- 4. 对精排原始分进行归一化 ---
         kgat_min = kgat_scores.min()
         kgat_max = kgat_scores.max()
-        # 加 1e-8 防止除以 0
         kgat_norm = (kgat_scores - kgat_min) / (kgat_max - kgat_min + 1e-8)
 
-        # 4. 执行 1:1 权重融合
-        # 最终得分 = 50% 语义精排能力 + 50% 召回相关性顺序
+        # --- 5. 执行 1:1 权重融合 ---
         final_fusion_scores = 0.5 * kgat_norm + 0.5 * recall_scores
 
-        # 5. 选取融合后的 Top 100
+        # --- 6. 选取融合后的 Top 100 ---
         top_k = min(100, recall_len)
         top_val, top_idx = torch.topk(final_fusion_scores, top_k)
 
         results = []
-        # 使用第 1 个锚点岗位作为解释器的背景参考
-        reference_job_id = real_job_ids[0]
-
         for i in range(top_k):
-            # 获取在原始候选名单中的索引
+            # 获取在当前活跃候选名单中的索引
             original_idx = top_idx[i].item()
-            raw_aid = str(candidate_raw_ids[original_idx])
+            raw_aid = str(active_candidates[original_idx])
 
+            # 获取作者基础统计指标
+            stats = self._fetch_sqlite_stats(raw_aid)
+
+            # 调用解释器获取证据链：包含 work_id, work_url 和 summary
+            exp_data = self.explainer.explain(raw_aid, real_job_ids)
+
+            # --- 构造符合前端期待的深度结果对象 ---
             results.append({
                 "rank": i + 1,
                 "author_id": raw_aid,
+                "name": stats.get('name'),
                 "score": round(float(top_val[i].item()), 4),  # 融合后的最终分
-                "kgat_score": round(float(kgat_norm[original_idx].item()), 4),  # 归一化后的精排贡献
-                "recall_score": round(float(recall_scores[original_idx].item()), 4),  # 召回顺序贡献
-                "metrics": self._fetch_sqlite_stats(raw_aid),
-                "evidence_chain": self.explainer.explain(raw_aid, real_job_ids)
+
+                # 核心需求 1：代表论文详细信息
+                "representative_work": {
+                    "work_id": exp_data.get("work_id"),
+                    "title": exp_data.get("key_evidence_work"),
+                    "link": exp_data.get("work_url"),
+                    "published_at": exp_data.get("source")
+                },
+
+                # 核心需求 2：清晰的推荐理由
+                "recommendation_reason": exp_data.get("summary"),
+
+                # 辅助信息与统计指标
+                "metrics": stats,
+                "collaboration": exp_data.get("collaborators"),
+                "details": {
+                    "kgat_score": round(float(kgat_norm[original_idx].item()), 4),
+                    "recall_score": round(float(recall_scores[original_idx].item()), 4),
+                    "match_type": exp_data.get("match_type")
+                }
             })
 
         return results
+
+    def _filter_by_domain_union(self, author_ids: list, pattern: str):
+        """
+        【新增辅助方法】利用领域并集正则(如 "1|17|2") 在精排前修剪 500 人候选池。
+        """
+        import re
+        try:
+            conn = sqlite3.connect(DB_PATH)  # DB_PATH 来自 config
+            placeholders = ','.join(['?'] * len(author_ids))
+
+            # 获取候选人在数据库中的所有领域分布
+            sql = f"""
+                SELECT DISTINCT a.author_id, w.domain_ids 
+                FROM authorships a 
+                JOIN works w ON a.work_id = w.work_id 
+                WHERE a.author_id IN ({placeholders})
+            """
+            rows = conn.execute(sql, author_ids).fetchall()
+            conn.close()
+
+            valid_authors = set()
+            # 编译正则：pattern 形如 "1|17|2|18"
+            # 逻辑：只要作者产出的论文领域中包含并集里的任何一个 ID，即视为合格
+            # 添加 r 前缀，变为 fr-string
+            regex = re.compile(fr"(^|,|\|)({pattern})(,|$|\|)")
+
+            for aid, d_ids in rows:
+                if d_ids and regex.search(str(d_ids)):
+                    valid_authors.add(aid)
+
+            # 维持原有的召回顺序返回
+            return [aid for aid in author_ids if aid in valid_authors]
+        except Exception as e:
+            print(f"[Error] 精排领域并集修剪失败: {e}")
+            return author_ids  # 失败则退回全量，防止流程中断
+
     def _fetch_sqlite_stats(self, raw_id):
         """获取学术指标并修复键名映射"""
         conn = sqlite3.connect(DB_PATH)
