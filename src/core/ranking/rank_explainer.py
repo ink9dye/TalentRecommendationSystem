@@ -23,14 +23,18 @@ class RankExplainer:
         norm_author_id = str(author_id).strip().lower()
         h_int = self.raw_to_int.get(f"a_{norm_author_id}", 0)
 
-        # 1. 增强版 Cypher：一次性提取技能、论文、期刊及前两位合作伙伴
+        # 1. 增强版 Cypher：引入相似度分数过滤，防止语义漂移
         multi_hop_query = """
         MATCH (j:Job) WHERE j.id IN $jids OR j.securityId IN $jids
         MATCH (j)-[:REQUIRE_SKILL]->(v1:Vocabulary)
         WHERE NOT v1.term IN ['computer science', 'mathematics', 'engineering', 'physics', 'technology', '领域专家']
 
-        OPTIONAL MATCH (v1)-[:SIMILAR_TO]-(v2:Vocabulary)
-        WITH v1, COALESCE(v2, v1) as target_v, j
+        // --- 核心修正点：增加 score 校验，只有强相似边 (>0.7) 才允许跳转 ---
+        OPTIONAL MATCH (v1)-[r:SIMILAR_TO]-(v2:Vocabulary)
+        WHERE r.score > 0.7
+
+        // 如果没有高分相似词，COALESCE 确保 target_v 维持原词 v1，走精准匹配逻辑
+        WITH j, v1, COALESCE(v2, v1) as target_v
 
         MATCH (target_v)<-[:HAS_TOPIC]-(w:Work)<-[:AUTHORED]-(a:Author {id: $aid})
 
@@ -90,20 +94,19 @@ class RankExplainer:
         # 5. 排序并选取最优路径
         best_path = sorted(paths, key=lambda x: (x['match_type'] == 'fallback', -x['att_weight']))[0]
 
-        # 6. 动态生成多样化总结文本 (推荐理由)
+        # 6. 动态生成总结文本
         summary = self._build_dynamic_summary(best_path)
 
-        # 【核心修改点】整合 Work ID、OpenAlex 链接和推荐理由
         return {
             "matched_skill": best_path['req_skill'],
             "key_evidence_work": best_path['title'],
-            "work_id": best_path['wid'],  # 数据库中的 Work ID，如 W4205891338
-            "work_url": f"https://openalex.org/{best_path['wid']}",  # 拼接 OpenAlex 链接
+            "work_id": best_path['wid'],
+            "work_url": f"https://openalex.org/{best_path['wid']}",
             "source": best_path.get('source_name', "相关领域核心刊物"),
             "collaborators": best_path['co_authors'],
             "match_type": best_path['match_type'],
             "model_confidence": round(float(best_path['att_weight']), 4),
-            "summary": summary  # 最终生成的推荐理由
+            "summary": summary
         }
     def _build_dynamic_summary(self, path):
         """利用多句式模板降低文本重复度"""

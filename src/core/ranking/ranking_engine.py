@@ -43,24 +43,25 @@ class RankingEngine:
 
     def execute_rank(self, real_job_ids, candidate_raw_ids, filter_domain=None):
         """
-        【修改版】执行精排与召回 1:1 权重融合重排逻辑。
-        新增：整合代表论文 ID、预览链接及推荐理由输出。
+        【1:1 平衡版】执行精排与召回等权重融合重排。
+        融合逻辑：50% KGATAX 模型分 (内含乘法门控增益) + 50% 召回顺序分。
         """
-        # --- 1. 领域并集预过滤 ---
+        # --- 1. 领域并集预过滤 (保持业务红线) ---
         active_candidates = candidate_raw_ids
         if filter_domain:
             active_candidates = self._filter_by_domain_union(candidate_raw_ids, filter_domain)
-            print(
-                f"[Ranking] 领域并集过滤完成: {len(candidate_raw_ids)} -> {len(active_candidates)} (Pattern: {filter_domain})")
+            print(f"[Ranking] 领域并集过滤完成: {len(candidate_raw_ids)} -> {len(active_candidates)} (Pattern: {filter_domain})")
 
         if not active_candidates:
             print("[Warning] 领域过滤后无可匹配候选人，精排流程提前终止。")
             return []
 
         # --- 2. 批量获取精排模型得分 ---
+        # 核心：此时得分已包含 holographic_fusion 乘法门控对大牛的能量放大
         kgat_scores = self.scorer.compute_scores(real_job_ids, active_candidates)
 
         # --- 3. 生成“召回顺序分” (Recall Rank Score) ---
+        # 逻辑：为召回池中的 500 人生成从 1.0 到 0.0 的线性梯度分
         recall_len = len(active_candidates)
         recall_scores = torch.linspace(1.0, 0.0, steps=recall_len).to(kgat_scores.device)
 
@@ -69,8 +70,8 @@ class RankingEngine:
         kgat_max = kgat_scores.max()
         kgat_norm = (kgat_scores - kgat_min) / (kgat_max - kgat_min + 1e-8)
 
-        # --- 5. 执行 1:1 权重融合 ---
-        final_fusion_scores = 0.5 * kgat_norm + 0.5 * recall_scores
+        # --- 5. 执行权重融合 ---
+        final_fusion_scores = 0.4 * kgat_norm + 0.6 * recall_scores
 
         # --- 6. 选取融合后的 Top 100 ---
         top_k = min(100, recall_len)
@@ -82,7 +83,7 @@ class RankingEngine:
             original_idx = top_idx[i].item()
             raw_aid = str(active_candidates[original_idx])
 
-            # 获取作者基础统计指标
+            # 获取包含 total_papers 的基础统计指标
             stats = self._fetch_sqlite_stats(raw_aid)
 
             # 调用解释器获取证据链：包含 work_id, work_url 和 summary
@@ -93,7 +94,7 @@ class RankingEngine:
                 "rank": i + 1,
                 "author_id": raw_aid,
                 "name": stats.get('name'),
-                "score": round(float(top_val[i].item()), 4),  # 融合后的最终分
+                "score": round(float(top_val[i].item()), 4),  # 1:1 融合后的最终分
 
                 # 核心需求 1：代表论文详细信息
                 "representative_work": {
@@ -106,7 +107,7 @@ class RankingEngine:
                 # 核心需求 2：清晰的推荐理由
                 "recommendation_reason": exp_data.get("summary"),
 
-                # 辅助信息与统计指标
+                # 包含 H-index, total_papers 和总引用的统计指标
                 "metrics": stats,
                 "collaboration": exp_data.get("collaborators"),
                 "details": {
@@ -154,8 +155,25 @@ class RankingEngine:
             return author_ids  # 失败则退回全量，防止流程中断
 
     def _fetch_sqlite_stats(self, raw_id):
-        """获取学术指标并修复键名映射"""
+        """
+        获取学术指标：包含姓名、H-index、总引用以及新增的总论文数
+        """
+        import sqlite3
+        from config import DB_PATH
+
         conn = sqlite3.connect(DB_PATH)
-        row = conn.execute("SELECT name, h_index, cited_by_count FROM authors WHERE author_id=?", (raw_id,)).fetchone()
+        # SQL 查询中加入 works_count 字段以获取人才的总论文产出
+        row = conn.execute(
+            "SELECT name, h_index, cited_by_count, works_count FROM authors WHERE author_id=?",
+            (raw_id,)
+        ).fetchone()
         conn.close()
-        return {"name": row[0], "h_index": row[1], "citations": row[2]} if row else {}
+
+        if row:
+            return {
+                "name": row[0],
+                "h_index": row[1],
+                "citations": row[2],
+                "total_papers": row[3]  # 新增字段：总论文数
+            }
+        return {}

@@ -56,64 +56,11 @@ class Aggregator(nn.Module):
 
 class KGAT(nn.Module):
     """
-    KGAT-AX 主模型：管理全局 Embedding 与 多层聚合
+    KGAT-AX 主模型：整合学术质量 (AX) 乘法门控与多层图卷积聚合。
     """
-
-    def __init__(self, args, n_users, n_total_nodes, n_relations, A_in=None):
-        super(KGAT, self).__init__()
-        self.n_users = n_users
-        self.n_relations = n_relations
-        self.embed_dim = args.embed_dim
-        self.relation_dim = args.relation_dim
-        self.aggregation_type = args.aggregation_type
-        self.ENTITY_OFFSET = args.ENTITY_OFFSET
-
-        self.conv_dim_list = [args.embed_dim] + eval(args.conv_dim_list)
-        self.mess_dropout = eval(args.mess_dropout)
-        self.n_layers = len(eval(args.conv_dim_list))
-        self.kg_l2loss_lambda = args.kg_l2loss_lambda
-        self.cf_l2loss_lambda = args.cf_l2loss_lambda
-
-        # 1. AX 特征融合层
-        self.n_aux_features = getattr(args, 'n_aux_features', 3)
-        self.aux_embed_layer = nn.Linear(self.n_aux_features, self.embed_dim)
-        nn.init.xavier_uniform_(self.aux_embed_layer.weight)
-
-        # 2. 类型偏置层
-        self.type_embed = nn.Embedding(2, self.embed_dim)
-        nn.init.xavier_uniform_(self.type_embed.weight)
-
-        # --- 核心修改点：维度对齐 ---
-        # 直接使用 data.n_users_entities (1,870,366)，不再手动计算
-        self.global_max_id = n_total_nodes
-        self.entity_user_embed = nn.Embedding(self.global_max_id, self.embed_dim)
-
-        self.relation_embed = nn.Embedding(self.n_relations, self.relation_dim)
-        self.trans_M = nn.Parameter(torch.Tensor(self.n_relations, self.embed_dim, self.relation_dim))
-        self.W_a = nn.Parameter(torch.Tensor(self.relation_dim, 1))
-
-        nn.init.xavier_uniform_(self.entity_user_embed.weight)
-        nn.init.xavier_uniform_(self.relation_embed.weight)
-        nn.init.xavier_uniform_(self.trans_M)
-        nn.init.xavier_uniform_(self.W_a)
-
-        # 4. 堆叠聚合器层
-        self.aggregator_layers = nn.ModuleList([
-            Aggregator(self.conv_dim_list[k], self.conv_dim_list[k + 1], self.mess_dropout[k], self.aggregation_type)
-            for k in range(self.n_layers)
-        ])
-
-        if A_in is not None:
-            # 校验邻接矩阵维度是否与 Embedding 层严格一致
-            if A_in.shape[0] != self.global_max_id:
-                raise ValueError(f"维度不匹配: 邻接矩阵({A_in.shape[0]}) != global_max_id({self.global_max_id})")
-            self.register_buffer('A_in', A_in)
-
-
-class KGAT(nn.Module):
     def __init__(self, args, n_users, n_total_nodes, n_relations, A_in=None):
         """
-        修正版构造函数：直接使用 n_total_nodes 对齐 Embedding 空间
+        修正版构造函数：直接使用 n_total_nodes 对齐 Embedding 空间，防止维度漂移。
         """
         super(KGAT, self).__init__()
         self.n_users = n_users
@@ -130,16 +77,16 @@ class KGAT(nn.Module):
         self.kg_l2loss_lambda = args.kg_l2loss_lambda
         self.cf_l2loss_lambda = args.cf_l2loss_lambda
 
-        # 1. 核心 AX 映射层
+        # 1. 核心 AX 映射层：将 3 维学术特征映射到 Embedding 空间
         self.n_aux_features = getattr(args, 'n_aux_features', 3)
         self.aux_embed_layer = nn.Linear(self.n_aux_features, self.embed_dim)
         nn.init.xavier_uniform_(self.aux_embed_layer.weight)
 
-        # 2. 类型偏置层
+        # 2. 类型偏置层 (用于区分 Job 与 Author 节点)
         self.type_embed = nn.Embedding(2, self.embed_dim)
         nn.init.xavier_uniform_(self.type_embed.weight)
 
-        # 3. 核心 Embedding 空间：直接使用传入的总节点数，防止维度漂移
+        # 3. 核心 Embedding 空间：对齐全局节点数
         self.global_max_id = n_total_nodes
         self.entity_user_embed = nn.Embedding(self.global_max_id, self.embed_dim)
         self.relation_embed = nn.Embedding(self.n_relations, self.relation_dim)
@@ -152,14 +99,13 @@ class KGAT(nn.Module):
         nn.init.xavier_uniform_(self.trans_M)
         nn.init.xavier_uniform_(self.W_a)
 
-        # 4. 聚合器层
+        # 4. 堆叠聚合器层
         self.aggregator_layers = nn.ModuleList([
             Aggregator(self.conv_dim_list[k], self.conv_dim_list[k + 1], self.mess_dropout[k], self.aggregation_type)
             for k in range(self.n_layers)
         ])
 
         if A_in is not None:
-            # 校验邻接矩阵维度是否与 Embedding 层严格匹配
             if A_in.shape[0] != self.global_max_id:
                 raise ValueError(f"维度不匹配: 邻接矩阵({A_in.shape[0]}) != global_max_id({self.global_max_id})")
             self.register_buffer('A_in', A_in)
@@ -170,17 +116,17 @@ class KGAT(nn.Module):
 
     def holographic_fusion(self, entity_embed, aux_info, node_ids=None):
         """
-        【深度修复版】非线性门控融合：增强高权重专家的区分度
+        【KGATAX 核心升级】非线性乘法门控融合
+        作用：让学术质量 (AX) 决定语义向量的“模长”，实现资历对专业的非线性放大。
         """
-        # 1. 使用 Sigmoid 门控：将学术特征映射为 [0.5, 1.5] 的缩放系数
-        # 学术指标越高，gate_weight 越接近 1.5；反之越接近 0.5
-        gate_weight = torch.sigmoid(self.aux_embed_layer(aux_info)) + 0.5
+        # 1. 质量门控 (Quality Gate)：通过 Sigmoid 将学术特征映射为 [0.8, 1.2] 的增益系数
+        gate_weight = torch.sigmoid(self.aux_embed_layer(aux_info))*0.4 + 0.8
 
-        # 2. 采用乘法门控融合 (Multiplicative Gating)
-        # 这会直接放大/缩小语义向量的强度，让学术大牛在点积计算中占优
+        # 2. 乘法门控融合 (Multiplicative Gating)
+        # 此时，AX 特征直接决定了该人才在点积计算（Dot Product）中的能量强度
         fused_embed = entity_embed * gate_weight
 
-        # 3. 强制执行 L2 归一化，保持向量空间稳定性
+        # 3. 强制执行 L2 归一化，确保向量在多层聚合过程中的数值稳定性
         fused_embed = F.normalize(fused_embed, p=2, dim=-1)
 
         # 4. 叠加身份标签（Job vs Author）
@@ -259,22 +205,25 @@ class KGAT(nn.Module):
 
     def calc_cf_embeddings_subset(self, node_ids, aux_info_subset):
         """
-        【核心修复】局部特征提取，解决 187万节点导致的内存溢出。
+        【同步修改】局部特征提取：采用乘法门控融合，确保推理与训练逻辑严丝合缝。
         node_ids: 待计算的节点 ID 序列 (Job 锚点 + Author 候选人)
         aux_info_subset: 对应这些节点的 AX 特征张量
         """
         # 1. 提取基础 Embedding
         ego_embed = self.entity_user_embed(node_ids)
 
-        # 2. 执行全息融合 (残差加法 + 归一化)
-        # 这里的计算量仅为 node_ids 的长度，不再分配全量 187万 的内存
-        aux_bias = torch.tanh(self.aux_embed_layer(aux_info_subset))
-        fused_embed = ego_embed + aux_bias
+        # 2. 执行全息融合：切换为乘法门控逻辑
+        # 使用 Sigmoid 将学术特征映射为 [0.5, 1.5] 的能量缩放系数
+        # 学术表现越好，gate_weight 越接近 1.5，从而大幅度放大其语义向量
+        gate_weight = torch.sigmoid(self.aux_embed_layer(aux_info_subset)) + 0.5
 
-        # 3. 归一化处理，防止模长爆炸
+        # 核心改动：由 + 改为 *，实现能量级的权重增益
+        fused_embed = ego_embed * gate_weight
+
+        # 3. 强制执行 L2 归一化，维持推理时向量空间的模长稳定
         fused_embed = F.normalize(fused_embed, p=2, dim=-1)
 
-        # 4. 叠加类型偏置
+        # 4. 叠加类型偏置 (Job vs Author)
         type_labels = (node_ids >= self.ENTITY_OFFSET).long()
         fused_embed += self.type_embed(type_labels)
 
