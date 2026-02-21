@@ -161,3 +161,14 @@ SQL_INIT_SCRIPTS = [
 KGATAX_TRAIN_DATA_DIR = os.path.join(DATA_DIR, "kgatax_train_data")
 if not os.path.exists(KGATAX_TRAIN_DATA_DIR):
     os.makedirs(KGATAX_TRAIN_DATA_DIR)
+
+
+# --- 13. 业务领域映射表 (新增) ---
+DOMAIN_MAP = {
+    "1": "计算机科学", "2": "医学", "3": "政治学", "4": "工程学", "5": "物理学",
+    "6": "材料科学", "7": "生物学", "8": "地理学", "9": "化学", "10": "商学",
+    "11": "社会学", "12": "哲学", "13": "环境科学", "14": "数学", "15": "心理学",
+    "16": "地质学", "17": "经济学"
+}
+# 反向查找表：支持“计算机科学” -> "1"
+NAME_TO_DOMAIN_ID = {v: k for k, v in DOMAIN_MAP.items()}

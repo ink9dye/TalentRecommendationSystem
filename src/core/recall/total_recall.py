@@ -105,7 +105,7 @@ class TotalRecallSystem:
         rank_map = {}
 
         # 赋予不同召回路径不同的基础权重
-        paths = [("v", v_res, 1.2), ("l", l_res, 1.1), ("c", c_res, 0.6)]
+        paths = [("v", v_res, 1.2), ("l", l_res, 1.0), ("c", c_res, 0.6)]
 
         for p_tag, res_list, weight in paths:
             for rank, aid in enumerate(res_list):

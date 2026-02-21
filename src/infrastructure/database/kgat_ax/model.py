@@ -116,20 +116,27 @@ class KGAT(nn.Module):
 
     def holographic_fusion(self, entity_embed, aux_info, node_ids=None):
         """
-        【KGATAX 核心升级】非线性乘法门控融合
-        作用：让学术质量 (AX) 决定语义向量的“模长”，实现资历对专业的非线性放大。
+        【统一对齐版】全息融合逻辑：语义相关性主导，学术影响力微调。
+        作用：确保人才推荐首先基于专业对口（基准模长），再由学术影响力（AX）实现 15% 以内的排名微调。
         """
-        # 1. 质量门控 (Quality Gate)：通过 Sigmoid 将学术特征映射为 [0.8, 1.2] 的增益系数
-        gate_weight = torch.sigmoid(self.aux_embed_layer(aux_info))*0.4 + 0.8
+        # 1. 学术特征平滑处理：使用 log1p 压制极端数值（如百万级引用），防止其产生压倒性的权重
+        # 这能确保 H-index 100 和 H-index 20 的差距在经过变换后处于合理区间
+        smooth_aux = torch.log1p(aux_info)
 
-        # 2. 乘法门控融合 (Multiplicative Gating)
-        # 此时，AX 特征直接决定了该人才在点积计算（Dot Product）中的能量强度
+        # 2. 构造“平局决胜”门控 (Tie-breaking Gate)：
+        # 修改点：将增益区间控制在 [1.0, 1.15] 之间
+        # 1.0 为相关性基准：保证即便是学术新人也不会在对口领域被无故降权
+        # 0.15 为最高增益：学术泰斗最高获得 15% 的分值提升，不足以使其在不相关领域超过专业对口者
+        gate_weight = torch.sigmoid(self.aux_embed_layer(smooth_aux)) * 0.15 + 1.0
+
+        # 3. 乘法门控融合：将学术增益注入语义向量
+        # 此时，AX 特征仅在语义距离（点积）接近的情况下，决定最终的 Rank 顺序
         fused_embed = entity_embed * gate_weight
 
-        # 3. 强制执行 L2 归一化，确保向量在多层聚合过程中的数值稳定性
+        # 4. 强制执行 L2 归一化：维持向量空间的模长稳定，确保推理时余弦相似度的准确性
         fused_embed = F.normalize(fused_embed, p=2, dim=-1)
 
-        # 4. 叠加身份标签（Job vs Author）
+        # 5. 叠加身份标签（Job 0 / Author 1）：利用 ENTITY_OFFSET 区分节点类型
         if node_ids is not None:
             type_labels = (node_ids >= self.ENTITY_OFFSET).long()
             fused_embed += self.type_embed(type_labels)
@@ -205,25 +212,27 @@ class KGAT(nn.Module):
 
     def calc_cf_embeddings_subset(self, node_ids, aux_info_subset):
         """
-        【同步修改】局部特征提取：采用乘法门控融合，确保推理与训练逻辑严丝合缝。
-        node_ids: 待计算的节点 ID 序列 (Job 锚点 + Author 候选人)
-        aux_info_subset: 对应这些节点的 AX 特征张量
+        【优化版】局部特征提取：平衡语义相关性与学术影响力。
+        核心逻辑：先确定专业对口（Semantic Match），再由学术指标做小幅优选（Refinement）。
         """
-        # 1. 提取基础 Embedding
+        # 1. 提取基础 Embedding (这部分决定了“是否对口”)
         ego_embed = self.entity_user_embed(node_ids)
 
-        # 2. 执行全息融合：切换为乘法门控逻辑
-        # 使用 Sigmoid 将学术特征映射为 [0.5, 1.5] 的能量缩放系数
-        # 学术表现越好，gate_weight 越接近 1.5，从而大幅度放大其语义向量
-        gate_weight = torch.sigmoid(self.aux_embed_layer(aux_info_subset)) + 0.5
+        # 2. 执行学术特征平滑处理
+        # 使用 log1p 压制极端数值（如部分大佬百万级的引用量），避免拉大差距
+        smooth_aux = torch.log1p(aux_info_subset)
 
-        # 核心改动：由 + 改为 *，实现能量级的权重增益
+        # 3. 构造学术门控 (AX Gate)
+        # 修改点：缩放系数0.2，位移0.8
+        gate_weight = torch.sigmoid(self.aux_embed_layer(smooth_aux)) * 0.2 + 0.8
+
+        # 4. 执行融合：语义向量 * 微调权重
         fused_embed = ego_embed * gate_weight
 
-        # 3. 强制执行 L2 归一化，维持推理时向量空间的模长稳定
+        # 5. 强制执行 L2 归一化，确保余弦相似度计算的稳定性
         fused_embed = F.normalize(fused_embed, p=2, dim=-1)
 
-        # 4. 叠加类型偏置 (Job vs Author)
+        # 6. 叠加类型偏置 (Job vs Author)
         type_labels = (node_ids >= self.ENTITY_OFFSET).long()
         fused_embed += self.type_embed(type_labels)
 

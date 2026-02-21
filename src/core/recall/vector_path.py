@@ -104,64 +104,70 @@ class VectorPath:
         return author_ids[:self.recall_limit], duration
 
 
+# 修改 vector_path.py 最后的 if __name__ == "__main__": 部分
 if __name__ == "__main__":
-    # 实例化向量路召回组件，设置召回上限为300
-    v_path = VectorPath(recall_limit=300)
+    from src.core.recall.input_to_vector import QueryEncoder  # 确保路径正确
 
-    print("\n" + "=" * 60)
-    print("🚀 向量路召回独立测试控制台")
-    print("请输入查询向量 (JSON列表格式) 进行语义召回")
-    print("=" * 60)
+    v_path = VectorPath(recall_limit=300)
+    encoder = QueryEncoder()
+
+    fields = {
+        "1": "计算机科学", "2": "医学", "3": "政治学", "4": "工程学", "5": "物理学",
+        "6": "材料科学", "7": "生物学", "8": "地理学", "9": "化学", "10": "商学",
+        "11": "社会学", "12": "哲学", "13": "环境科学", "14": "数学", "15": "心理学",
+        "16": "地质学", "17": "经济学"
+    }
+
+
+    def get_work_title(author_id):
+        """简单从 SQLite 获取该作者的一篇论文标题用于展示"""
+        conn = sqlite3.connect(DB_PATH)
+        res = conn.execute("""
+                           SELECT w.title
+                           FROM works w
+                                    JOIN authorships a ON w.work_id = a.work_id
+                           WHERE a.author_id = ? LIMIT 1
+                           """, (author_id,)).fetchone()
+        conn.close()
+        return res[0] if res else "无论文数据"
+
+
+    print("\n" + "=" * 115)
+    print("🚀 向量路 (Vector Path) 独立语义召回测试")
+    print("-" * 115)
+    f_list = list(fields.items())
+    for i in range(0, len(f_list), 6):
+        print(" | ".join([f"{k}:{v}" for k, v in f_list[i:i + 6]]))
+    print("=" * 115)
 
     try:
+        domain_choice = input("\n请选择领域编号 (1-17, 0跳过): ").strip() or "0"
+        current_field = fields.get(domain_choice, "全领域")
+
         while True:
-            raw_input = input("\n请粘贴稠密向量 (输入 'q' 退出):\n>> ").strip()
+            user_input = input(f"\n[{current_field}] 请输入岗位需求 (q退出): ").strip()
+            if not user_input or user_input.lower() == 'q': break
 
-            # 检查退出条件
-            if not raw_input or raw_input.lower() == 'q':
-                print("退出测试模式")
-                break
+            # 1. 文本转向量
+            query_vec, _ = encoder.encode(user_input)
+            faiss.normalize_L2(query_vec)
 
-            try:
-                # 解析JSON格式的向量列表
-                vector_list = json.loads(raw_input)
+            # 2. 执行召回
+            author_ids, duration = v_path.recall(query_vec,
+                                                 target_domains=domain_choice if domain_choice != "0" else None)
 
-                # 转换为numpy数组并调整维度
-                query_vec = np.array([vector_list]).astype('float32')
+            # 3. 打印报告
+            print(f"\n[召回报告] 耗时: {duration:.2f}ms | 命中人数: {len(author_ids)}")
+            print("-" * 115)
+            print(f"{'排名':<6} | {'作者 ID':<12} | {'检索路径':<15} | {'代表作标题 (数据源: SQLite)'}")
+            print("-" * 115)
 
-                # 执行L2归一化以适应Faiss的内积索引
-                faiss.normalize_L2(query_vec)
+            for rank, aid in enumerate(author_ids[:20], 1):
+                title = get_work_title(aid)
+                if len(title) > 70: title = title[:67] + "..."
+                print(f"#{rank:<5} | {aid:<12} | {'Vector (V)':<15} | {title}")
 
-                # 执行召回，开启verbose模式显示中间过程
-                print("\n[执行召回中...]")
-                author_ids, duration = v_path.recall(query_vec, verbose=True)
-
-                # 输出结果
-                print(f"\n[召回结果报告]")
-                print(f"- 召回耗时: {duration:.2f} ms")
-                print(f"- 召回作者数量: {len(author_ids)}")
-
-                if author_ids:
-                    print(f"- 前5位作者ID: {author_ids[:5]}")
-                    print(f"- 全部作者ID列表:")
-                    # 每行显示10个ID，提高可读性
-                    for i in range(0, len(author_ids), 10):
-                        print(f"  {author_ids[i:i + 10]}")
-                else:
-                    print("- 未找到相关作者")
-
-                print("-" * 30)
-
-            except json.JSONDecodeError:
-                print("[错误] JSON格式解析失败，请确保输入的是有效的JSON列表格式")
-                print("示例: [0.1, -0.2, 0.3, ...]")
-            except Exception as e:
-                print(f"[错误] 召回过程发生异常: {str(e)}")
-                import traceback
-
-                traceback.print_exc()
+            print("-" * 115)
 
     except KeyboardInterrupt:
-        print("\n\n[!] 测试被用户中断")
-
-    print("[*] 向量路召回测试结束")
+        print("\n[!] 测试结束")
