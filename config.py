@@ -21,7 +21,7 @@ if not os.path.exists(INDEX_DIR):
 # --- 4. 数据库路径 ---
 DB_PATH = os.path.join(DATA_DIR, "academic_dataset_v5.db")
 
-# --- 5. 三大向量索引具体路径 ---
+# --- 5. 向量索引具体路径 ---
 VOCAB_INDEX_PATH = os.path.join(INDEX_DIR, "vocabulary.faiss")
 VOCAB_MAP_PATH = os.path.join(INDEX_DIR, "vocabulary_mapping.json")
 
@@ -31,9 +31,12 @@ ABSTRACT_MAP_PATH = os.path.join(INDEX_DIR, "abstract_mapping.json")
 JOB_INDEX_PATH = os.path.join(INDEX_DIR, "job_description.faiss")
 JOB_MAP_PATH = os.path.join(INDEX_DIR, "job_description_mapping.json")
 
+
+
 # --- 6. 其他索引 ---
 FEATURE_INDEX_PATH = os.path.join(INDEX_DIR, "feature_index.json")
 COLLAB_DB_PATH = os.path.join(INDEX_DIR, "scholar_collaboration.db")
+VOCAB_STATS_DB_PATH = os.path.join(INDEX_DIR, 'vocab_stats.db')
 
 # --- 7. SBERT 模型本地存放路径 ---
 SBERT_DIR = os.path.join(DATA_DIR, "build_sbert")
