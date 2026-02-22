@@ -38,16 +38,16 @@ def run_pipeline(config):
         with monitor.track("Syncing All Entities"):
             # 警告：只有在需要彻底重构词库时才取消下面的注释
             # --- 基础实体同步标记 ---
-            state.reset_marker("vocab_sync")
-            state.reset_marker("author_sync")
-            state.reset_marker("work_sync")
-            state.reset_marker("inst_sync")  # 机构同步
-            state.reset_marker("source_sync")  # 出版源同步
-            state.reset_marker("job_sync")  # 岗位同步
-
-            # --- 关系与语义标记 ---
-            state.reset_marker("topology_sync")  # 专家-论文-机构拓扑关系
-            state.reset_marker("job_skill_sync")  # 岗位-技能关联
+            # state.reset_marker("vocab_sync")
+            # state.reset_marker("author_sync")
+            # state.reset_marker("work_sync")
+            # state.reset_marker("inst_sync")  # 机构同步
+            # state.reset_marker("source_sync")  # 出版源同步
+            # state.reset_marker("job_sync")  # 岗位同步
+            #
+            # # --- 关系与语义标记 ---
+            # state.reset_marker("topology_sync")  # 专家-论文-机构拓扑关系
+            # state.reset_marker("job_skill_sync")  # 岗位-技能关联
             state.reset_marker("semantic_bridge_sync")  # 词库间的 Faiss 相似度关联
 
             for task, sql, cypher, t_field in node_tasks:

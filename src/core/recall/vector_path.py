@@ -4,7 +4,7 @@ import sqlite3
 import time
 import numpy as np
 from config import ABSTRACT_INDEX_PATH, ABSTRACT_MAP_PATH, DB_PATH, JOB_INDEX_PATH, JOB_MAP_PATH
-
+from src.utils.domain_utils import DomainProcessor
 
 class VectorPath:
     """
@@ -27,22 +27,17 @@ class VectorPath:
 
     def recall(self, query_vector, target_domains=None, verbose=False):
         """
-        向量路召回：实现基于领域 ID 的论文级硬过滤，且 domain_id 为可选参数
+        向量路召回：实现基于领域 ID 的论文级硬过滤
         :param query_vector: 输入向量
-        :param target_domains: 领域 ID 列表或字符串，例如 ['1'] 或 '1'
+        :param target_domains: 领域 ID 列表或字符串，例如 ['1', '4'] 或 '1|4'
         :param verbose: 是否打印中间调试信息
         """
         start_t = time.time()
         conn = sqlite3.connect(DB_PATH)
 
-        # 统一处理 target_domains 格式
-        if target_domains:
-            if isinstance(target_domains, str):
-                target_set = {target_domains}
-            else:
-                target_set = set(target_domains)
-        else:
-            target_set = None
+        # --- 【修改 1】：统一使用 DomainProcessor 处理 target_domains 格式 ---
+        # 无论是 '1|4' 还是 ['1', '4']，统一转化为 set({'1', '4'})
+        target_set = DomainProcessor.to_set(target_domains) if target_domains else None
 
         try:
             # --- 步骤 1: 语义检索相似论文 (Faiss 获取最相关的论文 ID 序列) ---
@@ -64,24 +59,20 @@ class VectorPath:
                 if wid not in domain_dict:
                     continue
 
-                # 如果提供了 domain_id，执行交集校验
+                # --- 【修改 2】：使用 DomainProcessor.has_intersect 执行交集校验 ---
                 if target_set:
-                    work_domains_str = domain_dict[wid]
-                    if work_domains_str:
-                        actual_domains = set(work_domains_str.split('|'))
-                        if not (actual_domains & target_set):
-                            continue  # 领域不匹配，跳过此论文
-                    else:
-                        continue  # 论文无领域标签，跳过
+                    work_domains_raw = domain_dict[wid]
+                    # 只有当论文所属领域与目标领域有交集时才保留
+                    # 工具类会自动处理 split('|') 或 split(',') 逻辑
+                    if not DomainProcessor.has_intersect(work_domains_raw, target_set):
+                        continue
 
-                # 如果没有 domain_id 或匹配成功，则加入列表
                 filtered_work_ids.append(wid)
 
             if not filtered_work_ids:
                 return [], (time.time() - start_t) * 1000
 
             # --- 步骤 4: 映射到作者，并保持原始论文的语义排名顺序 ---
-            # 我们使用过滤后的论文列表顺序来查询作者
             work_placeholders = ','.join(['?'] * len(filtered_work_ids))
             ordered_work_str = ",".join(filtered_work_ids)
 

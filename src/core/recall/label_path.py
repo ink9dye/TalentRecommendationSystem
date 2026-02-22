@@ -1,6 +1,8 @@
 import faiss
 import json
 import re
+import os
+import sqlite3
 import time
 import math
 import collections
@@ -8,26 +10,25 @@ import numpy as np
 import traceback
 from datetime import datetime
 from py2neo import Graph
+from src.core.recall.input_to_vector import QueryEncoder
+from src.utils.domain_utils import DomainProcessor
 from config import (
     CONFIG_DICT, JOB_INDEX_PATH, JOB_MAP_PATH,
     VOCAB_INDEX_PATH, VOCAB_MAP_PATH, DB_PATH
 )
 
-# --- 配置常量 ---
+# --- 算法配置：不同领域（Domain ID）的年度时间价值衰减率 ---
+# 1-计算机(0.90, 更新快), 4-工程(0.92), 12-临床医学(0.99, 较稳定)
 DOMAIN_DECAY_RATES = {
     "1": 0.90, "4": 0.92, "2": 0.94, "12": 0.99, "14": 0.98, "default": 0.95
-}
-
-HARD_BLACKLIST = {
-    "深度学习", "deep learning", "机器学习", "machine learning",
-    "python", "算法", "algorithm", "c++", "pytorch", "tensorflow",
-    "人工智能", "ai", "神经网络", "neural network"
 }
 
 
 class LabelRecallPath:
     """
-    解耦版标签路召回 - 结构化流水线
+    【核心架构】解耦版标签路召回 - 结构化流水线
+    逻辑：通过向量检索探测领域 -> 从岗位(Job)提取工业技能锚点 -> 知识图谱语义扩展 ->
+          映射至学术词汇(Vocabulary) -> 召回论文(Work) -> 综合评分计算专家(Author)贡献度。
     """
 
     def __init__(self, recall_limit=200):
@@ -35,35 +36,52 @@ class LabelRecallPath:
         self.current_year = datetime.now().year
         self._init_resources()
 
-        # 预载入统计数据
+        # 预载入统计数据，用于计算后续 IDF 与 熔断率
         self.total_work_count = self._get_node_count("Work")
         self.total_job_count = self._get_node_count("Job")
 
     def _init_resources(self):
-        """初始化连接与索引资源"""
+        """
+        【资源初始化】解决 Faiss ID 与 向量矩阵的同步问题
+        1. Faiss 索引：仅用于快速 Top-K 检索。
+        2. .npy 矩阵：存储原始归一化向量，用于计算词汇间的语义紧密度（Proximity）。
+        3. SQLite 映射：确保矩阵行号(Index)与数据库 voc_id 严格对齐。
+        """
         try:
+            # A. 初始化图数据库连接
             self.graph = Graph(
                 CONFIG_DICT["NEO4J_URI"],
                 auth=(CONFIG_DICT["NEO4J_USER"], CONFIG_DICT["NEO4J_PASSWORD"]),
                 name=CONFIG_DICT["NEO4J_DATABASE"]
             )
+
+            # B. 加载岗位描述索引（用于第一阶段：领域探测）
             self.job_index = faiss.read_index(JOB_INDEX_PATH)
             with open(JOB_MAP_PATH, 'r', encoding='utf-8') as f:
                 self.job_id_map = json.load(f)
 
+            # C. 加载词汇索引与向量快照
             self.vocab_index = faiss.read_index(VOCAB_INDEX_PATH)
-            with open(VOCAB_MAP_PATH, 'r', encoding='utf-8') as f:
-                self.vocab_id_map = json.load(f)
-                self.vocab_to_idx = {str(vid): i for i, vid in enumerate(self.vocab_id_map)}
+            vec_path = VOCAB_INDEX_PATH.replace('.faiss', '_vectors.npy')
+            if not os.path.exists(vec_path):
+                raise FileNotFoundError(f"未发现向量快照: {vec_path}，请先运行 build_vector_index.py。")
 
-            self.all_vocab_vectors = self.vocab_index.reconstruct_n(0, self.vocab_index.ntotal).astype('float32')
-            print("[OK] 资源初始化完成")
+            # 直接加载原始向量矩阵，避开 IndexIDMap 不支持 reconstruct 的局限
+            self.all_vocab_vectors = np.load(vec_path).astype('float32')
+
+            # D. 建立 { 'voc_id': 矩阵行下标 } 映射
+            # 必须 ORDER BY voc_id 以匹配向量编码时的顺序
+            with sqlite3.connect(DB_PATH) as conn:
+                rows = conn.execute("SELECT voc_id FROM vocabulary ORDER BY voc_id ASC").fetchall()
+                self.vocab_to_idx = {str(r[0]): i for i, r in enumerate(rows)}
+
+            print("[OK] 标签路资源初始化完成")
         except Exception as e:
             print(f"[Error] 资源加载失败: {e}")
             self.graph = None
 
     def _get_node_count(self, label):
-        """统计节点总数"""
+        """统计图谱节点总数，作为计算 IDF 的分母"""
         try:
             res = self.graph.run(f"MATCH (n:{label}) RETURN count(n) AS c").data()
             return float(res[0]['c']) if res else 1000000.0
@@ -72,7 +90,10 @@ class LabelRecallPath:
 
     # --- 第一阶段：环境与领域探测 ---
     def _detect_domain_context(self, query_vector):
-        """探测 Job 空间的领域分布"""
+        """
+        【领域探测】通过用户 Query 在 Job 空间寻找最相关的行业分布
+        逻辑：检索相似岗位 -> 统计其 domain_ids -> 确定当前搜索的“主战场”。
+        """
         _, indices = self.job_index.search(query_vector, 10)
         candidate_ids = [self.job_id_map[idx] for idx in indices[0] if 0 <= idx < len(self.job_id_map)]
 
@@ -87,185 +108,285 @@ class LabelRecallPath:
                     domain_counter[d.strip()] += 1
 
         inferred = [d for d, _ in domain_counter.most_common(3)]
+        # dominance：主导领域在 Top10 中的占比，决定后续领域分值的加成强度
         dominance = (domain_counter.most_common(1)[0][1] / 10.0) if domain_counter else 0
         return candidate_ids, inferred, dominance
 
+
     # --- 第二阶段：锚点技能提取 ---
     def _extract_anchor_skills(self, target_job_ids):
-        """从匹配的 Job 中提取满足 2% 熔断条件的技能锚点"""
+        """
+        【工业侧：岗位技能提取】
+        目的：从匹配的岗位中找到“高含金量”的专业词。
+        逻辑：
+        1. 统计命中岗位(Top 3)所要求的所有技能(Vocabulary)。
+        2. 计算该技能在全量岗位节点(total_j)中的覆盖率 cov_j。
+        3. 1% 熔断：仅保留在全量 Job 中出现频率 < 1% 的专业技能，剔除“沟通、办公”等通用词。
+        4. 扩容：将 LIMIT 设为 50，以完整捕捉复合型岗位中的多个技术维度。
+        """
         cypher = """
         MATCH (j:Job) WHERE j.id IN $j_ids
         MATCH (j)-[:REQUIRE_SKILL]->(v:Vocabulary)
-        WITH v, COUNT { (v)<-[:REQUIRE_SKILL]-() } AS degree_j
-        OPTIONAL MATCH (v_topic:Vocabulary {term: v.term})
-        WHERE EXISTS { (v_topic)<-[:HAS_TOPIC]-() }
-        WITH v, degree_j, COUNT { (v_topic)<-[:HAS_TOPIC]-() } AS degree_w
-        WITH v, (degree_j * 1.0 / $total_j) AS cov_j, (degree_w * 1.0 / $total_w) AS cov_w,
-             log10($total_w / (degree_w + 1)) AS idf_val
-        WHERE cov_j < 0.02 AND cov_w < 0.02
-        RETURN DISTINCT v.id AS vid, v.term AS term, idf_val
-        ORDER BY idf_val DESC LIMIT 15
+        WITH v, (COUNT { (v)<-[:REQUIRE_SKILL]-() } * 1.0 / $total_j) AS cov_j
+
+        // --- 约束 1：岗位侧 1% 熔断 (按 Job 总节点数计算) ---
+        WHERE cov_j < 0.01 
+
+        RETURN DISTINCT v.id AS vid, v.term AS term, cov_j
+        ORDER BY cov_j ASC 
+        LIMIT 50 // 扩大上限至 50，确保长 JD 中的所有核心技术点(如 RRT, MPC, MuJoCo)均能作为锚点
         """
-        cursor = self.graph.run(cypher, j_ids=target_job_ids[:3],
-                                total_j=self.total_job_count, total_w=self.total_work_count)
+        cursor = self.graph.run(cypher, j_ids=target_job_ids[:5], total_j=self.total_job_count)
 
-        return {str(r['vid']): {"term": r['term'], "idf": r['idf_val']}
-                for r in cursor if len(r['term']) > 1 and r['term'].lower() not in HARD_BLACKLIST}
-
+        # 返回格式：{vid: {"term": "术语名称"}}
+        return {str(r['vid']): {"term": r['term']} for r in cursor if len(r['term']) > 1}
     # --- 第三阶段：语义扩展 ---
-    def _expand_semantic_map(self, core_vids, anchor_skills):
-        """扩展 Vocabulary 路径 (同名/相似度)"""
-        cypher = """
-        MATCH (v:Vocabulary) WHERE v.id IN $v_ids 
-        OPTIONAL MATCH (v_topic:Vocabulary {term: v.term}) WHERE EXISTS { (v_topic)<-[:HAS_TOPIC]-() }
-        OPTIONAL MATCH (v)-[:SIMILAR_TO]-(v_rel:Vocabulary) WHERE EXISTS { (v_rel)<-[:HAS_TOPIC]-() }
-        RETURN v.id AS source_id, collect(DISTINCT v_topic.id) AS t_ids, collect(DISTINCT v_rel.id) AS r_ids, v.term AS term
+    def _expand_semantic_map(self, core_vids, anchor_skills, domain_regex=None):
         """
-        cursor = self.graph.run(cypher, v_ids=core_vids)
+        【主函数】语义扩展引擎：引入“领域跨度”与“语义纯度”双重惩罚。
+        """
+        regex = domain_regex if domain_regex else ".*"
 
-        score_map, term_map = {}, {}
-        for rec in cursor:
-            s_term = rec['term']
-            for tid in rec['t_ids']:
-                score_map[str(tid)], term_map[str(tid)] = 100, s_term
-            for rid in rec['r_ids']:
-                if str(rid) not in score_map:
-                    score_map[str(rid)], term_map[str(rid)] = 60, s_term
-        return score_map, term_map
+        # 1. 辅助函数 A：执行图检索，获取包含领域跨度和纯度统计的原始数据
+        raw_results = self._query_expansion_with_topology(core_vids, regex)
+
+        # 2. 辅助函数 B：应用数学公式计算最终动态权重
+        return self._calculate_final_weights(raw_results)
+
+    def _query_expansion_with_topology(self, v_ids, regex):
+        """
+        【辅助函数 A】利用图拓扑计算学术词的“朋友圈”特征。
+        核心逻辑：计算该词连接了多少个不同领域（Span）以及其中目标领域的占比（Purity）。
+        """
+        cypher = """
+        MATCH (v:Vocabulary) WHERE v.id IN $v_ids
+        MATCH (v)-[:SIMILAR_TO]-(v_rel:Vocabulary)
+
+        // A. 基础过滤：跳转后的学术词必须在主战场有产出
+        WHERE EXISTS { (v_rel)<-[:HAS_TOPIC]-(w:Work) WHERE w.domain_ids =~ $regex }
+
+        // B. 拓扑统计：计算学术侧关联数(degree_w)和岗位侧覆盖率(cov_j)
+        // 以及目标领域的论文命中数 (target_degree_w)
+        MATCH (v_rel)<-[:HAS_TOPIC]-(w_rel:Work)
+        WITH v, v_rel, 
+             COUNT(DISTINCT w_rel) AS degree_w,
+             COUNT { (v_rel)<-[:HAS_TOPIC]-(w_t) WHERE w_t.domain_ids =~ $regex } AS target_degree_w,
+             (COUNT { (v_rel)<-[:REQUIRE_SKILL]-() } * 1.0 / $total_j) AS cov_j,
+             collect(DISTINCT w_rel.domain_ids) AS all_d_strs
+
+        // C. 计算领域跨度 (Domain Span)
+        // 将所有关联论文的领域标签展开，统计去重后的领域总数
+        UNWIND all_d_strs AS d_str
+        WITH v, v_rel, degree_w, target_degree_w, cov_j, split(d_str, ",") AS d_ids
+        UNWIND d_ids AS d_id
+        WITH v, v_rel, degree_w, target_degree_w, cov_j, COUNT(DISTINCT trim(d_id)) AS domain_span
+
+        // D. 双重熔断：比例限制 + 绝对值限制
+        WHERE (degree_w * 1.0 / $total_w) < 0.01 AND degree_w < 5000
+
+        RETURN v_rel.id AS tid, v_rel.term AS term, 
+               degree_w, target_degree_w, cov_j, domain_span
+        """
+        params = {
+            "v_ids": v_ids, "regex": regex,
+            "total_w": self.total_work_count, "total_j": self.total_job_count
+        }
+        return self.graph.run(cypher, **params).data()
+
+    def _calculate_final_weights(self, raw_results):
+        """
+        【辅助函数 B】数学引擎：将拓扑统计量转化为断崖式惩罚权重。
+        """
+        score_map, term_map, idf_map = {}, {}, {}
+
+        for rec in raw_results:
+            tid = str(rec['tid'])
+            degree_w = rec['degree_w']
+            cov_j = rec['cov_j']
+            domain_span = max(1, rec['domain_span'])  # 至少为 1
+
+            # 1. 计算学术词的语义纯度 (Tag Purity)
+            # 即：这个词关联的论文中，属于我们目标领域的比例是多少
+            tag_purity = rec['target_degree_w'] / degree_w
+
+            # 2. 计算基础 IDF
+            idf_val = math.log10(self.total_work_count / (degree_w + 1))
+
+            # 3. 【核心公式：断崖惩罚 + 纯度二次方奖励 / 领域跨度惩罚】
+            # a. exp(300*(cov_j-0.005)): 岗位侧断崖惩罚（压制“开源”等通用词）
+            # b. pow(tag_purity, 2): 纯度奖励。如果一个词 90% 的论文是教育，那它在机器人语境下权重仅剩 1%
+            # c. / domain_span: 跨界惩罚。如果一个词横跨了 15 个领域，它是“万金油”，权重除以 15
+            dynamic_weight = (
+                    (idf_val / (1.0 + math.exp(300.0 * (cov_j - 0.005))))
+                    * math.pow(tag_purity, 2)
+                    / domain_span
+            )
+
+            score_map[tid] = dynamic_weight
+            term_map[tid] = rec['term']
+            idf_map[tid] = idf_val
+
+        return score_map, term_map, idf_map
 
     # --- 第四阶段：向量紧密度计算 ---
     def _calculate_proximity(self, hit_ids):
-        """计算命中标签在向量空间中的平均余弦相似度"""
+        """
+        【语义纯度验证】计算命中标签在向量空间中的平均余弦相似度
+        逻辑：如果一个作者命中的标签彼此在语义上很近（如：SLAM 和 激光雷达），则证明专家在该细分领域非常专注，得分越高。
+        """
         if len(hit_ids) < 2: return 0.5
         idxs = [self.vocab_to_idx.get(str(vid)) for vid in hit_ids if str(vid) in self.vocab_to_idx]
         if len(idxs) < 2: return 0.5
+
+        # 提取向量并计算相似度矩阵
         vecs = self.all_vocab_vectors[idxs]
         sim_matrix = np.dot(vecs, vecs.T)
+        # 取上三角（不含对角线）计算均值
         return float(np.mean(sim_matrix[np.triu_indices(sim_matrix.shape[0], k=1)]))
 
     # --- 第五阶段：核心打分引擎 ---
-    import re
+    def _is_retracted(self, title):
+        """
+        【辅助函数 1】撤稿拦截器
+        逻辑：识别论文是否为撤稿通知，这类文档不具备人才评价价值。
+        """
+        return "retraction" in title.lower()
 
-    import re
-    import math
+    def _get_domain_purity_factor(self, paper_domains_raw, active_set, dominance):
+        """
+        【辅助函数 2】领域专注度计算（Purity Engine）
+        逻辑：
+        1. 领域一票否决：与目标领域完全无交集的论文直接排除。
+        2. 纯度惩罚（你的期待）：涉及的领域越多，非目标领域占比越大，得分越低。
+        3. 4 次方加成：通过 math.pow(ratio, 4) 让“不专注”的论文分数呈断崖式下跌。
+        """
+        paper_domains = DomainProcessor.to_set(paper_domains_raw)
+
+        # 计算交集：论文中属于目标领域的部分
+        intersect = paper_domains.intersection(active_set)
+
+        # 1. 领域硬约束：如果明确标注了领域但与目标集完全不交，分值为 0
+        if paper_domains and not intersect:
+            return 0.0
+
+        # 2. 计算纯度比率 (Purity Ratio)
+        # 逻辑：目标领域数 / 总涉及领域数。例如 {计算机, 工程, 教育} 找机器人，纯度为 2/3 = 0.66
+        purity_ratio = 1.0
+        if paper_domains:
+            purity_ratio = len(intersect) / len(paper_domains)
+
+        # 3. 基础领域分与纯度惩罚
+        # 采用 4 次方惩罚：纯度 0.5 的论文（如 CS+教育），其系数仅剩 0.0625 倍
+        base_score = 1.0 + (dominance * 5.0) if intersect else 0.5
+        return base_score * math.pow(purity_ratio, 4)
 
     def _compute_contribution(self, paper, context):
         """
-        单篇论文贡献度计算 - 拓扑信任版
-        逻辑：岗位向量驱动 -> 命中Job -> 获取Domain/Skill -> 匹配Work -> 为Author加分
+        【主评分函数】量化贡献度计算
+        调度逻辑：拦截撤稿 -> 计算领域纯度 -> 累加标签权重 -> 应用时序与紧密度加成。
         """
-        raw_title = (paper.get('title') or "").lower()
+        raw_title = (paper.get('title') or "")
 
-        # --- 1. 领域过滤逻辑 (基于你的思路：根据论文domain决定是否使用) ---
-        work_domains = str(paper.get('domains', '')).replace('|', ',').split(',')
-        # 检查论文领域是否在岗位推断出的 active_domains 列表中
-        has_domain_match = any(ad in work_domains for ad in context['active_domains'])
-
-        # 决策逻辑：
-        # A. 如果论文明确标了领域，但不在岗位相关的领域里 -> 跨行噪声，舍弃
-        # B. 如果论文没标领域 (None/Empty) -> 可能是新论文或标注缺失，选择信任其 HAS_TOPIC 关系，放行
-        if paper.get('domains') and not has_domain_match:
+        # 1. 撤稿拦截
+        if self._is_retracted(raw_title):
             return 0, []
 
-        # 领域系数：匹配则大幅加成，缺失则给中性基础权重 (0.5)
-        domain_coeff = 1.0 + (context['dominance'] * 5.0) if has_domain_match else 0.5
+        # 2. 领域纯度降权：调用辅助函数计算基于“专注度”的领域系数
+        # 解决了你担心的“涉及领域越多分越低”的问题
+        domain_coeff = self._get_domain_purity_factor(
+            paper.get('domains'),
+            context['active_domain_set'],
+            context['dominance']
+        )
+        if domain_coeff <= 0:
+            return 0, []
 
-        # --- 2. 标签匹配与 IDF 权重 (你的思路核心：通过topic找到论文) ---
+        # 3. 标签匹配与动态权重累加
+        # 这里的 score_map 已经包含了之前修改的“词级领域跨度惩罚”
         rank_score = 0
-        valid_hids = []
-        hit_terms = []
-
-        # context['score_map'] 存储了从 Job 节点溯源而来的所有 Vocabulary 及其权重
+        valid_hids, hit_terms = [], []
         for hit in paper['hits']:
             vid_s = str(hit['vid'])
             if vid_s in context['score_map']:
-                # 使用 IDF 平方加权：iLQR/MPC/ROS2 等硬核算法词的 IDF 远高于常用词
-                # 这确保了“含金量”高的技术点能给作者带来极高加分
-                weight = context['score_map'][vid_s] * math.pow(hit['idf'], 2)
-                rank_score += weight
+                rank_score += context['score_map'][vid_s] * hit['idf']
                 valid_hids.append(hit['vid'])
-                # 记录具体命中的标签名称，方便后续分析
-                hit_terms.append(f"{context['term_map'][vid_s]}")
+                hit_terms.append(context['term_map'][vid_s])
 
-        # 若该论文在图谱中并没有与岗位相关的技能词建立 HAS_TOPIC 关系，则不计分
         if rank_score == 0:
             return 0, []
 
-        # --- 3. 标题辅助奖励 (非硬性门槛) ---
-        # 即使标题没写词，只要有关系也能召回；若标题写了，属于“点题”，给小额加成
-        noise_penalty = 1.0
-        if context['anchor_kws']:
-            meaningful_kws = [k for k in context['anchor_kws'] if len(k) > 2 or k in ['ros', 'mpc']]
-            found_in_title = any(re.search(rf"(^|[^a-z0-9]){re.escape(akw)}($|[^a-z0-9])", raw_title)
-                                 for akw in meaningful_kws)
-            if found_in_title:
-                noise_penalty = 1.2
-
-        # --- 4. 时序衰减与综述降权 ---
-        # 综述论文 (命中标签过多) 贡献度衰减
+        # 4. 综述降权 (原样保留你的 1/n^2 逻辑)
         hit_count = len(valid_hids)
         survey_decay = (1.0 / math.pow(hit_count, 2)) if hit_count > 1 else 1.0
-        if any(k in raw_title for k in ['survey', 'overview', 'review']):
+        if any(k in raw_title.lower() for k in ['survey', 'overview', 'review']):
             survey_decay *= 0.1
 
-        # 时序分：越新的研究贡献越高
+        # 5. 指数级紧密度加成 (1+prox)^n
+        proximity = self._calculate_proximity(valid_hids)
+        proximity_bonus = math.pow(1.0 + proximity, hit_count)
+
+        # 6. 时序衰减与署名权重
         year_diff = max(0, self.current_year - int(paper.get('year', 2000)))
         time_decay = math.pow(context['decay_rate'], year_diff)
+        auth_weight = float(paper.get('weight') or 0.001)
 
-        # --- 5. 组合最终得分 ---
-        # 标签空间紧密度：命中的几个词在向量空间越近，说明作者在该垂直领域越深钻
-        proximity = self._calculate_proximity(valid_hids)
-
-        # 署名权重：基于 authored 边的权重（一作/通讯权重高）
-        auth_weight = paper['weight'] if paper['weight'] > 0 else 0.001
-
-        # 最终计算公式
-        score = rank_score * (1 + proximity) * domain_coeff * time_decay * survey_decay * auth_weight * noise_penalty
-
+        # 最终组合
+        score = rank_score * proximity_bonus * domain_coeff * time_decay * survey_decay * auth_weight
         return score, hit_terms
 
-    # --- 主召回逻辑 ---
     def recall(self, query_vector, domain_ids=None):
+        """
+        【主召回逻辑】全链路调度：工业需求 -> 领域探测 -> 技能锚点 -> 学术映射 -> 拓扑检索 -> 综合评分
+        修改说明：
+        1. 锚点扩容：支持从 Top 3 岗位中提取最多 50 个工业关键词。
+        2. 领域硬约束：在检索阶段通过正则严格过滤不属于目标领域的论文。
+        3. 诊断优化：学术词展示改为去重后的 Concept 名称，确保 Step 3 逻辑清晰。
+        """
         if not self.graph: return [], 0
         start_t = time.time()
 
-        # 1. 岗位空间探测：文本向量 -> 找到最接近的 Job 节点
+        # 1. 岗位空间探测：明确搜索背景（确定当前是在招什么领域的专家）
         job_ids, inferred_domains, dominance = self._detect_domain_context(query_vector)
 
-        # 2. 工业词提取 (JD侧)
-        # 这一步找到的是直接挂在 Job 上的原始标签
+        # 2. 锚点提取：确定核心技能词（已在内部修改为 LIMIT 50 且执行 1% 岗位侧熔断）
         anchor_skills = self._extract_anchor_skills(job_ids)
         if not anchor_skills:
-            self.last_debug_info = {"author_count": 0, "work_count": 0, "industrial_kws": [], "academic_kws": []}
             return [], 0
-
         industrial_kws = [v['term'] for v in anchor_skills.values()]
 
-        # 3. 确定核心上下文与领域并集
-        # 如果用户没传 domain_ids，则使用 inferred_domains 列表
-        active_domains = [str(domain_ids)] if domain_ids and str(domain_ids) != "0" else inferred_domains
+        # 3. 领域处理：确定最终过滤范围
+        active_domain_set = DomainProcessor.to_set(
+            domain_ids if domain_ids and str(domain_ids) != "0" else inferred_domains)
 
-        # 4. 语义扩展：工业词 -> SIMILAR_TO -> 学术 Topic
-        # 这一步是解决“工业词搜不到论文”的关键桥梁
-        score_map, term_map = self._expand_semantic_map([int(k) for k in anchor_skills.keys()], anchor_skills)
-        academic_kws = list(term_map.values())
+        # 4. 语义扩展：【解耦修改】获取学术侧 Concept 映射与 IDF
+        # 接收三个返回值，内部已实现 SIMILAR_TO 强制跳转与学术侧名称映射
+        score_map, term_map, idf_map = self._expand_semantic_map([int(k) for k in anchor_skills.keys()], anchor_skills)
 
-        # 5. 执行图谱检索 (Topic -> Work)
+        # --- 优化点：对诊断用的学术词进行去重，反映真实的 Concept 覆盖 ---
+        academic_kws = list(set(term_map.values()))
+
+        # 5. 图谱拓扑检索：通过学术词 ID 反查关联论文与作者
         params = {"v_ids": [int(k) for k in score_map.keys()], "total_w": self.total_work_count}
 
+        # 构建领域过滤正则
+        regex_str = DomainProcessor.build_neo4j_regex(active_domain_set)
+
+        # --- 核心改动：领域硬约束逻辑 ---
+        # 如果存在领域限制，则执行硬过滤；若无限制（如 domain=0），则不加约束
         domain_clause = ""
-        if active_domains:
-            # 构造领域正则，匹配并集
-            regex_str = f"(^|,){'|'.join(map(str, active_domains))}(,|$)"
-            domain_clause = "AND (w.domain_ids =~ $regex OR w.domain_ids IS NULL OR w.domain_ids = '')"
+        if regex_str:
+            # “否则就不算”：移除 NULL 或空字符串的兼容，执行严格正则匹配
+            domain_clause = "AND w.domain_ids =~ $regex"
             params["regex"] = regex_str
 
         final_cypher = f"""
         MATCH (v:Vocabulary) WHERE v.id IN $v_ids
         WITH v, COUNT {{ (v)<-[:HAS_TOPIC]-() }} AS degree_w
-        WHERE (degree_w * 1.0 / $total_w) < 0.01
+        // 学术侧二次熔断：确保检索的 Topic 在全量论文库中覆盖率低于 1%
+        WHERE (degree_w * 1.0 / $total_w) < 0.01 
         WITH v, log10($total_w / (degree_w + 1)) AS idf_weight
         MATCH (v)<-[:HAS_TOPIC]-(w:Work) 
+        // --- 领域一票否决权 ---
         WHERE 1=1 {domain_clause} 
         WITH w, collect({{vid: v.id, idf: idf_weight}}) AS hit_info LIMIT 2000
         MATCH (w)<-[auth_r:AUTHORED]-(a:Author)
@@ -274,27 +395,25 @@ class LabelRecallPath:
         """
         cursor = self.graph.run(final_cypher, **params)
 
-        # 6. 打分流水线 (使用 pos_weight 加分)
+        # 6. 打分与上下文构建
+        first_domain = list(active_domain_set)[0] if active_domain_set else "default"
         context = {
             'score_map': score_map,
-            'term_map': term_map,
-            'anchor_kws': [k.lower() for k in industrial_kws],
-            'active_domains': active_domains,
+            'term_map': term_map,  # 此时存储的是映射后的英文 Concept
+            'anchor_kws': [k.lower() for k in industrial_kws],  # 扩容后的 50 个词，提升标题奖励命中率
+            'active_domain_set': active_domain_set,
             'dominance': dominance,
-            'decay_rate': DOMAIN_DECAY_RATES.get(active_domains[0] if active_domains else "default", 0.95)
+            'decay_rate': DOMAIN_DECAY_RATES.get(first_domain, 0.95)
         }
 
-        scored_authors = []
-        all_works_count = 0
+        scored_authors, all_works_count = [], 0
         for record in cursor:
-            author_total_score = 0.0
-            best_paper = None
-
+            author_total_score, best_paper = 0.0, None
             for paper in record['papers']:
                 all_works_count += 1
+                # 核心贡献度计算
                 p_score, p_hits = self._compute_contribution(paper, context)
                 author_total_score += p_score
-
                 if p_score > 0 and (not best_paper or p_score > best_paper['contribution']):
                     best_paper = {
                         'title': paper['title'], 'year': paper['year'],
@@ -307,15 +426,14 @@ class LabelRecallPath:
                     'top_paper': best_paper, 'paper_count': len(record['papers'])
                 })
 
-        # 7. 排序与深度诊断信息记录
+        # 7. 排序与诊断记录封装
         scored_authors.sort(key=lambda x: x['score'], reverse=True)
-
         self.last_debug_info = {
-            'active_domains': active_domains,
+            'active_domains': list(active_domain_set),
             'dominance': f"{dominance * 100:.1f}%",
-            'industrial_kws': industrial_kws,  # 诊断：JD提取的原始词
-            'academic_kws': academic_kws,  # 诊断：扩展出来的学术词
-            'work_count': all_works_count,  # 诊断：检索到的论文总数
+            'industrial_kws': industrial_kws,  # 显示扩容后的 50 个锚点词
+            'academic_kws': academic_kws,  # 显示去重后的 Concept 名称
+            'work_count': all_works_count,
             'author_count': len(scored_authors),
             'top_samples': scored_authors[:20]
         }
@@ -323,9 +441,7 @@ class LabelRecallPath:
         return [a['aid'] for a in scored_authors[:self.recall_limit]], (time.time() - start_t) * 1000
 
 if __name__ == "__main__":
-    from src.core.recall.input_to_vector import QueryEncoder
-    import numpy as np
-    import traceback
+
 
     l_path = LabelRecallPath(recall_limit=200)
     encoder = QueryEncoder()

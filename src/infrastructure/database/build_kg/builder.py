@@ -2,6 +2,7 @@ import math
 import os
 import re
 import json
+import logging
 import faiss
 import sqlite3
 from tqdm import tqdm
@@ -90,73 +91,123 @@ class KGBuilder:
 
     def build_semantic_bridge(self):
         """
-        构建语义桥接（跨领域词汇关联）。
-        方案 A：自适应 K 值搜索，确保跨类型关联的达成率。
-        已修复：增加了增量位点 (Marker) 绑定，解决 sqlite3.ProgrammingError。
-        """
-        idx_path = self.config['VOCAB_INDEX_PATH']
-        map_path = self.config['VOCAB_MAP_PATH']
+        语义桥接终极版：通过向量空间计算词汇间的相似度，并在图谱中建立连接。
 
-        if not (os.path.exists(idx_path) and os.path.exists(map_path)):
+        【解决的核心痛点】：
+        1. 修复 KeyError: 直接从 config 模块导入无法在 CONFIG_DICT 找到的模板。
+        2. 绕过 reconstruct 限制: 既然索引不能直接反推向量，我们就重新编码。
+        3. 增量更新: 依靠 SQLite 记录进度，防止重复劳动。
+        """
+        import numpy as np
+        from sentence_transformers import SentenceTransformer
+        # 核心：直接引用模板字典，解决 self.config 缺少该键的问题
+        from config import CYPHER_TEMPLATES
+
+        # --- 第一步：参数准备（全部对齐 config.py） ---
+        idx_path = self.config['VOCAB_INDEX_PATH']  # Faiss 索引文件路径
+        db_path = self.config['DB_PATH']  # SQLite 数据库路径
+        sbert_dir = self.config['SBERT_DIR']  # 模型本地缓存目录
+        # 引用全局设定的批次大小（通常为 5000），保证写入 Neo4j 时的效率
+        batch_size_neo4j = self.config.get('BATCH_SIZE', 5000)
+
+        # 安全检查：如果没有索引文件，后续检索无法进行
+        if not os.path.exists(idx_path):
+            logging.warning(f"Vocab index path [{idx_path}] not found, skipping.")
             return
 
-        # 1. 获取增量标记 (Marker)
+        # --- 第二步：断点续传状态初始化 ---
         task_name = "semantic_bridge_sync"
-        marker = self.state.get_marker(task_name)
+        # 从 SQLite 中读取上一次成功同步到的词汇 ID (Marker)
+        marker_str = self.state.get_marker(task_name)
+        marker = int(marker_str) if marker_str.isdigit() else 0
 
+        # 加载 HNSW 索引（用于极速寻找最近邻）
         index = faiss.read_index(idx_path)
-        with open(map_path, 'r', encoding='utf-8') as f:
-            all_ids = json.load(f)
+        # 修复加载逻辑：使用‘模型名 + 路径’，解决 OSError 找不到权重文件的问题
+        model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2', cache_folder=sbert_dir)
 
-        with sqlite3.connect(self.config['DB_PATH']) as conn:
-            conn.row_factory = sqlite3.Row
-            # 预加载类型映射
-            vocab_meta = {str(r[0]): r[1] for r in
-                          conn.execute("SELECT voc_id, entity_type FROM vocabulary").fetchall()}
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row  # 使返回结果可以通过字段名访问
 
-            # 2. 核心修复点：传入 (marker,) 参数
-            cursor = conn.execute(SQL_QUERIES["GET_ALL_VOCAB"], (marker,))
-            batch = []
+            # --- 第三步：预加载元数据（性能优化关键） ---
+            logging.info("[*] 正在加载词汇元数据以执行语义桥接...")
+            # 我们需要 entity_type 来判断两个词是不是“同一类”
+            all_rows = conn.execute("SELECT voc_id, term, entity_type FROM vocabulary").fetchall()
+            # 将所有词汇类型存入字典，后续在循环中 O(1) 速度查询，避免频繁查库
+            vocab_meta = {int(r['voc_id']): r['entity_type'] for r in all_rows}
 
-            for v in tqdm(cursor, desc="Building Semantic Bridge (Adaptive)"):
-                source_id, source_type = str(v['id']), v['entity_type']
-                if source_id not in all_ids: continue
+            # 增量过滤：只处理 ID 大于上一次标记（Marker）的词汇
+            pending_rows = [r for r in all_rows if int(r['voc_id']) > marker]
+            if not pending_rows:
+                logging.info("[*] 语义桥接任务已完成，无需操作。")
+                return
 
-                try:
-                    vec_idx = all_ids.index(source_id)
-                    vec = index.reconstruct(vec_idx).reshape(1, -1)
+            # --- 第四步：核心批量处理循环 ---
+            # 为了提速，我们每 1024 个词汇作为一个块（Chunk）进行处理
+            encode_chunk_size = 1024
+            total_pending = len(pending_rows)
+            neo4j_batch = []  # 准备发往 Neo4j 的数据池
 
-                    # --- 方案 A 核心：阶梯式扩大搜索范围 ---
-                    for k_step in [1000, 3000, 5000]:
-                        scores, indices = index.search(vec, k_step)
-                        current_links = []
-                        for score, n_idx in zip(scores[0], indices[0]):
-                            if n_idx == -1: continue
-                            neighbor_id = all_ids[n_idx]
+            # 进度条显示：让 6.6 万条数据的同步过程可视化
+            for start_idx in tqdm(range(0, total_pending, encode_chunk_size), desc="Building Semantic Bridge"):
+                # 获取当前批次的待处理词汇
+                current_chunk = pending_rows[start_idx: start_idx + encode_chunk_size]
 
-                            # 过滤规则：非自身且类型不同
-                            if neighbor_id != source_id and vocab_meta.get(neighbor_id) != source_type:
-                                current_links.append({"f": int(source_id), "t": int(neighbor_id), "s": float(score)})
-                                if len(current_links) >= 3:
-                                    break
+                # 【重算向量】：批量生成向量，避开索引无法 reconstruct 的死穴
+                chunk_texts = [r['term'] for r in current_chunk]
+                chunk_embeddings = model.encode(chunk_texts, batch_size=128, show_progress_bar=False)
+                # 必须归一化：将向量长度变为 1，从而让 Dot Product 等价于余弦相似度
+                faiss.normalize_L2(chunk_embeddings)
 
-                        if len(current_links) >= 3 or k_step == 5000:
-                            batch.extend(current_links)
-                            break
+                # 【批量检索】：一次性寻找当前块内所有词的前 100 个邻居
+                all_scores, all_labels = index.search(chunk_embeddings.astype('float32'), 100)
 
-                except Exception:
-                    continue
+                # 遍历当前块中的每个词，筛选最合适的 3 个邻居
+                for idx, row in enumerate(current_chunk):
+                    source_id = int(row['voc_id'])
+                    source_type = row['entity_type']
 
-                # 3. 达到批次大小后写入 Neo4j 并更新位点
-                if len(batch) >= 500:
-                    self.state.engine.send_batch(CYPHER_TEMPLATES["LINK_SIMILAR"], batch)
-                    self.state.update_marker(task_name, str(v['id']))
-                    batch = []
+                    scores = all_scores[idx]
+                    labels = all_labels[idx]
 
-            if batch:
-                self.state.engine.send_batch(CYPHER_TEMPLATES["LINK_SIMILAR"], batch)
-                self.state.update_marker(task_name, str(v['id']))
+                    current_links = []
+                    # 遍历检索出的邻居（按相似度由高到低排列）
+                    for score, neighbor_id in zip(scores, labels):
+                        neighbor_id = int(neighbor_id)
 
+                        # 过滤无效项（-1 代表没搜到）以及自身
+                        if neighbor_id == -1 or neighbor_id == source_id:
+                            continue
+
+                        # 【核心桥接逻辑】：只连接“不同类型”的词
+                        # 例如：让“Java(技能)”去连接“后端开发(岗位)”，而不是连接“Python(技能)”
+                        if vocab_meta.get(neighbor_id) != source_type:
+                            current_links.append({
+                                "f": source_id,  # From (源词 ID)
+                                "t": neighbor_id,  # To (目标词 ID)
+                                "s": float(score)  # Similarity Score (相似度权重)
+                            })
+                            # 限制数量：每个词最多建立 3 个最强跨类关联，防止图谱爆炸
+                            if len(current_links) >= 3:
+                                break
+
+                    # 将本次筛选出的 3 个关联加入待推送大池子
+                    neo4j_batch.extend(current_links)
+
+                    # --- 第五步：写入数据库并记录进度 ---
+                    # 当池子里的关系累积到 5000 条时，统一写入一次 Neo4j
+                    if len(neo4j_batch) >= batch_size_neo4j:
+                        self.state.engine.send_batch(CYPHER_TEMPLATES["LINK_SIMILAR"], neo4j_batch)
+                        # 重要：每成功写入一批，就更新一次 SQLite 里的 Marker
+                        self.state.update_marker(task_name, str(source_id))
+                        neo4j_batch = []
+
+            # --- 第六步：清理收尾 ---
+            # 处理循环结束后，池子里可能还剩下没凑够 5000 条的“尾数”
+            if neo4j_batch:
+                self.state.engine.send_batch(CYPHER_TEMPLATES["LINK_SIMILAR"], neo4j_batch)
+                # 将最后一个处理的 ID 作为最终 Marker 保存
+                self.state.update_marker(task_name, str(pending_rows[-1]['voc_id']))
     def build_work_semantic_links(self):
         """
         建立论文与词汇节点的关联边 (Work)-[:HAS_TOPIC]->(Vocabulary)

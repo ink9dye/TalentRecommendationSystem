@@ -10,7 +10,19 @@ from contextlib import contextmanager
 
 class GraphEngine:
     def __init__(self, config):
-        self.driver = GraphDatabase.driver(config['NEO4J_URI'], auth=(config['NEO4J_USER'], config['NEO4J_PASSWORD']))
+        """
+        初始化 Neo4j 驱动。
+        修正：移除了无效的 socket_timeout，使用官方支持的超时参数。
+        """
+        self.driver = GraphDatabase.driver(
+            config['NEO4J_URI'],
+            auth=(config['NEO4J_USER'], config['NEO4J_PASSWORD']),
+            # --- 核心修复：使用 5.x 驱动支持的参数 ---
+            connection_timeout=60.0,      # 建立连接的超时时间 (秒)
+            max_transaction_retry_time=60.0, # 允许事务在网络波动或繁忙时自动重试的总时间
+            max_connection_lifetime=3600, # 限制连接寿命，防止陈旧连接导致假死
+            keep_alive=True               # 保持 TCP 长连接，防止因静默被防火墙切断
+        )
         self.db_name = config['NEO4J_DATABASE']
 
     def execute_query(self, query: str):
@@ -19,13 +31,14 @@ class GraphEngine:
             session.run(query)
 
     def send_batch(self, query: str, data: List[Dict]):
+        """执行带参数的批量写入"""
         if not data: return
         with self.driver.session(database=self.db_name) as session:
             session.run(query, {"data": data})
 
     def close(self):
+        """关闭驱动连接"""
         self.driver.close()
-
 
 class SyncStateManager:
     def __init__(self, engine: GraphEngine, config: Dict):
