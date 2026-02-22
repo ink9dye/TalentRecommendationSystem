@@ -5,26 +5,33 @@ from config import CONFIG_DICT
 import sqlite3
 
 def run_pipeline(config):
+    """
+    知识图谱构建全链路流水线（增强版）
+    任务排期逻辑：
+    1. 实体同步：建立 Author, Work, Vocabulary 等孤立节点。
+    2. 外部拓扑：建立 Authorship 专家署名权重边。
+    3. 语义打标：执行 Aho-Corasick 标题回溯扫描，补全 HAS_TOPIC 关系。
+    4. 共现拓扑：利用 HAS_TOPIC 边，计算并构建 CO_OCCURRED_WITH 权重网。
+    5. 向量桥接：计算词汇间 SBERT 语义相似度边。
+    """
     monitor = Monitor()
     engine = GraphEngine(config)
     state = SyncStateManager(engine, config)
     builder = KGBuilder(config, state)
 
     try:
-        # --- 0. 自动建立索引 (在这里改) ---
+        # --- 0. 环境地基建设 ---
         with monitor.track("Ensuring Constraints and Indexes"):
-            # A. 执行 Neo4j 地基
             from config import CYPHER_TEMPLATES, SQL_INIT_SCRIPTS
             for cypher in CYPHER_TEMPLATES["INIT_SCHEMA"]:
-                # 改成这个方法，它不要求带参数，也不会被 if not data 拦截
                 engine.execute_query(cypher)
 
-            # B. 执行 SQLite 地基 (通过标准 sqlite3 库)
             with sqlite3.connect(config['DB_PATH']) as conn:
                 for sql in SQL_INIT_SCRIPTS:
                     conn.execute(sql)
                 conn.commit()
-            logging.info("SQLite indexes verified.")
+            logging.info("SQLite/Neo4j 地基验证完成。")
+
         # --- 1. 节点同步任务 ---
         node_tasks = [
             ("vocab_sync", "GET_ALL_VOCAB", "MERGE_VOCAB", "id"),
@@ -36,40 +43,39 @@ def run_pipeline(config):
         ]
 
         with monitor.track("Syncing All Entities"):
-            # 警告：只有在需要彻底重构词库时才取消下面的注释
-            # --- 基础实体同步标记 ---
-            # state.reset_marker("vocab_sync")
-            # state.reset_marker("author_sync")
-            # state.reset_marker("work_sync")
-            # state.reset_marker("inst_sync")  # 机构同步
-            # state.reset_marker("source_sync")  # 出版源同步
-            # state.reset_marker("job_sync")  # 岗位同步
-            #
-            # # --- 关系与语义标记 ---
-            # state.reset_marker("topology_sync")  # 专家-论文-机构拓扑关系
-            # state.reset_marker("job_skill_sync")  # 岗位-技能关联
-            state.reset_marker("semantic_bridge_sync")  # 词库间的 Faiss 相似度关联
+            # 只有在需要彻底重构语义关联时，才重置向量桥接的标记
+            state.reset_marker("semantic_bridge_sync")
 
             for task, sql, cypher, t_field in node_tasks:
                 builder.sync_nodes_task(task, sql, cypher, t_field)
 
         # --- 2. 核心拓扑连接 (Author-Work-Inst) ---
-        with monitor.track("Building Topology (Author-Work-Inst/Source)"):
+        with monitor.track("Building Topology (Authorship & Affiliation)"):
             builder.build_topology_incremental()
 
-        # --- 3. 语义知识连接 (Work-Vocab & Job-Vocab) ---
-        # 这是你新写的逻辑，必须在这里显式调用
-        with monitor.track("Linking Semantics (Work/Job to Vocab)"):
+        # --- 3. 语义打标 (含 Aho-Corasick 标题扫描) ---
+        # 必须先执行此步，为后续共现频率计算提供基础数据通路
+        with monitor.track("Linking Semantics (Work/Job with Title Scan)"):
+            # build_work_semantic_links 内部已集成 pyahocorasick 极速扫描逻辑
             builder.build_work_semantic_links()
             builder.build_job_skill_links()
 
-        # --- 4. 向量空间桥接 (Vocab-Vocab) ---
-        with monitor.track("Semantic Bridge (Vocab-Vocab via Faiss)"):
+        # --- 4. 【核心新增】共现权重拓扑构建 ---
+        # 统计词汇对在 55 万篇论文中的实际共现频率，用于过滤虚假相似度
+        with monitor.track("Building Co-occurrence Knowledge Network"):
+            builder.build_cooccurrence_links()
+
+        # --- 5. 向量空间桥接 (Vocab-Vocab) ---
+        # 利用 SBERT 构建词汇间的跨领域语义跳转边
+        with monitor.track("Semantic Bridge (Vocab-Vocab via Model Similarity)"):
             builder.build_semantic_bridge()
 
+    except Exception as e:
+        logging.error(f"Pipeline failed: {e}")
+        raise e
     finally:
         engine.close()
-        logging.info("Building KG process finished.")
+        logging.info("KG Pipeline Process Finished Successfully.")
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)

@@ -4,7 +4,8 @@ import os
 import sys
 import numpy as np
 import faiss
-import logging
+import torch
+import gc
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
@@ -16,186 +17,189 @@ if sys.platform.startswith('win'):
 
 # 2. 导入统一配置
 from config import (
-    DB_PATH, INDEX_DIR, SBERT_DIR, SBERT_MODEL_NAME,  # <--- 增加这一行
+    DB_PATH, INDEX_DIR, SBERT_DIR, SBERT_MODEL_NAME,
     VOCAB_INDEX_PATH, VOCAB_MAP_PATH,
     ABSTRACT_INDEX_PATH, ABSTRACT_MAP_PATH,
     JOB_INDEX_PATH, JOB_MAP_PATH
 )
 
-MODEL_NAME = SBERT_MODEL_NAME  # <--- 使用 config 里的 'BAAI/bge-m3'
-BATCH_SIZE = 32               # <--- 必须调小！建议设为 32 或 16（取决于显存）
+# --- 针对 i5-1240P 的终极稳定配置 ---
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# 12代 i5 建议使用 8 线程，平衡 P-Core 性能与系统开销
+torch.set_num_threads(8)
+
+MODEL_NAME = SBERT_MODEL_NAME
+BATCH_SIZE = 16  # 1024 长度下，建议保持在 16 以免内存抖动
+SHARD_SIZE = 50000  # 5万条一个分片
+TEMP_SHARD_DIR = os.path.join(INDEX_DIR, "shards")
 
 
-class VectorIndexGenerator:
+class StableVectorGenerator:
     def __init__(self):
-        print(f"[*] 正在加载 SBERT 模型: {MODEL_NAME}")
-        print(f"[*] 模型存储位置: {SBERT_DIR}")
-        self.model = SentenceTransformer(MODEL_NAME, cache_folder=SBERT_DIR,trust_remote_code=True)
+        print(f"[*] 正在加载本地 SBERT 模型: {MODEL_NAME}")
+        self.model = SentenceTransformer(
+            MODEL_NAME,
+            cache_folder=SBERT_DIR,
+            trust_remote_code=True,
+            device="cpu"
+        )
+
+        # 【关键：精度平衡点】
+        # 基于 SQL 探测结果，1024 可覆盖 99.45% 的论文数据
+        self.model.max_seq_length = 1024
+        self.model.eval()
+
+        print("[*] 正在进行模型预热...")
+        self.model.encode(["warm up text"], batch_size=1)
+        print("[+] 预热完成，准备进入正式编码环节。")
 
         self.conn = sqlite3.connect(DB_PATH)
         self.conn.row_factory = sqlite3.Row
 
-        if not os.path.exists(INDEX_DIR):
-            os.makedirs(INDEX_DIR)
+        for d in [INDEX_DIR, TEMP_SHARD_DIR]:
+            if not os.path.exists(d): os.makedirs(d)
+
+    def _smart_trim(self, text):
+        """
+        针对超长文本的智能清洗策略：
+        如果超过 4000 字符，保留前 2000 字和后 2000 字，
+        通过“头尾拼接”最大程度保留论文的背景和结论信息。
+        """
+        if not text: return ""
+        if len(text) > 4000:
+            # 拼接头部和尾部，中间用空格隔开
+            return text[:2000] + " " + text[-2000:]
+        return text
 
     def _save_index(self, name, embeddings, ids, index_path, map_path, use_id_map=False):
-        """
-        双模式索引保存（增强版）：
-        在保存 .faiss 索引的同时，备份原始向量为 .npy 文件，
-        以解决后续召回阶段 reconstruct not implemented 的限制。
-        """
+        """通用索引保存逻辑（带向量备份）"""
         dimension = embeddings.shape[1]
-
-        # 1. 创建底层 HNSW 索引核心
-        # M=32, efConstruction=200 保证了 55w 规模下的检索精度与速度
         sub_index = faiss.IndexHNSWFlat(dimension, 32, faiss.METRIC_INNER_PRODUCT)
         sub_index.hnsw.efConstruction = 200
-
-        # 2. 归一化以支持余弦相似度
         faiss.normalize_L2(embeddings)
 
-        # --- 【核心新增】：保存原始向量快照 ---
-        # 路径规则：将 .faiss 后缀替换为 _vectors.npy
+        # 备份原始向量
         vec_save_path = index_path.replace('.faiss', '_vectors.npy')
         np.save(vec_save_path, embeddings)
-        print(f"[*] 原始向量已备份至: {os.path.basename(vec_save_path)}")
-        # ------------------------------------
+        print(f"[*] 原始向量已备份: {os.path.basename(vec_save_path)}")
 
         if use_id_map:
-            # --- 模式 A: IndexIDMap (Vocabulary 专用) ---
-            # 这种结构在搜索时极快，但无法通过索引反推原始向量
             index = faiss.IndexIDMap(sub_index)
-            ids_np = np.array(ids).astype('int64')
-
-            print(f"[*] 正在将向量写入 {name} 的 HNSW 原生 ID 索引...")
-            index.add_with_ids(embeddings, ids_np)
-
+            index.add_with_ids(embeddings, np.array(ids).astype('int64'))
             with open(map_path, 'w', encoding='utf-8') as f:
-                json.dump({"info": "Native IDMap used for continuous integer IDs"}, f)
+                json.dump({"info": "Native IDMap used"}, f)
         else:
-            # --- 模式 B: 物理索引 + JSON Map (Abstracts/Jobs 专用) ---
-            print(f"[*] 正在将向量写入 {name} 的 HNSW 物理索引...")
             sub_index.add(embeddings)
             index = sub_index
-
             with open(map_path, 'w', encoding='utf-8') as f:
                 json.dump(ids, f, ensure_ascii=False, indent=4)
 
-        # 3. 保存二进制索引文件
         faiss.write_index(index, index_path)
-        print(f"[成功] 索引已保存: {os.path.basename(index_path)} | 记录数: {len(ids)}")
-
-    def build_vocabulary_index(self):
-        """1. 词汇索引 - 适配连续整数 ID"""
-        print("\n>>> 任务 1: 构建词汇向量索引 (Vocabulary)")
-        cursor = self.conn.cursor()
-        rows = cursor.execute("SELECT voc_id, term FROM vocabulary").fetchall()
-
-        texts = [row['term'] for row in rows]
-        ids = [int(row['voc_id']) for row in rows]
-
-        if not texts: return
-
-        print(f"正在编码 {len(texts)} 个词汇...")
-        # 加上进度条
-        embeddings = self.model.encode(texts, batch_size=BATCH_SIZE, show_progress_bar=True)
-
-        self._save_index(
-            "vocabulary",
-            np.array(embeddings).astype('float32'),
-            ids,
-            VOCAB_INDEX_PATH,
-            VOCAB_MAP_PATH,
-            use_id_map=True
-        )
-
-    def build_abstract_index(self):
-        """2. 摘要索引 - CPU 多核提速 + 解决假死版"""
-        print("\n>>> 任务 2: 构建论文摘要向量索引 (Abstracts)")
-        cursor = self.conn.cursor()
-
-        # 添加读取提示，55万数据读取会有几秒延迟
-        print("[*] 正在从 SQLite 读取摘要数据（55万条规模，请稍候）...")
-        rows = cursor.execute("""
-                              SELECT work_id, full_text_en
-                              FROM abstracts
-                              WHERE full_text_en IS NOT NULL
-                                AND full_text_en != ''
-                              """).fetchall()
-
-        texts = [row['full_text_en'] for row in rows]
-        ids = [str(row['work_id']) for row in rows]
-
-        if not texts:
-            print("警告: 未发现可用的摘要文本。")
-            return
-
-        print(f"[OK] 数据加载成功，共计 {len(texts)} 条，准备开始多核编码...")
-
-        # --- 核心改进：带进度条的多进程编码 ---
-        try:
-            pool = self.model.start_multi_process_pool()
-            # 加上 show_progress_bar=True 以确保能看到 Batches 进度
-            embeddings = self.model.encode(
-                texts,
-                pool=pool,
-                batch_size=BATCH_SIZE,
-                show_progress_bar=True
-            )
-            self.model.stop_multi_process_pool(pool)
-        except Exception as e:
-            print(f"[!] 多进程启动异常 ({e})，正在回退到单进程编码...")
-            embeddings = self.model.encode(texts, batch_size=BATCH_SIZE, show_progress_bar=True)
-
-        self._save_index(
-            "abstract",
-            embeddings.astype('float32'),
-            ids,
-            ABSTRACT_INDEX_PATH,
-            ABSTRACT_MAP_PATH
-        )
+        print(f"[成功] {name} 索引已保存。记录数: {len(ids)}")
 
     def build_job_description_index(self):
-        """3. 岗位描述索引"""
-        print("\n>>> 任务 3: 构建岗位描述向量索引 (Jobs)")
+        """2. 岗位描述索引 (Jobs)"""
+        print("\n>>> 任务 1: 构建岗位描述向量索引 (Jobs)")
         cursor = self.conn.cursor()
         rows = cursor.execute("SELECT securityId, job_name, description FROM jobs").fetchall()
 
-        texts = [f"{row['job_name']} {row['description']}" for row in rows]
+        # 应用智能清洗
+        texts = [self._smart_trim(f"{row['job_name']} {row['description']}") for row in rows]
         ids = [str(row['securityId']) for row in rows]
 
         if not texts: return
-
-        print(f"正在编码 {len(texts)} 个岗位描述...")
-        # 加上进度条
         embeddings = self.model.encode(texts, batch_size=BATCH_SIZE, show_progress_bar=True)
-        self._save_index("job_description", np.array(embeddings).astype('float32'), ids, JOB_INDEX_PATH, JOB_MAP_PATH)
+        self._save_index("job_description", np.array(embeddings).astype('float32'), ids,
+                         JOB_INDEX_PATH, JOB_MAP_PATH)
+
+    def build_abstract_index(self, start_shard=None, end_shard=None):
+        """3. 摘要索引 (并行分片模式 - 支持指定范围)"""
+        print("\n>>> 任务 2: 构建论文摘要向量索引 (并行模式)")
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM abstracts WHERE full_text_en IS NOT NULL AND full_text_en != ''")
+        total_count = cursor.fetchone()[0]
+
+        if total_count == 0: return
+        num_shards = (total_count + SHARD_SIZE - 1) // SHARD_SIZE
+
+        # --- 并行范围逻辑 ---
+        # 如果未指定范围，默认处理全量分片
+        s_idx = start_shard if start_shard is not None else 0
+        e_idx = end_shard if end_shard is not None else num_shards
+        print(f"[*] 任务分配: 处理分片 {s_idx + 1} 到 {e_idx} (总分片数: {num_shards})")
+
+        # 只跑指定范围内的分片
+        for i in range(s_idx, e_idx):
+            shard_vec_path = os.path.join(TEMP_SHARD_DIR, f"shard_{i}.npy")
+            shard_id_path = os.path.join(TEMP_SHARD_DIR, f"shard_{i}_ids.json")
+
+            if os.path.exists(shard_vec_path):
+                print(f"[-] 分片 {i + 1}/{num_shards} 已存在，跳过。")
+                continue
+
+            start_offset = i * SHARD_SIZE
+            print(f"\n[*] [当前进程] 正在处理分片 {i + 1}/{num_shards} (Offset: {start_offset})")
+            cursor.execute(f"""
+                SELECT work_id, full_text_en FROM abstracts 
+                WHERE full_text_en IS NOT NULL AND full_text_en != ''
+                LIMIT {SHARD_SIZE} OFFSET {start_offset}
+            """)
+            shard_rows = cursor.fetchall()
+
+            texts = [self._smart_trim(r['full_text_en']) for r in shard_rows]
+            ids = [str(r['work_id']) for r in shard_rows]
+            del shard_rows
+
+            embeddings = self.model.encode(
+                texts,
+                batch_size=BATCH_SIZE,
+                show_progress_bar=True,
+                convert_to_numpy=True
+            )
+
+            np.save(shard_vec_path, embeddings.astype('float32'))
+            with open(shard_id_path, 'w', encoding='utf-8') as f:
+                json.dump(ids, f)
+
+            del texts, ids, embeddings
+            gc.collect()
+
+        # --- 安全合并检查 ---
+        # 只有当磁盘上已经集齐了全部 12 个分片时，才执行最后的合并操作
+        print(f"\n[*] 进程 {s_idx + 1}-{e_idx} 完成阶段性任务，正在检查全部分片是否就绪...")
+        all_completed = all(os.path.exists(os.path.join(TEMP_SHARD_DIR, f"shard_{j}.npy")) for j in range(num_shards))
+
+        if all_completed:
+            self._merge_abstract_shards(num_shards)
+        else:
+            print(f"[!] 尚有其他分片未完成，请等待另一个窗口结束后自动或手动合并。")
+
+    def _merge_abstract_shards(self, num_shards):
+        """合并所有分片并构建最终 Faiss 索引"""
+        print("\n[*] 检测到所有分片已完成，正在从磁盘执行全量合并...")
+        all_vecs, all_ids = [], []
+        for i in tqdm(range(num_shards), desc="读取分片"):
+            vec_path = os.path.join(TEMP_SHARD_DIR, f"shard_{i}.npy")
+            id_path = os.path.join(TEMP_SHARD_DIR, f"shard_{i}_ids.json")
+
+            all_vecs.append(np.load(vec_path))
+            with open(id_path, 'r', encoding='utf-8') as f:
+                all_ids.extend(json.load(f))
+
+        # 调用原有的通用保存函数
+        self._save_index("abstract", np.vstack(all_vecs), all_ids, ABSTRACT_INDEX_PATH, ABSTRACT_MAP_PATH)
+        print("\n[!!!] 55万条论文摘要全量索引构建圆满完成！")
 
     def run_all(self):
-        # 如果任务 1 已经跑完，可以在这里注释掉以节省时间
+        # 按照从易到难顺序执行
         # self.build_vocabulary_index()
+        # self.build_job_description_index()
         self.build_abstract_index()
-        self.build_job_description_index()
-        print("\n[所有索引构建完成]")
-        print(f"模型存放于: {SBERT_DIR}")
-        print(f"索引存放于: {INDEX_DIR}")
 
 
 if __name__ == "__main__":
-    # Windows 环境下必须在 __main__ 下运行生成器，防止多进程报错
-    generator = VectorIndexGenerator()
-
-    # 建议按照以下顺序执行：
-
-    # 任务 1: 构建词汇索引（数据量中等，验证模型加载）
-    generator.build_vocabulary_index()
-
-    # 任务 2: 构建岗位描述索引（数据量最小，快速看到结果）
-    generator.build_job_description_index()
-
-    # 任务 3: 构建论文摘要索引（数据量最大，55万条，建议最后挂机跑）
-    generator.build_abstract_index()
-
-    print("向量索引已构建完毕！")
-
-
+    generator = StableVectorGenerator()
+    generator.run_all()

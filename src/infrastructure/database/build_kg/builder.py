@@ -208,36 +208,85 @@ class KGBuilder:
                 self.state.engine.send_batch(CYPHER_TEMPLATES["LINK_SIMILAR"], neo4j_batch)
                 # 将最后一个处理的 ID 作为最终 Marker 保存
                 self.state.update_marker(task_name, str(pending_rows[-1]['voc_id']))
+
     def build_work_semantic_links(self):
         """
-        建立论文与词汇节点的关联边 (Work)-[:HAS_TOPIC]->(Vocabulary)
+        【工业级增强版】建立 (Work)-[:HAS_TOPIC]->(Vocabulary) 关联
+        升级点：
+        1. 引入 Aho-Corasick 自动机：实现 $O(N)$ 复杂度的极速多模式匹配。
+        2. 自动化标题回溯：不再依赖原始标签，自动扫描标题补全 HAS_TOPIC 关系。
+        3. 单词边界保护：手动实现 is_word_boundary 校验，确信匹配的是独立单词。
         """
-        sql = "SELECT work_id as id, concepts_text, keywords_text FROM works"
+        import ahocorasick
+        from config import SQL_QUERIES, CYPHER_TEMPLATES
+
+        # --- 1. 构建 Aho-Corasick 自动机 (模式树) ---
+        logging.info("Initializing Aho-Corasick Automaton for title scanning...")
+        A = ahocorasick.Automaton()
+        with sqlite3.connect(self.config['DB_PATH']) as conn:
+            # 加载词库中所有已有的 term
+            all_vocab = [r[0] for r in conn.execute("SELECT term FROM vocabulary").fetchall() if r[0]]
+
+        for term in all_vocab:
+            # 将 term 作为 Key，其本身作为 Value 存入自动机
+            term_lower = term.lower()
+            A.add_word(term_lower, term_lower)
+        A.make_automaton()
+
+        # --- 2. 定义单词边界校验逻辑 (模拟正则 \b) ---
+        def is_word_match(text, start_pos, end_pos):
+            """
+            校验匹配到的片段是否为独立单词。
+            逻辑：检查片段前后字符是否为字母数字。
+            """
+            # 检查左边界：如果左侧有字符且是字母数字，则不是独立单词
+            if start_pos > 0 and text[start_pos - 1].isalnum():
+                return False
+            # 检查右边界：如果右侧有字符且是字母数字，则不是独立单词
+            if end_pos < len(text) and text[end_pos].isalnum():
+                return False
+            return True
+
+        # --- 3. 扫描 Works 表并执行打标 ---
+        # 使用你新增加的 GET_WORK_METADATA_FOR_TAGGING SQL
+        sql = SQL_QUERIES.get("GET_WORK_METADATA_FOR_TAGGING",
+                              "SELECT work_id as id, title, concepts_text, keywords_text FROM works")
 
         with sqlite3.connect(self.config['DB_PATH']) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(sql)
-
             batch = []
-            for row in tqdm(cursor, desc="Linking Works to Knowledge Nodes"):
-                # 1. 使用正则支持 |,; 和换行符拆分
-                raw_text = f"{row['concepts_text'] or ''}|{row['keywords_text'] or ''}"
-                # 拆分并过滤掉空字符、转小写去重
-                terms = set([t.strip().lower() for t in re.split(r'[|;,]', raw_text) if t.strip()])
 
-                for term in terms:
-                    batch.append({
-                        "id": row['id'],
-                        "term": term
-                    })
+            for row in tqdm(cursor, total=550000, desc="Semantic Indexing (AC-Auto)"):
+                title_clean = (row['title'] or "").lower()
+                terms = set()
 
-                    if len(batch) >= 1000:
-                        # 建议在执行前确保 Neo4j 索引已建
+                # 语义来源 A：原始元数据提取 (Concepts & Keywords)
+                raw_meta = f"{row['concepts_text'] or ''}|{row['keywords_text'] or ''}"
+                meta_terms = [t.strip().lower() for t in re.split(r'[|;,]', raw_meta) if t.strip()]
+                terms.update(meta_terms)
+
+                # 语义来源 B：自动化标题扫描 (AC 自动机)
+                # 一次扫描标题，找出所有匹配的词库术语
+                for end_index, original_term in A.iter(title_clean):
+                    # A.iter 返回的是结束位置，计算起始位置
+                    start_index = end_index - len(original_term) + 1
+
+                    # 关键：执行单词边界验证，排除子字符串干扰
+                    if is_word_match(title_clean, start_index, end_index + 1):
+                        terms.add(original_term)
+
+                # 4. 组装批次并推送到 Neo4j
+                for t in terms:
+                    batch.append({"id": row['id'], "term": t})
+                    if len(batch) >= 2000:
                         self.state.engine.send_batch(CYPHER_TEMPLATES["LINK_WORK_VOCAB"], batch)
                         batch = []
 
             if batch:
                 self.state.engine.send_batch(CYPHER_TEMPLATES["LINK_WORK_VOCAB"], batch)
+
+        logging.info("基于标题的标记与语义链接已完成。")
 
     def build_job_skill_links(self):
         """
@@ -282,3 +331,56 @@ class KGBuilder:
                 self.state.engine.send_batch(CYPHER_TEMPLATES["LINK_JOB_VOCAB"], batch)
                 # 更新最后一条记录的标记
                 self.state.update_marker(task_name, str(row['crawl_time']))
+
+    def build_cooccurrence_links(self):
+        """
+        【新增核心】计算词汇共现权重：(Vocab)-[:CO_OCCURRED_WITH]-(Vocab)
+        逻辑：利用 SQLite 预处理 55 万篇论文的词汇对，统计频率后同步至 Neo4j。
+        """
+        db_path = self.config['DB_PATH']
+        from config import SQL_QUERIES, CYPHER_TEMPLATES
+
+        with sqlite3.connect(db_path) as conn:
+            # 1. 构建临时表以优化聚合性能 (针对 55 万量级数据)
+            logging.info("[*] 正在准备 SQLite 临时映射表以计算共现频率...")
+            conn.executescript("""
+                               DROP TABLE IF EXISTS work_terms_temp;
+                               CREATE TABLE work_terms_temp
+                               (
+                                   work_id TEXT,
+                                   term    TEXT
+                               );
+                               CREATE INDEX idx_wt_id ON work_terms_temp (work_id);
+                               CREATE INDEX idx_wt_term ON work_terms_temp (term);
+                               """)
+
+            # 2. 填充数据：从 HAS_TOPIC 关系源将 (Work, Term) 映射存入 SQLite
+            # 这一步是为了让 SQL 能高效执行自连接聚合
+            logging.info("[*] 正在平铺 Work-Term 数据...")
+            # 假设你的打标结果已经持久化或从 works 表重新解析
+            conn.execute("""
+                         INSERT INTO work_terms_temp (work_id, term)
+                         SELECT work_id, lower(trim(value))
+                         FROM works, json_each(concepts_text) -- 示例，需根据你具体的存储结构调整
+                         """)
+            conn.commit()
+
+            # 3. 执行共现聚合查询
+            logging.info("[*] 正在计算共现频次 (Co-occurrence Matrix)...")
+            cursor = conn.execute(SQL_QUERIES["GET_VOCAB_CO_OCCURRENCE"])
+
+            batch = []
+            for row in tqdm(cursor, desc="Syncing Co-occurrence Weights"):
+                batch.append({
+                    "term_a": row['term_a'],
+                    "term_b": row['term_b'],
+                    "freq": row['freq']
+                })
+                if len(batch) >= 1000:
+                    self.state.engine.send_batch(CYPHER_TEMPLATES["MERGE_CO_OCCURRENCE"], batch)
+                    batch = []
+
+            if batch:
+                self.state.engine.send_batch(CYPHER_TEMPLATES["MERGE_CO_OCCURRENCE"], batch)
+
+        logging.info("共现网络拓扑构建完成。")

@@ -143,18 +143,43 @@ class LabelRecallPath:
     # --- 第三阶段：语义扩展 ---
     def _expand_semantic_map(self, core_vids, anchor_skills, domain_regex=None, query_vector=None):
         """
-        【主函数】语义扩展引擎：引入“领域跨度”与“语义纯度”双重惩罚。
-        逻辑：作为中转站，将检索到的图拓扑数据与原始 JD 向量（query_vector）传递给打分引擎。
+        【学术共鸣版】语义扩展引擎
+        逻辑：工业锚点激发 -> 学术候选池生成 -> 学术共现网实证校验 -> 最终打分。
         """
         regex = domain_regex if domain_regex else ".*"
 
-        # 1. 辅助函数 A：执行图检索，获取包含领域跨度、纯度及击中数（hit_count）的原始数据
-        # 这一步利用 Neo4j 跳转和 SQLite 索引实现极速查询
+        # 1. 辅助函数 A：执行图检索，获取初步的学术词候选（tid 列表）
+        # 这一步通过 SIMILAR_TO 建立物理通路
         raw_results = self._query_expansion_with_topology(core_vids, regex)
+        if not raw_results:
+            return {}, {}, {}
 
-        # 2. 辅助函数 B：应用数学公式计算最终动态权重
-        # 【修复关键】：补齐 query_vector 参数，以支持 SBERT 语义守门员逻辑
+        # --- 2. 【核心新增：学术共鸣校验】 ---
+        # 逻辑：在 55 万篇论文构成的横向网络中，寻找哪些学术词属于“同一技术簇”
+        tids = [r['tid'] for r in raw_results]
+        resonance_map = self._calculate_academic_resonance(tids)
+
+        # 将共鸣分数注入原始结果，供下游数学引擎使用
+        for rec in raw_results:
+            rec['resonance'] = resonance_map.get(rec['tid'], 0.0)
+
+        # 3. 辅助函数 B：应用数学公式计算最终动态权重
+        # 此时 raw_results 已包含基于“社交证明”的共鸣分
         return self._calculate_final_weights(raw_results, query_vector)
+
+    def _calculate_academic_resonance(self, tids):
+        """
+        【学术逻辑层】计算候选词集内部的连通密度。
+        逻辑：如果 MPC 和 WBC 都在候选名单里，且它们在图谱中有强共现边，则两者都会获得“共鸣加成”。
+        """
+        cypher = """
+        MATCH (v1:Vocabulary)-[r:CO_OCCURRED_WITH]-(v2:Vocabulary)
+        WHERE v1.id IN $tids AND v2.id IN $tids
+        RETURN v1.id AS vid, SUM(r.weight) AS resonance_score
+        """
+        results = self.graph.run(cypher, tids=tids).data()
+        # 返回格式：{vid: resonance_score}
+        return {r['vid']: float(r['resonance_score']) for r in results}
 
     def _query_expansion_with_topology(self, v_ids, regex):
         """
@@ -228,13 +253,12 @@ class LabelRecallPath:
 
     def _apply_word_quality_penalty(self, rec, query_vector):
         """
-        【信号收敛+语义增强版】核心数学引擎
-        降噪维度：语义守门员(SBERT) + 领域跨度(Span) + 领域纯度(Purity)
-        加成维度：IDF + 技术共振奖励(Hit Count)
+        【学术共鸣+语义拦截版】核心数学引擎
+        降噪维度：语义守门员(SBERT) + 领域跨度(Span) + 领域纯度(Purity) + 共鸣熔断(Resonance)
+        加成维度：IDF + 技术共振奖励(Hit Count) + 学术群落加成
         """
         degree_w = rec['degree_w']
         cov_j = rec['cov_j']
-        # 确保分母不为 0
         domain_span = max(1, rec['domain_span'])
 
         # 1. 计算语义纯度 (Tag Purity)
@@ -245,35 +269,41 @@ class LabelRecallPath:
         idf_val = math.log10(self.total_work_count / (degree_w + 1))
 
         # 3. 计算断崖式岗位惩罚 (Suppression of generic job terms)
-        # 针对 0.5% 以上覆盖率的词进行指数级压制
         job_penalty = 1.0 + math.exp(300.0 * (cov_j - 0.005))
 
-        # --- 4. 【新增：多路信号收敛奖励】 ---
-        # 逻辑：一个学术词被越多的工业锚点同时命中，说明其确定性越高。
-        # 使用 log1p 以获得边际效应递减的平滑增长。
+        # --- 4. 【核心修改：学术共鸣与共振奖励】 ---
+        # 逻辑 A：hit_count 代表有多少工业锚点支撑这个词
         hit_count = rec.get('hit_count', 1)
-        convergence_bonus = math.log1p(hit_count)
 
-        # --- 5. 【新增：SBERT 语义守门员】 ---
-        # 逻辑：利用预计算的向量矩阵，计算学术词与当前 JD 整体语义的余弦相似度。
-        cos_sim = 0.5  # 默认中立分
+        # 逻辑 B：resonance 代表该词在 55 万篇论文中与当前其他候选词的“熟识度”
+        resonance = rec.get('resonance', 0.0)
+
+        # 【共鸣熔断器】：
+        # 如果共现权重 > 0，则给与 log1p 增益；
+        # 如果共现权重为 0（代表完全孤立），则给予 0.1 倍的惩罚，熔断噪声路径
+        resonance_factor = (1.0 + math.log1p(resonance)) if resonance > 0 else 0.1
+
+        # 综合收敛奖惩：技术簇共鸣越强，分值越高
+        convergence_bonus = math.log1p(hit_count) * resonance_factor
+
+        # --- 5. SBERT 语义守门员 ---
+        # 逻辑：计算学术词向量与当前 JD 整体语义的余弦相似度
+        cos_sim = 0.5
         idx = self.vocab_to_idx.get(str(rec['tid']))
         if idx is not None and query_vector is not None:
             term_vec = self.all_vocab_vectors[idx]
-            # 计算点积（归一化向量即为余弦相似度）
             cos_sim = float(np.dot(term_vec, query_vector.flatten()))
 
-        # 应用非线性惩罚：pow(cos_sim, 6)
-        # 这将导致相似度低于 0.7 的词（如加密算法之于机器人）权重呈断崖式下跌。
+        # 应用 6 次方非线性惩罚，实现对弱相关词的断崖式拦截
         semantic_factor = math.pow(max(0, cos_sim), 6)
 
         # 6. 【最终公式：立体的评价体系】
-        # $$Weight = \frac{IDF}{JobPenalty} \times Purity^2 \times \frac{Bonus}{Span} \times SemanticFactor$$
+        # $$Weight = \frac{IDF}{JobPenalty} \times Purity^2 \times \frac{ConvergenceBonus}{Span} \times SemanticFactor$$
         dynamic_weight = (
                 (idf_val / job_penalty)
                 * math.pow(tag_purity, 2)  # 纯度平方奖励垂直度
                 / domain_span  # 跨度降权压制万金油
-                * convergence_bonus  # 技术共振加成
+                * convergence_bonus  # 【包含学术群落实证加成】
                 * semantic_factor  # SBERT 语义守门员
         )
 
@@ -487,16 +517,12 @@ class LabelRecallPath:
         }
 
         return [a['aid'] for a in scored_authors[:self.recall_limit]], (time.time() - start_t) * 1000
+
+
 if __name__ == "__main__":
-
-
     l_path = LabelRecallPath(recall_limit=200)
     encoder = QueryEncoder()
 
-
-    print("\n" + "=" * 115)
-    print("🚀 增强诊断版：标签路 (Label Path) 全链路追踪")
-    print("=" * 115)
 
     try:
         domain_choice = input("\n请选择领域编号 (0跳过): ").strip() or "0"
@@ -514,50 +540,52 @@ if __name__ == "__main__":
             db = l_path.last_debug_info
             print("\n" + "🔍 [深度诊断流水线]" + "-" * 98)
 
-            # 1. 领域并集
+            # 1. 领域探测
             domains = db.get('active_domains', [])
             domain_str = " | ".join(domains) if domains else "未限制"
             print(f"【Step 1: 领域探测】目标领域并集: [{domain_str}] (置信度: {db.get('dominance')})")
 
-            # 2. 工业词 (JD 侧)
+            # 2. 工业锚点
             i_kws = db.get('industrial_kws', [])
-            print(f"【Step 2: 工业锚点】从 JD 提取的原始词: {i_kws}")
+            print(f"【Step 2: 工业锚点】从 JD 提取的核心技能: {i_kws}")
 
-            # 3. 学术词 (跳转后)
-            a_kws = db.get('academic_kws', [])
-            print(f"【Step 3: 语义扩展】通过 SIMILAR_TO 映射到的学术词: {a_kws}")
+            # 3. 学术语义扩展与“学术共鸣”校验
+            print(f"【Step 3: 语义扩展与实证校验】学术词质量评估:")
+            print(f"      {'学术词 (Term)':<25} | {'收敛(Hits)':<10} | {'共鸣(Resonance)':<15} | {'状态'}")
+            print(f"      {'-' * 25} | {'-' * 10} | {'-' * 15} | {'-' * 10}")
 
-            # 诊断跳转失败
-            if i_kws and not a_kws:
-                print("   ⚠️ 错误: 工业词未能跳转到学术词！请检查 Vocabulary 节点间的 SIMILAR_TO 关系。")
+            # 这里的 logic 假设 recall 方法已将 raw_results 存入 debug_info
+            # 如果尚未修改 recall，建议在 recall 的 self.last_debug_info 里加入 'detailed_kws': raw_results
+            detailed_kws = db.get('detailed_kws', [])
+            for kw in sorted(detailed_kws, key=lambda x: x.get('resonance', 0), reverse=True)[:15]:
+                hits = kw.get('hit_count', 1)
+                res = kw.get('resonance', 0)
+                # 状态判定逻辑
+                status = "✅ 核心簇" if res > 0 and hits > 1 else "⚠️ 孤立点"
+                if res == 0: status = "❌ 已熔断"  # 共现为 0 的噪音
 
-            # 4. 论文检索
+                print(f"      {kw['term'][:25]:<25} | {hits:<10} | {int(res):<15} | {status}")
+
+            # 4. 论文与作者召回
             w_count = db.get('work_count', 0)
-            print(f"【Step 4: 论文检索】在上述学术词下检索到 {w_count} 篇论文 (已过领域并集过滤)。")
-
-            if a_kws and w_count == 0:
-                print("   ⚠️ 警告: 已有学术词但召回为 0。可能原因：")
-                print(f"      - 这些学术词在图谱中没有 HAS_TOPIC 连向 Work 节点。")
-                print(f"      - 论文的领域标签与 [{domain_str}] 完全不交叠。")
-
-            # 5. 作者加分
             a_count = db.get('author_count', 0)
-            print(f"【Step 5: 贡献评价】最终有效作者: {a_count} 名")
+            print(f"【Step 4: 召回规模】检索到 {w_count} 篇学术论文，最终锁定 {a_count} 名垂直领域专家。")
 
-            # --- 结果展示 ---
+            # --- 专家排名展示 ---
             print("-" * 115)
-            print(f"{'排名':<6} | {'作者 ID':<12} | {'综合得分':<15} | {'知识图谱核心作 (命中标签数)'}")
+            print(f"{'排名':<6} | {'作者 ID':<12} | {'综合得分':<15} | {'学术领域代表作 (命中标签)'}")
             print("-" * 115)
 
             for i, item in enumerate(db.get('top_samples', []), 1):
                 tp = item.get('top_paper', {})
                 title = tp.get('title', 'Unknown')[:55]
-                hit_info = f"(命中 {len(tp.get('hits', []))} 标签: {', '.join(tp.get('hits', []))})"
+                # 命中标签详细展示
+                hit_tags = ", ".join(tp.get('hits', []))
                 print(f"#{i:<5} | {item['aid']:<12} | {int(item['score']):<15} | 《{title}》")
-                print(f"{' ':23} ┗━ {hit_info}")
+                print(f"{' ':23} ┗━ 核心命中: {hit_tags}")
 
             print("-" * 115)
-            print(f"[*] 诊断完成。耗时: {search_time:.2f}ms")
+            print(f"[*] 诊断完成。全链路耗时: {search_time:.2f}ms")
 
     except Exception as e:
         print(f"运行出错: {e}")
