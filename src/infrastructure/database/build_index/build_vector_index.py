@@ -16,21 +16,21 @@ if sys.platform.startswith('win'):
 
 # 2. 导入统一配置
 from config import (
-    DB_PATH, INDEX_DIR, SBERT_DIR,
+    DB_PATH, INDEX_DIR, SBERT_DIR, SBERT_MODEL_NAME,  # <--- 增加这一行
     VOCAB_INDEX_PATH, VOCAB_MAP_PATH,
     ABSTRACT_INDEX_PATH, ABSTRACT_MAP_PATH,
     JOB_INDEX_PATH, JOB_MAP_PATH
 )
 
-MODEL_NAME = 'paraphrase-multilingual-MiniLM-L12-v2'
-BATCH_SIZE = 128  # 向量化批处理大小
+MODEL_NAME = SBERT_MODEL_NAME  # <--- 使用 config 里的 'BAAI/bge-m3'
+BATCH_SIZE = 32               # <--- 必须调小！建议设为 32 或 16（取决于显存）
 
 
 class VectorIndexGenerator:
     def __init__(self):
         print(f"[*] 正在加载 SBERT 模型: {MODEL_NAME}")
         print(f"[*] 模型存储位置: {SBERT_DIR}")
-        self.model = SentenceTransformer(MODEL_NAME, cache_folder=SBERT_DIR)
+        self.model = SentenceTransformer(MODEL_NAME, cache_folder=SBERT_DIR,trust_remote_code=True)
 
         self.conn = sqlite3.connect(DB_PATH)
         self.conn.row_factory = sqlite3.Row
@@ -185,13 +185,17 @@ if __name__ == "__main__":
     # Windows 环境下必须在 __main__ 下运行生成器，防止多进程报错
     generator = VectorIndexGenerator()
 
-    # 运行词汇索引任务 ---
+    # 建议按照以下顺序执行：
 
-    # generator.build_vocabulary_index()
+    # 任务 1: 构建词汇索引（数据量中等，验证模型加载）
+    generator.build_vocabulary_index()
 
-    # --- 如果你还需要更新岗位索引，可以取消下面这行的注释 ---
-    # generator.build_job_description_index()
+    # 任务 2: 构建岗位描述索引（数据量最小，快速看到结果）
+    generator.build_job_description_index()
 
-    # --- 暂时注释掉 run_all()，防止误触发全量更新 ---
-    # generator.run_all()
+    # 任务 3: 构建论文摘要索引（数据量最大，55万条，建议最后挂机跑）
+    generator.build_abstract_index()
+
+    print("向量索引已构建完毕！")
+
 

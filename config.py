@@ -39,9 +39,12 @@ COLLAB_DB_PATH = os.path.join(INDEX_DIR, "scholar_collaboration.db")
 VOCAB_STATS_DB_PATH = os.path.join(INDEX_DIR, 'vocab_stats.db')
 
 # --- 7. SBERT 模型本地存放路径 ---
+SBERT_MODEL_NAME = 'Alibaba-NLP/gte-multilingual-base'
+
 SBERT_DIR = os.path.join(DATA_DIR, "build_sbert")
 if not os.path.exists(SBERT_DIR):
     os.makedirs(SBERT_DIR)
+
 
 # --- 8. 知识图谱构建 SQL 语句 ---
 SQL_QUERIES = {

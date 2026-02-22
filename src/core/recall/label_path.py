@@ -141,63 +141,58 @@ class LabelRecallPath:
         # 返回格式：{vid: {"term": "术语名称"}}
         return {str(r['vid']): {"term": r['term']} for r in cursor if len(r['term']) > 1}
     # --- 第三阶段：语义扩展 ---
-    def _expand_semantic_map(self, core_vids, anchor_skills, domain_regex=None):
+    def _expand_semantic_map(self, core_vids, anchor_skills, domain_regex=None, query_vector=None):
         """
         【主函数】语义扩展引擎：引入“领域跨度”与“语义纯度”双重惩罚。
+        逻辑：作为中转站，将检索到的图拓扑数据与原始 JD 向量（query_vector）传递给打分引擎。
         """
         regex = domain_regex if domain_regex else ".*"
 
-        # 1. 辅助函数 A：执行图检索，获取包含领域跨度和纯度统计的原始数据
+        # 1. 辅助函数 A：执行图检索，获取包含领域跨度、纯度及击中数（hit_count）的原始数据
+        # 这一步利用 Neo4j 跳转和 SQLite 索引实现极速查询
         raw_results = self._query_expansion_with_topology(core_vids, regex)
 
         # 2. 辅助函数 B：应用数学公式计算最终动态权重
-        return self._calculate_final_weights(raw_results)
+        # 【修复关键】：补齐 query_vector 参数，以支持 SBERT 语义守门员逻辑
+        return self._calculate_final_weights(raw_results, query_vector)
 
     def _query_expansion_with_topology(self, v_ids, regex):
         """
-        【极速索引版】辅助函数 A：利用预计算索引替代实时图聚合。
+        【信号收敛版】辅助函数 A：统计“技术共振”击中数。
         逻辑：
-        1. Neo4j 只负责 SIMILAR_TO 跳转和岗位侧统计 (cov_j)，查询量级极小，响应极快。
-        2. SQLite (vocab_stats.db) 提供论文侧的全局领域分布 (domain_dist) 和跨度 (span)。
+        1. Neo4j 统计每个学术词被多少个不同的工业锚点(v)击中。
+        2. SQLite 提供论文侧的全局领域统计。
         """
-        # 1. 极速 Neo4j 跳转：仅获取跳转后的词 ID 和其岗位覆盖率
-        # 此处不再 MATCH (w:Work)，彻底避开图谱中最沉重的 I/O 操作
+        # 1. 极速 Neo4j 跳转：统计 hit_count
+        # DISTINCT v 确保即使物理上有重复边，逻辑上也只计算一次有效击中
         cypher = """
         MATCH (v:Vocabulary) WHERE v.id IN $v_ids
         MATCH (v)-[:SIMILAR_TO]-(v_rel:Vocabulary)
         RETURN v_rel.id AS tid, v_rel.term AS term,
+               COUNT(DISTINCT v) AS hit_count, 
                (COUNT { (v_rel)<-[:REQUIRE_SKILL]-() } * 1.0 / $total_j) AS cov_j
         """
         params = {"v_ids": v_ids, "total_j": self.total_job_count}
         candidates = self.graph.run(cypher, **params).data()
 
-        # 解析当前的 active_domains (例如 从 "1|4|14" 中提取 {'1', '4', '14'})
+        # 解析当前目标领域 ID
         active_domains = set(re.findall(r'\d+', regex))
-
         results = []
 
-        # 2. 极速 SQLite 查表：替代原本沉重的 Work 节点扫描
-        # 即使某篇教育论文标错了 Domain，只要 Adaptive Learning 这个词在全图谱中关联了教育领域，
-        # 索引里的 domain_dist 就会暴露它的“不纯度”。
+        # 2. 极速 SQLite 查表
         for cand in candidates:
             tid = cand['tid']
-            # 从 vocabulary_domain_stats 表中直接读取预计算结果
             row = self.stats_conn.execute(
                 "SELECT work_count, domain_span, domain_dist FROM vocabulary_domain_stats WHERE voc_id=?",
                 (tid,)
             ).fetchone()
 
-            if not row:
-                continue
+            if not row: continue
 
             degree_w, domain_span, dist_json = row
-            dist = json.loads(dist_json)  # 格式如 {"1": 100, "11": 900}
-
-            # 实时计算：在当前目标领域（如机器人相关的 1, 4, 14）内的论文命中数
-            # 这一步是计算 tag_purity 的基础，解决了“涉及领域越多分越低”的底层需求
+            dist = json.loads(dist_json)
             target_degree_w = sum(dist.get(str(d), 0) for d in active_domains)
 
-            # 只有在当前目标领域有实际产出的词才作为有效扩展词
             if target_degree_w > 0:
                 results.append({
                     'tid': tid,
@@ -205,37 +200,37 @@ class LabelRecallPath:
                     'degree_w': degree_w,
                     'target_degree_w': target_degree_w,
                     'cov_j': cand['cov_j'],
-                    'domain_span': domain_span # 领域跨度：解决词汇“万金油”程度的降权因子
+                    'domain_span': domain_span,
+                    'hit_count': cand['hit_count']  # <--- 传递信号收敛强度
                 })
 
         return results
 
-    def _calculate_final_weights(self, raw_results):
+    def _calculate_final_weights(self, raw_results, query_vector):
         """
-        【主函数】权重计算调度器
-        逻辑：遍历检索结果，映射 TID 到最终的动态权重地图。
+        【收敛加权版】权重计算调度器
+        逻辑：将图谱收敛信号与向量空间语义信号进行融合。
         """
         score_map, term_map, idf_map = {}, {}, {}
 
         for rec in raw_results:
             tid = str(rec['tid'])
 
-            # 1. 调用核心数学引擎计算权重
-            dynamic_weight, idf_val = self._apply_word_quality_penalty(rec)
+            # 1. 调用增强版数学引擎，应用多路信号收敛奖惩
+            dynamic_weight, idf_val = self._apply_word_quality_penalty(rec, query_vector)
 
-            # 2. 存储计算结果
+            # 2. 存储结果
             score_map[tid] = dynamic_weight
             term_map[tid] = rec['term']
             idf_map[tid] = idf_val
 
         return score_map, term_map, idf_map
 
-    def _apply_word_quality_penalty(self, rec):
+    def _apply_word_quality_penalty(self, rec, query_vector):
         """
-        【核心数学引擎】应用断崖惩罚、语义纯度与领域跨度降权。
-        逻辑：
-        - 语义纯度 (Tag Purity): 解决“对不对”的问题（局部噪音）。
-        - 领域跨度 (Domain Span): 解决“专不专业”的问题（全局噪音）。
+        【信号收敛+语义增强版】核心数学引擎
+        降噪维度：语义守门员(SBERT) + 领域跨度(Span) + 领域纯度(Purity)
+        加成维度：IDF + 技术共振奖励(Hit Count)
         """
         degree_w = rec['degree_w']
         cov_j = rec['cov_j']
@@ -243,25 +238,43 @@ class LabelRecallPath:
         domain_span = max(1, rec['domain_span'])
 
         # 1. 计算语义纯度 (Tag Purity)
-        # 逻辑：目标领域的产出占比。解决你提到的教育论文即便标了 Domain 1，
-        # 但如果该词在全图谱 90% 都在讲教育，那它的纯度就会极低。
+        # 逻辑：目标领域的产出占比，过滤“挂羊头卖狗肉”的词汇
         tag_purity = rec['target_degree_w'] / degree_w
 
         # 2. 计算基础学术稀缺度 (IDF)
         idf_val = math.log10(self.total_work_count / (degree_w + 1))
 
         # 3. 计算断崖式岗位惩罚 (Suppression of generic job terms)
-        # 针对 0.5% 以上覆盖率的词（如“开源”）进行指数级压制
+        # 针对 0.5% 以上覆盖率的词进行指数级压制
         job_penalty = 1.0 + math.exp(300.0 * (cov_j - 0.005))
 
-        # 4. 【核心公式：双重降权】
-        # 为什么要查两次？
-        # - domain_span 是全局性的：一个词横跨了 15 个领域，说明它是“大路货”，权重除以 15。
-        # - tag_purity 是针对性的：这个词只有 10% 的产出在机器人领域，权重再乘 0.1^2。
+        # --- 4. 【新增：多路信号收敛奖励】 ---
+        # 逻辑：一个学术词被越多的工业锚点同时命中，说明其确定性越高。
+        # 使用 log1p 以获得边际效应递减的平滑增长。
+        hit_count = rec.get('hit_count', 1)
+        convergence_bonus = math.log1p(hit_count)
+
+        # --- 5. 【新增：SBERT 语义守门员】 ---
+        # 逻辑：利用预计算的向量矩阵，计算学术词与当前 JD 整体语义的余弦相似度。
+        cos_sim = 0.5  # 默认中立分
+        idx = self.vocab_to_idx.get(str(rec['tid']))
+        if idx is not None and query_vector is not None:
+            term_vec = self.all_vocab_vectors[idx]
+            # 计算点积（归一化向量即为余弦相似度）
+            cos_sim = float(np.dot(term_vec, query_vector.flatten()))
+
+        # 应用非线性惩罚：pow(cos_sim, 6)
+        # 这将导致相似度低于 0.7 的词（如加密算法之于机器人）权重呈断崖式下跌。
+        semantic_factor = math.pow(max(0, cos_sim), 6)
+
+        # 6. 【最终公式：立体的评价体系】
+        # $$Weight = \frac{IDF}{JobPenalty} \times Purity^2 \times \frac{Bonus}{Span} \times SemanticFactor$$
         dynamic_weight = (
                 (idf_val / job_penalty)
-                * math.pow(tag_purity, 2)  # 纯度平方：让“不专一”的词得分呈断崖下跌
-                / domain_span  # 跨度降权：涉及领域越多，专业权重越低
+                * math.pow(tag_purity, 2)  # 纯度平方奖励垂直度
+                / domain_span  # 跨度降权压制万金油
+                * convergence_bonus  # 技术共振加成
+                * semantic_factor  # SBERT 语义守门员
         )
 
         return dynamic_weight, idf_val
@@ -374,61 +387,54 @@ class LabelRecallPath:
 
     def recall(self, query_vector, domain_ids=None):
         """
-        【修复版】全链路调度：引入索引级领域感知
+        【最终修复版】全链路调度：引入 SBERT 语义守门员与多路信号收敛。
         修改点：
-        1. 前置领域正则构建，确保语义扩展阶段能正确计算 Tag Purity。
-        2. 修复 _expand_semantic_map 调用，显式传递领域约束参数。
+        1. 修复参数传递链：显式将 query_vector 传入语义扩展模块。
+        2. 确保 Step 4 能够激活底层的向量相似度校验与技术共振计算。
         """
         if not self.graph: return [], 0
         start_t = time.time()
 
-        # 1. 岗位空间探测：明确搜索背景
+        # 1. 岗位空间探测：探测当前 JD 所属的主战场领域
         job_ids, inferred_domains, dominance = self._detect_domain_context(query_vector)
 
-        # 2. 锚点提取：从 JD 提取核心技能锚点
+        # 2. 锚点提取：获取工业侧硬核技能词
         anchor_skills = self._extract_anchor_skills(job_ids)
         if not anchor_skills:
             return [], 0
         industrial_kws = [v['term'] for v in anchor_skills.values()]
 
-        # 3. 领域处理：确定最终过滤范围
+        # 3. 领域处理：确定最终过滤范围（正则字符串）
         active_domain_set = DomainProcessor.to_set(
             domain_ids if domain_ids and str(domain_ids) != "0" else inferred_domains)
-
-        # --- 【核心修改：逻辑提前】 ---
-        # 必须先生成领域正则字符串，因为 Step 4 的索引查表需要解析它来确定目标领域 ID
         regex_str = DomainProcessor.build_neo4j_regex(active_domain_set)
 
-        # 4. 语义扩展：【修复调用链】
-        # 传入 regex_str 以激活索引库中的“纯度（Purity）”与“跨度（Span）”计算
-        # 该步骤现在仅需 ~30ms，因为它查的是本地 SQLite 预计算表
+        # 4. 语义扩展：【核心修复点】
+        # 补齐 query_vector 参数，彻底解决 _calculate_final_weights 报错问题。
+        # 此步骤现在集成：技术共振奖励(Hit Count) + SBERT 语义守门员(Semantic Factor)
         score_map, term_map, idf_map = self._expand_semantic_map(
             [int(k) for k in anchor_skills.keys()],
             anchor_skills,
-            domain_regex=regex_str  # <--- 此处必须传入，解决 Step 3 返回空的问题
+            domain_regex=regex_str,
+            query_vector=query_vector  # <--- 关键修复：补齐此参数传递
         )
 
-        # 对诊断用的学术词进行去重
+        # 对诊断用的学术词进行去重展示
         academic_kws = list(set(term_map.values()))
 
-        # 5. 图谱拓扑检索：通过学术词 ID 反查关联论文与作者
+        # 5. 图谱拓扑检索：通过学术词反查 Work 节点
         params = {"v_ids": [int(k) for k in score_map.keys()], "total_w": self.total_work_count}
-
-        # 领域硬约束子句构建
         domain_clause = ""
         if regex_str:
-            # 执行严格正则匹配，一票否决非目标领域的论文
             domain_clause = "AND w.domain_ids =~ $regex"
             params["regex"] = regex_str
 
         final_cypher = f"""
         MATCH (v:Vocabulary) WHERE v.id IN $v_ids
         WITH v, COUNT {{ (v)<-[:HAS_TOPIC]-() }} AS degree_w
-        // 学术侧二次熔断：确保 Topic 足够专业
         WHERE (degree_w * 1.0 / $total_w) < 0.01 
         WITH v, log10($total_w / (degree_w + 1)) AS idf_weight
         MATCH (v)<-[:HAS_TOPIC]-(w:Work) 
-        // --- 领域一票否决权 ---
         WHERE 1=1 {domain_clause} 
         WITH w, collect({{vid: v.id, idf: idf_weight}}) AS hit_info LIMIT 2000
         MATCH (w)<-[auth_r:AUTHORED]-(a:Author)
@@ -453,7 +459,7 @@ class LabelRecallPath:
             author_total_score, best_paper = 0.0, None
             for paper in record['papers']:
                 all_works_count += 1
-                # 核心贡献度计算：内部包含“4 次方领域纯度惩罚”
+                # 贡献度计算：内含 4 次方纯度惩罚与负向领域拦截
                 p_score, p_hits = self._compute_contribution(paper, context)
                 author_total_score += p_score
                 if p_score > 0 and (not best_paper or p_score > best_paper['contribution']):
@@ -468,7 +474,7 @@ class LabelRecallPath:
                     'top_paper': best_paper, 'paper_count': len(record['papers'])
                 })
 
-        # 7. 排序与诊断记录封装
+        # 7. 最终排序与诊断封装
         scored_authors.sort(key=lambda x: x['score'], reverse=True)
         self.last_debug_info = {
             'active_domains': list(active_domain_set),
@@ -481,16 +487,12 @@ class LabelRecallPath:
         }
 
         return [a['aid'] for a in scored_authors[:self.recall_limit]], (time.time() - start_t) * 1000
-
 if __name__ == "__main__":
 
 
     l_path = LabelRecallPath(recall_limit=200)
     encoder = QueryEncoder()
 
-    fields = {
-        "1": "计算机科学", "4": "工程学", "5": "物理学", "14": "数学"
-    }
 
     print("\n" + "=" * 115)
     print("🚀 增强诊断版：标签路 (Label Path) 全链路追踪")

@@ -7,33 +7,41 @@ import collections
 import numpy as np
 import faiss  # 用于后续高效向量检索的库
 from sentence_transformers import SentenceTransformer
-from config import SBERT_DIR, DB_PATH
+from config import SBERT_DIR, DB_PATH, SBERT_MODEL_NAME # 增加导入
 
 
 class QueryEncoder:
     """
-    语义编码器：将自然语言需求转化为 384 维稠密向量。
+    语义编码器：将自然语言需求转化为 768 维稠密向量。
     核心技术：【动态自共振增强 (Dynamic Resonance)】
     原理：通过重复出现核心技术词，人为提高 Transformer 模型在注意力机制（Attention）中对这些词的权重。
     """
 
-    def __init__(self, model_name='paraphrase-multilingual-MiniLM-L12-v2'):
+    def __init__(self, model_name=None):
         """
         初始化编码器
-        :param model_name: 预训练模型名。MiniLM 是一类轻量级高性能模型，L12 表示 12 层层级。
+        :param model_name: 预训练模型名。设置为 None 时自动加载 config.py 中的 SBERT_MODEL_NAME (BGE-M3)。
         """
+        # 1. 确保缓存目录存在
         if not os.path.exists(SBERT_DIR):
             os.makedirs(SBERT_DIR)
 
-        # 1. 加载 SBERT 模型（如果本地没有，会自动下载到 SBERT_DIR）
-        print(f"[*] 正在初始化编码器并加载 SBERT 模型...", flush=True)
-        start_load = time.time()
-        self.model = SentenceTransformer(model_name, cache_folder=SBERT_DIR)
+        # 2. 核心修正：将默认值设为 None，确保在不传参时默认启用 BGE-M3 (768维)
+        # 这对于处理你定义的 17 个学科领域的跨语言对齐至关重要
+        self.active_model_name = model_name if model_name else SBERT_MODEL_NAME
 
-        # 2. 执行动态词库构建（这是本类的精华：让模型具备“行业常识”）
+        print(f"[*] 正在初始化编码器并加载 SBERT 模型: {self.active_model_name}...", flush=True)
+        start_load = time.time()
+
+        # 3. 加载 SBERT 模型（自动下载或从本地 SBERT_DIR 加载）
+        self.model = SentenceTransformer(self.active_model_name, cache_folder=SBERT_DIR,
+            trust_remote_code=True)
+
+        # 4. 执行动态词库构建（这是本类的精华：让模型具备“行业常识”）
         self.hardcore_lexicon = self._build_dynamic_lexicon()
-        print(
-            f"[OK] 动态特征库加载完毕 (核心词条: {len(self.hardcore_lexicon)}), 耗时: {time.time() - start_load:.4f}s")
+
+        print(f"[OK] 动态特征库加载完毕 (核心词条: {len(self.hardcore_lexicon)})")
+        print(f"[*] 语义编码器就绪，当前维度: 768，耗时: {time.time() - start_load:.4f}s")
 
     def _build_dynamic_lexicon(self):
         """
@@ -165,7 +173,7 @@ if __name__ == "__main__":
             print(f"- 向量维度: {vec.shape}")
 
             # --- 核心修改：打印可直接复制的向量数值 ---
-            # vec 的形状是 (1, 384)，通过 [0] 取出具体的向量，tolist() 转为 Python 列表
+            # vec 的形状是 (1, 768)，通过 [0] 取出具体的向量，tolist() 转为 Python 列表
             vector_json = json.dumps(vec[0].tolist())
             print(f"- 转化后的向量 (JSON 格式，可直接复制):")
             print(vector_json)
