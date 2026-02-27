@@ -41,7 +41,11 @@ VOCAB_STATS_DB_PATH = os.path.join(INDEX_DIR, 'vocab_stats.db')
 # --- 7. SBERT 模型本地存放路径 ---
 SBERT_MODEL_NAME = 'Alibaba-NLP/gte-multilingual-base'
 
-SBERT_DIR = os.path.join(DATA_DIR, "build_sbert")
+# 核心修改：在 build_sbert 下增加一个以模型名命名的子文件夹
+# 使用 .split('/')[-1] 得到 'gte-multilingual-base'
+SBERT_DIR = os.path.join(DATA_DIR, "build_sbert", SBERT_MODEL_NAME.split('/')[-1])
+
+# 确保多层目录都能自动创建
 if not os.path.exists(SBERT_DIR):
     os.makedirs(SBERT_DIR)
 

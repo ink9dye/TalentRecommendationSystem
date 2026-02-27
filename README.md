@@ -1,223 +1,143 @@
-# 人才推荐系统技术架构文档
+# TalentRecommendationSystem (智能人才推荐系统)
 
-##  系统架构分层详解
+## 📖 项目概述
 
+`TalentRecommendationSystem` 是一个面向工业级场景的智能人才推荐引擎。不同于传统的关键词匹配，本项目采用了 **“多路召回 + 深度精排”** 的双阶段架构。
 
-
-
-### 1. 基础设施层 (Infrastructure Layer)
-**核心职责**：负责多源数据的全生命周期管理，包括获取、持久化以及特征校准
-
-#### **crawler 模块**
-- **OpenAlex 采集**：
-    - 采用**四阶段任务流**：
-        1. 爬取目标领域最新及高引论文
-        2. 识别精英学者
-        3. 获取代表作
-        4. 记录 H-index 和引用量等核心学术指标
-- **BOSS 采集**：
-    - 划定 **7 大领域**（计算机、生物医药等）
-    - 针对各领域代表性职业关键词爬取岗位描述
-    - 提取核心技能需求，覆盖工业侧真实人才偏好
-
-#### ️ **database 模块**
-
-
-#### **models 模块**
-- **sbert_models**
-    放置预训练的 SBERT 模型
-- **KGAT-AX 模型**：
-    - 核心模型实现
-    - 利用全息嵌入层将 H-index、引用量等数值特征（点属性）与图谱拓扑向量（边关系）进行 **Hadamard 积运算**
-    - 生成增强三元组，实现人才画像的精准建模
-
-
-
-####  **data_processor 模块**
-- **数据规范化**：
-    - 通过 `generate_work_id` 函数依据 DOI 或 OpenAlex ID 进行去重
-    - 根据 `pos_index`（署名顺位）和 `is_corresponding`（通讯标识）动态分配作者权重
-- **特征工程**：
-    - 引入**时序衰减机制**
-    - 通过数学函数降低陈旧论文对评价结果的影响
-    - 确保推荐的人才处于科研活跃期
+核心亮点在于集成了 **KGAT-AX (Knowledge Graph Attention Network - AX)** 排序模型，能够深度挖掘“人才-技能-岗位”知识图谱中的隐式关联，并针对非标准 DOI（如 `doi:egusphere-...`）进行了健壮的文本解析处理。
 
 ---
 
-### 2. 核心计算层 (Core Logic Layer)
-**核心职责**：执行跨语言语义对齐、三路并行召回以及基于深度学习的精排评分
+## 📂 详细项目结构
 
+该项目遵循高度模块化的设计原则，将算法逻辑、基础设施和交互界面清晰解耦：
 
-####  **embedding 模块**
-- **SBERT 编码**：
-    - 采用 `paraphrase-multilingual-MiniLM-L12-v2` 教师模型
-    - 将中英文文本映射至统一的 384 维向量空间
-    - 解决中英文学术术语对应障碍
+```bash
+TalentRecommendationSystem/
+├── data/                       # 数据仓库
+│   ├── raw/                    # 原始简历、JD 文本及三元组数据
+│   ├── processed/              # 预处理后的特征矩阵及图谱索引
+│   └── index/                  # Faiss 向量索引与协同过滤缓存
+├── models/                     # 模型存储
+│   ├── sbert_backbone/         # 语义向量化模型
+│   └── kgat_ax_weights/        # 训练好的 KGAT-AX 权重文件
+├── src/                        # 源代码核心
+│   ├── core/                   # 推荐引擎核心逻辑
+│   │   ├── recall/             # 第一阶段：多路召回模块
+│   │   │   ├── vector_path.py  # 基于 SBERT + Faiss 的向量语义召回
+│   │   │   ├── label_path.py   # 基于技能标签（Tags）的精确召回
+│   │   │   └── collaboration_path.py # 基于历史投递行为的协同召回
+│   │   ├── total_recall.py     # 召回汇总器：多路结果去重与分值对齐
+│   │   ├── ranking_engine.py   # 第二阶段：精排引擎（调用 KGAT-AX）
+│   │   ├── talent_app.py       # 业务逻辑封装（Top-N 筛选、过滤规则）
+│   │   └── total_core.py       # 系统总控入口：串联召回与排序流
+│   ├── infrastructure/         # 基础设施与数据底座
+│   │   ├── database/           # 数据访问层
+│   │   │   └── kgat_ax/        # KGAT-AX 排序模型核心实现
+│   │   │       ├── model.py    # PyTorch 神经网络架构
+│   │   │       ├── data_loader.py # 图数据采样与 Batch 序列化
+│   │   │       └── kgat_parser/ 
+│   │   │           └── parser_kgat.py # 超参数定义与命令行解析
+│   │   ├── build_vector_index.py        # 构建 Faiss 向量检索索引
+│   │   ├── build_feature_index.py       # 构建结构化特征倒排索引
+│   │   └── build_collaborative_index.py # 构建用户行为协同矩阵
+│   ├── interface/              # 交互界面
+│   │   └── app.py              # 基于 Streamlit 的可视化演示端
+│   ├── preprocess.py           # 全局数据清洗与 Work_ID (DOI) 标准化
+│   ├── recommend.py            # API 级接口封装
+│   └── evaluate.py             # 模型离线指标评估 (Hit Rate, NDCG, MRR)
+├── requirements.txt            # 项目依赖清单
+└── README.md                   # 本文件
 
-####  **recall 模块**
-| 召回策略 | 实现方式 | 输出规模 |
-|----------|----------|----------|
-| **向量路** | 在摘要向量索引（Faiss）中实时检索语义最接近的论文 | 初筛 300 名作者 |
-| **标签路** | 将非结构化文本锚定至职位节点，通过知识图谱路径扩展将全图搜索压缩为局部检索 | 召回 300 名相关学者 |
-| **协同路** | 利用学者协作相似度索引，通过学术协作网络挖掘高潜力年轻人才 | 补充召回 |
-
-####  **ranking 模块**
-- **精排推理**：
-    - 结合需求向量与召回的 500 名候选人特征
-    - 特征经过归一化处理
-    - 计算最终匹配分值
-    - 筛选出 **Top 20** 最终名单
-
----
-
-### 3. 接口层 (Presentation Layer)
-**核心职责**：将后端计算能力转化为可交互的 Web 服务，并提供可解释的推荐依据
-
-#### **api 模块**
-- **FastAPI 框架**：
-    - 实现高性能异步接口，利用 Python 协程处理并发查询。
-    - 通过解耦计算密集型任务（如 KGAT-AX 推理），优化数据检索逻辑。
-    - 力求将整体响应时间控制在 **2s 以内**。
-- **Service 逻辑**：
-    - **多路召回整合**：聚合 SBERT 语义召回、协同过滤及知识图谱路径召回的初步结果。
-    - **精排模型调用**：调用精排逻辑对人才进行二次打分，确保推荐精准度。
-    - **证据链生成**：基于 Neo4j 路径构建可视化的“推荐理由”数据结构。
-
-#### **web 模块**
-- **前端架构**：采用 **Vue 3 + TypeScript + Vite** 构建高性能单页应用（SPA），实现响应式交互。
-- **多维结果展示**：
-    - **人才排名列表**：动态渲染 Top 20 推荐名单。
-    - **学术画像刻画**：直观展示学术指标（H-index、发文量）及匹配度分值。
-- **证据链可视化**：
-    - **交互式图谱**：基于 ECharts 渲染人才与领域概念、岗位技能之间的关联路径。
-    - **路径溯源**：直观展示“人—技能—岗位”证据链，解决推荐算法的“黑盒”问题。
-
-- **src/** 项目源码
-  - **api/** - API 接口定义
-    - `talent.ts` - 定义后端 FastAPI 的通信契约
-      - `getRecommendations()`: 获取 Top 20 推荐名单
-      - `getEvidencePath()`: 获取特定人才的知识图谱路径
-  - **assets/** - 静态资源
-    - **styles/** - 全局 CSS
-      - 科技感背景样式
-      - Element Plus 主题覆盖
-  - **components/** - 核心 UI 组件
-    - `SearchBar.vue` - 语义搜索组件
-    - `TalentCard.vue` - 人才名片
-    - `EvidenceGraph.vue` - 基于 ECharts 的关系图
-  - **views/** - 页面视图
-    - `Home.vue` - 科技人才发现 Dashboard
-  - **mock/** - 离线模拟数据
-    - `talentData.ts` - 符合 KGAT-AX 和 Neo4j 格式的模拟数据
-  - **utils/** - 工具函数
-    - `echartsAdapter.ts` - Neo4j 路径数据转换为 ECharts Graph
-    - `formatters.ts` - 数值格式化工具
-  - `App.vue` - 根组件 (Layout 配置)
-  - `main.ts` - 项目入口
----
-
-### 4. 数据存储 (Data Storage)
-####  **数据目录结构**
-
-| 目录 | 存储内容 | 用途说明 |
-|------|----------|----------|
-| **sqlite/** | 清洗后的关系型数据（.db） | 系统的静态属性主库 |
-| **neo4j/** | 持久化的图节点与关系数据 | 知识图谱关系存储 |
-| **faiss/** | 论文摘要向量索引、职位描述向量索引 | 支持毫米级语义检索 |
-| **models/** | 训练好的权重文件（.pth）、SBERT 预训练模型 | 减少在线计算开销 |
-
-
-- **SQLite**：
-    - 维护 8 张基础表：
-        - `works` - 论文作品
-        - `authors` - 作者信息
-        - `institutions` - 机构信息
-        - `sources` - 来源期刊/会议
-        - `concepts` - 研究概念
-        - `vocabulary` - 词汇表
-        - `jobs` - 岗位信息
-        - `authorships` - 作者关系
-- **Neo4j**：
-    - 构建"人—作—所—源—词—岗"异质信息网络
-    - 通过 Cypher 实现高阶路径查询
-    - 解决深层语义联系缺失问题
----
-
-### 5. 测试 (Testing)
-####  **单元测试**
-- 数据清洗逻辑验证
-- 向量化编码验证
-- Cypher 查询语句验证
-
-####  **系统测试**
-- 模拟用户搜索流程
-- 测试高并发下的响应时延
-- 验证推荐结果的准确性
+```
 
 ---
 
-##  开发启动步骤
+## 🛠️ 技术深度解析
 
-1. 创建虚拟环境: `python -m venv venv`
+### 1. 多路召回 (Multi-path Recall)
 
-2. 激活虚拟环境: `venv\Scripts\activate` (Windows) 或 `source venv/bin/activate` (Mac/Linux)
+为了平衡系统的召回率与响应速度，`total_recall.py` 调度了三条路径：
 
-3. 安装依赖: `pip install -r requirements.txt`
+* **语义路径 (`vector_path.py`)**：通过 SBERT 将岗位描述映射为 768 维向量，捕获“懂 Python 的数据分析师”与“算法工程师”之间的深层语义联系。
+* **结构化路径 (`label_path.py`)**：强制匹配核心硬技能（如学历、证书、编程语言）。
+* **图关联路径 (`collaboration_path.py`)**：利用知识图谱的一阶和二阶邻居，发现潜在的交叉学科人才。
 
-4. 复制环境变量配置: `cp .env.example .env`
+### 2. KGAT-AX 精排模型
 
-5. 编辑 `.env` 文件，配置数据库连接、API密钥等
+精排层位于 `src/infrastructure/database/kgat_ax/`，其核心思想是：
 
+* **图注意力机制**：在“人才-技能-岗位”构成的异质图上进行消息传递。
+* **AX 增强优化**：针对人才推荐场景中极其稀疏的交互数据进行了正则化优化，提升了长尾人才的推荐精度。
 
+### 3. 数据处理特色
 
-## 📊 核心数据结构与索引设计 (Technical Specifications)
+在 `preprocess.py` 中，项目对人才简历中的学术/项目标识符（Work ID）进行了特殊处理，支持如下非标准 DOI 格式：
 
-为了满足百万级人才数据下的实时响应需求，系统设计了五大离线预计算索引及异质信息网络图谱。
-
----
-
-### 1. 五大离线中间索引 (Offline Indices)
-
-| 索引名称 | 存储介质 | 输入数据 (Source) | 输出格式 (Format) | 核心用途 |
-| :--- | :--- | :--- | :--- | :--- |
-| **语义向量检索索引** | Faiss | 技能词汇、学术概念文本  | `vocab_id` -> `Float32[384]` | 构建知识图谱词汇关联边  |
-| **摘要向量检索索引** | Faiss | 论文摘要全文 (OpenAlex)  | `work_id` -> `Float32[384]` | 向量路召回：语义相似度匹配  |
-| **描述向量检索索引** | Faiss | 岗位描述文本 (BOSS直聘)  | `job_id` -> `Float32[384]` | 标签路召回：需求锚定职位节点  |
-| **学者协作相似度索引** | SQLite | 合作关系、署名权重、被引数  | `(id_i, id_j)` -> `score` (Float) | 协同路召回：挖掘潜在科研协作人才  |
-| **实体特征索引** | SQLite | H-index、引用量、论文数  | `entity_id` -> `Norm_Vector` | 精排阶段：KGAT-AX 数值特征注入  |
+* `doi:egusphere-2025-4093-ac2`
+* `doi:v2`
+* 传统的 `10.xxx` 格式
 
 ---
 
-### 2. 知识图谱建模 (Neo4j Logic)
+## 🚀 快速上手
 
-系统在 Neo4j 中构建“人—作—所—源—词—岗”异质信息网络。 
+### 环境准备
 
-#### **节点定义 (Nodes)**
-* **Author (作者)**: `{author_id, name, H_index}` 
-* **Work (作品)**: `{work_id, title, year, citation_count}` 
-* **Job (岗位)**: `{job_id, name, domain}` 
-* **Vocab (词汇)**: `{vocab_id, name, type}` (含技能词与学术概念) 
-* **Inst (机构)** & **Source (来源)**: 唯一标识符采用 OpenAlex ID 
+```bash
+# 克隆仓库
+git clone https://github.com/ink9dye/TalentRecommendationSystem.git
+cd TalentRecommendationSystem
 
-#### **关系定义 (Relationships)**
-* **WRITE (作者-作品)**:
-    * **权重计算**: 基于署名顺位 (`pos_index`)、通讯标识 (`is_corresponding`) 及时序衰减机制。 
-* **REQUIRE (岗位-词汇)**:
-    * **映射逻辑**: 岗位需求对核心技能词的直接映射。 
-* **SIMILAR (词汇-词汇)**:
-    * **对齐方式**: 基于“语义向量检索索引”计算的余弦相似度，解决中英文学术与应用术语隔阂。 
+# 安装依赖
+pip install -r requirements.txt
+
+```
+
+### 初始化索引
+
+在首次运行推荐前，需要预计算索引文件：
+
+```bash
+python src/infrastructure/build_vector_index.py
+python src/infrastructure/build_feature_index.py
+
+```
+
+### 运行可视化 Demo
+
+```bash
+streamlit run src/interface/app.py
+
+```
 
 ---
 
-### 3. 两阶段推荐数据流 (Data Flow)
+## 📊 评估指标
 
+项目通过 `evaluate.py` 提供标准的推荐系统评估：
+| 指标 | 描述 |
+| :--- | :--- |
+| **Recall@100** | 多路召回阶段对真实投递人才的覆盖率 |
+| **NDCG@10** | 精排阶段前 10 名推荐结果的排序质量 |
+| **Inference Time** | 从输入 JD 到输出 Top 100 结果的平均耗时 |
 
+---
 
-1.  **召回阶段 (Recall)**:
-    * **输入**: 用户需求文本向量 (384维)。 
-    * **过程**: 向量路、标签路、协同路并行检索，各取前 300 名候选人。 
-    * **输出**: 合并去重后的 500 名候选人名单。 
-2.  **精排阶段 (Ranking)**:
-    * **输入**: 500 名候选人 ID + 需求向量 + 实体特征索引。 
-    * **过程**: **KGAT-AX** 执行 Hadamard 积运算，融合拓扑特征与学术质量数值。 
-    * **输出**: Top 20 最终推荐名单及路径证据链。 
+## 🤝 参与贡献
+
+1. Fork 本项目。
+2. 在 `src/core/recall/` 下新增你的召回路径文件。
+3. 在 `total_recall.py` 中注册新路径。
+4. 提交 Pull Request。
+
+---
+
+## 📧 联系方式
+
+* **项目维护者**: ink9dye
+* **GitHub**: [https://github.com/ink9dye](https://www.google.com/search?q=https://github.com/ink9dye)
+
+---
+
+**Would you like me to generate a specific `config.yaml` or a sample `requirements.txt` based on the tech stack mentioned above?**
