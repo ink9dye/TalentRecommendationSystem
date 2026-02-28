@@ -113,7 +113,7 @@ CYPHER_TEMPLATES = {
     "MERGE_INSTITUTION": "UNWIND $data AS row MERGE (i:Institution {id: row.id}) SET i.name = row.name, i.works_count = row.works_count, i.citations = row.citations",
     "MERGE_SOURCE": "UNWIND $data AS row MERGE (s:Source {id: row.id}) SET s.name = row.name, s.type = row.type, s.works_count = row.works_count, s.citations = row.citations",
     "MERGE_JOB": "UNWIND $data AS row MERGE (j:Job {id: row.id}) SET j.name = row.name, j.skills = row.skills, j.description = row.description, j.domain_ids = row.domain_ids",
-    "MERGE_VOCAB": "UNWIND $data AS row MERGE (v:Vocabulary {id: row.id}) SET v.term = toLower(row.term), v.type = row.entity_type",
+    "MERGE_VOCAB": "UNWIND $data AS row MERGE (v:Vocabulary {id: row.id}) SET v.term = toLower(row.term), v.name = toLower(row.term), v.type = row.entity_type",
 
     "LINK_AUTHORED_COMPLEX": """
         UNWIND $data AS row
@@ -158,8 +158,9 @@ CONFIG_DICT = {
     "NEO4J_USER": NEO4J_USER,
     "NEO4J_PASSWORD": NEO4J_PASSWORD,
     "NEO4J_DATABASE": NEO4J_DATABASE,
-    "BATCH_SIZE": 5000,
-    "SBERT_DIR": SBERT_DIR
+    "BATCH_SIZE": 1000,
+    "SBERT_DIR": SBERT_DIR,
+    "SBERT_MODEL_NAME": SBERT_MODEL_NAME
 }
 
 # --- 11. SQLite 索引初始化脚本 ---

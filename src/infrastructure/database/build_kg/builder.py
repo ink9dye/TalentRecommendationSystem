@@ -7,7 +7,7 @@ import faiss
 import sqlite3
 from tqdm import tqdm
 from datetime import datetime
-from config import SQL_QUERIES, CYPHER_TEMPLATES
+from config import SQL_QUERIES, CYPHER_TEMPLATES,SBERT_MODEL_NAME
 
 
 class WeightStrategy:
@@ -124,7 +124,12 @@ class KGBuilder:
         # 加载 HNSW 索引（用于极速寻找最近邻）
         index = faiss.read_index(idx_path)
         # 修复加载逻辑：使用‘模型名 + 路径’，解决 OSError 找不到权重文件的问题
-        model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2', cache_folder=sbert_dir)
+        model = SentenceTransformer(
+            self.config['SBERT_MODEL_NAME'],
+            cache_folder=sbert_dir,
+            trust_remote_code=True,
+            device="cpu"
+        )
 
         with sqlite3.connect(db_path) as conn:
             conn.row_factory = sqlite3.Row  # 使返回结果可以通过字段名访问
@@ -354,15 +359,24 @@ class KGBuilder:
                                CREATE INDEX idx_wt_term ON work_terms_temp (term);
                                """)
 
-            # 2. 填充数据：从 HAS_TOPIC 关系源将 (Work, Term) 映射存入 SQLite
-            # 这一步是为了让 SQL 能高效执行自连接聚合
+            # 2. 填充数据：从 works 的 concepts_text/keywords_text 按分隔符拆成 (work_id, term) 写入临时表
+            # concepts_text 实际存储为竖线分隔 "a|b|c"（见 processor.py），非 JSON，故用 Python 拆分
             logging.info("[*] 正在平铺 Work-Term 数据...")
-            # 假设你的打标结果已经持久化或从 works 表重新解析
-            conn.execute("""
-                         INSERT INTO work_terms_temp (work_id, term)
-                         SELECT work_id, lower(trim(value))
-                         FROM works, json_each(concepts_text) -- 示例，需根据你具体的存储结构调整
-                         """)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                "SELECT work_id, concepts_text, keywords_text FROM works WHERE concepts_text IS NOT NULL OR keywords_text IS NOT NULL"
+            )
+            batch = []
+            for row in cursor:
+                raw_meta = f"{row['concepts_text'] or ''}|{row['keywords_text'] or ''}"
+                terms = [t.strip().lower() for t in re.split(r'[|;,]', raw_meta) if t.strip()]
+                for term in terms:
+                    batch.append((row['work_id'], term))
+                if len(batch) >= 50000:
+                    conn.executemany("INSERT INTO work_terms_temp (work_id, term) VALUES (?, ?)", batch)
+                    batch = []
+            if batch:
+                conn.executemany("INSERT INTO work_terms_temp (work_id, term) VALUES (?, ?)", batch)
             conn.commit()
 
             # 3. 执行共现聚合查询
