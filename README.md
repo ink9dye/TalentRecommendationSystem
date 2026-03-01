@@ -78,7 +78,7 @@ TalentRecommendationSystem-master/
     │   │   ├── build_index/
     │   │   │   ├── build_vector_index.py      # 构建词汇 / 摘要 / Job 向量索引
     │   │   │   ├── build_collaborative_index.py # 基于 authorships 构建协作索引
-    │   │   │   ├── build_vocab_domain_index.py  # 词汇领域分布统计索引
+    │   │   │   ├── build_vocab_stats_index.py  # 词汇统计索引（领域分布 + 共现）
     │   │   │   ├── build_feature_index.py       # 作者 / 机构特征 JSON 索引
     │   │   │   └── download_model.py            # 下载并缓存 SBERT 模型权重
     │   │   ├── kgat_ax/
@@ -440,7 +440,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 
 ## 索引构建详解
 
-本节说明四类离线索引的**目的**与**实现方法**，对应代码：`src/infrastructure/database/build_index/` 下的 `build_collaborative_index.py`、`build_feature_index.py`、`build_vector_index.py`、`build_vocab_domain_index.py`；路径与开关由 `config.py` 统一配置。
+本节说明四类离线索引的**目的**与**实现方法**，对应代码：`src/infrastructure/database/build_index/` 下的 `build_collaborative_index.py`、`build_feature_index.py`、`build_vector_index.py`、`build_vocab_stats_index.py`；路径与开关由 `config.py` 统一配置。
 
 ### 1. 协作索引（build_collaborative_index.py）
 
@@ -514,7 +514,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 
 ---
 
-### 4. 词汇领域统计索引（build_vocab_domain_index.py）
+### 4. 词汇统计索引（build_vocab_stats_index.py，领域分布 + 共现）
 
 **目的**  
 为**标签路召回**提供「每个学术词」的领域统计：**work_count (degree_w)**：该词关联多少篇论文；**domain_span**：涉及多少个不同领域；**domain_dist**：各领域论文数分布（如 `{"1":100,"4":50}`）。用于：领域纯度、领域跨度惩罚（跨领域多的词降权）、以及和 Neo4j 的 HAS_TOPIC 一起做 1% 熔断、IDF/稀缺度等计算。
@@ -531,8 +531,10 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 
 - **建库**：若库不存在会创建；`PRAGMA journal_mode=WAL; synchronous=OFF` 提升写入性能；先 `DROP/CREATE vocabulary_domain_stats` 再批量 `executemany`（batch 约 500 词/批，每 1000 条提交）。
 
+- **共现表**：同一脚本还会从主库 `works` 的 concepts_text/keywords_text 构建临时表 `work_terms_temp`，执行 `GET_VOCAB_CO_OCCURRENCE` 得到 (term_a, term_b, freq)，写入 `vocabulary_cooccurrence`（term_a < term_b），与 build_kg 的 CO_OCCURRED_WITH 数据源一致，供索引侧查询词对共现频次而无需依赖 Neo4j。
+
 **产出**  
-SQLite 表 `vocabulary_domain_stats`，标签路在 `_expand_semantic_map`、`_apply_word_quality_penalty` 等处读取，用于领域纯度、跨度惩罚、共振与收敛奖励等。
+SQLite 库 `vocab_stats.db` 内两张表：`vocabulary_domain_stats`（标签路在 `_expand_semantic_map`、`_apply_word_quality_penalty` 等处读取，用于领域纯度、跨度惩罚、共振与收敛奖励等）；`vocabulary_cooccurrence`（词对共现频次，可被标签路或解释模块按需查询）。
 
 ---
 
@@ -543,7 +545,7 @@ SQLite 表 `vocabulary_domain_stats`，标签路在 `_expand_semantic_map`、`_a
 | **协作索引** | 预计算作者协作分，支撑协同路 | 权重(署名+时间+引用)→直接协作→间接 Bridge→Top100+双向覆盖索引 | `DB_PATH`, `COLLAB_DB_PATH` |
 | **特征索引** | 作者/机构特征供 KGAT-AX 精排 | log1p + Min-Max，JSON 存 author/inst 特征 | `DB_PATH`, `FEATURE_INDEX_PATH` |
 | **向量索引** | 摘要/岗位/词汇的语义检索 | 同一 SBERT、L2 归一化、HNSW 内积；摘要分片合并 | `DB_PATH`, `INDEX_DIR`, `SBERT_*`, `*_INDEX_PATH`, `*_MAP_PATH` |
-| **词汇领域索引** | 每个词的论文数、领域跨度与分布 | Neo4j HAS_TOPIC 聚合 → SQLite vocabulary_domain_stats | `CONFIG_DICT`(Neo4j), `VOCAB_STATS_DB_PATH` |
+| **词汇统计索引** | 领域分布 + 词对共现 | Neo4j HAS_TOPIC → vocabulary_domain_stats；主库 work_terms_temp → vocabulary_cooccurrence | `CONFIG_DICT`(Neo4j), `VOCAB_STATS_DB_PATH`, `DB_PATH`, `SQL_QUERIES` |
 
 整体上：**协作索引**面向「谁和谁合作」；**特征索引**面向精排输入；**向量索引**面向三路召回里的语义与领域探测；**词汇领域索引**面向标签路里学术词的质量与领域约束。
 
@@ -982,12 +984,8 @@ KGAT-AX 是「**知识图谱注意力网络 + 学术指标增强（AX）**」的
     - 阶段 2：统计作者两两合作的直接协作分数；
     - 阶段 3：引入间接协作（共同合作者）与 H‑index 正则化，生成最终 `scholar_collaboration` 表，并裁剪为 Top‑100 伙伴。
 
-- **`build_vocab_domain_index.py`**  
-  - `VocabDomainIndexer` 从 Neo4j 中收集 `(Vocabulary)<-[:HAS_TOPIC]-(Work)` 关系，为每个词计算：
-    - 关联论文数；
-    - 涉及领域数（span）；
-    - 各领域论文分布（JSON）；
-  - 写入独立的 `vocabulary_domain_stats` SQLite 库，供标签路评分使用。
+- **`build_vocab_stats_index.py`**  
+  - `VocabStatsIndexer` 构建 vocab_stats.db 中两张表：（1）`vocabulary_domain_stats`：从 Neo4j 收集 `(Vocabulary)<-[:HAS_TOPIC]-(Work)`，为每个词计算关联论文数、领域跨度、各领域论文分布（JSON），供标签路评分；（2）`vocabulary_cooccurrence`：从主库 works 计算词对共现频次 (term_a, term_b, freq)，与 KG CO_OCCURRED_WITH 一致，供索引侧查询共现。
 
 - **`build_feature_index.py`**  
   - `FeatureIndexBuilder` 从 `authors / institutions` 表抽取学术指标（H‑index、论文数、引用数），做 log1p + Min‑Max 归一化，生成：
@@ -1315,7 +1313,7 @@ python build_vector_index.py
 python build_feature_index.py
 
 # 构建词汇领域分布索引
-python build_vocab_domain_index.py
+python build_vocab_stats_index.py
 
 # 构建作者协作相似度索引
 python build_collaborative_index.py
