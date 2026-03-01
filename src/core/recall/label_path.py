@@ -1,3 +1,13 @@
+# -*- coding: utf-8 -*-
+"""
+标签路召回模块（LabelRecallPath）。
+
+实现「岗位技能 → 学术词 → 论文 → 作者」的图谱召回与多维度词权重计算。除领域探测、锚点提取、
+语义扩展（SIMILAR_TO）、学术共鸣（CO_OCCURRED_WITH）与 SBERT 语义守门员外，还依赖 vocab_stats.db 的
+vocabulary_cooccurrence 与 vocabulary_domain_stats，为每个候选词计算共现领域指标（cooc_span / cooc_purity），
+实现：与多领域词共现 → 万金油降权；只与目标领域词共现 → 专精加权；与本次搜索词共现 → 共鸣加成。
+输入输出格式与原有接口一致。
+"""
 import faiss
 import json
 import re
@@ -14,7 +24,7 @@ from src.core.recall.input_to_vector import QueryEncoder
 from src.utils.domain_utils import DomainProcessor
 from config import (
     CONFIG_DICT, JOB_INDEX_PATH, JOB_MAP_PATH,
-    VOCAB_INDEX_PATH, VOCAB_MAP_PATH, DB_PATH,VOCAB_STATS_DB_PATH
+    VOCAB_INDEX_PATH, VOCAB_MAP_PATH, DB_PATH, VOCAB_STATS_DB_PATH
 )
 
 # --- 算法配置：不同领域（Domain ID）的年度时间价值衰减率 ---
@@ -27,8 +37,15 @@ DOMAIN_DECAY_RATES = {
 class LabelRecallPath:
     """
     【核心架构】解耦版标签路召回 - 结构化流水线
+
     逻辑：通过向量检索探测领域 -> 从岗位(Job)提取工业技能锚点 -> 知识图谱语义扩展 ->
           映射至学术词汇(Vocabulary) -> 召回论文(Work) -> 综合评分计算专家(Author)贡献度。
+
+    语义扩展阶段的词级权重除原有维度外，还引入共现领域指标（依赖 vocab_stats.db 的
+    vocabulary_cooccurrence + vocabulary_domain_stats）：
+      - 与各种领域的词都共现 → 万金油 → 按共现伙伴平均领域跨度(cooc_span)降权；
+      - 只跟特定领域的词共现 → 专精 → 按共现伙伴目标领域纯度(cooc_purity)加权；
+      - 与本次要搜索的词汇有共现 → 单词协作 → 沿用 resonance 与 convergence_bonus 加权。
     """
 
     def __init__(self, recall_limit=200):
@@ -143,8 +160,10 @@ class LabelRecallPath:
     # --- 第三阶段：语义扩展 ---
     def _expand_semantic_map(self, core_vids, anchor_skills, domain_regex=None, query_vector=None):
         """
-        【学术共鸣版】语义扩展引擎
-        逻辑：工业锚点激发 -> 学术候选池生成 -> 学术共现网实证校验 -> 最终打分。
+        【学术共鸣 + 共现领域版】语义扩展引擎。
+
+        逻辑：工业锚点激发 -> 学术候选池生成 -> 学术共鸣(resonance)与共现领域指标(cooc_span/cooc_purity) ->
+              最终打分。输入输出格式不变：仍返回 (score_map, term_map, idf_map)，key 为 tid 字符串。
         """
         regex = domain_regex if domain_regex else ".*"
 
@@ -154,23 +173,29 @@ class LabelRecallPath:
         if not raw_results:
             return {}, {}, {}
 
-        # --- 2. 【核心新增：学术共鸣校验】 ---
-        # 逻辑：在 55 万篇论文构成的横向网络中，寻找哪些学术词属于“同一技术簇”
+        # --- 2. 【学术共鸣】候选词与本次要搜索的词汇的共现（单词协作）---
         tids = [r['tid'] for r in raw_results]
         resonance_map = self._calculate_academic_resonance(tids)
-
-        # 将共鸣分数注入原始结果，供下游数学引擎使用
         for rec in raw_results:
             rec['resonance'] = resonance_map.get(rec['tid'], 0.0)
 
-        # 3. 辅助函数 B：应用数学公式计算最终动态权重
-        # 此时 raw_results 已包含基于“社交证明”的共鸣分
+        # --- 3. 【共现领域指标】为“万金油降权”与“领域专精加权”提供 cooc_span / cooc_purity ---
+        # 从 domain_regex 解析出目标领域 ID 集合（与 _query_expansion_with_topology 内一致）
+        active_domain_ids = set(re.findall(r'\d+', regex)) if regex and regex != ".*" else set()
+        cooc_metrics = self._get_cooccurrence_domain_metrics(raw_results, active_domain_ids)
+        for rec in raw_results:
+            tid_key = str(rec['tid'])
+            rec['cooc_span'] = cooc_metrics.get(tid_key, {}).get('cooc_span', 0.0)
+            rec['cooc_purity'] = cooc_metrics.get(tid_key, {}).get('cooc_purity', 0.0)
+
+        # 4. 应用数学公式计算最终动态权重（含共鸣、共现广度惩罚、共现纯度奖励）
         return self._calculate_final_weights(raw_results, query_vector)
 
     def _calculate_academic_resonance(self, tids):
         """
-        【学术逻辑层】计算候选词集内部的连通密度。
+        【学术逻辑层】计算候选词集内部的连通密度（与本次要搜索的词汇的共现 = 单词协作）。
         逻辑：如果 MPC 和 WBC 都在候选名单里，且它们在图谱中有强共现边，则两者都会获得“共鸣加成”。
+        输出：{vid: resonance_score}，供下游 convergence_bonus 加权。
         """
         cypher = """
         MATCH (v1:Vocabulary)-[r:CO_OCCURRED_WITH]-(v2:Vocabulary)
@@ -178,8 +203,117 @@ class LabelRecallPath:
         RETURN v1.id AS vid, SUM(r.weight) AS resonance_score
         """
         results = self.graph.run(cypher, tids=tids).data()
-        # 返回格式：{vid: resonance_score}
         return {r['vid']: float(r['resonance_score']) for r in results}
+
+    def _get_cooccurrence_domain_metrics(self, raw_results, active_domain_ids):
+        """
+        【共现领域指标】从 vocab_stats.db 的 vocabulary_cooccurrence + vocabulary_domain_stats 计算每个候选词的两项指标，
+        用于后续“万金油降权”与“领域专精加权”，不改变输入/输出格式，仅向 raw_results 的调用方提供可注入的数值。
+
+        指标含义：
+          - cooc_span：共现伙伴的（按共现频次加权的）平均领域跨度 domain_span。
+            越大表示该词常与“跨很多领域”的词一起出现 → 万金油 → 下游做降权。
+          - cooc_purity：共现伙伴在目标领域上的（按共现频次加权的）论文占比。
+            越高表示该词常与“只在本领域出现”的词共现 → 领域专精 → 下游做加权。
+
+        数据来源：
+          - vocabulary_cooccurrence(term_a, term_b, freq)：词对共现频次，按 term 查询。
+          - vocabulary_domain_stats(voc_id, work_count, domain_span, domain_dist)：词汇领域统计，按 voc_id 查询。
+          - 主库 vocabulary(voc_id, term)：伙伴 term → voc_id，用于查 domain_stats。
+
+        输入：
+          - raw_results：语义扩展得到的候选列表，每项至少含 'tid', 'term'。
+          - active_domain_ids：当前搜索的目标领域 ID 集合（如 {"1","4"}），用于计算 cooc_purity 的目标领域占比。
+
+        输出：{tid_str: {"cooc_span": float, "cooc_purity": float}}，无共现或表不存在时对应项为 0。
+        """
+        if not raw_results or not active_domain_ids:
+            return {str(rec['tid']): {"cooc_span": 0.0, "cooc_purity": 0.0} for rec in raw_results}
+
+        try:
+            terms = list({rec['term'] for rec in raw_results})
+            terms_set = set(terms)
+            # 1. 从 vocabulary_cooccurrence 查出候选词各自的共现伙伴及频次
+            placeholders = ','.join('?' * len(terms))
+            sql_cooc = (
+                f"SELECT term_a, term_b, freq FROM vocabulary_cooccurrence "
+                f"WHERE term_a IN ({placeholders}) OR term_b IN ({placeholders})"
+            )
+            rows = self.stats_conn.execute(sql_cooc, terms + terms).fetchall()
+
+            # 2. 构建 候选 term -> [(partner_term, freq), ...]
+            term_to_partners = collections.defaultdict(list)
+            for term_a, term_b, freq in rows:
+                if term_a in terms_set:
+                    term_to_partners[term_a].append((term_b, freq))
+                if term_b in terms_set:
+                    term_to_partners[term_b].append((term_a, freq))
+
+            partner_terms = set()
+            for pairs in term_to_partners.values():
+                for p, _ in pairs:
+                    partner_terms.add(p)
+            if not partner_terms:
+                return {str(rec['tid']): {"cooc_span": 0.0, "cooc_purity": 0.0} for rec in raw_results}
+
+            # 3. 主库：伙伴 term -> voc_id
+            partner_list = list(partner_terms)
+            ph = ','.join('?' * len(partner_list))
+            with sqlite3.connect(DB_PATH) as main_conn:
+                main_conn.row_factory = sqlite3.Row
+                main_rows = main_conn.execute(
+                    f"SELECT voc_id, term FROM vocabulary WHERE term IN ({ph})", partner_list
+                ).fetchall()
+            partner_term_to_vocid = {row['term']: row['voc_id'] for row in main_rows}
+
+            partner_voc_ids = list(partner_term_to_vocid.values())
+            if not partner_voc_ids:
+                return {str(rec['tid']): {"cooc_span": 0.0, "cooc_purity": 0.0} for rec in raw_results}
+
+            # 4. vocabulary_domain_stats：voc_id -> (work_count, domain_span, domain_dist)
+            ph2 = ','.join('?' * len(partner_voc_ids))
+            stats_rows = self.stats_conn.execute(
+                f"SELECT voc_id, work_count, domain_span, domain_dist FROM vocabulary_domain_stats WHERE voc_id IN ({ph2})",
+                partner_voc_ids,
+            ).fetchall()
+            vocid_to_stats = {}
+            for r in stats_rows:
+                vocid_to_stats[r[0]] = (r[1], r[2], r[3])  # work_count, domain_span, domain_dist
+
+            # 5. 对每个候选词计算按共现频次加权的 cooc_span 与 cooc_purity
+            out = {}
+            for rec in raw_results:
+                tid, term = rec['tid'], rec['term']
+                pairs = term_to_partners.get(term, [])
+                cooc_span_sum = cooc_purity_sum = total_freq = 0.0
+                for partner_term, freq in pairs:
+                    voc_id = partner_term_to_vocid.get(partner_term)
+                    if voc_id is None:
+                        continue
+                    st = vocid_to_stats.get(voc_id)
+                    if not st:
+                        continue
+                    work_count, domain_span, dist_json = st
+                    try:
+                        dist = json.loads(dist_json) if isinstance(dist_json, str) else dist_json
+                    except (TypeError, ValueError):
+                        dist = {}
+                    target_degree = sum(dist.get(str(d), 0) for d in active_domain_ids)
+                    target_ratio = (target_degree / work_count) if work_count else 0.0
+                    cooc_span_sum += domain_span * freq
+                    cooc_purity_sum += target_ratio * freq
+                    total_freq += freq
+                if total_freq > 0:
+                    out[str(tid)] = {
+                        "cooc_span": cooc_span_sum / total_freq,
+                        "cooc_purity": cooc_purity_sum / total_freq,
+                    }
+                else:
+                    out[str(tid)] = {"cooc_span": 0.0, "cooc_purity": 0.0}
+            return out
+        except Exception:
+            # 共现表或主库不可用时不改变行为，全部置 0
+            return {str(rec['tid']): {"cooc_span": 0.0, "cooc_purity": 0.0} for rec in raw_results}
 
     def _query_expansion_with_topology(self, v_ids, regex):
         """
@@ -253,9 +387,13 @@ class LabelRecallPath:
 
     def _apply_word_quality_penalty(self, rec, query_vector):
         """
-        【学术共鸣+语义拦截版】核心数学引擎
+        【学术共鸣 + 共现领域 + 语义拦截】核心数学引擎。
+
         降噪维度：语义守门员(SBERT) + 领域跨度(Span) + 领域纯度(Purity) + 共鸣熔断(Resonance)
-        加成维度：IDF + 技术共振奖励(Hit Count) + 学术群落加成
+                 + 共现领域广度(cooc_span)：与多领域词都共现 → 万金油降权。
+        加成维度：IDF + 技术共振(Hit Count) + 学术共鸣(Resonance) + 共现目标领域纯度(cooc_purity)：专精加权。
+        输入 rec 需含 degree_w, cov_j, domain_span, target_degree_w, hit_count, resonance；可选 cooc_span, cooc_purity。
+        输出 (dynamic_weight, idf_val) 格式不变。
         """
         degree_w = rec['degree_w']
         cov_j = rec['cov_j']
@@ -297,14 +435,24 @@ class LabelRecallPath:
         # 应用 6 次方非线性惩罚，实现对弱相关词的断崖式拦截
         semantic_factor = math.pow(max(0, cos_sim), 6)
 
-        # 6. 【最终公式：立体的评价体系】
-        # $$Weight = \frac{IDF}{JobPenalty} \times Purity^2 \times \frac{ConvergenceBonus}{Span} \times SemanticFactor$$
+        # --- 6. 【共现领域惩罚与奖励】基于 vocab_stats 的 vocabulary_cooccurrence ---
+        # 降权：与各种领域的词都共现 → 万金油 → 共现伙伴平均领域跨度大 → cooc_span 大 → 乘小于 1 的因子
+        cooc_span = rec.get('cooc_span', 0.0)
+        span_penalty = 1.0 / (1.0 + math.log1p(cooc_span)) if cooc_span > 0 else 1.0
+        # 加权：只跟特定领域的词共现 → 专精 → 共现伙伴目标领域占比高 → cooc_purity 大 → 乘大于 1 的因子
+        cooc_purity = rec.get('cooc_purity', 0.0)
+        purity_bonus = (1.0 + math.log1p(cooc_purity)) if cooc_purity > 0 else 1.0
+
+        # 7. 【最终公式：立体的评价体系】
+        # 在原有公式上再乘 span_penalty（万金油降权）与 purity_bonus（领域专精加权），输入输出格式不变
         dynamic_weight = (
                 (idf_val / job_penalty)
                 * math.pow(tag_purity, 2)  # 纯度平方奖励垂直度
                 / domain_span  # 跨度降权压制万金油
-                * convergence_bonus  # 【包含学术群落实证加成】
+                * convergence_bonus  # 学术共鸣（与本次搜索词共现）加成
                 * semantic_factor  # SBERT 语义守门员
+                * span_penalty  # 共现伙伴跨多领域 → 降权
+                * purity_bonus  # 共现伙伴集中目标领域 → 加权
         )
 
         return dynamic_weight, idf_val

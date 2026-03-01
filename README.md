@@ -371,8 +371,9 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 
 3. **语义扩展 `_expand_semantic_map()`**  
    - **图扩展** `_query_expansion_with_topology`：从锚点词出发沿 (Vocabulary)-[:SIMILAR_TO]-(Vocabulary) 找邻居学术词；对每个邻居统计「被多少个不同锚点命中」hit_count、在 Job 侧的覆盖率 cov_j；在 SQLite 的 vocabulary_domain_stats 里查 work_count、domain_span、domain_dist，只保留在目标领域里有产出的词。  
-   - **学术共鸣** `_calculate_academic_resonance`：对当前候选词集合在 Neo4j 里查 CO_OCCURRED_WITH，对每个词汇总共现边的 weight 之和作为 resonance_score（与其它候选词在论文里经常一起出现的词加分）。  
-   - **词权重** `_apply_word_quality_penalty`：IDF、岗位惩罚（cov_j 过高压分）、领域纯度与跨度、共鸣熔断/加成、收敛奖励（多锚点命中 + 共现强）；**SBERT 语义守门员**：用 all_vocab_vectors 与 query_vector 的余弦相似度，取 semantic_factor = max(0, cos_sim)^6，弱相关词被断崖式压低；最终词权重公式：Weight = (IDF/job_penalty) × purity² × (convergence_bonus/span) × semantic_factor。
+   - **学术共鸣** `_calculate_academic_resonance`：对当前候选词集合在 Neo4j 里查 CO_OCCURRED_WITH，对每个词汇总共现边的 weight 之和作为 resonance_score（与其它候选词在论文里经常一起出现的词加分，即「单词协作」）。  
+   - **共现领域指标** `_get_cooccurrence_domain_metrics`：从 vocab_stats.db 的 vocabulary_cooccurrence 与 vocabulary_domain_stats（及主库 vocabulary）为每个候选词算 **cooc_span**（共现伙伴的平均领域跨度）与 **cooc_purity**（共现伙伴在目标领域的论文占比）。与各种领域的词都共现 → 万金油 → 用 cooc_span 降权；只跟特定领域的词共现 → 专精 → 用 cooc_purity 加权。  
+   - **词权重** `_apply_word_quality_penalty`：IDF、岗位惩罚（cov_j 过高压分）、领域纯度与跨度、共鸣熔断/加成、收敛奖励（多锚点命中 + 共现强）；**SBERT 语义守门员**：semantic_factor = max(0, cos_sim)^6；**共现领域**：span_penalty = 1/(1+log1p(cooc_span))（万金油降权）、purity_bonus = 1+log1p(cooc_purity)（领域专精加权）；最终公式：Weight = (IDF/job_penalty) × purity² × (convergence_bonus/span) × semantic_factor × span_penalty × purity_bonus。
 
 4. **图谱反查论文与作者**  
    Cypher 从带权重的 Vocabulary 集合出发沿 (Vocabulary)<-[:HAS_TOPIC]-(Work) 找论文（可选 w.domain_ids =~ $regex）；再 (Work)<-[auth_r:AUTHORED]-(Author)；对论文做 1% 熔断（degree_w/total_w < 0.01）；为每篇论文收集命中的 (vid, idf_weight)、auth_r.pos_weight、title、year、domains 等，用于下一步作者级打分。
@@ -534,7 +535,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 - **共现表**：同一脚本还会从主库 `works` 的 concepts_text/keywords_text 构建临时表 `work_terms_temp`，执行 `GET_VOCAB_CO_OCCURRENCE` 得到 (term_a, term_b, freq)，写入 `vocabulary_cooccurrence`（term_a < term_b），与 build_kg 的 CO_OCCURRED_WITH 数据源一致，供索引侧查询词对共现频次而无需依赖 Neo4j。
 
 **产出**  
-SQLite 库 `vocab_stats.db` 内两张表：`vocabulary_domain_stats`（标签路在 `_expand_semantic_map`、`_apply_word_quality_penalty` 等处读取，用于领域纯度、跨度惩罚、共振与收敛奖励等）；`vocabulary_cooccurrence`（词对共现频次，可被标签路或解释模块按需查询）。
+SQLite 库 `vocab_stats.db` 内两张表：`vocabulary_domain_stats`（标签路在 `_expand_semantic_map`、`_apply_word_quality_penalty` 等处读取，用于领域纯度、跨度惩罚、共振与收敛奖励等）；`vocabulary_cooccurrence`（词对共现频次，标签路通过 `_get_cooccurrence_domain_metrics` 计算 cooc_span/cooc_purity，实现「与多领域词共现→万金油降权」与「只与目标领域词共现→专精加权」，亦可被解释模块按需查询）。
 
 ---
 
@@ -875,8 +876,9 @@ KGAT-AX 是「**知识图谱注意力网络 + 学术指标增强（AX）**」的
     1. 通过 Job 向量索引检测 Query 所属领域；
     2. 从 Job 节点中提取高含金量技能锚点；
     3. 在 Neo4j 中沿 `SIMILAR_TO`、`HAS_TOPIC` 等关系扩展学术词集合；
-    4. 结合 SQLite 中的 `vocabulary_domain_stats` 与 SBERT 向量，对候选学术词进行多维打分（稀缺度、领域纯度、共现共鸣、语义相似度等）；
+    4. 结合 SQLite 的 `vocabulary_domain_stats` 与 SBERT 向量对候选学术词多维打分；并利用 `vocabulary_cooccurrence` 通过 `_get_cooccurrence_domain_metrics` 计算 **cooc_span**（共现伙伴领域跨度）与 **cooc_purity**（共现伙伴目标领域纯度），实现万金油降权与领域专精加权；同时保留学术共鸣（与本次搜索词共现）加成；
     5. 在 Neo4j 中反查 `(Vocabulary)<-[:HAS_TOPIC]-(Work)<-[:AUTHORED]-(Author)`，基于论文贡献度与时序衰减聚合成作者得分。
+  - 输入输出格式不变：`recall(query_vector, domain_ids)` 仍返回 `(author_id_list, elapsed_ms)`；语义扩展仍返回 `(score_map, term_map, idf_map)`。
   - `last_debug_info` 字段用于输出完整诊断链路（领域探测、锚点、学术词质量、论文/作者规模等），便于调参与可解释性分析。
 
 - **`src/core/recall/collaboration_path.py`**  
