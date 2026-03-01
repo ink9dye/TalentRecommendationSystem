@@ -286,7 +286,7 @@ class LabelRecallPath:
 
     def _get_cooccurrence_domain_metrics(self, raw_results, active_domain_ids):
         """
-        【共现领域指标】从 vocab_stats.db 的 vocabulary_cooccurrence + vocabulary_domain_stats 计算每个候选词的两项指标，
+        【共现领域指标】从 vocab_stats.db 计算每个候选词的两项指标，
         用于后续“万金油降权”与“领域专精加权”，不改变输入/输出格式，仅向 raw_results 的调用方提供可注入的数值。
 
         指标含义：
@@ -296,9 +296,8 @@ class LabelRecallPath:
             越高表示该词常与“只在本领域出现”的词共现 → 领域专精 → 下游做加权。
 
         数据来源：
-          - vocabulary_cooccurrence(term_a, term_b, freq)：词对共现频次，按 term 查询。
-          - vocabulary_domain_stats(voc_id, work_count, domain_span, domain_dist)：词汇领域统计，按 voc_id 查询。
-          - 主库 vocabulary(voc_id, term)：伙伴 term → voc_id，用于查 domain_stats。
+          - cooc_purity：优先从 vocabulary_cooc_domain_ratio(voc_id, domain_id, ratio) 按目标领域 SUM(ratio) 查表，无表时回退到共现+领域统计计算。
+          - cooc_span：vocabulary_cooccurrence + vocabulary_domain_stats（伙伴的 domain_span 按 freq 加权）。
 
         输入：
           - raw_results：语义扩展得到的候选列表，每项至少含 'tid', 'term'。
@@ -308,6 +307,22 @@ class LabelRecallPath:
         """
         if not raw_results or not active_domain_ids:
             return {str(rec['tid']): {"cooc_span": 0.0, "cooc_purity": 0.0} for rec in raw_results}
+
+        # 优先从预计算的 vocabulary_cooc_domain_ratio 取 cooc_purity（按目标领域 SUM(ratio)）
+        cooc_purity_from_table = {}
+        try:
+            tids = [rec["tid"] for rec in raw_results]
+            domain_list = [str(d) for d in active_domain_ids]
+            if tids and domain_list:
+                ph_t = ",".join("?" * len(tids))
+                ph_d = ",".join("?" * len(domain_list))
+                rows = self.stats_conn.execute(
+                    f"SELECT voc_id, SUM(ratio) AS cooc_purity FROM vocabulary_cooc_domain_ratio WHERE voc_id IN ({ph_t}) AND domain_id IN ({ph_d}) GROUP BY voc_id",
+                    tids + domain_list,
+                ).fetchall()
+                cooc_purity_from_table = {str(r[0]): float(r[1]) for r in rows}
+        except Exception:
+            pass
 
         try:
             terms = list({rec['term'] for rec in raw_results})
@@ -332,8 +347,9 @@ class LabelRecallPath:
             for pairs in term_to_partners.values():
                 for p, _ in pairs:
                     partner_terms.add(p)
+            default_out = {str(rec["tid"]): {"cooc_span": 0.0, "cooc_purity": cooc_purity_from_table.get(str(rec["tid"]), 0.0)} for rec in raw_results}
             if not partner_terms:
-                return {str(rec['tid']): {"cooc_span": 0.0, "cooc_purity": 0.0} for rec in raw_results}
+                return default_out
 
             # 3. 主库：伙伴 term -> voc_id
             partner_list = list(partner_terms)
@@ -347,7 +363,7 @@ class LabelRecallPath:
 
             partner_voc_ids = list(partner_term_to_vocid.values())
             if not partner_voc_ids:
-                return {str(rec['tid']): {"cooc_span": 0.0, "cooc_purity": 0.0} for rec in raw_results}
+                return default_out
 
             # 4. vocabulary_domain_stats：voc_id -> (work_count, domain_span, domain_dist)
             ph2 = ','.join('?' * len(partner_voc_ids))
@@ -385,14 +401,17 @@ class LabelRecallPath:
                 if total_freq > 0:
                     out[str(tid)] = {
                         "cooc_span": cooc_span_sum / total_freq,
-                        "cooc_purity": cooc_purity_sum / total_freq,
+                        "cooc_purity": cooc_purity_from_table.get(str(tid), cooc_purity_sum / total_freq),
                     }
                 else:
-                    out[str(tid)] = {"cooc_span": 0.0, "cooc_purity": 0.0}
+                    out[str(tid)] = {
+                        "cooc_span": 0.0,
+                        "cooc_purity": cooc_purity_from_table.get(str(tid), 0.0),
+                    }
             return out
         except Exception:
-            # 共现表或主库不可用时不改变行为，全部置 0
-            return {str(rec['tid']): {"cooc_span": 0.0, "cooc_purity": 0.0} for rec in raw_results}
+            # 共现表或主库不可用时不改变行为，cooc_span 置 0，cooc_purity 用表数据若有
+            return {str(rec["tid"]): {"cooc_span": 0.0, "cooc_purity": cooc_purity_from_table.get(str(rec["tid"]), 0.0)} for rec in raw_results}
 
     def _query_expansion_with_topology(self, v_ids, regex):
         """
