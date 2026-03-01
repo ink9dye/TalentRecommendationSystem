@@ -169,7 +169,7 @@ class LabelRecallPath:
             )
             per_job = [{'jid': r['jid'], 'skill_count': r['skill_count']} for r in cursor]
 
-            # 所有技能及 cov_j（不应用 1% 熔断），用于统计熔断前后
+            # 所有技能及 cov_j（不应用 3% 熔断），用于统计熔断前后
             cypher_all = """
             MATCH (j:Job) WHERE j.id IN $j_ids
             MATCH (j)-[:REQUIRE_SKILL]->(v:Vocabulary)
@@ -178,8 +178,8 @@ class LabelRecallPath:
             """
             rows = self.graph.run(cypher_all, j_ids=job_ids[:5], total_j=total_j).data()
             before_melt = len(rows)
-            after_melt = len([r for r in rows if r['cov_j'] < 0.01 and len((r.get('term') or '')) > 1])
-            melted = [r['term'] for r in rows if r['cov_j'] >= 0.01][:20]
+            after_melt = len([r for r in rows if r['cov_j'] < 0.03 and len((r.get('term') or '')) > 1])
+            melted = [r['term'] for r in rows if r['cov_j'] >= 0.03][:20]
             return {
                 'per_job_skill_count': per_job,
                 'skills_before_melt': before_melt,
@@ -190,50 +190,23 @@ class LabelRecallPath:
             return {}
 
     # --- 第二阶段：锚点技能提取 ---
-    def _extract_anchor_skills(self, target_job_ids, query_text=None):
+    def _extract_anchor_skills(self, target_job_ids):
         """
-        【工业侧：岗位技能提取】支持「查询词不熔断」。
-        逻辑：
-        1. 统计命中岗位(Top5)所要求的所有技能及 cov_j。
-        2. 若提供 query_text：出现在 JD 文本中的技能词一律保留（不熔断）；其余仍按 cov_j < 1% 熔断。
-        3. 未提供 query_text 时行为与原先一致：仅保留 cov_j < 1% 的词。
-        4. 锚点总数上限 50（先满足“在 JD 中出现”的词，再按 cov_j 升序补足）。
+        【工业侧：岗位技能提取】对工业查询词也做熔断，3% 熔断（cov_j < 0.03）。
+        逻辑：统计命中岗位(Top5)所要求的所有技能及 cov_j，仅保留 cov_j < 0.03 的词，上限 50。
         """
         cypher = """
         MATCH (j:Job) WHERE j.id IN $j_ids
         MATCH (j)-[:REQUIRE_SKILL]->(v:Vocabulary)
         WITH v, (COUNT { (v)<-[:REQUIRE_SKILL]-() } * 1.0 / $total_j) AS cov_j
+        WHERE cov_j < 0.03
         WITH v.id AS vid, v.term AS term, cov_j
         RETURN DISTINCT vid, term, cov_j
         ORDER BY cov_j ASC
+        LIMIT 50
         """
         cursor = self.graph.run(cypher, j_ids=target_job_ids[:5], total_j=self.total_job_count)
-        rows = [r for r in cursor if r['term'] and len(r['term']) > 1]
-
-        query_lower = (query_text or "").lower()
-        in_query = []   # (vid, term) 出现在 JD 中的词，不熔断
-        other = []      # (vid, term, cov_j) 其余词，按 cov_j 熔断
-
-        for r in rows:
-            vid, term, cov_j = str(r['vid']), r['term'], float(r['cov_j'])
-            if term.lower() in query_lower:
-                in_query.append((vid, term))
-            else:
-                other.append((vid, term, cov_j))
-
-        result = {}
-        for (vid, term) in in_query:
-            result[vid] = {"term": term}
-        other.sort(key=lambda x: x[2])
-        for (vid, term, cov_j) in other:
-            if len(result) >= 50:
-                break
-            if cov_j >= 0.01:
-                continue
-            if vid not in result:
-                result[vid] = {"term": term}
-
-        return result
+        return {str(r['vid']): {"term": r['term']} for r in cursor if r['term'] and len(r['term']) > 1}
     # --- 第三阶段：语义扩展 ---
     def _expand_semantic_map(self, core_vids, anchor_skills, domain_regex=None, query_vector=None):
         """
@@ -256,8 +229,12 @@ class LabelRecallPath:
         for rec in raw_results:
             rec['resonance'] = resonance_map.get(rec['tid'], 0.0)
 
-        # --- 2.5 【锚点共鸣】候选词与工业锚点词在论文中的共现，用于熔断“只从 python 等扩出、与 控制/机械臂 无共现”的噪音 ---
-        anchor_resonance_map = self._calculate_anchor_resonance(tids, core_vids)
+        # --- 2.5 【锚点共鸣】与“第一层学术词”的共现（工业词与学术词无论文共现，故用第一层学术词做参考）
+        # 第一层学术词 = 本轮扩展结果；取 hit_count>=2 的作为“核心第一层”（多锚点共识），若无则用全部第一层
+        first_layer_core = [r['tid'] for r in raw_results if r.get('hit_count', 0) >= 2]
+        if not first_layer_core:
+            first_layer_core = tids
+        anchor_resonance_map = self._calculate_anchor_resonance(tids, first_layer_core)
         for rec in raw_results:
             rec['anchor_resonance'] = anchor_resonance_map.get(rec['tid'], 0.0)
 
@@ -288,21 +265,21 @@ class LabelRecallPath:
         results = self.graph.run(cypher, tids=tids).data()
         return {r['vid']: float(r['resonance_score']) for r in results}
 
-    def _calculate_anchor_resonance(self, tids, core_vids):
+    def _calculate_anchor_resonance(self, tids, first_layer_tids):
         """
-        【锚点共鸣】计算每个候选学术词与工业锚点词（core_vids）在论文中的 CO_OCCURRED_WITH 权重之和。
-        用于熔断：与锚点无共现的词（如仅从 python 扩出的 statistics）给 0.1 惩罚；与 控制/机械臂 等有共现的词保留。
+        【锚点共鸣】计算每个候选学术词与“第一层学术词”（first_layer_tids）在论文中的 CO_OCCURRED_WITH 权重之和。
+        工业词与学术词在论文中无共现，故用第一层学术词（由锚点 SIMILAR_TO 得到）做共现参考；与核心第一层无共现的扩展词给 0.1 惩罚。
         输出：{tid: anchor_resonance_score}。
         """
-        if not core_vids:
+        if not first_layer_tids:
             return {tid: 0.0 for tid in tids}
         cypher = """
         MATCH (v1:Vocabulary)-[r:CO_OCCURRED_WITH]-(v2:Vocabulary)
-        WHERE v1.id IN $tids AND v2.id IN $core_vids
+        WHERE v1.id IN $tids AND v2.id IN $first_layer_tids
         RETURN v1.id AS vid, SUM(r.weight) AS anchor_resonance_score
         """
         try:
-            results = self.graph.run(cypher, tids=tids, core_vids=core_vids).data()
+            results = self.graph.run(cypher, tids=tids, first_layer_tids=first_layer_tids).data()
             return {r['vid']: float(r['anchor_resonance_score']) for r in results}
         except Exception:
             return {tid: 0.0 for tid in tids}
@@ -511,23 +488,23 @@ class LabelRecallPath:
         # 3. 计算断崖式岗位惩罚 (Suppression of generic job terms)
         job_penalty = 1.0 + math.exp(300.0 * (cov_j - 0.005))
 
-        # --- 4. 【核心修改：学术共鸣与共振奖励】 ---
-        # 逻辑 A：hit_count 代表有多少工业锚点支撑这个词
+        # --- 4. 【核心修改：学术共鸣与共振奖励 + hit_count 直接加权】 ---
+        # 逻辑 A：hit_count 代表有多少工业锚点支撑这个词；单锚点(hit_count=1)多为 python 等扩出的噪音，直接降权
         hit_count = rec.get('hit_count', 1)
+        hit_count_factor = 0.4 if hit_count == 1 else 1.0  # 单锚点 0.4x，多锚点共识保持 1.0
 
-        # 逻辑 B：resonance 代表该词与当前其他候选词的共现；anchor_resonance 代表与工业锚点词的共现
+        # 逻辑 B：resonance 代表该词与当前其他候选词的共现；anchor_resonance 代表与第一层学术词的共现
         resonance = rec.get('resonance', 0.0)
         anchor_resonance = rec.get('anchor_resonance', 0.0)
 
-        # 【共鸣熔断器】：必须与锚点词有共现才给满分，否则 0.1 惩罚（熔断仅从 python 等扩出、与 控制/机械臂 无共现的噪音）
-        # 与锚点有共现时，加分幅度仍由 resonance（延伸词间共现）参与，泛词仍由 cooc_span 等压
+        # 【共鸣熔断器】：必须与第一层学术词有共现才给满分，否则 0.1 惩罚
         if anchor_resonance > 0:
             resonance_factor = 1.0 + math.log1p(resonance)
         else:
             resonance_factor = 0.1
 
-        # 综合收敛奖惩：技术簇共鸣越强，分值越高
-        convergence_bonus = math.log1p(hit_count) * resonance_factor
+        # 综合收敛奖惩：技术簇共鸣 + hit_count 直接加权（多锚点共识词得分更高）
+        convergence_bonus = hit_count_factor * math.log1p(hit_count) * resonance_factor
 
         # --- 5. SBERT 语义守门员 ---
         # 逻辑：计算学术词向量与当前 JD 整体语义的余弦相似度
@@ -552,7 +529,7 @@ class LabelRecallPath:
         # 在原有公式上再乘 span_penalty（万金油降权）与 purity_bonus（领域专精加权），输入输出格式不变
         dynamic_weight = (
                 (idf_val / job_penalty)
-                * math.pow(tag_purity, 2)  # 纯度平方奖励垂直度
+                * math.pow(tag_purity, 4)  # 纯度 4 次方，整体压泛词（跨多领域词得分断崖式下降）
                 / domain_span  # 跨度降权压制万金油
                 * convergence_bonus  # 学术共鸣（与本次搜索词共现）加成
                 * semantic_factor  # SBERT 语义守门员
@@ -671,7 +648,7 @@ class LabelRecallPath:
     def recall(self, query_vector, domain_id=None, query_text=None):
         """
         全链路调度：领域探测 → 锚点提取 → 语义扩展（含共现领域指标）→ 图谱反查 → 作者打分。
-        入参 domain_id 与向量路统一；query_text 用于「查询词不熔断」；返回 (author_id_list, duration_ms)。
+        入参 domain_id 与向量路统一；工业词 3% 熔断（含查询词）；学术词 2% 熔断。返回 (author_id_list, duration_ms)。
         """
         if not self.graph: return [], 0
         start_t = time.time()
@@ -680,8 +657,8 @@ class LabelRecallPath:
         job_ids, inferred_domains, dominance = self._detect_domain_context(query_vector)
         job_previews = self._get_job_previews(job_ids)
 
-        # 2. 锚点提取：获取工业侧硬核技能词（传入 query_text 时，JD 中出现的技能不熔断）
-        anchor_skills = self._extract_anchor_skills(job_ids, query_text=query_text)
+        # 2. 锚点提取：工业词 3% 熔断（对查询词也熔断，python 等高频词会被熔掉）
+        anchor_skills = self._extract_anchor_skills(job_ids)
         anchor_debug = self._get_anchor_debug_stats(job_ids[:5], self.total_job_count) if job_ids else {}
         if not anchor_skills:
             return [], 0
@@ -715,7 +692,7 @@ class LabelRecallPath:
         final_cypher = f"""
         MATCH (v:Vocabulary) WHERE v.id IN $v_ids
         WITH v, COUNT {{ (v)<-[:HAS_TOPIC]-() }} AS degree_w
-        WHERE (degree_w * 1.0 / $total_w) < 0.01 
+        WHERE (degree_w * 1.0 / $total_w) < 0.02 
         WITH v, log10($total_w / (degree_w + 1)) AS idf_weight
         MATCH (v)<-[:HAS_TOPIC]-(w:Work) 
         WHERE 1=1 {domain_clause} 
@@ -799,7 +776,7 @@ if __name__ == "__main__":
             query_vec, _ = encoder.encode(user_input)
             faiss.normalize_L2(query_vec)
 
-            top_ids, search_time = l_path.recall(query_vec, domain_id=domain_choice, query_text=user_input)
+            top_ids, search_time = l_path.recall(query_vec, domain_id=domain_choice)
 
             # --- 核心诊断日志 ---
             db = l_path.last_debug_info
@@ -834,7 +811,7 @@ if __name__ == "__main__":
                 after_melt = anchor_debug.get('skills_after_melt', 0)
                 melted_sample = anchor_debug.get('melted_terms_sample', [])
                 print(f"      参与锚点提取的岗位 (Top5) 每岗 REQUIRE_SKILL 数: {per_job}")
-                print(f"      1% 熔断: 熔断前 {before_melt} 个技能词，熔断后保留 {after_melt} 个；被熔断词样例: {melted_sample[:15]}")
+                print(f"      3% 熔断: 熔断前 {before_melt} 个技能词，熔断后保留 {after_melt} 个；被熔断词样例: {melted_sample[:15]}")
 
             # 3. 学术语义扩展与“学术共鸣”校验
             print(f"【Step 3: 语义扩展与实证校验】学术词质量评估:")
