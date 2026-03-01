@@ -191,7 +191,6 @@ KGATAX_TRAIN_DATA_DIR = os.path.join(DATA_DIR, "kgatax_train_data")
 if not os.path.exists(KGATAX_TRAIN_DATA_DIR):
     os.makedirs(KGATAX_TRAIN_DATA_DIR)
 
-
 # --- 13. 业务领域映射表 (新增) ---
 DOMAIN_MAP = {
     "1": "计算机科学", "2": "医学", "3": "政治学", "4": "工程学", "5": "物理学",

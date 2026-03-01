@@ -26,12 +26,7 @@ from config import (
     CONFIG_DICT, JOB_INDEX_PATH, JOB_MAP_PATH,
     VOCAB_INDEX_PATH, VOCAB_MAP_PATH, DB_PATH, VOCAB_STATS_DB_PATH
 )
-
-# --- 算法配置：不同领域（Domain ID）的年度时间价值衰减率 ---
-# 1-计算机(0.90, 更新快), 4-工程(0.92), 12-临床医学(0.99, 较稳定)
-DOMAIN_DECAY_RATES = {
-    "1": 0.90, "4": 0.92, "2": 0.94, "12": 0.99, "14": 0.98, "default": 0.95
-}
+from src.utils.domain_config import DOMAIN_DECAY_RATES, DEFAULT_DECAY_RATE
 
 
 class LabelRecallPath:
@@ -48,8 +43,9 @@ class LabelRecallPath:
       - 与本次要搜索的词汇有共现 → 单词协作 → 沿用 resonance 与 convergence_bonus 加权。
     """
 
-    def __init__(self, recall_limit=200):
+    def __init__(self, recall_limit=200, verbose=False):
         self.recall_limit = recall_limit
+        self.verbose = verbose
         self.current_year = datetime.now().year
         self._init_resources()
 
@@ -129,34 +125,115 @@ class LabelRecallPath:
         dominance = (domain_counter.most_common(1)[0][1] / 10.0) if domain_counter else 0
         return candidate_ids, inferred, dominance
 
+    def _get_job_previews(self, job_ids, max_snippet=200):
+        """
+        查询命中岗位的名称与描述片段，用于诊断「Top10 是否真是目标领域岗位」。
+        返回: [{"id": id, "name": name, "description_snippet": desc[:max_snippet]}, ...]
+        """
+        if not job_ids or not self.graph:
+            return []
+        try:
+            cursor = self.graph.run(
+                "MATCH (j:Job) WHERE j.id IN $j_ids RETURN j.id AS id, j.name AS name, j.description AS desc",
+                j_ids=job_ids[:10]
+            )
+            out = []
+            for row in cursor:
+                desc = (row.get('desc') or '') or ''
+                if isinstance(desc, str) and len(desc) > max_snippet:
+                    desc = desc[:max_snippet] + '...'
+                out.append({
+                    'id': row.get('id'),
+                    'name': (row.get('name') or '')[:80],
+                    'description_snippet': desc
+                })
+            return out
+        except Exception:
+            return []
+
+    def _get_anchor_debug_stats(self, job_ids, total_j):
+        """
+        统计参与锚点提取的岗位的 REQUIRE_SKILL 数量，以及 1% 熔断前后词数、被熔断词样例。
+        返回: {"per_job_skill_count": [...], "skills_before_melt": N, "skills_after_melt": M, "melted_terms_sample": [...]}
+        """
+        if not job_ids or not self.graph or total_j <= 0:
+            return {}
+        try:
+            # 每个岗位的 REQUIRE_SKILL 数量
+            cursor = self.graph.run(
+                """MATCH (j:Job) WHERE j.id IN $j_ids
+                   MATCH (j)-[:REQUIRE_SKILL]->(v:Vocabulary)
+                   WITH j.id AS jid, count(v) AS skill_count
+                   RETURN jid, skill_count ORDER BY jid""",
+                j_ids=job_ids[:5]
+            )
+            per_job = [{'jid': r['jid'], 'skill_count': r['skill_count']} for r in cursor]
+
+            # 所有技能及 cov_j（不应用 1% 熔断），用于统计熔断前后
+            cypher_all = """
+            MATCH (j:Job) WHERE j.id IN $j_ids
+            MATCH (j)-[:REQUIRE_SKILL]->(v:Vocabulary)
+            WITH v, (COUNT { (v)<-[:REQUIRE_SKILL]-() } * 1.0 / $total_j) AS cov_j
+            RETURN v.id AS vid, v.term AS term, cov_j
+            """
+            rows = self.graph.run(cypher_all, j_ids=job_ids[:5], total_j=total_j).data()
+            before_melt = len(rows)
+            after_melt = len([r for r in rows if r['cov_j'] < 0.01 and len((r.get('term') or '')) > 1])
+            melted = [r['term'] for r in rows if r['cov_j'] >= 0.01][:20]
+            return {
+                'per_job_skill_count': per_job,
+                'skills_before_melt': before_melt,
+                'skills_after_melt': after_melt,
+                'melted_terms_sample': melted
+            }
+        except Exception:
+            return {}
 
     # --- 第二阶段：锚点技能提取 ---
-    def _extract_anchor_skills(self, target_job_ids):
+    def _extract_anchor_skills(self, target_job_ids, query_text=None):
         """
-        【工业侧：岗位技能提取】
-        目的：从匹配的岗位中找到“高含金量”的专业词。
+        【工业侧：岗位技能提取】支持「查询词不熔断」。
         逻辑：
-        1. 统计命中岗位(Top 3)所要求的所有技能(Vocabulary)。
-        2. 计算该技能在全量岗位节点(total_j)中的覆盖率 cov_j。
-        3. 1% 熔断：仅保留在全量 Job 中出现频率 < 1% 的专业技能，剔除“沟通、办公”等通用词。
-        4. 扩容：将 LIMIT 设为 50，以完整捕捉复合型岗位中的多个技术维度。
+        1. 统计命中岗位(Top5)所要求的所有技能及 cov_j。
+        2. 若提供 query_text：出现在 JD 文本中的技能词一律保留（不熔断）；其余仍按 cov_j < 1% 熔断。
+        3. 未提供 query_text 时行为与原先一致：仅保留 cov_j < 1% 的词。
+        4. 锚点总数上限 50（先满足“在 JD 中出现”的词，再按 cov_j 升序补足）。
         """
         cypher = """
         MATCH (j:Job) WHERE j.id IN $j_ids
         MATCH (j)-[:REQUIRE_SKILL]->(v:Vocabulary)
         WITH v, (COUNT { (v)<-[:REQUIRE_SKILL]-() } * 1.0 / $total_j) AS cov_j
-
-        // --- 约束 1：岗位侧 1% 熔断 (按 Job 总节点数计算) ---
-        WHERE cov_j < 0.01 
-
-        RETURN DISTINCT v.id AS vid, v.term AS term, cov_j
-        ORDER BY cov_j ASC 
-        LIMIT 50 // 扩大上限至 50，确保长 JD 中的所有核心技术点(如 RRT, MPC, MuJoCo)均能作为锚点
+        WITH v.id AS vid, v.term AS term, cov_j
+        RETURN DISTINCT vid, term, cov_j
+        ORDER BY cov_j ASC
         """
         cursor = self.graph.run(cypher, j_ids=target_job_ids[:5], total_j=self.total_job_count)
+        rows = [r for r in cursor if r['term'] and len(r['term']) > 1]
 
-        # 返回格式：{vid: {"term": "术语名称"}}
-        return {str(r['vid']): {"term": r['term']} for r in cursor if len(r['term']) > 1}
+        query_lower = (query_text or "").lower()
+        in_query = []   # (vid, term) 出现在 JD 中的词，不熔断
+        other = []      # (vid, term, cov_j) 其余词，按 cov_j 熔断
+
+        for r in rows:
+            vid, term, cov_j = str(r['vid']), r['term'], float(r['cov_j'])
+            if term.lower() in query_lower:
+                in_query.append((vid, term))
+            else:
+                other.append((vid, term, cov_j))
+
+        result = {}
+        for (vid, term) in in_query:
+            result[vid] = {"term": term}
+        other.sort(key=lambda x: x[2])
+        for (vid, term, cov_j) in other:
+            if len(result) >= 50:
+                break
+            if cov_j >= 0.01:
+                continue
+            if vid not in result:
+                result[vid] = {"term": term}
+
+        return result
     # --- 第三阶段：语义扩展 ---
     def _expand_semantic_map(self, core_vids, anchor_skills, domain_regex=None, query_vector=None):
         """
@@ -179,6 +256,11 @@ class LabelRecallPath:
         for rec in raw_results:
             rec['resonance'] = resonance_map.get(rec['tid'], 0.0)
 
+        # --- 2.5 【锚点共鸣】候选词与工业锚点词在论文中的共现，用于熔断“只从 python 等扩出、与 控制/机械臂 无共现”的噪音 ---
+        anchor_resonance_map = self._calculate_anchor_resonance(tids, core_vids)
+        for rec in raw_results:
+            rec['anchor_resonance'] = anchor_resonance_map.get(rec['tid'], 0.0)
+
         # --- 3. 【共现领域指标】为“万金油降权”与“领域专精加权”提供 cooc_span / cooc_purity ---
         # 从 domain_regex 解析出目标领域 ID 集合（与 _query_expansion_with_topology 内一致）
         active_domain_ids = set(re.findall(r'\d+', regex)) if regex and regex != ".*" else set()
@@ -189,6 +271,7 @@ class LabelRecallPath:
             rec['cooc_purity'] = cooc_metrics.get(tid_key, {}).get('cooc_purity', 0.0)
 
         # 4. 应用数学公式计算最终动态权重（含共鸣、共现广度惩罚、共现纯度奖励）
+        self._last_expansion_raw_results = raw_results
         return self._calculate_final_weights(raw_results, query_vector)
 
     def _calculate_academic_resonance(self, tids):
@@ -204,6 +287,25 @@ class LabelRecallPath:
         """
         results = self.graph.run(cypher, tids=tids).data()
         return {r['vid']: float(r['resonance_score']) for r in results}
+
+    def _calculate_anchor_resonance(self, tids, core_vids):
+        """
+        【锚点共鸣】计算每个候选学术词与工业锚点词（core_vids）在论文中的 CO_OCCURRED_WITH 权重之和。
+        用于熔断：与锚点无共现的词（如仅从 python 扩出的 statistics）给 0.1 惩罚；与 控制/机械臂 等有共现的词保留。
+        输出：{tid: anchor_resonance_score}。
+        """
+        if not core_vids:
+            return {tid: 0.0 for tid in tids}
+        cypher = """
+        MATCH (v1:Vocabulary)-[r:CO_OCCURRED_WITH]-(v2:Vocabulary)
+        WHERE v1.id IN $tids AND v2.id IN $core_vids
+        RETURN v1.id AS vid, SUM(r.weight) AS anchor_resonance_score
+        """
+        try:
+            results = self.graph.run(cypher, tids=tids, core_vids=core_vids).data()
+            return {r['vid']: float(r['anchor_resonance_score']) for r in results}
+        except Exception:
+            return {tid: 0.0 for tid in tids}
 
     def _get_cooccurrence_domain_metrics(self, raw_results, active_domain_ids):
         """
@@ -413,13 +515,16 @@ class LabelRecallPath:
         # 逻辑 A：hit_count 代表有多少工业锚点支撑这个词
         hit_count = rec.get('hit_count', 1)
 
-        # 逻辑 B：resonance 代表该词在 55 万篇论文中与当前其他候选词的“熟识度”
+        # 逻辑 B：resonance 代表该词与当前其他候选词的共现；anchor_resonance 代表与工业锚点词的共现
         resonance = rec.get('resonance', 0.0)
+        anchor_resonance = rec.get('anchor_resonance', 0.0)
 
-        # 【共鸣熔断器】：
-        # 如果共现权重 > 0，则给与 log1p 增益；
-        # 如果共现权重为 0（代表完全孤立），则给予 0.1 倍的惩罚，熔断噪声路径
-        resonance_factor = (1.0 + math.log1p(resonance)) if resonance > 0 else 0.1
+        # 【共鸣熔断器】：必须与锚点词有共现才给满分，否则 0.1 惩罚（熔断仅从 python 等扩出、与 控制/机械臂 无共现的噪音）
+        # 与锚点有共现时，加分幅度仍由 resonance（延伸词间共现）参与，泛词仍由 cooc_span 等压
+        if anchor_resonance > 0:
+            resonance_factor = 1.0 + math.log1p(resonance)
+        else:
+            resonance_factor = 0.1
 
         # 综合收敛奖惩：技术簇共鸣越强，分值越高
         convergence_bonus = math.log1p(hit_count) * resonance_factor
@@ -563,28 +668,28 @@ class LabelRecallPath:
         score = rank_score * proximity_bonus * domain_coeff * time_decay * survey_decay * auth_weight
         return score, hit_terms
 
-    def recall(self, query_vector, domain_ids=None):
+    def recall(self, query_vector, domain_id=None, query_text=None):
         """
-        【最终修复版】全链路调度：引入 SBERT 语义守门员与多路信号收敛。
-        修改点：
-        1. 修复参数传递链：显式将 query_vector 传入语义扩展模块。
-        2. 确保 Step 4 能够激活底层的向量相似度校验与技术共振计算。
+        全链路调度：领域探测 → 锚点提取 → 语义扩展（含共现领域指标）→ 图谱反查 → 作者打分。
+        入参 domain_id 与向量路统一；query_text 用于「查询词不熔断」；返回 (author_id_list, duration_ms)。
         """
         if not self.graph: return [], 0
         start_t = time.time()
 
         # 1. 岗位空间探测：探测当前 JD 所属的主战场领域
         job_ids, inferred_domains, dominance = self._detect_domain_context(query_vector)
+        job_previews = self._get_job_previews(job_ids)
 
-        # 2. 锚点提取：获取工业侧硬核技能词
-        anchor_skills = self._extract_anchor_skills(job_ids)
+        # 2. 锚点提取：获取工业侧硬核技能词（传入 query_text 时，JD 中出现的技能不熔断）
+        anchor_skills = self._extract_anchor_skills(job_ids, query_text=query_text)
+        anchor_debug = self._get_anchor_debug_stats(job_ids[:5], self.total_job_count) if job_ids else {}
         if not anchor_skills:
             return [], 0
         industrial_kws = [v['term'] for v in anchor_skills.values()]
 
-        # 3. 领域处理：确定最终过滤范围（正则字符串）
+        # 3. 领域处理：确定最终过滤范围（正则字符串），domain_id 与向量路命名统一
         active_domain_set = DomainProcessor.to_set(
-            domain_ids if domain_ids and str(domain_ids) != "0" else inferred_domains)
+            domain_id if domain_id and str(domain_id) != "0" else inferred_domains)
         regex_str = DomainProcessor.build_neo4j_regex(active_domain_set)
 
         # 4. 语义扩展：【核心修复点】
@@ -629,7 +734,7 @@ class LabelRecallPath:
             'anchor_kws': [k.lower() for k in industrial_kws],
             'active_domain_set': active_domain_set,
             'dominance': dominance,
-            'decay_rate': DOMAIN_DECAY_RATES.get(first_domain, 0.95)
+            'decay_rate': DOMAIN_DECAY_RATES.get(first_domain, DEFAULT_DECAY_RATE)
         }
 
         scored_authors, all_works_count = [], 0
@@ -654,11 +759,23 @@ class LabelRecallPath:
 
         # 7. 最终排序与诊断封装
         scored_authors.sort(key=lambda x: x['score'], reverse=True)
+        # 学术词按权重排序，供主函数打印 Top15
+        sorted_terms = sorted(
+            [(term_map.get(tid, ''), score_map.get(tid, 0)) for tid in score_map],
+            key=lambda x: x[1], reverse=True
+        )
         self.last_debug_info = {
             'active_domains': list(active_domain_set),
             'dominance': f"{dominance * 100:.1f}%",
+            'job_ids': job_ids,
+            'job_previews': job_previews,
+            'anchor_debug': anchor_debug,
             'industrial_kws': industrial_kws,
+            'anchor_detail': [f"{k}={v['term']}" for k, v in anchor_skills.items()],
             'academic_kws': academic_kws,
+            'detailed_kws': getattr(self, '_last_expansion_raw_results', []),
+            'top_scored_terms': sorted_terms,
+            'recall_vocab_count': len(score_map),
             'work_count': all_works_count,
             'author_count': len(scored_authors),
             'top_samples': scored_authors[:20]
@@ -671,66 +788,102 @@ if __name__ == "__main__":
     l_path = LabelRecallPath(recall_limit=200)
     encoder = QueryEncoder()
 
-
     try:
         domain_choice = input("\n请选择领域编号 (0跳过): ").strip() or "0"
 
         while True:
             user_input = input(f"\n请输入岗位需求 (q退出): ").strip()
-            if not user_input or user_input.lower() == 'q': break
+            if not user_input or user_input.lower() == 'q':
+                break
 
             query_vec, _ = encoder.encode(user_input)
             faiss.normalize_L2(query_vec)
 
-            top_ids, search_time = l_path.recall(query_vec, domain_ids=domain_choice)
+            top_ids, search_time = l_path.recall(query_vec, domain_id=domain_choice, query_text=user_input)
 
             # --- 核心诊断日志 ---
             db = l_path.last_debug_info
             print("\n" + "🔍 [深度诊断流水线]" + "-" * 98)
 
-            # 1. 领域探测
+            # 1. 领域探测（增强：打印命中的岗位 ID + Top10 岗位名称与描述片段）
             domains = db.get('active_domains', [])
             domain_str = " | ".join(domains) if domains else "未限制"
             print(f"【Step 1: 领域探测】目标领域并集: [{domain_str}] (置信度: {db.get('dominance')})")
+            job_ids = db.get('job_ids', [])
+            if job_ids:
+                print(f"      命中岗位 ID (Top10): {[jid[:50]+'...' if len(jid)>50 else jid for jid in job_ids[:10]]}")
+            job_previews = db.get('job_previews', [])
+            if job_previews:
+                print(f"      Top10 岗位名称与描述片段（用于判断是否匹配「机器人/运动控制」）:")
+                for i, jp in enumerate(job_previews[:10], 1):
+                    name = (jp.get('name') or '')[:60]
+                    snippet = (jp.get('description_snippet') or '')[:120]
+                    print(f"        #{i} 名称: {name}")
+                    print(f"            描述: {snippet}...")
 
-            # 2. 工业锚点
+            # 2. 工业锚点（增强：每个岗位 REQUIRE_SKILL 数、熔断前/后、被熔断词样例）
             i_kws = db.get('industrial_kws', [])
-            print(f"【Step 2: 工业锚点】从 JD 提取的核心技能: {i_kws}")
+            anchor_detail = db.get('anchor_detail', [])
+            print(f"【Step 2: 工业锚点】从 JD 提取的核心技能 (共 {len(i_kws)} 个): {i_kws}")
+            if anchor_detail:
+                print(f"      锚点明细 (vid -> term): {anchor_detail[:15]}")
+            anchor_debug = db.get('anchor_debug', {})
+            if anchor_debug:
+                per_job = anchor_debug.get('per_job_skill_count', [])
+                before_melt = anchor_debug.get('skills_before_melt', 0)
+                after_melt = anchor_debug.get('skills_after_melt', 0)
+                melted_sample = anchor_debug.get('melted_terms_sample', [])
+                print(f"      参与锚点提取的岗位 (Top5) 每岗 REQUIRE_SKILL 数: {per_job}")
+                print(f"      1% 熔断: 熔断前 {before_melt} 个技能词，熔断后保留 {after_melt} 个；被熔断词样例: {melted_sample[:15]}")
 
             # 3. 学术语义扩展与“学术共鸣”校验
             print(f"【Step 3: 语义扩展与实证校验】学术词质量评估:")
             print(f"      {'学术词 (Term)':<25} | {'收敛(Hits)':<10} | {'共鸣(Resonance)':<15} | {'状态'}")
             print(f"      {'-' * 25} | {'-' * 10} | {'-' * 15} | {'-' * 10}")
 
-            # 这里的 logic 假设 recall 方法已将 raw_results 存入 debug_info
-            # 如果尚未修改 recall，建议在 recall 的 self.last_debug_info 里加入 'detailed_kws': raw_results
             detailed_kws = db.get('detailed_kws', [])
+            if not detailed_kws:
+                print("      （无数据）")
             for kw in sorted(detailed_kws, key=lambda x: x.get('resonance', 0), reverse=True)[:15]:
                 hits = kw.get('hit_count', 1)
                 res = kw.get('resonance', 0)
-                # 状态判定逻辑
                 status = "✅ 核心簇" if res > 0 and hits > 1 else "⚠️ 孤立点"
-                if res == 0: status = "❌ 已熔断"  # 共现为 0 的噪音
+                if res == 0:
+                    status = "❌ 已熔断"
+                term_str = (kw.get('term') or '')[:25]
+                print(f"      {term_str:<25} | {hits:<10} | {int(res):<15} | {status}")
 
-                print(f"      {kw['term'][:25]:<25} | {hits:<10} | {int(res):<15} | {status}")
+            # 3.5 参与召回的学术词及权重 Top15（便于发现 stub file、folklore 等噪音）
+            top_scored_terms = db.get('top_scored_terms', [])
+            if top_scored_terms:
+                print(f"      参与召回的学术词权重 Top15:")
+                for term, score in top_scored_terms[:15]:
+                    print(f"        - {term[:40]:<40}  weight={score:.6f}")
 
             # 4. 论文与作者召回
             w_count = db.get('work_count', 0)
             a_count = db.get('author_count', 0)
-            print(f"【Step 4: 召回规模】检索到 {w_count} 篇学术论文，最终锁定 {a_count} 名垂直领域专家。")
+            vocab_count = db.get('recall_vocab_count', 0)
+            if vocab_count:
+                print(f"【Step 4: 召回规模】参与检索的学术词数: {vocab_count}，检索到 {w_count} 篇学术论文，最终锁定 {a_count} 名垂直领域专家。")
+            else:
+                print(f"【Step 4: 召回规模】检索到 {w_count} 篇学术论文，最终锁定 {a_count} 名垂直领域专家。")
 
-            # --- 专家排名展示 ---
+            # --- 专家排名展示（增强：前几条打印原始得分 + 代表作详情）---
             print("-" * 115)
             print(f"{'排名':<6} | {'作者 ID':<12} | {'综合得分':<15} | {'学术领域代表作 (命中标签)'}")
             print("-" * 115)
 
             for i, item in enumerate(db.get('top_samples', []), 1):
                 tp = item.get('top_paper', {})
-                title = tp.get('title', 'Unknown')[:55]
-                # 命中标签详细展示
+                title = (tp.get('title') or 'Unknown')[:55]
                 hit_tags = ", ".join(tp.get('hits', []))
-                print(f"#{i:<5} | {item['aid']:<12} | {int(item['score']):<15} | 《{title}》")
+                raw_score = item.get('score', 0)
+                contrib = tp.get('contribution', 0)
+                print(f"#{i:<5} | {item['aid']:<12} | {int(raw_score):<15} | 《{title}》")
                 print(f"{' ':23} ┗━ 核心命中: {hit_tags}")
+                if i <= 5:
+                    print(f"{' ':23}     [调试] 原始得分={raw_score:.6f}, 代表作贡献={contrib:.6f}")
 
             print("-" * 115)
             print(f"[*] 诊断完成。全链路耗时: {search_time:.2f}ms")
