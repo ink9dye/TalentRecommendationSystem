@@ -20,6 +20,7 @@
 import re
 import sqlite3
 import json
+import gc
 import os
 import collections
 from tqdm import tqdm
@@ -71,12 +72,11 @@ class VocabStatsIndexer:
           2. vocabulary_domain_ratio：按 (voc_id, domain_id) 存 ratio，供查询时一条 SQL 筛出领域占比≥阈值的词。
           3. vocabulary_cooccurrence：词对共现频次（term_a, term_b, freq）。
           4. vocabulary_cooc_domain_ratio：按 (voc_id, domain_id) 存共现伙伴的领域占比之 freq 加权均值，供标签路查 cooc_purity。
-        启用 WAL 与 synchronous=OFF 以提升批量写入性能。
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=60)
         conn.executescript("""
             PRAGMA journal_mode=WAL;
-            PRAGMA synchronous=OFF;
+            PRAGMA synchronous=NORMAL;
 
             -- 表1：词汇领域分布（按词统计）
             DROP TABLE IF EXISTS vocabulary_domain_stats;
@@ -137,7 +137,7 @@ class VocabStatsIndexer:
         voc_ids = [r["vid"] for r in self.graph.run(voc_query)]
 
         batch_size = 500
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=60)
         pbar = tqdm(total=len(voc_ids), desc="Indexing Vocab Domain Distribution")
 
         batch_results = []
@@ -203,7 +203,7 @@ class VocabStatsIndexer:
         使用 Python 内存展开 + 批处理写入 + 进度条。
         """
         print("-> 正在构建词汇领域占比索引 (vocabulary_domain_ratio)...")
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=60)
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
             "SELECT voc_id, work_count, domain_dist FROM vocabulary_domain_stats WHERE work_count > 0 AND domain_dist IS NOT NULL AND domain_dist != ''"
@@ -242,167 +242,149 @@ class VocabStatsIndexer:
 
     def _build_cooccurrence_index(self):
         """
-        构建词汇共现表并写入 vocabulary_cooccurrence。
-        重构方案：放弃 SQL Join，改用 Python 内存计数 + 批量写入 + 精准进度条。
+        优化版：
+        - 不使用巨型 Counter
+        - 分批写入 SQLite
+        - 使用 INSERT ... ON CONFLICT 累加 freq
+        - 内存常数级
         """
         import itertools
-        from collections import Counter
 
-        print("-> 正在构建词汇共现索引 (Python 内存计数版)...")
-        main_db_path = DB_PATH
-        if not os.path.exists(main_db_path):
-            print(f"  [Skip] 主库不存在: {main_db_path}，跳过共现索引。")
+        print("-> 正在构建词汇共现索引 (流式优化版)...")
+
+        if not os.path.exists(DB_PATH):
+            print(f"  [Skip] 主库不存在: {DB_PATH}")
             return
 
-        # 1. 初始化内存计数器
-        cooc_counts = Counter()
+        stats_conn = sqlite3.connect(self.db_path, timeout=60)
 
-        # 2. 阶段一：从主库读取数据并进行内存聚合计数
-        with sqlite3.connect(main_db_path) as main_conn:
+
+        # 清空旧数据
+        stats_conn.execute("DELETE FROM vocabulary_cooccurrence")
+        stats_conn.commit()
+
+        batch = []
+        batch_size = 5000
+
+        with sqlite3.connect(DB_PATH) as main_conn:
             main_conn.row_factory = sqlite3.Row
 
-            # 获取总记录数用于初始化进度条
-            count_cursor = main_conn.execute(
-                "SELECT COUNT(*) as total FROM works WHERE concepts_text IS NOT NULL OR keywords_text IS NOT NULL"
-            )
-            total_works = count_cursor.fetchone()["total"]
+            cursor = main_conn.execute("""
+                                       SELECT concepts_text, keywords_text
+                                       FROM works
+                                       WHERE concepts_text IS NOT NULL
+                                          OR keywords_text IS NOT NULL
+                                       """)
 
-            cursor = main_conn.execute(
-                "SELECT concepts_text, keywords_text FROM works "
-                "WHERE concepts_text IS NOT NULL OR keywords_text IS NOT NULL"
-            )
-
-            # 遍历论文提取词对
-            for row in tqdm(cursor, total=total_works, desc="Step 1/2: Counting pairs in memory"):
-                # 合并概念和关键词
+            for row in tqdm(cursor, desc="Counting & Writing Cooccurrence"):
                 raw_meta = f"{row['concepts_text'] or ''}|{row['keywords_text'] or ''}"
-                # 清洗、去重并排序（排序保证了 term_a < term_b，符合数据库索引约定）
-                terms = sorted(list(set([
+
+                terms = sorted(set(
                     t.strip().lower()
                     for t in re.split(r"[|;,]", raw_meta)
                     if t.strip()
-                ])))
+                ))
 
-                # 只有词数 >= 2 时才生成共现组合
-                if len(terms) >= 2:
-                    # itertools.combinations 生成所有唯一对 (n! / (2! * (n-2)!))
-                    for pair in itertools.combinations(terms, 2):
-                        cooc_counts[pair] += 1
+                if len(terms) < 2:
+                    continue
 
-        # 3. 统计有效共现数 (freq > 1)，以便展示精准的写入进度条
-        print(f"-> 内存处理完成，总词对数: {len(cooc_counts)}")
-        valid_pairs_count = sum(1 for f in cooc_counts.values() if f > 1)
-        print(f"-> 有效共现对 (freq > 1): {valid_pairs_count}")
+                for term_a, term_b in itertools.combinations(terms, 2):
+                    batch.append((term_a, term_b, 1))
 
-        # 4. 阶段二：批量写入目标统计库
-        stats_conn = sqlite3.connect(self.db_path)
-        # 启用性能优化 PRAGMA
-        stats_conn.execute("PRAGMA journal_mode=WAL;")
-        stats_conn.execute("PRAGMA synchronous=OFF;")
+                    if len(batch) >= batch_size:
+                        stats_conn.executemany("""
+                                               INSERT INTO vocabulary_cooccurrence (term_a, term_b, freq)
+                                               VALUES (?, ?, ?) ON CONFLICT(term_a, term_b)
+                            DO
+                                               UPDATE SET freq = freq + 1
+                                               """, batch)
+                        stats_conn.commit()
+                        batch = []
 
-        write_batch = []
-        batch_size = 10000
-
-        # 写入阶段进度条
-        pbar = tqdm(total=valid_pairs_count, desc="Step 2/2: Writing to Database")
-
-        for (term_a, term_b), freq in cooc_counts.items():
-            if freq > 1:
-                write_batch.append((term_a, term_b, freq))
-
-                if len(write_batch) >= batch_size:
-                    stats_conn.executemany(
-                        "INSERT OR REPLACE INTO vocabulary_cooccurrence (term_a, term_b, freq) VALUES (?, ?, ?)",
-                        write_batch,
-                    )
-                    stats_conn.commit()
-                    pbar.update(len(write_batch))
-                    write_batch = []
-
-        # 写入最后剩余的批次
-        if write_batch:
-            stats_conn.executemany(
-                "INSERT OR REPLACE INTO vocabulary_cooccurrence (term_a, term_b, freq) VALUES (?, ?, ?)",
-                write_batch,
-            )
+        if batch:
+            stats_conn.executemany("""
+                                   INSERT INTO vocabulary_cooccurrence (term_a, term_b, freq)
+                                   VALUES (?, ?, ?) ON CONFLICT(term_a, term_b)
+                DO
+                                   UPDATE SET freq = freq + 1
+                                   """, batch)
             stats_conn.commit()
-            pbar.update(len(write_batch))
 
-        pbar.close()
         stats_conn.close()
 
-        # 清空计数器释放内存
-        cooc_counts.clear()
-        print("  -> 词汇共现索引构建完成。")
+        print("  -> 共现索引构建完成（内存安全版）")
 
     def _build_cooc_domain_ratio(self):
-        """
-        构建词汇共现领域占比表 vocabulary_cooc_domain_ratio。
-        对每个 (voc_id T, domain_id d)：ratio = Σ freq(T,P)*ratio(P,d) / Σ freq(T,P)，
-        其中 ratio(P,d) 来自 vocabulary_domain_ratio（伙伴 P 的领域占比），freq 来自 vocabulary_cooccurrence。
-        依赖：vocabulary_cooccurrence、vocabulary_domain_ratio 已就绪；主库 vocabulary 表提供 term->voc_id。
-        """
-        print("-> 正在构建词汇共现领域占比索引 (vocabulary_cooc_domain_ratio)...")
+        print("-> 正在构建词汇共现领域占比索引 (最终稳定优化版)...")
+
         if not os.path.exists(DB_PATH):
-            print(f"  [Skip] 主库不存在: {DB_PATH}，跳过共现领域占比。")
+            print(f"  [Skip] 主库不存在: {DB_PATH}")
             return
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
 
-        # 1. 主库：term -> voc_id（共现表为小写 term，用小写做 key），带进度条
-        with sqlite3.connect(DB_PATH) as main_conn:
-            main_conn.row_factory = sqlite3.Row
-            rows = main_conn.execute("SELECT voc_id, term FROM vocabulary WHERE term IS NOT NULL AND term != ''").fetchall()
-        term_to_vocid = {}
-        for r in tqdm(rows, desc="Step 1/4: 加载 term->voc_id"):
-            t = (r["term"] or "").strip().lower()
-            if t:
-                term_to_vocid[t] = r["voc_id"]
+        conn = sqlite3.connect(self.db_path, timeout=60)
+        conn.execute("ATTACH DATABASE ? AS main_db", (DB_PATH,))
 
-        # 2. vocabulary_domain_ratio：voc_id -> [(domain_id, ratio), ...]，内存加载
-        ratio_rows = conn.execute(
-            "SELECT voc_id, domain_id, ratio FROM vocabulary_domain_ratio"
-        ).fetchall()
-        vocid_to_ratios = collections.defaultdict(list)
-        for r in tqdm(ratio_rows, desc="Step 2/4: 加载领域占比 (内存)"):
-            vocid_to_ratios[r["voc_id"]].append((str(r["domain_id"]), float(r["ratio"])))
+        try:
+            # 开启单事务（提高大规模写入性能）
+            conn.execute("BEGIN;")
 
-        # 3. 共现表：遍历 (term_a, term_b, freq)，Python 内存计数 + 进度条
-        cooc_rows = conn.execute("SELECT term_a, term_b, freq FROM vocabulary_cooccurrence").fetchall()
-        num = collections.defaultdict(float)   # (voc_id_T, domain_id) -> sum(freq * ratio_P_d)
-        den = collections.defaultdict(float)   # (voc_id_T, domain_id) -> sum(freq)
+            # 清空旧数据
+            conn.execute("DELETE FROM vocabulary_cooc_domain_ratio;")
 
-        for row in tqdm(cooc_rows, desc="Step 3/4: 共现领域聚合 (内存计数)"):
-            term_a, term_b, freq = row["term_a"], row["term_b"], int(row["freq"])
-            if freq <= 0:
-                continue
-            va = term_to_vocid.get((term_a or "").strip().lower())
-            vb = term_to_vocid.get((term_b or "").strip().lower())
-            if va is None or vb is None:
-                continue
-            for (d, r) in vocid_to_ratios.get(vb, []):
-                num[(va, d)] += freq * r
-                den[(va, d)] += freq
-            for (d, r) in vocid_to_ratios.get(va, []):
-                num[(vb, d)] += freq * r
-                den[(vb, d)] += freq
+            # 防止重复运行时报 TEMP 表已存在
+            conn.execute("DROP TABLE IF EXISTS temp.term_voc_map;")
 
-        # 4. 批处理写入 vocabulary_cooc_domain_ratio + 进度条
-        batch = []
-        for (vid, d), total_freq in den.items():
-            if total_freq <= 0:
-                continue
-            batch.append((vid, d, num[(vid, d)] / total_freq))
-        batch_size = 10000
-        for i in tqdm(range(0, len(batch), batch_size), desc="Step 4/4: 批量写入 DB"):
-            chunk = batch[i : i + batch_size]
-            conn.executemany(
-                "INSERT OR REPLACE INTO vocabulary_cooc_domain_ratio (voc_id, domain_id, ratio) VALUES (?, ?, ?)",
-                chunk,
-            )
+            # 构建临时映射表
+            conn.execute("""
+                         CREATE
+                         TEMP TABLE term_voc_map AS
+                         SELECT LOWER(term) AS term, voc_id
+                         FROM main_db.vocabulary
+                         WHERE term IS NOT NULL
+                           AND term != '';
+                         """)
+
+            # 给临时表建索引（加速 JOIN）
+            conn.execute("CREATE INDEX idx_temp_term ON term_voc_map(term);")
+
+            # 一次性 UNION ALL 聚合
+            conn.execute("""
+                         INSERT INTO vocabulary_cooc_domain_ratio (voc_id, domain_id, ratio)
+                         SELECT target_voc_id,
+                                domain_id,
+                                SUM(weighted) * 1.0 / SUM(freq) AS ratio
+                         FROM (
+                                  -- term_a 方向
+                                  SELECT t.voc_id         AS target_voc_id,
+                                         r.domain_id,
+                                         c.freq,
+                                         c.freq * r.ratio AS weighted
+                                  FROM vocabulary_cooccurrence c
+                                           JOIN term_voc_map t ON t.term = c.term_a
+                                           JOIN term_voc_map p ON p.term = c.term_b
+                                           JOIN vocabulary_domain_ratio r ON r.voc_id = p.voc_id
+
+                                  UNION ALL
+
+                                  -- term_b 方向
+                                  SELECT t.voc_id         AS target_voc_id,
+                                         r.domain_id,
+                                         c.freq,
+                                         c.freq * r.ratio AS weighted
+                                  FROM vocabulary_cooccurrence c
+                                           JOIN term_voc_map t ON t.term = c.term_b
+                                           JOIN term_voc_map p ON p.term = c.term_a
+                                           JOIN vocabulary_domain_ratio r ON r.voc_id = p.voc_id)
+                         GROUP BY target_voc_id, domain_id;
+                         """)
+
             conn.commit()
-        conn.close()
-        print(f"  -> 词汇共现领域占比索引构建完成，共 {len(batch)} 条。")
+
+        finally:
+            conn.close()
+
+        print("  -> 共现领域占比索引构建完成（稳定高性能版）")
+
 
     def build_index(self):
         """
