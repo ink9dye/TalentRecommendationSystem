@@ -75,18 +75,20 @@ class VocabStatsIndexer:
         """
         conn = sqlite3.connect(self.db_path, timeout=60)
         conn.executescript("""
-            PRAGMA journal_mode=WAL;
-            PRAGMA synchronous=NORMAL;
-
-            -- 表1：词汇领域分布（按词统计）
-            DROP TABLE IF EXISTS vocabulary_domain_stats;
-            CREATE TABLE vocabulary_domain_stats (
-                voc_id INTEGER PRIMARY KEY,
-                work_count INTEGER,    -- 该词关联的论文总数 (degree_w)
-                domain_span INTEGER,   -- 涉及的唯一领域总数 (span)
-                domain_dist TEXT,      -- 领域统计分布的 JSON: {"1": 100, "4": 50}
-                updated_at TIMESTAMP
-            );
+        PRAGMA journal_mode=TRUNCATE;
+        PRAGMA synchronous=OFF;
+        PRAGMA temp_store=MEMORY;
+        PRAGMA cache_size=-200000;
+        PRAGMA busy_timeout=60000;
+        -- 表1：词汇领域分布（按词统计）
+        DROP TABLE IF EXISTS vocabulary_domain_stats;
+        CREATE TABLE vocabulary_domain_stats (
+            voc_id INTEGER PRIMARY KEY,
+            work_count INTEGER,    -- 该词关联的论文总数 (degree_w)
+            domain_span INTEGER,   -- 涉及的唯一领域总数 (span)
+            domain_dist TEXT,      -- 领域统计分布的 JSON: {"1": 100, "4": 50}
+            updated_at TIMESTAMP
+        );
             CREATE INDEX idx_vds_span ON vocabulary_domain_stats(domain_span);
 
             -- 表2：词汇领域占比（按词+领域展开，便于查询时 SUM(ratio) 得目标领域占比）
@@ -109,6 +111,8 @@ class VocabStatsIndexer:
             );
             CREATE INDEX idx_cooc_term_a ON vocabulary_cooccurrence(term_a);
             CREATE INDEX idx_cooc_term_b ON vocabulary_cooccurrence(term_b);
+            CREATE INDEX idx_cooc_pair
+            ON vocabulary_cooccurrence(term_a,term_b);
 
             -- 表4：词汇共现领域占比（按词+领域，伙伴的 vocabulary_domain_ratio 按 freq 加权平均）
             DROP TABLE IF EXISTS vocabulary_cooc_domain_ratio;
@@ -264,7 +268,7 @@ class VocabStatsIndexer:
         stats_conn.commit()
 
         batch = []
-        batch_size = 5000
+        batch_size = 20000
 
         with sqlite3.connect(DB_PATH) as main_conn:
             main_conn.row_factory = sqlite3.Row
@@ -315,76 +319,90 @@ class VocabStatsIndexer:
         print("  -> 共现索引构建完成（内存安全版）")
 
     def _build_cooc_domain_ratio(self):
-        print("-> 正在构建词汇共现领域占比索引 (最终稳定优化版)...")
+
+        print("-> 正在构建词汇共现领域占比索引 (chunk版)...")
 
         if not os.path.exists(DB_PATH):
-            print(f"  [Skip] 主库不存在: {DB_PATH}")
+            print(f"[Skip] 主库不存在: {DB_PATH}")
             return
 
         conn = sqlite3.connect(self.db_path, timeout=60)
         conn.execute("ATTACH DATABASE ? AS main_db", (DB_PATH,))
+        conn.row_factory = sqlite3.Row
 
         try:
-            # 开启单事务（提高大规模写入性能）
-            conn.execute("BEGIN;")
+            conn.execute("DROP TABLE IF EXISTS temp.term_voc_map")
 
-            # 清空旧数据
-            conn.execute("DELETE FROM vocabulary_cooc_domain_ratio;")
-
-            # 防止重复运行时报 TEMP 表已存在
-            conn.execute("DROP TABLE IF EXISTS temp.term_voc_map;")
-
-            # 构建临时映射表
             conn.execute("""
                          CREATE
                          TEMP TABLE term_voc_map AS
-                         SELECT LOWER(term) AS term, voc_id
+                         SELECT LOWER(term) term, voc_id
                          FROM main_db.vocabulary
                          WHERE term IS NOT NULL
-                           AND term != '';
+                           AND term!=''
                          """)
 
-            # 给临时表建索引（加速 JOIN）
-            conn.execute("CREATE INDEX idx_temp_term ON term_voc_map(term);")
+            conn.execute("CREATE INDEX idx_temp_term ON term_voc_map(term)")
+            conn.execute("CREATE INDEX idx_temp_voc ON term_voc_map(voc_id)")
 
-            # 一次性 UNION ALL 聚合
-            conn.execute("""
-                         INSERT INTO vocabulary_cooc_domain_ratio (voc_id, domain_id, ratio)
-                         SELECT target_voc_id,
-                                domain_id,
-                                SUM(weighted) * 1.0 / SUM(freq) AS ratio
-                         FROM (
-                                  -- term_a 方向
-                                  SELECT t.voc_id         AS target_voc_id,
-                                         r.domain_id,
-                                         c.freq,
-                                         c.freq * r.ratio AS weighted
-                                  FROM vocabulary_cooccurrence c
-                                           JOIN term_voc_map t ON t.term = c.term_a
-                                           JOIN term_voc_map p ON p.term = c.term_b
-                                           JOIN vocabulary_domain_ratio r ON r.voc_id = p.voc_id
+            conn.execute("DELETE FROM vocabulary_cooc_domain_ratio")
 
-                                  UNION ALL
+            # 总数用于进度条
+            total = conn.execute(
+                "SELECT COUNT(*) FROM vocabulary_cooccurrence"
+            ).fetchone()[0]
 
-                                  -- term_b 方向
-                                  SELECT t.voc_id         AS target_voc_id,
-                                         r.domain_id,
-                                         c.freq,
-                                         c.freq * r.ratio AS weighted
-                                  FROM vocabulary_cooccurrence c
-                                           JOIN term_voc_map t ON t.term = c.term_b
-                                           JOIN term_voc_map p ON p.term = c.term_a
-                                           JOIN vocabulary_domain_ratio r ON r.voc_id = p.voc_id)
-                         GROUP BY target_voc_id, domain_id;
-                         """)
+            chunk = 20000
 
-            conn.commit()
+            for offset in tqdm(range(0, total, chunk), desc="Computing cooc_domain_ratio"):
+                rows = conn.execute(
+                    f"""
+                    SELECT term_a, term_b, freq
+                    FROM vocabulary_cooccurrence
+                    LIMIT {chunk} OFFSET {offset}
+                    """
+                ).fetchall()
+
+                conn.execute("BEGIN IMMEDIATE")
+
+                conn.executemany("""
+                                 INSERT INTO vocabulary_cooc_domain_ratio
+                                     (voc_id, domain_id, ratio)
+
+                                 SELECT target_voc_id,
+                                        domain_id,
+                                        SUM(weighted) * 1.0 / SUM(freq)
+
+                                 FROM (SELECT t.voc_id    target_voc_id,
+                                              r.domain_id,
+                                              ?           freq,
+                                              ? * r.ratio weighted
+                                       FROM term_voc_map t
+                                                JOIN vocabulary_domain_ratio r ON r.voc_id = t.voc_id
+                                       WHERE t.term = ?
+
+                                       UNION ALL
+
+                                       SELECT t.voc_id    target_voc_id,
+                                              r.domain_id,
+                                              ?           freq,
+                                              ? * r.ratio weighted
+                                       FROM term_voc_map t
+                                                JOIN vocabulary_domain_ratio r ON r.voc_id = t.voc_id
+                                       WHERE t.term = ?)
+                                 GROUP BY target_voc_id, domain_id
+                                 """, [
+                                     (row["freq"], row["freq"], row["term_b"],
+                                      row["freq"], row["freq"], row["term_a"])
+                                     for row in rows
+                                 ])
+
+                conn.commit()
+
+            print("-> 共现领域占比索引构建完成")
 
         finally:
             conn.close()
-
-        print("  -> 共现领域占比索引构建完成（稳定高性能版）")
-
 
     def build_index(self):
         """
@@ -398,9 +416,9 @@ class VocabStatsIndexer:
         """
         print(f"--- 开始构建词汇统计索引 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ---")
 
-        self._build_domain_stats()
-        self._build_domain_ratio()
-        self._build_cooccurrence_index()
+        # self._build_domain_stats()
+        # self._build_domain_ratio()
+        # self._build_cooccurrence_index()
         self._build_cooc_domain_ratio()
 
         print("--- 词汇统计索引构建完成 ---")
