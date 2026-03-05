@@ -78,7 +78,7 @@ class TotalRecallSystem:
         # 将 processed_domain 传递给底层，底层 LabelRecallPath 会据此拼接 Cypher
         # 注意：这里参数名对齐为你修改后的 domain_ids
         future_v = self.executor.submit(self.v_path.recall, query_vec, target_domains=processed_domain)
-        future_l = self.executor.submit(self.l_path.recall, query_vec, domain_ids=processed_domain)
+        future_l = self.executor.submit(self.l_path.recall, query_vec, domain_id=processed_domain)
 
         v_list, v_cost = future_v.result()
         l_list, l_cost = future_l.result()

@@ -2,10 +2,13 @@
 """
 标签路召回模块（LabelRecallPath）。
 
-实现「岗位技能 → 学术词 → 论文 → 作者」的图谱召回与多维度词权重计算。除领域探测、锚点提取、
-语义扩展（SIMILAR_TO）、学术共鸣（CO_OCCURRED_WITH）与 SBERT 语义守门员外，还依赖 vocab_stats.db 的
-vocabulary_cooccurrence 与 vocabulary_domain_stats，为每个候选词计算共现领域指标（cooc_span / cooc_purity），
-实现：与多领域词共现 → 万金油降权；只与目标领域词共现 → 专精加权；与本次搜索词共现 → 共鸣加成。
+实现「Job → 技能清洗 → Job Vocabulary → SIMILAR_TO(top3, sim≥0.65) → 学术词(paper_count≤277) →
+score=sim/log(1+paper_count) → Paper → Author」的图谱召回。
+  - Step1 技能清洗：过滤 HR 垃圾词（经验/竞赛/获奖/发表/能力/熟悉/了解、不限/其他、长度<2）。
+  - Step2 锚点：仅保留清洗后词在图谱 REQUIRE_SKILL 中的技能，3% 熔断。
+  - Step3 扩展：每锚点 SIMILAR_TO 最多 top3、边权≥0.65；学术词过滤 work_count≤277。
+  - Step4 打分：vocab_score = sim / log(1+paper_count)，论文/作者分累加。
+依赖 vocab_stats.db 的 vocabulary_domain_stats；共鸣/共现指标仍计算供调试，最终权重采用上述公式。
 输入输出格式与原有接口一致。
 """
 import faiss
@@ -24,7 +27,8 @@ from src.core.recall.input_to_vector import QueryEncoder
 from src.utils.domain_utils import DomainProcessor
 from config import (
     CONFIG_DICT, JOB_INDEX_PATH, JOB_MAP_PATH,
-    VOCAB_INDEX_PATH, VOCAB_MAP_PATH, DB_PATH, VOCAB_STATS_DB_PATH
+    VOCAB_INDEX_PATH, VOCAB_MAP_PATH, DB_PATH, VOCAB_STATS_DB_PATH,
+    VOCAB_P95_PAPER_COUNT, SIMILAR_TO_TOP_K, SIMILAR_TO_MIN_SCORE,
 )
 from src.utils.domain_config import DOMAIN_DECAY_RATES, DEFAULT_DECAY_RATE
 
@@ -135,7 +139,7 @@ class LabelRecallPath:
         try:
             cursor = self.graph.run(
                 "MATCH (j:Job) WHERE j.id IN $j_ids RETURN j.id AS id, j.name AS name, j.description AS desc",
-                j_ids=job_ids[:10]
+                j_ids=job_ids[:20]
             )
             out = []
             for row in cursor:
@@ -165,7 +169,7 @@ class LabelRecallPath:
                    MATCH (j)-[:REQUIRE_SKILL]->(v:Vocabulary)
                    WITH j.id AS jid, count(v) AS skill_count
                    RETURN jid, skill_count ORDER BY jid""",
-                j_ids=job_ids[:5]
+                j_ids=job_ids[:20]
             )
             per_job = [{'jid': r['jid'], 'skill_count': r['skill_count']} for r in cursor]
 
@@ -176,7 +180,7 @@ class LabelRecallPath:
             WITH v, (COUNT { (v)<-[:REQUIRE_SKILL]-() } * 1.0 / $total_j) AS cov_j
             RETURN v.id AS vid, v.term AS term, cov_j
             """
-            rows = self.graph.run(cypher_all, j_ids=job_ids[:5], total_j=total_j).data()
+            rows = self.graph.run(cypher_all, j_ids=job_ids[:20], total_j=total_j).data()
             before_melt = len(rows)
             after_melt = len([r for r in rows if r['cov_j'] < 0.03 and len((r.get('term') or '')) > 1])
             melted = [r['term'] for r in rows if r['cov_j'] >= 0.03][:20]
@@ -189,12 +193,47 @@ class LabelRecallPath:
         except Exception:
             return {}
 
+    def _clean_job_skills(self, skills_text):
+        """
+        【Step 1 技能清洗】从岗位技能文本中提取并过滤，去除 HR 描述词与泛词。
+        规则：拆分后删除含「经验|竞赛|获奖|发表|能力|熟悉|了解」的片段、
+        删除「不限」「其他」、删除长度 < 2，返回小写集合（与图谱 term 对齐）。
+        """
+        if not skills_text or not isinstance(skills_text, str):
+            return set()
+        stop_substrings = re.compile(r"经验|竞赛|获奖|发表|能力|熟悉|了解", re.I)
+        forbidden = {"不限", "其他"}
+        raw = re.split(r"[,，、；;|\s]+", skills_text)
+        out = set()
+        for s in raw:
+            t = s.strip()
+            if not t or len(t) < 2:
+                continue
+            if stop_substrings.search(t) or t in forbidden:
+                continue
+            out.add(t.lower())
+        return out
+
     # --- 第二阶段：锚点技能提取 ---
     def _extract_anchor_skills(self, target_job_ids):
         """
-        【工业侧：岗位技能提取】对工业查询词也做熔断，3% 熔断（cov_j < 0.03）。
-        逻辑：统计命中岗位(Top5)所要求的所有技能及 cov_j，仅保留 cov_j < 0.03 的词，上限 50。
+        【工业侧：岗位技能提取】先做技能清洗，再 3% 熔断（cov_j < 0.03）。
+        逻辑：从命中岗位取 raw skills -> 清洗 -> 仅保留在图谱 REQUIRE_SKILL 中且 term 在清洗结果中的词，上限 50。
         """
+        cleaned_terms = set()
+        try:
+            cursor = self.graph.run(
+                "MATCH (j:Job) WHERE j.id IN $j_ids RETURN j.skills AS skills",
+                j_ids=target_job_ids[:20]
+            )
+            for row in cursor:
+                if row.get("skills"):
+                    cleaned_terms |= self._clean_job_skills(str(row["skills"]))
+        except Exception:
+            pass
+        if not cleaned_terms:
+            cleaned_terms = None  # 无清洗结果时不按词过滤，退化为原逻辑
+
         cypher = """
         MATCH (j:Job) WHERE j.id IN $j_ids
         MATCH (j)-[:REQUIRE_SKILL]->(v:Vocabulary)
@@ -205,8 +244,11 @@ class LabelRecallPath:
         ORDER BY cov_j ASC
         LIMIT 50
         """
-        cursor = self.graph.run(cypher, j_ids=target_job_ids[:5], total_j=self.total_job_count)
-        return {str(r['vid']): {"term": r['term']} for r in cursor if r['term'] and len(r['term']) > 1}
+        cursor = self.graph.run(cypher, j_ids=target_job_ids[:20], total_j=self.total_job_count)
+        rows = [r for r in cursor if r["term"] and len(r["term"]) > 1]
+        if cleaned_terms is not None:
+            rows = [r for r in rows if (r["term"] or "").lower() in cleaned_terms]
+        return {str(r["vid"]): {"term": r["term"]} for r in rows}
     # --- 第三阶段：语义扩展 ---
     def _expand_semantic_map(self, core_vids, anchor_skills, domain_regex=None, query_vector=None):
         """
@@ -415,70 +457,89 @@ class LabelRecallPath:
 
     def _query_expansion_with_topology(self, v_ids, regex):
         """
-        【信号收敛版】辅助函数 A：统计“技术共振”击中数。
-        逻辑：
-        1. Neo4j 统计每个学术词被多少个不同的工业锚点(v)击中。
-        2. SQLite 提供论文侧的全局领域统计。
+        【改造版】SIMILAR_TO 每锚点 top-K、权重下限 + 学术词 paper_count 上限。
+        逻辑：每锚点取 top3 且 score>=0.65 -> 按 tid 聚合 max(sim)、hit_count ->
+              vocabulary_domain_stats 过滤 work_count<=277，保留 target_degree_w>0，并写入 sim_score。
         """
-        # 1. 极速 Neo4j 跳转：统计 hit_count
-        # DISTINCT v 确保即使物理上有重复边，逻辑上也只计算一次有效击中
-        cypher = """
-        MATCH (v:Vocabulary) WHERE v.id IN $v_ids
-        MATCH (v)-[:SIMILAR_TO]-(v_rel:Vocabulary)
-        RETURN v_rel.id AS tid, v_rel.term AS term,
-               COUNT(DISTINCT v) AS hit_count, 
-               (COUNT { (v_rel)<-[:REQUIRE_SKILL]-() } * 1.0 / $total_j) AS cov_j
-        """
-        params = {"v_ids": v_ids, "total_j": self.total_job_count}
-        candidates = self.graph.run(cypher, **params).data()
-
-        # 解析当前目标领域 ID
+        if not v_ids:
+            return []
         active_domains = set(re.findall(r'\d+', regex))
-        results = []
+        params = {
+            "v_ids": list(v_ids),
+            "min_score": SIMILAR_TO_MIN_SCORE,
+            "top_k": SIMILAR_TO_TOP_K,
+        }
+        cypher = """
+        UNWIND $v_ids AS vid
+        MATCH (v:Vocabulary {id: vid})-[r:SIMILAR_TO]->(v_rel:Vocabulary)
+        WHERE r.score >= $min_score
+        WITH vid, v_rel.id AS tid, v_rel.term AS term, r.score AS sim_score
+        ORDER BY vid, sim_score DESC
+        WITH vid, collect({tid: tid, term: term, sim_score: sim_score})[0..$top_k] AS top3
+        UNWIND top3 AS c
+        RETURN c.tid AS tid, c.term AS term, c.sim_score AS sim_score
+        """
+        rows = self.graph.run(cypher, **params).data()
+        if not rows:
+            return []
 
-        # 2. 极速 SQLite 查表
-        for cand in candidates:
-            tid = cand['tid']
+        # 按 tid 聚合：取 max(sim_score)，hit_count = 被多少锚点命中
+        by_tid = {}
+        for r in rows:
+            tid = r["tid"]
+            term = r["term"] or ""
+            sim = float(r["sim_score"])
+            if tid not in by_tid:
+                by_tid[tid] = {"tid": tid, "term": term, "sim_score": sim, "hit_count": 0}
+            by_tid[tid]["sim_score"] = max(by_tid[tid]["sim_score"], sim)
+            by_tid[tid]["hit_count"] += 1
+
+        tids = list(by_tid.keys())
+        results = []
+        for tid in tids:
             row = self.stats_conn.execute(
                 "SELECT work_count, domain_span, domain_dist FROM vocabulary_domain_stats WHERE voc_id=?",
-                (tid,)
+                (tid,),
             ).fetchone()
-
-            if not row: continue
-
+            if not row:
+                continue
             degree_w, domain_span, dist_json = row
-            dist = json.loads(dist_json)
+            if degree_w > VOCAB_P95_PAPER_COUNT:
+                continue
+            try:
+                dist = json.loads(dist_json) if isinstance(dist_json, str) else dist_json
+            except (TypeError, ValueError):
+                dist = {}
             target_degree_w = sum(dist.get(str(d), 0) for d in active_domains)
-
-            if target_degree_w > 0:
-                results.append({
-                    'tid': tid,
-                    'term': cand['term'],
-                    'degree_w': degree_w,
-                    'target_degree_w': target_degree_w,
-                    'cov_j': cand['cov_j'],
-                    'domain_span': domain_span,
-                    'hit_count': cand['hit_count']  # <--- 传递信号收敛强度
-                })
-
+            if target_degree_w <= 0:
+                continue
+            rec = by_tid[tid]
+            rec["degree_w"] = degree_w
+            rec["target_degree_w"] = target_degree_w
+            rec["domain_span"] = domain_span
+            rec["cov_j"] = 0.0
+            results.append(rec)
         return results
 
     def _calculate_final_weights(self, raw_results, query_vector):
         """
-        【收敛加权版】权重计算调度器
-        逻辑：将图谱收敛信号与向量空间语义信号进行融合。
+        【收敛加权版】权重计算调度器。
+        若扩展结果含 sim_score（改造版 SIMILAR_TO + paper_count 过滤），则用 score = sim / log(1+paper_count)。
         """
         score_map, term_map, idf_map = {}, {}, {}
 
         for rec in raw_results:
-            tid = str(rec['tid'])
-
-            # 1. 调用增强版数学引擎，应用多路信号收敛奖惩
-            dynamic_weight, idf_val = self._apply_word_quality_penalty(rec, query_vector)
-
-            # 2. 存储结果
+            tid = str(rec["tid"])
+            if "sim_score" in rec and "degree_w" in rec:
+                # 改造版：score = sim / log(1 + paper_count)，惩罚泛词
+                degree_w = rec["degree_w"]
+                sim_score = rec["sim_score"]
+                dynamic_weight = sim_score / math.log(1.0 + degree_w)
+                idf_val = math.log10(self.total_work_count / (degree_w + 1))
+            else:
+                dynamic_weight, idf_val = self._apply_word_quality_penalty(rec, query_vector)
             score_map[tid] = dynamic_weight
-            term_map[tid] = rec['term']
+            term_map[tid] = rec.get("term") or ""
             idf_map[tid] = idf_val
 
         return score_map, term_map, idf_map
@@ -678,7 +739,7 @@ class LabelRecallPath:
 
         # 2. 锚点提取：工业词 3% 熔断（对查询词也熔断，python 等高频词会被熔掉）
         anchor_skills = self._extract_anchor_skills(job_ids)
-        anchor_debug = self._get_anchor_debug_stats(job_ids[:5], self.total_job_count) if job_ids else {}
+        anchor_debug = self._get_anchor_debug_stats(job_ids[:20], self.total_job_count) if job_ids else {}
         if not anchor_skills:
             return [], 0
         industrial_kws = [v['term'] for v in anchor_skills.values()]
@@ -807,10 +868,10 @@ if __name__ == "__main__":
             print(f"【Step 1: 领域探测】目标领域并集: [{domain_str}] (置信度: {db.get('dominance')})")
             job_ids = db.get('job_ids', [])
             if job_ids:
-                print(f"      命中岗位 ID (Top10): {[jid[:50]+'...' if len(jid)>50 else jid for jid in job_ids[:10]]}")
+                print(f"      命中岗位 ID (Top20): {[jid[:50]+'...' if len(jid)>50 else jid for jid in job_ids[:20]]}")
             job_previews = db.get('job_previews', [])
             if job_previews:
-                print(f"      Top10 岗位名称与描述片段（用于判断是否匹配「机器人/运动控制」）:")
+                print(f"      Top20 岗位名称与描述片段（用于判断是否匹配）:")
                 for i, jp in enumerate(job_previews[:10], 1):
                     name = (jp.get('name') or '')[:60]
                     snippet = (jp.get('description_snippet') or '')[:120]
