@@ -1,4 +1,5 @@
 import os
+os.environ["HF_HUB_OFFLINE"] = "1"
 import sqlite3
 import re
 import time
@@ -14,26 +15,24 @@ class QueryEncoder:
     集成核心技术：【动态自共振增强 (Dynamic Resonance)】
     """
 
-    def __init__(self, model_name=None):
-        self.active_model_name = model_name if model_name else SBERT_MODEL_NAME
+    def __init__(self):
 
-        print(f"[*] 正在初始化线上编码器: {self.active_model_name}...", flush=True)
+        print(f"[*] 正在初始化本地编码器: {SBERT_DIR}...", flush=True)
         start_load = time.time()
 
         self.model = SentenceTransformer(
-            self.active_model_name,
-            cache_folder=os.path.abspath(SBERT_DIR),
+            SBERT_DIR,
             trust_remote_code=True,
             device="cpu"
         )
+
         self.model.max_seq_length = 1024
         self.model.eval()
 
         self.hardcore_lexicon = self._build_dynamic_lexicon()
 
         print(f"[OK] 动态特征库加载完毕 (核心词条: {len(self.hardcore_lexicon)})")
-        print(f"[*] 语义编码器就绪 (SentenceTransformer)，耗时: {time.time() - start_load:.4f}s")
-
+        print(f"[*] 语义编码器就绪，耗时: {time.time() - start_load:.4f}s")
     def _build_dynamic_lexicon(self):
         """（保持原有的统计学过滤逻辑不变）"""
         lexicon = set()

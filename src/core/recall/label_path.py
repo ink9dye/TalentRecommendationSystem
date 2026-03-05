@@ -504,6 +504,10 @@ class LabelRecallPath:
             if not row:
                 continue
             degree_w, domain_span, dist_json = row
+            # 新增
+            # if degree_w < 2:
+            #     continue
+
             if degree_w > VOCAB_P95_PAPER_COUNT:
                 continue
             try:
@@ -511,7 +515,14 @@ class LabelRecallPath:
             except (TypeError, ValueError):
                 dist = {}
             target_degree_w = sum(dist.get(str(d), 0) for d in active_domains)
+
             if target_degree_w <= 0:
+                continue
+
+            # 新增：领域纯度过滤
+            domain_ratio = target_degree_w / degree_w
+
+            if domain_ratio < 0.2:
                 continue
             rec = by_tid[tid]
             rec["degree_w"] = degree_w
