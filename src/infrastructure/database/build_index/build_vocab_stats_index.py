@@ -67,63 +67,115 @@ class VocabStatsIndexer:
         """
         初始化 vocab_stats.db 的表结构及索引。
 
-        创建四张表：
+        创建四张表 + 进度表：
           1. vocabulary_domain_stats：词汇维度的领域统计（voc_id, work_count, domain_span, domain_dist）。
           2. vocabulary_domain_ratio：按 (voc_id, domain_id) 存 ratio，供查询时一条 SQL 筛出领域占比≥阈值的词。
           3. vocabulary_cooccurrence：词对共现频次（term_a, term_b, freq）。
-          4. vocabulary_cooc_domain_ratio：按 (voc_id, domain_id) 存共现伙伴的领域占比之 freq 加权均值，供标签路查 cooc_purity。
+          4. vocabulary_cooc_domain_ratio：按 (voc_id, domain_id) 存共现伙伴的领域占比之 freq 加权均值，写入 vocabulary_cooc_domain_ratio。
+          5. vocabulary_cooc_domain_accum：共现领域占比的分子分母累加表，支持分块/断点计算。
+          6. build_progress：存各步骤断点信息，支持断点续传。
         """
         conn = sqlite3.connect(self.db_path, timeout=60)
         conn.executescript("""
-        PRAGMA journal_mode=TRUNCATE;
-        PRAGMA synchronous=OFF;
+        PRAGMA journal_mode=WAL;
+        PRAGMA synchronous=NORMAL;
         PRAGMA temp_store=MEMORY;
         PRAGMA cache_size=-200000;
         PRAGMA busy_timeout=60000;
+
         -- 表1：词汇领域分布（按词统计）
-        DROP TABLE IF EXISTS vocabulary_domain_stats;
-        CREATE TABLE vocabulary_domain_stats (
+        CREATE TABLE IF NOT EXISTS vocabulary_domain_stats (
             voc_id INTEGER PRIMARY KEY,
-            work_count INTEGER,    -- 该词关联的论文总数 (degree_w)
-            domain_span INTEGER,   -- 涉及的唯一领域总数 (span)
-            domain_dist TEXT,      -- 领域统计分布的 JSON: {"1": 100, "4": 50}
+            work_count INTEGER,
+            domain_span INTEGER,
+            domain_dist TEXT,
             updated_at TIMESTAMP
         );
-            CREATE INDEX idx_vds_span ON vocabulary_domain_stats(domain_span);
+        CREATE INDEX IF NOT EXISTS idx_vds_span ON vocabulary_domain_stats(domain_span);
 
-            -- 表2：词汇领域占比（按词+领域展开，便于查询时 SUM(ratio) 得目标领域占比）
-            DROP TABLE IF EXISTS vocabulary_domain_ratio;
-            CREATE TABLE vocabulary_domain_ratio (
-                voc_id INTEGER,
-                domain_id TEXT,
-                ratio REAL,            -- 该词在该领域的论文数 / work_count
-                PRIMARY KEY (voc_id, domain_id)
-            );
-            CREATE INDEX idx_vdr_domain ON vocabulary_domain_ratio(domain_id, voc_id);
+        -- 表2：词汇领域占比（按词+领域展开，便于查询时 SUM(ratio) 得目标领域占比）
+        CREATE TABLE IF NOT EXISTS vocabulary_domain_ratio (
+            voc_id INTEGER,
+            domain_id TEXT,
+            ratio REAL,
+            PRIMARY KEY (voc_id, domain_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_vdr_domain ON vocabulary_domain_ratio(domain_id, voc_id);
+        CREATE INDEX IF NOT EXISTS idx_vdr_voc ON vocabulary_domain_ratio(voc_id);
 
-            -- 表3：词汇共现频次（按词对统计，与 KG CO_OCCURRED_WITH 对应）
-            DROP TABLE IF EXISTS vocabulary_cooccurrence;
-            CREATE TABLE vocabulary_cooccurrence (
-                term_a TEXT,
-                term_b TEXT,
-                freq INTEGER,
-                PRIMARY KEY (term_a, term_b)
-            );
-            CREATE INDEX idx_cooc_term_a ON vocabulary_cooccurrence(term_a);
-            CREATE INDEX idx_cooc_term_b ON vocabulary_cooccurrence(term_b);
-            CREATE INDEX idx_cooc_pair
-            ON vocabulary_cooccurrence(term_a,term_b);
+        -- 表3：词汇共现频次（按词对统计，与 KG CO_OCCURRED_WITH 对应）
+        CREATE TABLE IF NOT EXISTS vocabulary_cooccurrence (
+            term_a TEXT,
+            term_b TEXT,
+            freq INTEGER,
+            PRIMARY KEY (term_a, term_b)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cooc_term_a ON vocabulary_cooccurrence(term_a);
+        CREATE INDEX IF NOT EXISTS idx_cooc_term_b ON vocabulary_cooccurrence(term_b);
+        CREATE INDEX IF NOT EXISTS idx_cooc_pair ON vocabulary_cooccurrence(term_a,term_b);
 
-            -- 表4：词汇共现领域占比（按词+领域，伙伴的 vocabulary_domain_ratio 按 freq 加权平均）
-            DROP TABLE IF EXISTS vocabulary_cooc_domain_ratio;
-            CREATE TABLE vocabulary_cooc_domain_ratio (
-                voc_id INTEGER,
-                domain_id TEXT,
-                ratio REAL,            -- 该词的共现伙伴在该领域的占比之 freq 加权均值
-                PRIMARY KEY (voc_id, domain_id)
-            );
-            CREATE INDEX idx_vcodr_domain ON vocabulary_cooc_domain_ratio(domain_id, voc_id);
+        -- 表4：词汇共现领域占比（按词+领域，伙伴的 vocabulary_domain_ratio 按 freq 加权平均）
+        CREATE TABLE IF NOT EXISTS vocabulary_cooc_domain_ratio (
+            voc_id INTEGER,
+            domain_id TEXT,
+            ratio REAL,
+            PRIMARY KEY (voc_id, domain_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_vcodr_domain ON vocabulary_cooc_domain_ratio(domain_id, voc_id);
+
+        -- 表4-中间累加表：存共现领域占比的分子分母，避免一次性巨型 SQL
+        CREATE TABLE IF NOT EXISTS vocabulary_cooc_domain_accum (
+            voc_id INTEGER,
+            domain_id TEXT,
+            sum_freq REAL,
+            sum_weight REAL,
+            PRIMARY KEY (voc_id, domain_id)
+        );
+
+        -- 构建进度表：支持断点续传
+        CREATE TABLE IF NOT EXISTS build_progress (
+            step TEXT PRIMARY KEY,
+            checkpoint INTEGER,
+            done INTEGER DEFAULT 0,
+            updated_at TIMESTAMP
+        );
         """)
+        conn.close()
+
+    def _get_progress(self, step: str):
+        """
+        从 build_progress 表读取某一步骤的断点信息。
+        返回: (checkpoint, done)
+        """
+        conn = sqlite3.connect(self.db_path, timeout=60)
+        cur = conn.execute(
+            "SELECT checkpoint, done FROM build_progress WHERE step = ?",
+            (step,),
+        )
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            return 0, False
+        checkpoint, done = row
+        return int(checkpoint or 0), bool(done)
+
+    def _set_progress(self, step: str, checkpoint: int, done: bool = False):
+        """
+        更新某一步骤的断点信息。
+        """
+        conn = sqlite3.connect(self.db_path, timeout=60)
+        conn.execute(
+            """
+            INSERT INTO build_progress(step, checkpoint, done, updated_at)
+            VALUES(?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(step) DO UPDATE SET
+                checkpoint = excluded.checkpoint,
+                done = excluded.done,
+                updated_at = excluded.updated_at
+            """,
+            (step, int(checkpoint), int(done)),
+        )
+        conn.commit()
         conn.close()
 
     def _build_domain_stats(self):
@@ -140,12 +192,29 @@ class VocabStatsIndexer:
         voc_query = "MATCH (v:Vocabulary) RETURN v.id AS vid"
         voc_ids = [r["vid"] for r in self.graph.run(voc_query)]
 
+        if not voc_ids:
+            print("  -> Neo4j 中无 Vocabulary 节点，跳过。")
+            return
+
+        total = len(voc_ids)
         batch_size = 500
+
+        # 断点续传：checkpoint 存的是已处理到的下标 i
+        start_idx, done = self._get_progress("domain_stats")
+        if done:
+            print("  -> 已完成，跳过。")
+            return
+
+        start_idx = max(0, min(start_idx, total))
+
         conn = sqlite3.connect(self.db_path, timeout=60)
-        pbar = tqdm(total=len(voc_ids), desc="Indexing Vocab Domain Distribution")
+        pbar = tqdm(
+            total=total - start_idx,
+            desc="Indexing Vocab Domain Distribution",
+        )
 
         batch_results = []
-        for i in range(0, len(voc_ids), batch_size):
+        for i in range(start_idx, total, batch_size):
             v_batch = voc_ids[i : i + batch_size]
             cypher = """
             MATCH (v:Vocabulary)<-[:HAS_TOPIC]-(w:Work)
@@ -171,33 +240,47 @@ class VocabStatsIndexer:
                 work_count = sum(dist.values())
                 domain_span = len(dist)
 
-                batch_results.append((
-                    vid,
-                    work_count,
-                    domain_span,
-                    json.dumps(dist),
-                    datetime.now().isoformat(),
-                ))
+                batch_results.append(
+                    (
+                        vid,
+                        work_count,
+                        domain_span,
+                        json.dumps(dist),
+                        datetime.now().isoformat(),
+                    )
+                )
 
             if len(batch_results) >= 1000:
                 conn.executemany(
-                    "INSERT INTO vocabulary_domain_stats VALUES (?, ?, ?, ?, ?)",
+                    """
+                    INSERT OR REPLACE INTO vocabulary_domain_stats
+                    (voc_id, work_count, domain_span, domain_dist, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
                     batch_results,
                 )
                 conn.commit()
                 batch_results = []
+                # 已成功写入，以 i+batch_size 作为新的断点
+                self._set_progress("domain_stats", i + batch_size, done=False)
 
             pbar.update(len(v_batch))
 
         if batch_results:
             conn.executemany(
-                "INSERT INTO vocabulary_domain_stats VALUES (?, ?, ?, ?, ?)",
+                """
+                INSERT OR REPLACE INTO vocabulary_domain_stats
+                (voc_id, work_count, domain_span, domain_dist, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
                 batch_results,
             )
             conn.commit()
 
         pbar.close()
         conn.close()
+        # 全部完成
+        self._set_progress("domain_stats", total, done=True)
         print("  -> 词汇领域分布索引构建完成。")
 
     def _build_domain_ratio(self):
@@ -209,40 +292,90 @@ class VocabStatsIndexer:
         print("-> 正在构建词汇领域占比索引 (vocabulary_domain_ratio)...")
         conn = sqlite3.connect(self.db_path, timeout=60)
         conn.row_factory = sqlite3.Row
-        cursor = conn.execute(
-            "SELECT voc_id, work_count, domain_dist FROM vocabulary_domain_stats WHERE work_count > 0 AND domain_dist IS NOT NULL AND domain_dist != ''"
+
+        # 断点续传：checkpoint 存的是已处理到的 voc_id
+        last_voc_id, done = self._get_progress("domain_ratio")
+        if done:
+            print("  -> 已完成，跳过。")
+            conn.close()
+            return
+
+        # 预估总量用于进度条（非必需，仅用于显示）
+        total_rows = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM vocabulary_domain_stats
+            WHERE work_count > 0
+              AND domain_dist IS NOT NULL
+              AND domain_dist != ''
+              AND voc_id > ?
+            """,
+            (last_voc_id,),
+        ).fetchone()[0]
+
+        pbar = tqdm(
+            total=total_rows,
+            desc="Building vocabulary_domain_ratio (stream)",
         )
-        rows = cursor.fetchall()
-        cursor.close()
 
-        # 阶段一：内存展开，带进度条
-        batch = []
-        for row in tqdm(rows, desc="Step 1/2: 展开 domain_dist (内存计数)"):
-            voc_id = row["voc_id"]
-            work_count = int(row["work_count"])
-            if work_count <= 0:
-                continue
-            try:
-                dist = json.loads(row["domain_dist"])
-            except (TypeError, json.JSONDecodeError):
-                continue
-            for domain_id, count in dist.items():
-                if not domain_id or count <= 0:
+        page_size = 1000
+        processed_rows = 0
+
+        while True:
+            rows = conn.execute(
+                """
+                SELECT voc_id, work_count, domain_dist
+                FROM vocabulary_domain_stats
+                WHERE work_count > 0
+                  AND domain_dist IS NOT NULL
+                  AND domain_dist != ''
+                  AND voc_id > ?
+                ORDER BY voc_id
+                LIMIT ?
+                """,
+                (last_voc_id, page_size),
+            ).fetchall()
+
+            if not rows:
+                break
+
+            batch = []
+            for row in rows:
+                voc_id = row["voc_id"]
+                work_count = int(row["work_count"])
+                if work_count <= 0:
                     continue
-                ratio = float(count) / work_count
-                batch.append((voc_id, str(domain_id).strip(), ratio))
+                try:
+                    dist = json.loads(row["domain_dist"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                for domain_id, count in dist.items():
+                    if not domain_id or count <= 0:
+                        continue
+                    ratio = float(count) / work_count
+                    batch.append((voc_id, str(domain_id).strip(), ratio))
+                last_voc_id = voc_id
+                processed_rows += 1
 
-        # 阶段二：批处理写入
-        batch_size = 10000
-        for i in tqdm(range(0, len(batch), batch_size), desc="Step 2/2: 批量写入 DB"):
-            chunk = batch[i : i + batch_size]
-            conn.executemany(
-                "INSERT OR REPLACE INTO vocabulary_domain_ratio (voc_id, domain_id, ratio) VALUES (?, ?, ?)",
-                chunk,
-            )
-            conn.commit()
+            if batch:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO vocabulary_domain_ratio
+                    (voc_id, domain_id, ratio)
+                    VALUES (?, ?, ?)
+                    """,
+                    batch,
+                )
+                conn.commit()
+                self._set_progress("domain_ratio", last_voc_id, done=False)
+
+            pbar.update(len(rows))
+
+        pbar.close()
+        # 全部完成
+        self._set_progress("domain_ratio", last_voc_id, done=True)
         conn.close()
-        print(f"  -> 词汇领域占比索引构建完成，共 {len(batch)} 条。")
+        print("  -> 词汇领域占比索引构建完成。")
 
     def _build_cooccurrence_index(self):
         """
@@ -254,7 +387,7 @@ class VocabStatsIndexer:
         """
         import itertools
 
-        print("-> 正在构建词汇共现索引 (流式优化版)...")
+        print("-> 正在构建词汇共现索引 (流式 + 断点版)...")
 
         if not os.path.exists(DB_PATH):
             print(f"  [Skip] 主库不存在: {DB_PATH}")
@@ -262,144 +395,248 @@ class VocabStatsIndexer:
 
         stats_conn = sqlite3.connect(self.db_path, timeout=60)
 
-
-        # 清空旧数据
-        stats_conn.execute("DELETE FROM vocabulary_cooccurrence")
-        stats_conn.commit()
+        # 断点续传：checkpoint 存的是主库 works.rowid
+        last_rowid, done = self._get_progress("cooccurrence")
+        if done:
+            print("  -> 已完成，跳过。")
+            stats_conn.close()
+            return
 
         batch = []
-        batch_size = 20000
+        batch_size = 100000
 
         with sqlite3.connect(DB_PATH) as main_conn:
             main_conn.row_factory = sqlite3.Row
 
-            cursor = main_conn.execute("""
-                                       SELECT concepts_text, keywords_text
-                                       FROM works
-                                       WHERE concepts_text IS NOT NULL
-                                          OR keywords_text IS NOT NULL
-                                       """)
+            # 预估总量用于进度条
+            total_rows = main_conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM works
+                WHERE (concepts_text IS NOT NULL OR keywords_text IS NOT NULL)
+                  AND rowid > ?
+                """,
+                (last_rowid,),
+            ).fetchone()[0]
 
-            for row in tqdm(cursor, desc="Counting & Writing Cooccurrence"):
-                raw_meta = f"{row['concepts_text'] or ''}|{row['keywords_text'] or ''}"
+            pbar = tqdm(
+                total=total_rows,
+                desc="Counting & Writing Cooccurrence (stream)",
+            )
 
-                terms = sorted(set(
-                    t.strip().lower()
-                    for t in re.split(r"[|;,]", raw_meta)
-                    if t.strip()
-                ))
+            while True:
+                rows = main_conn.execute(
+                    """
+                    SELECT rowid, concepts_text, keywords_text
+                    FROM works
+                    WHERE (concepts_text IS NOT NULL OR keywords_text IS NOT NULL)
+                      AND rowid > ?
+                    ORDER BY rowid
+                    LIMIT 10000
+                    """,
+                    (last_rowid,),
+                ).fetchall()
 
-                if len(terms) < 2:
-                    continue
+                if not rows:
+                    break
 
-                for term_a, term_b in itertools.combinations(terms, 2):
-                    batch.append((term_a, term_b, 1))
+                for row in rows:
+                    raw_meta = f"{row['concepts_text'] or ''}|{row['keywords_text'] or ''}"
 
-                    if len(batch) >= batch_size:
-                        stats_conn.executemany("""
-                                               INSERT INTO vocabulary_cooccurrence (term_a, term_b, freq)
-                                               VALUES (?, ?, ?) ON CONFLICT(term_a, term_b)
-                            DO
-                                               UPDATE SET freq = freq + 1
-                                               """, batch)
-                        stats_conn.commit()
-                        batch = []
+                    terms = sorted(
+                        set(
+                            t.strip().lower()
+                            for t in re.split(r"[|;,]", raw_meta)
+                            if t.strip()
+                        )
+                    )
 
-        if batch:
-            stats_conn.executemany("""
-                                   INSERT INTO vocabulary_cooccurrence (term_a, term_b, freq)
-                                   VALUES (?, ?, ?) ON CONFLICT(term_a, term_b)
-                DO
-                                   UPDATE SET freq = freq + 1
-                                   """, batch)
-            stats_conn.commit()
+                    if len(terms) < 2:
+                        last_rowid = row["rowid"]
+                        continue
 
+                    for term_a, term_b in itertools.combinations(terms, 2):
+                        batch.append((term_a, term_b, 1))
+
+                        if len(batch) >= batch_size:
+                            stats_conn.executemany(
+                                """
+                                INSERT INTO vocabulary_cooccurrence (term_a, term_b, freq)
+                                VALUES (?, ?, ?)
+                                ON CONFLICT(term_a, term_b) DO UPDATE SET
+                                    freq = freq + excluded.freq
+                                """,
+                                batch,
+                            )
+                            stats_conn.commit()
+                            batch = []
+                            self._set_progress(
+                                "cooccurrence", last_rowid, done=False
+                            )
+
+                    last_rowid = row["rowid"]
+                    pbar.update(1)
+
+            if batch:
+                stats_conn.executemany(
+                    """
+                    INSERT INTO vocabulary_cooccurrence (term_a, term_b, freq)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(term_a, term_b) DO UPDATE SET
+                        freq = freq + excluded.freq
+                    """,
+                    batch,
+                )
+                stats_conn.commit()
+
+            pbar.close()
+
+        # 全部完成
+        self._set_progress("cooccurrence", last_rowid, done=True)
         stats_conn.close()
 
-        print("  -> 共现索引构建完成（内存安全版）")
+        print("  -> 共现索引构建完成（流式 + 断点版）")
 
     def _build_cooc_domain_ratio(self):
 
-        print("-> 正在构建词汇共现领域占比索引 (chunk版)...")
+        print("-> 正在构建词汇共现领域占比索引 (分块 + 高速版)...")
 
         if not os.path.exists(DB_PATH):
             print(f"[Skip] 主库不存在: {DB_PATH}")
             return
 
-        conn = sqlite3.connect(self.db_path, timeout=60)
+        conn = sqlite3.connect(self.db_path, timeout=60, isolation_level=None)
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-200000")
         conn.execute("ATTACH DATABASE ? AS main_db", (DB_PATH,))
         conn.row_factory = sqlite3.Row
 
         try:
+            # term -> voc_id 映射
             conn.execute("DROP TABLE IF EXISTS temp.term_voc_map")
 
             conn.execute("""
                          CREATE
                          TEMP TABLE term_voc_map AS
-                         SELECT LOWER(term) term, voc_id
+                         SELECT LOWER(term) AS term, voc_id
                          FROM main_db.vocabulary
                          WHERE term IS NOT NULL
-                           AND term!=''
+                           AND term != ''
                          """)
 
             conn.execute("CREATE INDEX idx_temp_term ON term_voc_map(term)")
-            conn.execute("CREATE INDEX idx_temp_voc ON term_voc_map(voc_id)")
 
-            conn.execute("DELETE FROM vocabulary_cooc_domain_ratio")
+            # chunk 临时表
+            conn.execute("""
+                         CREATE
+                         TEMP TABLE IF NOT EXISTS temp_chunk_cooc(
+                term_a TEXT,
+                term_b TEXT,
+                freq INTEGER
+            )
+                         """)
 
-            # 总数用于进度条
-            total = conn.execute(
-                "SELECT COUNT(*) FROM vocabulary_cooccurrence"
-            ).fetchone()[0]
+            last_rowid, done = self._get_progress("cooc_domain_ratio")
 
-            chunk = 20000
+            if done:
+                print("  -> 已完成，跳过。")
+                return
 
-            for offset in tqdm(range(0, total, chunk), desc="Computing cooc_domain_ratio"):
-                rows = conn.execute(
-                    f"""
-                    SELECT term_a, term_b, freq
-                    FROM vocabulary_cooccurrence
-                    LIMIT {chunk} OFFSET {offset}
-                    """
-                ).fetchall()
+            if last_rowid == 0:
+                conn.execute("DELETE FROM vocabulary_cooc_domain_accum")
+                conn.commit()
+
+            total = conn.execute("""
+                                 SELECT COUNT(*)
+                                 FROM vocabulary_cooccurrence
+                                 WHERE rowid > ?
+                                 """, (last_rowid,)).fetchone()[0]
+
+            chunk = 50000
+
+            pbar = tqdm(
+                total=total,
+                desc="Computing cooc_domain_ratio (fast chunk)",
+            )
+
+            while True:
+
+                rows = conn.execute("""
+                                    SELECT rowid, term_a, term_b, freq
+                                    FROM vocabulary_cooccurrence
+                                    WHERE rowid > ?
+                                    ORDER BY rowid LIMIT ?
+                                    """, (last_rowid, chunk)).fetchall()
+
+                if not rows:
+                    break
 
                 conn.execute("BEGIN IMMEDIATE")
 
+                conn.execute("DELETE FROM temp_chunk_cooc")
+
                 conn.executemany("""
-                                 INSERT INTO vocabulary_cooc_domain_ratio
-                                     (voc_id, domain_id, ratio)
+                                 INSERT INTO temp_chunk_cooc(term_a, term_b, freq)
+                                 VALUES (?, ?, ?)
+                                 """, ((r["term_a"], r["term_b"], r["freq"]) for r in rows))
 
-                                 SELECT target_voc_id,
-                                        domain_id,
-                                        SUM(weighted) * 1.0 / SUM(freq)
+                conn.execute("""
+                             INSERT INTO vocabulary_cooc_domain_accum
+                             SELECT target_voc_id,
+                                    domain_id,
+                                    SUM(freq),
+                                    SUM(weighted)
+                             FROM (SELECT v.voc_id         AS target_voc_id,
+                                          r.domain_id,
+                                          c.freq,
+                                          c.freq * r.ratio AS weighted
+                                   FROM temp_chunk_cooc c
+                                            JOIN term_voc_map v ON v.term = c.term_b
+                                            JOIN vocabulary_domain_ratio r ON r.voc_id = v.voc_id
 
-                                 FROM (SELECT t.voc_id    target_voc_id,
-                                              r.domain_id,
-                                              ?           freq,
-                                              ? * r.ratio weighted
-                                       FROM term_voc_map t
-                                                JOIN vocabulary_domain_ratio r ON r.voc_id = t.voc_id
-                                       WHERE t.term = ?
+                                   UNION ALL
 
-                                       UNION ALL
-
-                                       SELECT t.voc_id    target_voc_id,
-                                              r.domain_id,
-                                              ?           freq,
-                                              ? * r.ratio weighted
-                                       FROM term_voc_map t
-                                                JOIN vocabulary_domain_ratio r ON r.voc_id = t.voc_id
-                                       WHERE t.term = ?)
-                                 GROUP BY target_voc_id, domain_id
-                                 """, [
-                                     (row["freq"], row["freq"], row["term_b"],
-                                      row["freq"], row["freq"], row["term_a"])
-                                     for row in rows
-                                 ])
+                                   SELECT v.voc_id,
+                                          r.domain_id,
+                                          c.freq,
+                                          c.freq * r.ratio
+                                   FROM temp_chunk_cooc c
+                                            JOIN term_voc_map v ON v.term = c.term_a
+                                            JOIN vocabulary_domain_ratio r ON r.voc_id = v.voc_id)
+                             GROUP BY target_voc_id, domain_id ON CONFLICT(voc_id, domain_id) DO
+                             UPDATE SET
+                                 sum_freq = sum_freq + excluded.sum_freq,
+                                 sum_weight = sum_weight + excluded.sum_weight
+                             """)
 
                 conn.commit()
 
-            print("-> 共现领域占比索引构建完成")
+                last_rowid = rows[-1]["rowid"]
+
+                self._set_progress("cooc_domain_ratio", last_rowid, done=False)
+
+                pbar.update(len(rows))
+
+            pbar.close()
+
+            conn.execute("DELETE FROM vocabulary_cooc_domain_ratio")
+
+            conn.execute("""
+                         INSERT INTO vocabulary_cooc_domain_ratio (voc_id, domain_id, ratio)
+                         SELECT voc_id,
+                                domain_id,
+                                CASE
+                                    WHEN sum_freq > 0 THEN sum_weight * 1.0 / sum_freq
+                                    ELSE 0
+                                    END
+                         FROM vocabulary_cooc_domain_accum
+                         """)
+
+            conn.commit()
+
+            self._set_progress("cooc_domain_ratio", last_rowid, done=True)
+
+            print("-> 共现领域占比索引构建完成（高速版）")
 
         finally:
             conn.close()
@@ -416,9 +653,10 @@ class VocabStatsIndexer:
         """
         print(f"--- 开始构建词汇统计索引 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ---")
 
-        # self._build_domain_stats()
-        # self._build_domain_ratio()
-        # self._build_cooccurrence_index()
+        # 四个步骤均支持断点续传；多次执行不会自动清空表，只会按需增量/覆盖。
+        self._build_domain_stats()
+        self._build_domain_ratio()
+        self._build_cooccurrence_index()
         self._build_cooc_domain_ratio()
 
         print("--- 词汇统计索引构建完成 ---")
