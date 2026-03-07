@@ -522,7 +522,7 @@ class LabelRecallPath:
             # 新增：领域纯度过滤
             domain_ratio = target_degree_w / degree_w
 
-            if domain_ratio < 0.2:
+            if domain_ratio < 0.4:
                 continue
             rec = by_tid[tid]
             rec["degree_w"] = degree_w

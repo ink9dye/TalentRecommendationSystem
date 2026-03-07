@@ -1,7 +1,7 @@
 import json
 import logging
 from datetime import datetime
-from utils import generate_work_id, clean_id, safe_get
+from alex_utils import generate_work_id, clean_id, safe_get
 from database import DatabaseManager
 from src.infrastructure.crawler.use_openalex.db_config import FIELDS # 导入 17 领域配置
 

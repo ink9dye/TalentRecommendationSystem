@@ -1,7 +1,7 @@
 import logging
 from api_client import APIClient
 from processor import DataProcessor
-from utils import safe_get, clean_id
+from alex_utils import safe_get, clean_id
 from datetime import datetime
 
 logger = logging.getLogger(__name__)

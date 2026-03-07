@@ -1,7 +1,7 @@
 import logging
 import json
 from api_client import APIClient
-from utils import clean_id
+from alex_utils import clean_id
 from src.infrastructure.crawler.use_openalex.db_config import EMAIL
 
 # 将日志级别设为 DEBUG 以观察 APIClient 的底层动作

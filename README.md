@@ -106,7 +106,7 @@ TalentRecommendationSystem-master/
     │           ├── database.py       # 学术数据库管理（统一索引与统计）
     │           ├── models.py         # Work / AuthorProfile 数据类定义
     │           ├── processor.py      # 单篇论文解析与写入 SQLite
-    │           ├── utils.py          # ID 生成 / 字段清洗等通用工具
+    │           ├── alex_utils.py          # ID 生成 / 字段清洗等通用工具
     │           └── db_config.py      # OpenAlex 抓取配置（EMAIL / FIELDS / 路径）
     └── infrastructure/
         └── crawler/
