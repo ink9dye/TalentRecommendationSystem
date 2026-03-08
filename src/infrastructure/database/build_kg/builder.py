@@ -8,6 +8,7 @@ import sqlite3
 from tqdm import tqdm
 from datetime import datetime
 from config import SQL_QUERIES, CYPHER_TEMPLATES,SBERT_MODEL_NAME
+from src.utils.tools import extract_skills
 
 
 class WeightStrategy:
@@ -317,7 +318,7 @@ class KGBuilder:
                 if not raw_skills: continue
 
                 # 拆分并清洗：支持中英文逗号、分号及斜杠
-                skills = set([s.strip().lower() for s in re.split(r'[,，;；/]', raw_skills) if s.strip()])
+                skills = set(extract_skills(raw_skills))
 
                 for skill in skills:
                     batch.append({

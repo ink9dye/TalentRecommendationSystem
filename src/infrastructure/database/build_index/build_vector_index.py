@@ -192,9 +192,9 @@ class StableVectorGenerator:
             print("\n[!!!] 论文摘要全量索引构建圆满完成！")
 
     def run_all(self):
-        # self.build_vocabulary_index()
-        # self.build_job_description_index()
-        self.build_abstract_index()
+        self.build_vocabulary_index()
+        # # self.build_job_description_index()
+        # self.build_abstract_index()
 
 
 if __name__ == "__main__":
