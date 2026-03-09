@@ -1,16 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-词汇统计索引构建模块（领域分布 + 共现矩阵）
+词汇统计索引构建模块（领域分布 + 共现矩阵 + 概念簇）
 
-本模块负责构建并写入 vocab_stats.db，包含四类与 Vocabulary 相关的统计型索引：
+本模块负责构建并写入 vocab_stats.db，包含五类与 Vocabulary 相关的统计型索引：
   1. 领域分布索引 (vocabulary_domain_stats)：每个词汇关联论文的领域分布与跨度，供标签路召回降噪/排序。
   2. 领域占比索引 (vocabulary_domain_ratio)：按 (voc_id, domain_id) 存 ratio=该领域论文数/work_count，供查询时快速筛「单词领域占比≥阈值」。
   3. 共现索引 (vocabulary_cooccurrence)：词对在同一篇 Work 下的共现频次，与知识图谱 CO_OCCURRED_WITH 一致。
   4. 共现领域占比索引 (vocabulary_cooc_domain_ratio)：按 (voc_id, domain_id) 存「共现伙伴的领域占比」的 freq 加权均值，供标签路直接查 cooc_purity。
+  5. 概念簇索引 (vocabulary_cluster, cluster_members)：词→簇、簇→学术词成员，供标签路按簇扩展；并产出 cluster_centroids.npy。
 
 数据来源：
   - 领域分布：从 Neo4j 图谱 (Vocabulary)<-[:HAS_TOPIC]-(Work) 聚合得到。
   - 共现统计：从主库 academic_dataset_v5.db 的 works 表 (concepts_text/keywords_text) 计算得到，与 build_kg 逻辑一致。
+  - 概念簇：依赖 build_vector_index 产出的 vocabulary 向量与主库 vocabulary.entity_type。
 
 运行方式：在项目根目录执行
   python -m src.infrastructure.database.build_index.build_vocab_stats_index
@@ -23,17 +25,27 @@ import json
 import gc
 import os
 import collections
+import numpy as np
 from tqdm import tqdm
 from datetime import datetime
 from py2neo import Graph
+from sklearn.cluster import KMeans
 
-# 词汇统计库路径、Neo4j 配置、主库路径及共现用 SQL 均从 config 统一读取
+# 词汇统计库路径、Neo4j 配置、主库路径、索引路径及共现用 SQL 均从 config 统一读取
 from config import (
     CONFIG_DICT,
     VOCAB_STATS_DB_PATH,
     DB_PATH,
     SQL_QUERIES,
+    VOCAB_INDEX_PATH,
+    VOCAB_MAP_PATH,
+    INDEX_DIR,
 )
+
+# 概念簇参数：学术词聚类数；工业词最多归属簇数；工业词归属最低相似度
+CONCEPT_CLUSTER_K = 700
+INDUSTRY_TOP_CLUSTERS = 2
+INDUSTRY_CLUSTER_MIN_SCORE = 0.3
 
 
 class VocabStatsIndexer:
@@ -67,13 +79,15 @@ class VocabStatsIndexer:
         """
         初始化 vocab_stats.db 的表结构及索引。
 
-        创建四张表 + 进度表：
+        创建多张表 + 进度表：
           1. vocabulary_domain_stats：词汇维度的领域统计（voc_id, work_count, domain_span, domain_dist）。
           2. vocabulary_domain_ratio：按 (voc_id, domain_id) 存 ratio，供查询时一条 SQL 筛出领域占比≥阈值的词。
           3. vocabulary_cooccurrence：词对共现频次（term_a, term_b, freq）。
-          4. vocabulary_cooc_domain_ratio：按 (voc_id, domain_id) 存共现伙伴的领域占比之 freq 加权均值，写入 vocabulary_cooc_domain_ratio。
+          4. vocabulary_cooc_domain_ratio：按 (voc_id, domain_id) 存共现伙伴的领域占比之 freq 加权均值。
           5. vocabulary_cooc_domain_accum：共现领域占比的分子分母累加表，支持分块/断点计算。
           6. build_progress：存各步骤断点信息，支持断点续传。
+          7. vocabulary_cluster：概念簇表一，词→簇（voc_id, cluster_id, score）。
+          8. cluster_members：概念簇表二，簇→学术词成员（cluster_id, voc_id）。
         """
         conn = sqlite3.connect(self.db_path, timeout=60)
         conn.executescript("""
@@ -139,6 +153,24 @@ class VocabStatsIndexer:
             done INTEGER DEFAULT 0,
             updated_at TIMESTAMP
         );
+
+        -- 概念簇表1：词 -> 簇（学术词 + 工业词）
+        CREATE TABLE IF NOT EXISTS vocabulary_cluster (
+            voc_id INTEGER NOT NULL,
+            cluster_id INTEGER NOT NULL,
+            score REAL NOT NULL DEFAULT 1.0,
+            PRIMARY KEY (voc_id, cluster_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_vc_voc ON vocabulary_cluster(voc_id);
+        CREATE INDEX IF NOT EXISTS idx_vc_cluster ON vocabulary_cluster(cluster_id);
+
+        -- 概念簇表2：簇 -> 成员（仅学术词）
+        CREATE TABLE IF NOT EXISTS cluster_members (
+            cluster_id INTEGER NOT NULL,
+            voc_id INTEGER NOT NULL,
+            PRIMARY KEY (cluster_id, voc_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cm_cluster ON cluster_members(cluster_id);
         """)
         conn.close()
 
@@ -641,23 +673,181 @@ class VocabStatsIndexer:
         finally:
             conn.close()
 
+    def _build_concept_clusters(self):
+        """
+        构建概念簇索引：对学术词做 K-means 聚类，工业词按与簇中心相似度归属到 top-K 簇。
+        写入 vocabulary_cluster（词→簇）、cluster_members（簇→学术词），并保存 cluster_centroids.npy。
+        依赖 build_vector_index 已产出的 vocabulary 向量与主库 vocabulary.entity_type。
+        """
+        print("-> 正在构建概念簇索引 (vocabulary_cluster, cluster_members)...")
+
+        _, done = self._get_progress("concept_clusters")
+        if done:
+            print("  -> 已完成，跳过。")
+            return
+
+        vec_path = VOCAB_INDEX_PATH.replace(".faiss", "_vectors.npy")
+        if not os.path.exists(vec_path):
+            print(f"  [Skip] 未找到 vocabulary 向量文件: {vec_path}，请先运行 build_vector_index 构建词汇表索引。")
+            return
+
+        # 1. 读入向量与 voc_id 顺序
+        vectors = np.load(vec_path).astype(np.float32)
+        if vectors.ndim != 2:
+            print("  [Skip] 向量维度异常，跳过概念簇。")
+            return
+
+        with open(VOCAB_MAP_PATH, "r", encoding="utf-8") as f:
+            raw_map = json.load(f)
+        if isinstance(raw_map, list):
+            voc_ids_ordered = [str(x) for x in raw_map]
+        else:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT voc_id FROM vocabulary WHERE term IS NOT NULL AND term != '' ORDER BY voc_id ASC"
+                ).fetchall()
+            voc_ids_ordered = [str(r["voc_id"]) for r in rows]
+        if len(voc_ids_ordered) != len(vectors):
+            print(f"  [Skip] 向量行数 {len(vectors)} 与 voc_id 数 {len(voc_ids_ordered)} 不一致，跳过概念簇。")
+            return
+
+        # 2. 主库取 entity_type
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT voc_id, entity_type FROM vocabulary").fetchall()
+        voc_id_to_entity = {}
+        for r in rows:
+            vid = r["voc_id"]
+            voc_id_to_entity[str(vid)] = (r["entity_type"] or "").strip().lower()
+
+        # 3. 拆出学术词与工业词
+        academic_indices = []
+        industry_indices = []
+        for i, vid in enumerate(voc_ids_ordered):
+            et = voc_id_to_entity.get(vid) or ""
+            if et in ("concept", "keyword"):
+                academic_indices.append(i)
+            elif et == "industry":
+                industry_indices.append(i)
+
+        X_academic = vectors[academic_indices]
+        voc_ids_academic = [voc_ids_ordered[i] for i in academic_indices]
+        n_academic = len(voc_ids_academic)
+
+        K = min(CONCEPT_CLUSTER_K, max(2, n_academic - 1))
+        if n_academic < K:
+            print(f"  [Skip] 学术词数 {n_academic} 小于簇数 K={CONCEPT_CLUSTER_K}，跳过概念簇。")
+            return
+
+        # 4. L2 归一化后对学术词做 K-means
+        norms = np.linalg.norm(X_academic, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        X_academic_norm = (X_academic / norms).astype(np.float32)
+
+        km = KMeans(n_clusters=K, random_state=42, n_init=10)
+        km.fit(X_academic_norm)
+        labels_academic = km.labels_
+        centroids = km.cluster_centers_.astype(np.float32)
+        cent_norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+        cent_norms[cent_norms == 0] = 1.0
+        centroids = (centroids / cent_norms).astype(np.float32)
+
+        # 5. 写表一、表二（学术词）
+        stats_conn = sqlite3.connect(self.db_path, timeout=60)
+        stats_conn.execute("DELETE FROM vocabulary_cluster")
+        stats_conn.execute("DELETE FROM cluster_members")
+        stats_conn.commit()
+
+        batch_vc = []
+        batch_cm = []
+        batch_size = 3000
+        for j in range(n_academic):
+            vid = int(voc_ids_academic[j]) if voc_ids_academic[j].isdigit() else voc_ids_academic[j]
+            cid = int(labels_academic[j])
+            batch_vc.append((vid, cid, 1.0))
+            batch_cm.append((cid, vid))
+            if len(batch_vc) >= batch_size:
+                stats_conn.executemany(
+                    "INSERT OR REPLACE INTO vocabulary_cluster (voc_id, cluster_id, score) VALUES (?, ?, ?)",
+                    batch_vc,
+                )
+                stats_conn.executemany(
+                    "INSERT OR REPLACE INTO cluster_members (cluster_id, voc_id) VALUES (?, ?)",
+                    batch_cm,
+                )
+                stats_conn.commit()
+                batch_vc, batch_cm = [], []
+        if batch_vc:
+            stats_conn.executemany(
+                "INSERT OR REPLACE INTO vocabulary_cluster (voc_id, cluster_id, score) VALUES (?, ?, ?)",
+                batch_vc,
+            )
+            stats_conn.executemany(
+                "INSERT OR REPLACE INTO cluster_members (cluster_id, voc_id) VALUES (?, ?)",
+                batch_cm,
+            )
+            stats_conn.commit()
+
+        # 6. 工业词归属到簇（只写表一）
+        if industry_indices:
+            vectors_industry = vectors[industry_indices].astype(np.float32)
+            in_norms = np.linalg.norm(vectors_industry, axis=1, keepdims=True)
+            in_norms[in_norms == 0] = 1.0
+            vectors_industry = (vectors_industry / in_norms).astype(np.float32)
+            scores = np.dot(vectors_industry, centroids.T)
+
+            batch_industry = []
+            for idx, i in enumerate(industry_indices):
+                vid = voc_ids_ordered[i]
+                vid_int = int(vid) if vid.isdigit() else vid
+                row = scores[idx]
+                top_k = min(INDUSTRY_TOP_CLUSTERS, len(row))
+                top_indices = np.argsort(row)[::-1][:top_k]
+                for cid in top_indices:
+                    sc = float(row[cid])
+                    if sc >= INDUSTRY_CLUSTER_MIN_SCORE:
+                        batch_industry.append((vid_int, int(cid), sc))
+                if len(batch_industry) >= batch_size:
+                    stats_conn.executemany(
+                        "INSERT OR REPLACE INTO vocabulary_cluster (voc_id, cluster_id, score) VALUES (?, ?, ?)",
+                        batch_industry,
+                    )
+                    stats_conn.commit()
+                    batch_industry = []
+            if batch_industry:
+                stats_conn.executemany(
+                    "INSERT OR REPLACE INTO vocabulary_cluster (voc_id, cluster_id, score) VALUES (?, ?, ?)",
+                    batch_industry,
+                )
+                stats_conn.commit()
+
+        # 7. 保存簇中心
+        centroids_path = os.path.join(INDEX_DIR, "cluster_centroids.npy")
+        np.save(centroids_path, centroids)
+        self._set_progress("concept_clusters", 1, done=True)
+        stats_conn.close()
+        print("  -> 概念簇索引构建完成。")
+
     def build_index(self):
         """
-        全量构建词汇统计索引：先领域分布，再共现。
+        全量构建词汇统计索引：先领域分布，再共现，再概念簇。
 
         执行顺序：
           1. _build_domain_stats()：依赖 Neo4j，写入 vocabulary_domain_stats。
           2. _build_domain_ratio()：从 vocabulary_domain_stats 展开，写入 vocabulary_domain_ratio。
           3. _build_cooccurrence_index()：依赖主库 works，写入 vocabulary_cooccurrence。
           4. _build_cooc_domain_ratio()：依赖 vocabulary_cooccurrence + vocabulary_domain_ratio + 主库 vocabulary，写入 vocabulary_cooc_domain_ratio。
+          5. _build_concept_clusters()：依赖 vocabulary 向量与 entity_type，写入 vocabulary_cluster、cluster_members，并保存 cluster_centroids.npy。
         """
         print(f"--- 开始构建词汇统计索引 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ---")
 
-        # 四个步骤均支持断点续传；多次执行不会自动清空表，只会按需增量/覆盖。
+        # 各步骤均支持断点续传；多次执行不会自动清空表，只会按需增量/覆盖。
         self._build_domain_stats()
         self._build_domain_ratio()
         self._build_cooccurrence_index()
         self._build_cooc_domain_ratio()
+        self._build_concept_clusters()
 
         print("--- 词汇统计索引构建完成 ---")
 
