@@ -101,13 +101,20 @@ class StableVectorGenerator:
             rows = cursor.execute(
                 "SELECT voc_id, term FROM vocabulary WHERE term IS NOT NULL AND term != ''").fetchall()
             texts = [row['term'] for row in rows]
-            ids = [str(row['voc_id']) for row in rows]
+            # 关键：用 IndexIDMap 写入 voc_id(int64)，确保 Faiss search 返回的 label 就是 voc_id
+            ids = [int(row['voc_id']) for row in rows]
             if not texts: return
 
             with torch.no_grad():
                 embeddings = self.model.encode(texts, batch_size=BATCH_SIZE, show_progress_bar=True)
-            self._save_index("vocabulary", np.array(embeddings).astype('float32'), ids, VOCAB_INDEX_PATH,
-                             VOCAB_MAP_PATH)
+            self._save_index(
+                "vocabulary",
+                np.array(embeddings).astype('float32'),
+                ids,
+                VOCAB_INDEX_PATH,
+                VOCAB_MAP_PATH,
+                use_id_map=True
+            )
         except Exception as e:
             print(f"[!] 词汇表建索异常: {e}")
 
