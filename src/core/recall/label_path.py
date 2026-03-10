@@ -386,7 +386,8 @@ class LabelRecallPath:
             seed_sim_map[vid] = float(rec.get("sim_score", 1.0))
 
         # 聚合簇扩展出来的候选学术词
-        cluster_expanded = {}  # vid -> {"sim_score": float, "support": int}
+        # vid -> {"sim_score": float, "support": int, "seed_vids": set[int]}
+        cluster_expanded = {}
 
         for rec in raw_results:
             try:
@@ -435,10 +436,11 @@ class LabelRecallPath:
                 if contrib <= 0:
                     continue
                 entry = cluster_expanded.setdefault(
-                    int(m), {"sim_score": 0.0, "support": 0}
+                    int(m), {"sim_score": 0.0, "support": 0, "seed_vids": set()}
                 )
                 entry["sim_score"] = max(entry["sim_score"], contrib)
                 entry["support"] += 1
+                entry["seed_vids"].add(int(vid))
 
         if not cluster_expanded:
             return raw_results
@@ -500,10 +502,12 @@ class LabelRecallPath:
                 "term": term_map[vid],
                 "sim_score": agg["sim_score"],
                 "hit_count": agg["support"],
+                "seed_vids": sorted(list(agg.get("seed_vids") or [])),
                 "degree_w": degree_w,
                 "target_degree_w": target_degree_w,
                 "domain_span": domain_span,
                 "cov_j": 0.0,
+                "origin": "cluster",
             }
             raw_results.append(new_rec)
 
@@ -711,11 +715,26 @@ class LabelRecallPath:
         ORDER BY vid, sim_score DESC
         WITH vid, collect({tid: tid, term: term, sim_score: sim_score})[0..$top_k] AS top3
         UNWIND top3 AS c
-        RETURN c.tid AS tid, c.term AS term, c.sim_score AS sim_score
+        RETURN vid AS src_vid, c.tid AS tid, c.term AS term, c.sim_score AS sim_score
         """
         rows = self.graph.run(cypher, **params).data()
         if not rows:
+            # 记录空的 raw，便于诊断
+            self._last_similar_to_raw_rows = []
+            self._last_similar_to_agg = []
+            self._last_similar_to_pass = []
             return []
+
+        # 缓存 SIMILAR_TO 原始扩展行（仅保留必要字段，避免 debug 体积过大）
+        self._last_similar_to_raw_rows = [
+            {
+                "src_vid": r.get("src_vid"),
+                "tid": r.get("tid"),
+                "term": r.get("term"),
+                "sim_score": float(r.get("sim_score", 0.0) or 0.0),
+            }
+            for r in rows
+        ]
 
         # --- 调试：语义扩展管道各阶段计数 ---
         pipeline = {
@@ -734,19 +753,49 @@ class LabelRecallPath:
             "fail_domain_ratio_details": [],
         }
 
-        # 按 tid 聚合：取 max(sim_score)，hit_count = 被多少锚点命中
+        # 按 tid 聚合：取 max(sim_score)，hit_count = 被多少“不同锚点(src_vid)”命中
         by_tid = {}
         for r in rows:
             tid = r["tid"]
             term = r["term"] or ""
             sim = float(r["sim_score"])
             if tid not in by_tid:
-                by_tid[tid] = {"tid": tid, "term": term, "sim_score": sim, "hit_count": 0}
+                by_tid[tid] = {
+                    "tid": tid,
+                    "term": term,
+                    "sim_score": sim,
+                    "src_vids": set(),
+                    "hit_count": 0,
+                    "origin": "similar_to",
+                }
             by_tid[tid]["sim_score"] = max(by_tid[tid]["sim_score"], sim)
-            by_tid[tid]["hit_count"] += 1
+            src_vid = r.get("src_vid")
+            if src_vid is not None:
+                try:
+                    by_tid[tid]["src_vids"].add(int(src_vid))
+                except Exception:
+                    pass
+
+        for tid, rec in by_tid.items():
+            rec["hit_count"] = len(rec.get("src_vids") or [])
+            # set 不可序列化，转 list 供 debug
+            rec["src_vids"] = sorted(list(rec.get("src_vids") or []))
 
         tids = list(by_tid.keys())
         pipeline["n_unique_tids"] = len(tids)
+
+        # 保存“去重聚合后的候选（尚未做 stats/领域过滤）”供诊断
+        self._last_similar_to_agg = [
+            {
+                "tid": v.get("tid"),
+                "term": v.get("term", ""),
+                "sim_score": float(v.get("sim_score", 0.0) or 0.0),
+                "hit_count": int(v.get("hit_count", 0) or 0),
+                "src_vids": v.get("src_vids", []),
+            }
+            for v in by_tid.values()
+        ]
+
         results = []
         for tid in tids:
             row = self.stats_conn.execute(
@@ -799,6 +848,21 @@ class LabelRecallPath:
             rec["cov_j"] = 0.0
             results.append(rec)
         self._last_expansion_pipeline_stats = pipeline
+
+        # 保存“stats/领域过滤后”的第一层学术词（similar_to 通过项）供诊断
+        self._last_similar_to_pass = [
+            {
+                "tid": r.get("tid"),
+                "term": r.get("term", ""),
+                "sim_score": float(r.get("sim_score", 0.0) or 0.0),
+                "hit_count": int(r.get("hit_count", 0) or 0),
+                "src_vids": r.get("src_vids", []),
+                "degree_w": int(r.get("degree_w", 0) or 0),
+                "target_degree_w": int(r.get("target_degree_w", 0) or 0),
+                "domain_span": int(r.get("domain_span", 0) or 0),
+            }
+            for r in results
+        ]
         return results
 
     def _calculate_final_weights(self, raw_results, query_vector):
@@ -1125,6 +1189,9 @@ class LabelRecallPath:
             'active_domains': list(active_domain_set),
             'dominance': f"{dominance * 100:.1f}%",
             'expansion_pipeline': getattr(self, '_last_expansion_pipeline_stats', None),
+            'similar_to_raw': getattr(self, '_last_similar_to_raw_rows', []),
+            'similar_to_agg': getattr(self, '_last_similar_to_agg', []),
+            'similar_to_pass': getattr(self, '_last_similar_to_pass', []),
             'regex_str': regex_str,
             'job_ids': job_ids,
             'job_previews': job_previews,
@@ -1185,7 +1252,10 @@ if __name__ == "__main__":
             anchor_detail = db.get('anchor_detail', [])
             print(f"【Step 2: 工业锚点】从 JD 提取的核心技能 (共 {len(i_kws)} 个): {i_kws}")
             if anchor_detail:
-                print(f"      锚点明细 (vid -> term): {anchor_detail[:15]}")
+                max_show = 200  # 想全量可调大；避免控制台刷屏导致难定位
+                print(f"      锚点明细 (vid -> term) (展示 {min(len(anchor_detail), max_show)}/{len(anchor_detail)}):")
+                for s in anchor_detail[:max_show]:
+                    print(f"        - {s}")
             anchor_debug = db.get('anchor_debug', {})
             if anchor_debug:
                 per_job = anchor_debug.get('per_job_skill_count', [])
@@ -1206,6 +1276,64 @@ if __name__ == "__main__":
                 print(f"      领域正则(regex): {regex_str}")
                 print(f"      SIMILAR_TO 原始行数: {p.get('n_similar_to_rows', 0)}")
                 print(f"      去重后候选学术词数: {p.get('n_unique_tids', 0)}")
+
+                # 打印 SIMILAR_TO 原始扩展：按“源锚点(src_vid)”分组，展示每个锚点的 top 扩展
+                similar_to_raw = db.get('similar_to_raw', []) or []
+                if similar_to_raw:
+                    src_map = collections.defaultdict(list)  # src_vid -> [(tid, term, sim)]
+                    for r in similar_to_raw:
+                        src = r.get('src_vid')
+                        if src is None:
+                            continue
+                        src_map[int(src)].append(
+                            (r.get('tid'), r.get('term'), float(r.get('sim_score', 0.0) or 0.0))
+                        )
+
+                    # 用锚点明细做 src_vid -> src_term 映射（形如 "167211=wbc"）
+                    src_term_map = {}
+                    for s in db.get('anchor_detail', []) or []:
+                        if isinstance(s, str) and "=" in s:
+                            k, v = s.split("=", 1)
+                            if k.strip().isdigit():
+                                src_term_map[int(k.strip())] = v.strip()
+
+                    print("      SIMILAR_TO 原始扩展（按源锚点分组，每个锚点展示 Top3）:")
+                    for src_vid in sorted(src_map.keys()):
+                        items = sorted(src_map[src_vid], key=lambda x: x[2], reverse=True)[:3]
+                        src_term = src_term_map.get(src_vid, "")
+                        head = f"        - src_vid={src_vid}" + (f"({src_term})" if src_term else "")
+                        print(head)
+                        for tid, term, sc in items:
+                            print(f"            -> tid={tid}  term={term}  sim={sc:.4f}")
+
+                # 打印聚合后的候选（去重后，带 hit_count 与 src_vids）
+                sim_agg = db.get('similar_to_agg', []) or []
+                if sim_agg:
+                    top_show = 20
+                    sim_agg_sorted = sorted(
+                        sim_agg,
+                        key=lambda x: (int(x.get('hit_count', 0) or 0), float(x.get('sim_score', 0.0) or 0.0)),
+                        reverse=True
+                    )
+                    print(f"      SIMILAR_TO 聚合后候选 Top{top_show}（按 hits、sim_score 排序）:")
+                    for r in sim_agg_sorted[:top_show]:
+                        sc = float(r.get('sim_score', 0.0) or 0.0)
+                        print(f"        - tid={r.get('tid')}  term={r.get('term')}  sim={sc:.4f}  hits={r.get('hit_count')}  src_vids={r.get('src_vids')}")
+
+                # 打印“通过 stats/领域过滤”的第一层学术词
+                sim_pass = db.get('similar_to_pass', []) or []
+                if sim_pass:
+                    print("      通过过滤的第一层学术词（similar_to_pass）:")
+                    for r in sorted(
+                        sim_pass,
+                        key=lambda x: (int(x.get('hit_count', 0) or 0), float(x.get('sim_score', 0.0) or 0.0)),
+                        reverse=True
+                    )[:30]:
+                        deg = int(r.get('degree_w', 0) or 0)
+                        tgt = int(r.get('target_degree_w', 0) or 0)
+                        ratio = (float(tgt) / float(deg)) if deg else 0.0
+                        sc = float(r.get('sim_score', 0.0) or 0.0)
+                        print(f"        - tid={r.get('tid')}  term={r.get('term')}  sim={sc:.4f}  hits={r.get('hit_count')}  src_vids={r.get('src_vids')}  degree_w={deg}  target_w={tgt}  ratio={ratio:.3f}")
                 print(f"      无 vocabulary_domain_stats 行: {p.get('n_no_stats', 0)}  (样例 tid: {p.get('sample_fail_no_stats', [])[:5]})")
                 print(f"      work_count > P95(277) 被筛: {p.get('n_fail_degree_w', 0)}  (样例: {p.get('sample_fail_degree', [])[:5]})")
                 print(f"      目标领域 0 篇(target_degree_w<=0) 被筛: {p.get('n_fail_target_degree_w', 0)}  (样例: {p.get('sample_fail_target', [])[:5]})")
