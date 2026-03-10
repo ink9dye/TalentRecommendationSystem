@@ -669,6 +669,23 @@ class LabelRecallPath:
         if not rows:
             return []
 
+        # --- 调试：语义扩展管道各阶段计数 ---
+        pipeline = {
+            "n_similar_to_rows": len(rows),
+            "active_domains": list(active_domains),
+            "n_unique_tids": 0,
+            "n_no_stats": 0,
+            "n_fail_degree_w": 0,
+            "n_fail_target_degree_w": 0,
+            "n_fail_domain_ratio": 0,
+            "n_final": 0,
+            "sample_fail_no_stats": [],
+            "sample_fail_degree": [],
+            "sample_fail_target": [],
+            "sample_fail_ratio": [],
+            "fail_domain_ratio_details": [],
+        }
+
         # 按 tid 聚合：取 max(sim_score)，hit_count = 被多少锚点命中
         by_tid = {}
         for r in rows:
@@ -681,6 +698,7 @@ class LabelRecallPath:
             by_tid[tid]["hit_count"] += 1
 
         tids = list(by_tid.keys())
+        pipeline["n_unique_tids"] = len(tids)
         results = []
         for tid in tids:
             row = self.stats_conn.execute(
@@ -688,34 +706,47 @@ class LabelRecallPath:
                 (tid,),
             ).fetchone()
             if not row:
+                pipeline["n_no_stats"] += 1
+                if len(pipeline["sample_fail_no_stats"]) < 5:
+                    pipeline["sample_fail_no_stats"].append(tid)
                 continue
             degree_w, domain_span, dist_json = row
-            # 新增
-            # if degree_w < 2:
-            #     continue
-
             if degree_w > VOCAB_P95_PAPER_COUNT:
+                pipeline["n_fail_degree_w"] += 1
+                if len(pipeline["sample_fail_degree"]) < 5:
+                    pipeline["sample_fail_degree"].append(tid)
                 continue
             try:
                 dist = json.loads(dist_json) if isinstance(dist_json, str) else dist_json
             except (TypeError, ValueError):
                 dist = {}
             target_degree_w = sum(dist.get(str(d), 0) for d in active_domains)
-
-            if target_degree_w <= 0:
-                continue
-
-            # 新增：领域纯度过滤
+            # 领域纯度过滤：三个目标领域合计占比 ≥40%（不再要求“至少 1 篇在 3 领域”，由纯度统一过滤）
             domain_ratio = target_degree_w / degree_w
-
             if domain_ratio < 0.4:
+                pipeline["n_fail_domain_ratio"] += 1
+                if len(pipeline["sample_fail_ratio"]) < 5:
+                    pipeline["sample_fail_ratio"].append(tid)
+                details = pipeline.get("fail_domain_ratio_details", [])
+                if len(details) < 20:
+                    details.append({
+                        "tid": tid,
+                        "term": by_tid[tid].get("term", ""),
+                        "degree_w": degree_w,
+                        "target_degree_w": target_degree_w,
+                        "domain_ratio": round(domain_ratio, 4),
+                        "target_domains_dist": {str(d): dist.get(str(d), 0) for d in active_domains},
+                    })
+                    pipeline["fail_domain_ratio_details"] = details
                 continue
+            pipeline["n_final"] += 1
             rec = by_tid[tid]
             rec["degree_w"] = degree_w
             rec["target_degree_w"] = target_degree_w
             rec["domain_span"] = domain_span
             rec["cov_j"] = 0.0
             results.append(rec)
+        self._last_expansion_pipeline_stats = pipeline
         return results
 
     def _calculate_final_weights(self, raw_results, query_vector):
@@ -1024,6 +1055,8 @@ class LabelRecallPath:
         self.last_debug_info = {
             'active_domains': list(active_domain_set),
             'dominance': f"{dominance * 100:.1f}%",
+            'expansion_pipeline': getattr(self, '_last_expansion_pipeline_stats', None),
+            'regex_str': regex_str,
             'job_ids': job_ids,
             'job_previews': job_previews,
             'anchor_debug': anchor_debug,
@@ -1094,6 +1127,34 @@ if __name__ == "__main__":
                 print(f"      3% 熔断: 熔断前 {before_melt} 个技能词，熔断后保留 {after_melt} 个；被熔断词样例: {melted_sample[:15]}")
 
             # 3. 学术语义扩展与“学术共鸣”校验
+            # 2.5 语义扩展管道（Step 3 前置）：看清在哪个环节被筛光
+            expansion_pipeline = db.get('expansion_pipeline')
+            regex_str = db.get('regex_str', '')
+            if expansion_pipeline:
+                p = expansion_pipeline
+                print(f"【Step 3 前置: 语义扩展管道】")
+                print(f"      目标领域 ID: {p.get('active_domains', [])}")
+                print(f"      领域正则(regex): {regex_str}")
+                print(f"      SIMILAR_TO 原始行数: {p.get('n_similar_to_rows', 0)}")
+                print(f"      去重后候选学术词数: {p.get('n_unique_tids', 0)}")
+                print(f"      无 vocabulary_domain_stats 行: {p.get('n_no_stats', 0)}  (样例 tid: {p.get('sample_fail_no_stats', [])[:5]})")
+                print(f"      work_count > P95(277) 被筛: {p.get('n_fail_degree_w', 0)}  (样例: {p.get('sample_fail_degree', [])[:5]})")
+                print(f"      目标领域 0 篇(target_degree_w<=0) 被筛: {p.get('n_fail_target_degree_w', 0)}  (样例: {p.get('sample_fail_target', [])[:5]})")
+                print(f"      领域纯度 < 40% 被筛: {p.get('n_fail_domain_ratio', 0)}  (样例: {p.get('sample_fail_ratio', [])[:5]})")
+                fail_details = p.get("fail_domain_ratio_details", [])
+                if fail_details:
+                    print(f"      被筛词纯度明细 (最多展示 20 条):")
+                    print(f"      {'term':<20} | {'tid':<8} | {'degree_w':<10} | {'target_degree_w':<16} | {'domain_ratio':<12} | 目标领域分布")
+                    print(f"      {'-' * 20} | {'-' * 8} | {'-' * 10} | {'-' * 16} | {'-' * 12} | ---------")
+                    for x in fail_details:
+                        term_s = (x.get("term") or "")[:20]
+                        dist_s = x.get("target_domains_dist") or {}
+                        dist_str = ", ".join(f"{k}:{v}" for k, v in sorted(dist_s.items()))
+                        print(f"      {term_s:<20} | {x.get('tid', ''):<8} | {x.get('degree_w', 0):<10} | {x.get('target_degree_w', 0):<16} | {x.get('domain_ratio', 0):<12} | {dist_str}")
+                print(f"      最终通过进入 Step 3 的学术词数: {p.get('n_final', 0)}")
+            else:
+                print(f"【Step 3 前置: 语义扩展管道】无数据（未执行或未记录）")
+
             print(f"【Step 3: 语义扩展与实证校验】学术词质量评估:")
             print(f"      {'学术词 (Term)':<25} | {'收敛(Hits)':<10} | {'共鸣(Resonance)':<15} | {'状态'}")
             print(f"      {'-' * 25} | {'-' * 10} | {'-' * 15} | {'-' * 10}")
