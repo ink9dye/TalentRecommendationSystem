@@ -154,6 +154,12 @@ class KGBuilder:
             total_pending = len(pending_rows)
             neo4j_batch = []  # 准备发往 Neo4j 的数据池
 
+            # 语义桥接阈值：工业词要求更高，仅保留少量高置信跨类边
+            INDUSTRY_MIN_SCORE = 0.85
+            INDUSTRY_MAX_LINKS = 2
+            OTHERS_MIN_SCORE = 0.70
+            OTHERS_MAX_LINKS = 3
+
             # 进度条显示：让 6.6 万条数据的同步过程可视化
             for start_idx in tqdm(range(0, total_pending, encode_chunk_size), desc="Building Semantic Bridge"):
                 # 获取当前批次的待处理词汇
@@ -185,16 +191,40 @@ class KGBuilder:
                         if neighbor_id == -1 or neighbor_id == source_id:
                             continue
 
-                        # 【核心桥接逻辑】：只连接“不同类型”的词
-                        # 例如：让“Java(技能)”去连接“后端开发(岗位)”，而不是连接“Python(技能)”
-                        if vocab_meta.get(neighbor_id) != source_type:
+                        neigh_type = vocab_meta.get(neighbor_id)
+
+                        if source_type == "industry":
+                            # 工业词只连到学术侧 Vocabulary（concept / keyword）
+                            if neigh_type not in ("concept", "keyword"):
+                                continue
+                            # 工业词要求更高的语义相似度
+                            if score < INDUSTRY_MIN_SCORE:
+                                continue
+
                             current_links.append({
                                 "f": source_id,  # From (源词 ID)
                                 "t": neighbor_id,  # To (目标词 ID)
                                 "s": float(score)  # Similarity Score (相似度权重)
                             })
-                            # 限制数量：每个词最多建立 3 个最强跨类关联，防止图谱爆炸
-                            if len(current_links) >= 3:
+                            # 每个工业词最多保留少量高置信跨类边，其他覆盖交由概念簇与召回阶段扩展
+                            if len(current_links) >= INDUSTRY_MAX_LINKS:
+                                break
+                        else:
+                            if source_type in ("concept", "keyword") and neigh_type in ("concept", "keyword"):
+                                continue
+                            # 非工业词仍然只连接“不同类型”的词，避免同类自环
+                            if neigh_type == source_type:
+                                continue
+                            if score < OTHERS_MIN_SCORE:
+                                continue
+
+                            current_links.append({
+                                "f": source_id,
+                                "t": neighbor_id,
+                                "s": float(score)
+                            })
+                            # 控制每个词的跨类关联数量，防止图谱爆炸
+                            if len(current_links) >= OTHERS_MAX_LINKS:
                                 break
 
                     # 将本次筛选出的 3 个关联加入待推送大池子

@@ -92,6 +92,26 @@ class LabelRecallPath:
                 rows = conn.execute("SELECT voc_id FROM vocabulary ORDER BY voc_id ASC").fetchall()
                 self.vocab_to_idx = {str(r[0]): i for i, r in enumerate(rows)}
             self.stats_conn = sqlite3.connect(VOCAB_STATS_DB_PATH, check_same_thread=False)
+
+            # E. 概念簇缓存：cluster_id -> [voc_id]，voc_id -> [(cluster_id, score)]
+            self.cluster_members = collections.defaultdict(list)
+            self.voc_to_clusters = collections.defaultdict(list)
+            try:
+                cur = self.stats_conn.execute(
+                    "SELECT cluster_id, voc_id FROM cluster_members"
+                )
+                for cid, vid in cur:
+                    self.cluster_members[int(cid)].append(int(vid))
+                cur = self.stats_conn.execute(
+                    "SELECT voc_id, cluster_id, score FROM vocabulary_cluster"
+                )
+                for vid, cid, sc in cur:
+                    self.voc_to_clusters[int(vid)].append((int(cid), float(sc)))
+            except Exception:
+                # 概念簇索引缺失时退化为无簇模式
+                self.cluster_members = collections.defaultdict(list)
+                self.voc_to_clusters = collections.defaultdict(list)
+
             print("[OK] 标签路资源初始化完成")
         except Exception as e:
             print(f"[Error] 资源加载失败: {e}")
@@ -265,6 +285,9 @@ class LabelRecallPath:
         if not raw_results:
             return {}, {}, {}
 
+        # 1.5 概念簇扩展：在簇内为每个 seed 找少量近邻学术词，作为次级扩展
+        raw_results = self._expand_with_clusters(raw_results, regex)
+
         # --- 2. 【学术共鸣】候选词与本次要搜索的词汇的共现（单词协作）---
         tids = [r['tid'] for r in raw_results]
         resonance_map = self._calculate_academic_resonance(tids)
@@ -292,6 +315,169 @@ class LabelRecallPath:
         # 4. 应用数学公式计算最终动态权重（含共鸣、共现广度惩罚、共现纯度奖励）
         self._last_expansion_raw_results = raw_results
         return self._calculate_final_weights(raw_results, query_vector)
+
+    def _expand_with_clusters(self, raw_results, domain_regex, topk_per_seed=10, weight_decay=0.4):
+        """
+        使用概念簇对第一层学术词做局部扩展：
+          1. 对每个 seed 词，找到其所属簇（取 score 最高的一个）。
+          2. 在该簇内按向量相似度取 topk_per_seed 个最近学术词作为扩展词。
+          3. 扩展词的初始 sim_score 约为 seed_sim_score * sim_in_cluster * weight_decay。
+        返回扩展后的 raw_results 列表，结构与原始列表一致（附加若干新 tid）。
+        """
+        # 若簇索引不可用，直接退化为原逻辑
+        if not getattr(self, "cluster_members", None) or not getattr(self, "voc_to_clusters", None):
+            return raw_results
+
+        # 解析当前激活领域集合（与后续领域过滤保持一致）
+        active_domain_ids = set(re.findall(r'\d+', domain_regex)) if domain_regex and domain_regex != ".*" else set()
+
+        seed_vids = [int(rec["tid"]) for rec in raw_results]
+        seed_vids_set = set(seed_vids)
+
+        # seed -> 最优簇 (cluster_id, cluster_score)
+        seed_to_cluster = {}
+        for vid in seed_vids:
+            clusters = self.voc_to_clusters.get(int(vid))
+            if not clusters:
+                continue
+            # 取 score 最大的簇
+            cid, cscore = max(clusters, key=lambda x: x[1])
+            seed_to_cluster[int(vid)] = (cid, cscore)
+
+        if not seed_to_cluster:
+            return raw_results
+
+        # 建立 seed -> sim_score 映射，若缺失则视为 1.0
+        seed_sim_map = {}
+        for rec in raw_results:
+            try:
+                vid = int(rec["tid"])
+            except Exception:
+                continue
+            seed_sim_map[vid] = float(rec.get("sim_score", 1.0))
+
+        # 聚合簇扩展出来的候选学术词
+        cluster_expanded = {}  # vid -> {"sim_score": float, "support": int}
+
+        for rec in raw_results:
+            try:
+                vid = int(rec["tid"])
+            except Exception:
+                continue
+            if vid not in seed_to_cluster:
+                continue
+
+            cid, _ = seed_to_cluster[vid]
+            members = self.cluster_members.get(int(cid)) or []
+            if not members:
+                continue
+
+            # 排除自身与已在初始候选中的词
+            candidates = [m for m in members if m not in seed_vids_set]
+            if not candidates:
+                continue
+
+            seed_idx = self.vocab_to_idx.get(str(vid))
+            if seed_idx is None:
+                continue
+            seed_vec = self.all_vocab_vectors[seed_idx]
+
+            sims = []
+            for m in candidates:
+                midx = self.vocab_to_idx.get(str(m))
+                if midx is None:
+                    continue
+                mvec = self.all_vocab_vectors[midx]
+                sim_in_cluster = float(np.dot(seed_vec, mvec))
+                sims.append((m, sim_in_cluster))
+
+            if not sims:
+                continue
+
+            sims.sort(key=lambda x: x[1], reverse=True)
+            top = sims[:topk_per_seed]
+            seed_sim = seed_sim_map.get(vid, 1.0)
+
+            for m, sim_in_cluster in top:
+                contrib = weight_decay * seed_sim * sim_in_cluster
+                if contrib <= 0:
+                    continue
+                entry = cluster_expanded.setdefault(
+                    int(m), {"sim_score": 0.0, "support": 0}
+                )
+                entry["sim_score"] = max(entry["sim_score"], contrib)
+                entry["support"] += 1
+
+        if not cluster_expanded:
+            return raw_results
+
+        # 查扩展词的 term 与领域统计
+        new_vids = [vid for vid in cluster_expanded.keys() if vid not in seed_vids_set]
+        if not new_vids:
+            return raw_results
+
+        term_map = {}
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            ph = ",".join("?" * len(new_vids))
+            rows = conn.execute(
+                f"SELECT voc_id, term FROM vocabulary WHERE voc_id IN ({ph})", new_vids
+            ).fetchall()
+            for r in rows:
+                term_map[int(r["voc_id"])] = r["term"]
+
+        stats_map = {}
+        ph = ",".join("?" * len(new_vids))
+        rows = self.stats_conn.execute(
+            f"SELECT voc_id, work_count, domain_span, domain_dist FROM vocabulary_domain_stats WHERE voc_id IN ({ph})",
+            new_vids,
+        ).fetchall()
+        for r in rows:
+            stats_map[int(r[0])] = (int(r[1]), int(r[2]), r[3])  # work_count, span, dist_json
+
+        # 按与 _query_expansion_with_topology 相同的过滤逻辑进行领域过滤与熔断
+        active_domains = set(active_domain_ids)
+        for vid, agg in cluster_expanded.items():
+            if vid not in term_map or vid not in stats_map:
+                continue
+
+            degree_w, domain_span, dist_json = stats_map[vid]
+            if degree_w <= 0:
+                continue
+            if degree_w > VOCAB_P95_PAPER_COUNT:
+                continue
+
+            try:
+                dist = json.loads(dist_json) if isinstance(dist_json, str) else dist_json
+            except (TypeError, ValueError):
+                dist = {}
+
+            if active_domains:
+                target_degree_w = sum(dist.get(str(d), 0) for d in active_domains)
+            else:
+                # 未限定领域时视作全部论文均有效
+                target_degree_w = degree_w
+
+            # if target_degree_w <= 0:
+            #     continue
+
+            domain_ratio = target_degree_w / degree_w
+            if domain_ratio < 0.4:
+                continue
+
+            new_rec = {
+                "tid": vid,
+                "term": term_map[vid],
+                "sim_score": agg["sim_score"],
+                "hit_count": agg["support"],
+                "degree_w": degree_w,
+                "target_degree_w": target_degree_w,
+                "domain_span": domain_span,
+                "cov_j": 0.0,
+            }
+            raw_results.append(new_rec)
+
+        return raw_results
 
     def _calculate_academic_resonance(self, tids):
         """
@@ -756,8 +942,11 @@ class LabelRecallPath:
         industrial_kws = [v['term'] for v in anchor_skills.values()]
 
         # 3. 领域处理：确定最终过滤范围（正则字符串），domain_id 与向量路命名统一
+        # 只保留最多 3 个领域，避免杂领域带入医学等无关学术词
         active_domain_set = DomainProcessor.to_set(
             domain_id if domain_id and str(domain_id) != "0" else inferred_domains)
+        if len(active_domain_set) > 3:
+            active_domain_set = set(list(sorted(active_domain_set))[:3])
         regex_str = DomainProcessor.build_neo4j_regex(active_domain_set)
 
         # 4. 语义扩展：【核心修复点】
