@@ -30,7 +30,7 @@ from config import (
     VOCAB_INDEX_PATH, VOCAB_MAP_PATH, DB_PATH, VOCAB_STATS_DB_PATH,
     VOCAB_P95_PAPER_COUNT, SIMILAR_TO_TOP_K, SIMILAR_TO_MIN_SCORE,
 )
-from src.utils.domain_config import DOMAIN_DECAY_RATES, DEFAULT_DECAY_RATE
+from src.utils.domain_config import DOMAIN_DECAY_RATES, DEFAULT_DECAY_RATE, DOMAIN_MAP
 
 
 class LabelRecallPath:
@@ -47,6 +47,11 @@ class LabelRecallPath:
       - 与本次要搜索的词汇有共现 → 单词协作 → 沿用 resonance 与 convergence_bonus 加权。
     """
 
+    # 领域探测：检索岗位数、候选领域数、最终领域数
+    DETECT_JOBS_TOP_K = 20
+    CANDIDATE_DOMAINS_TOP_K = 5
+    ACTIVE_DOMAINS_TOP_K = 3
+
     def __init__(self, recall_limit=200, verbose=False):
         self.recall_limit = recall_limit
         self.verbose = verbose
@@ -56,6 +61,10 @@ class LabelRecallPath:
         # 预载入统计数据，用于计算后续 IDF 与 熔断率
         self.total_work_count = self._get_node_count("Work")
         self.total_job_count = self._get_node_count("Job")
+
+        # 领域向量：用于从 Top5 候选领域中按 query 相似度选 Top3
+        self.domain_vectors = {}
+        self._build_domain_vectors()
 
     def _init_resources(self):
         """
@@ -125,13 +134,31 @@ class LabelRecallPath:
         except:
             return 1000000.0
 
+    def _build_domain_vectors(self):
+        """
+        用领域中文名编码得到领域向量（与 QueryEncoder 同空间、已 L2 归一化），
+        供 recall 时从 Top5 候选领域中按与 query 的余弦相似度选 Top3。
+        """
+        try:
+            encoder = QueryEncoder()
+            for domain_id, name in DOMAIN_MAP.items():
+                vec, _ = encoder.encode(name)
+                if vec is not None and vec.size > 0:
+                    self.domain_vectors[str(domain_id)] = np.asarray(vec.flatten(), dtype=np.float32)
+            if self.domain_vectors:
+                print(f"[OK] 领域向量已构建 (共 {len(self.domain_vectors)} 个)")
+        except Exception as e:
+            print(f"[Warn] 领域向量构建失败: {e}，将退化为按候选领域顺序取前 3")
+
     # --- 第一阶段：环境与领域探测 ---
     def _detect_domain_context(self, query_vector):
         """
         【领域探测】通过用户 Query 在 Job 空间寻找最相关的行业分布
-        逻辑：检索相似岗位 -> 统计其 domain_ids -> 确定当前搜索的“主战场”。
+        逻辑：检索 Top20 相似岗位 -> 统计其 domain_ids -> 取 most_common(5) 作为候选领域；
+              后续在 recall() 中再用 query 与 5 个领域向量算相似度取 Top3。
         """
-        _, indices = self.job_index.search(query_vector, 10)
+        k = self.DETECT_JOBS_TOP_K
+        _, indices = self.job_index.search(query_vector, k)
         candidate_ids = [self.job_id_map[idx] for idx in indices[0] if 0 <= idx < len(self.job_id_map)]
 
         domain_counter = collections.Counter()
@@ -141,17 +168,19 @@ class LabelRecallPath:
         )
         for row in cursor:
             if row['d_ids']:
-                for d in str(row['d_ids']).split(','):
-                    domain_counter[d.strip()] += 1
+                for d in DomainProcessor.to_set(row['d_ids']):
+                    domain_counter[d] += 1
 
-        inferred = [d for d, _ in domain_counter.most_common(3)]
-        # dominance：主导领域在 Top10 中的占比，决定后续领域分值的加成强度
-        dominance = (domain_counter.most_common(1)[0][1] / 10.0) if domain_counter else 0
+        # 候选领域 Top5，最终 Top3 在 recall() 中按 query–领域向量相似度选取
+        n_candidate = self.CANDIDATE_DOMAINS_TOP_K
+        inferred = [d for d, _ in domain_counter.most_common(n_candidate)]
+        # dominance：主导领域在这 k 个岗位中的占比
+        dominance = (domain_counter.most_common(1)[0][1] / float(k)) if domain_counter else 0
         return candidate_ids, inferred, dominance
 
     def _get_job_previews(self, job_ids, max_snippet=200):
         """
-        查询命中岗位的名称与描述片段，用于诊断「Top10 是否真是目标领域岗位」。
+        查询命中岗位的名称与描述片段，用于诊断「Top20 是否真是目标领域岗位」。
         返回: [{"id": id, "name": name, "description_snippet": desc[:max_snippet]}, ...]
         """
         if not job_ids or not self.graph:
@@ -285,8 +314,8 @@ class LabelRecallPath:
         if not raw_results:
             return {}, {}, {}
 
-        # 1.5 概念簇扩展：在簇内为每个 seed 找少量近邻学术词，作为次级扩展
-        raw_results = self._expand_with_clusters(raw_results, regex)
+        # 1.5 概念簇扩展：在簇内为每个 seed 找少量近邻学术词（top5，且簇内相似度≥0.6），作为次级扩展
+        raw_results = self._expand_with_clusters(raw_results, regex, topk_per_seed=5)
 
         # --- 2. 【学术共鸣】候选词与本次要搜索的词汇的共现（单词协作）---
         tids = [r['tid'] for r in raw_results]
@@ -316,11 +345,11 @@ class LabelRecallPath:
         self._last_expansion_raw_results = raw_results
         return self._calculate_final_weights(raw_results, query_vector)
 
-    def _expand_with_clusters(self, raw_results, domain_regex, topk_per_seed=10, weight_decay=0.4):
+    def _expand_with_clusters(self, raw_results, domain_regex, topk_per_seed=5, weight_decay=0.4):
         """
         使用概念簇对第一层学术词做局部扩展：
           1. 对每个 seed 词，找到其所属簇（取 score 最高的一个）。
-          2. 在该簇内按向量相似度取 topk_per_seed 个最近学术词作为扩展词。
+          2. 在该簇内只保留 sim_in_cluster >= 0.6 的成员，再按相似度取 topk_per_seed 个作为扩展词。
           3. 扩展词的初始 sim_score 约为 seed_sim_score * sim_in_cluster * weight_decay。
         返回扩展后的 raw_results 列表，结构与原始列表一致（附加若干新 tid）。
         """
@@ -391,6 +420,9 @@ class LabelRecallPath:
                 sim_in_cluster = float(np.dot(seed_vec, mvec))
                 sims.append((m, sim_in_cluster))
 
+            # 只保留簇内相似度 ≥0.6 的成员，再取 topk
+            CLUSTER_MIN_SIM = 0.6
+            sims = [(m, s) for m, s in sims if s >= CLUSTER_MIN_SIM]
             if not sims:
                 continue
 
@@ -451,17 +483,15 @@ class LabelRecallPath:
                 dist = json.loads(dist_json) if isinstance(dist_json, str) else dist_json
             except (TypeError, ValueError):
                 dist = {}
+            expanded = self._expand_domain_dist(dist)
+            degree_w_expanded = sum(expanded.values())
 
             if active_domains:
-                target_degree_w = sum(dist.get(str(d), 0) for d in active_domains)
+                target_degree_w = sum(expanded.get(str(d), 0) for d in active_domains)
             else:
-                # 未限定领域时视作全部论文均有效
-                target_degree_w = degree_w
+                target_degree_w = degree_w_expanded
 
-            # if target_degree_w <= 0:
-            #     continue
-
-            domain_ratio = target_degree_w / degree_w
+            domain_ratio = target_degree_w / degree_w_expanded if degree_w_expanded else 0
             if domain_ratio < 0.4:
                 continue
 
@@ -621,8 +651,10 @@ class LabelRecallPath:
                         dist = json.loads(dist_json) if isinstance(dist_json, str) else dist_json
                     except (TypeError, ValueError):
                         dist = {}
-                    target_degree = sum(dist.get(str(d), 0) for d in active_domain_ids)
-                    target_ratio = (target_degree / work_count) if work_count else 0.0
+                    expanded = self._expand_domain_dist(dist)
+                    degree_w_exp = sum(expanded.values())
+                    target_degree = sum(expanded.get(str(d), 0) for d in active_domain_ids)
+                    target_ratio = (target_degree / degree_w_exp) if degree_w_exp else 0.0
                     cooc_span_sum += domain_span * freq
                     cooc_purity_sum += target_ratio * freq
                     total_freq += freq
@@ -640,6 +672,22 @@ class LabelRecallPath:
         except Exception:
             # 共现表或主库不可用时不改变行为，cooc_span 置 0，cooc_purity 用表数据若有
             return {str(rec["tid"]): {"cooc_span": 0.0, "cooc_purity": cooc_purity_from_table.get(str(rec["tid"]), 0.0)} for rec in raw_results}
+
+    def _expand_domain_dist(self, dist):
+        """
+        将 domain_dist 中可能存在的复合 key（如 "2|7|9"）拆成单领域并合并计数。
+        与 DomainProcessor.to_set 的拆分规则一致（支持 | , 空格），索引不变时在召回侧解析。
+        返回: 单领域 ID -> 该领域下的 (论文-领域) 出现次数。
+        """
+        if not dist:
+            return {}
+        out = {}
+        for key, count in dist.items():
+            if not key or not count:
+                continue
+            for d in DomainProcessor.to_set(key):
+                out[d] = out.get(d, 0) + count
+        return out
 
     def _query_expansion_with_topology(self, v_ids, regex):
         """
@@ -720,22 +768,26 @@ class LabelRecallPath:
                 dist = json.loads(dist_json) if isinstance(dist_json, str) else dist_json
             except (TypeError, ValueError):
                 dist = {}
-            target_degree_w = sum(dist.get(str(d), 0) for d in active_domains)
-            # 领域纯度过滤：三个目标领域合计占比 ≥40%（不再要求“至少 1 篇在 3 领域”，由纯度统一过滤）
-            domain_ratio = target_degree_w / degree_w
+            expanded = self._expand_domain_dist(dist)
+            degree_w_expanded = sum(expanded.values())
+            target_degree_w = sum(expanded.get(str(d), 0) for d in active_domains)
+            # 领域纯度过滤：三个目标领域合计占比 ≥40%（用展开后的单领域统计，兼容索引中的复合 key 如 "2|7|9"）
+            domain_ratio = target_degree_w / degree_w_expanded if degree_w_expanded else 0
             if domain_ratio < 0.4:
                 pipeline["n_fail_domain_ratio"] += 1
                 if len(pipeline["sample_fail_ratio"]) < 5:
                     pipeline["sample_fail_ratio"].append(tid)
                 details = pipeline.get("fail_domain_ratio_details", [])
                 if len(details) < 20:
+                    all_ratio = {d: round(expanded.get(d, 0) / degree_w_expanded, 4) for d in expanded} if degree_w_expanded else {}
                     details.append({
                         "tid": tid,
                         "term": by_tid[tid].get("term", ""),
                         "degree_w": degree_w,
                         "target_degree_w": target_degree_w,
                         "domain_ratio": round(domain_ratio, 4),
-                        "target_domains_dist": {str(d): dist.get(str(d), 0) for d in active_domains},
+                        "target_domains_dist": {str(d): expanded.get(str(d), 0) for d in active_domains},
+                        "all_domains_ratio": all_ratio,
                     })
                     pipeline["fail_domain_ratio_details"] = details
                 continue
@@ -973,11 +1025,28 @@ class LabelRecallPath:
         industrial_kws = [v['term'] for v in anchor_skills.values()]
 
         # 3. 领域处理：确定最终过滤范围（正则字符串），domain_id 与向量路命名统一
-        # 只保留最多 3 个领域，避免杂领域带入医学等无关学术词
-        active_domain_set = DomainProcessor.to_set(
-            domain_id if domain_id and str(domain_id) != "0" else inferred_domains)
-        if len(active_domain_set) > 3:
-            active_domain_set = set(list(sorted(active_domain_set))[:3])
+        # 若用户指定 domain_id：按原逻辑 to_set 后最多取 3 个；否则从 Top5 候选领域按 query–领域向量相似度取 Top3
+        if domain_id and str(domain_id) != "0":
+            active_domain_set = DomainProcessor.to_set(domain_id)
+            if len(active_domain_set) > self.ACTIVE_DOMAINS_TOP_K:
+                active_domain_set = set(list(sorted(active_domain_set))[: self.ACTIVE_DOMAINS_TOP_K])
+        else:
+            candidate_5 = inferred_domains  # 来自 _detect_domain_context 的 most_common(5)
+            if self.domain_vectors and len(candidate_5) > self.ACTIVE_DOMAINS_TOP_K:
+                q = np.asarray(query_vector, dtype=np.float32).flatten()
+                if q.size > 0:
+                    scores = []
+                    for d in candidate_5:
+                        dv = self.domain_vectors.get(str(d))
+                        if dv is not None and dv.size == q.size:
+                            sc = float(np.dot(q, dv))
+                            scores.append((d, sc))
+                    scores.sort(key=lambda x: x[1], reverse=True)
+                    active_domain_set = set(x[0] for x in scores[: self.ACTIVE_DOMAINS_TOP_K])
+                else:
+                    active_domain_set = set(list(sorted(candidate_5))[: self.ACTIVE_DOMAINS_TOP_K])
+            else:
+                active_domain_set = set(list(sorted(candidate_5))[: self.ACTIVE_DOMAINS_TOP_K])
         regex_str = DomainProcessor.build_neo4j_regex(active_domain_set)
 
         # 4. 语义扩展：【核心修复点】
@@ -1095,7 +1164,7 @@ if __name__ == "__main__":
             db = l_path.last_debug_info
             print("\n" + "🔍 [深度诊断流水线]" + "-" * 98)
 
-            # 1. 领域探测（增强：打印命中的岗位 ID + Top10 岗位名称与描述片段）
+            # 1. 领域探测（增强：打印命中的岗位 ID + Top20 岗位名称与描述片段）
             domains = db.get('active_domains', [])
             domain_str = " | ".join(domains) if domains else "未限制"
             print(f"【Step 1: 领域探测】目标领域并集: [{domain_str}] (置信度: {db.get('dominance')})")
@@ -1151,6 +1220,12 @@ if __name__ == "__main__":
                         dist_s = x.get("target_domains_dist") or {}
                         dist_str = ", ".join(f"{k}:{v}" for k, v in sorted(dist_s.items()))
                         print(f"      {term_s:<20} | {x.get('tid', ''):<8} | {x.get('degree_w', 0):<10} | {x.get('target_degree_w', 0):<16} | {x.get('domain_ratio', 0):<12} | {dist_str}")
+                        all_ratio = x.get("all_domains_ratio") or {}
+                        if all_ratio:
+                            ratio_str = ", ".join(
+                                f"{DOMAIN_MAP.get(d, d)}({d}):{all_ratio[d]*100:.1f}%" for d in sorted(all_ratio.keys(), key=lambda d: -all_ratio[d])
+                            )
+                            print(f"        各领域占比: {ratio_str}")
                 print(f"      最终通过进入 Step 3 的学术词数: {p.get('n_final', 0)}")
             else:
                 print(f"【Step 3 前置: 语义扩展管道】无数据（未执行或未记录）")
