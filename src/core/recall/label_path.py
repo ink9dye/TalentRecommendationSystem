@@ -299,18 +299,64 @@ class LabelRecallPath:
             rows = [r for r in rows if (r["term"] or "").lower() in cleaned_terms]
         return {str(r["vid"]): {"term": r["term"]} for r in rows}
     # --- 第三阶段：语义扩展 ---
-    def _expand_semantic_map(self, core_vids, anchor_skills, domain_regex=None, query_vector=None):
+    # 融合权重：相似边 0.2，语境向量 0.8；多次命中奖励：泛词(work_count大)不奖励，其余按 ln(min(hit,5)) 计算并封顶
+    CTX_EDGE_WEIGHT = 0.8
+    EDGE_WEIGHT = 0.2
+    HIT_BONUS_BETA = 0.25
+    HIT_BONUS_CAP = 1.5
+    HIT_BONUS_HIT_CAP = 5
+    HIT_BONUS_DEGREE_GATE = 200
+    # 领域纯度阈值：目标领域产出占比下限（用于筛掉跨领域泛词）
+    DOMAIN_PURITY_MIN = 0.6
+    # ctx 路向量加权和参数：v_ctx = normalize(λ*v_jd + (1-λ)*v_term)
+    CTX_MIX_LAMBDA = 0.7
+
+    def _expand_semantic_map(self, core_vids, anchor_skills, domain_regex=None, query_vector=None, query_text=None):
         """
         【学术共鸣 + 共现领域版】语义扩展引擎。
 
-        逻辑：工业锚点激发 -> 学术候选池生成 -> 学术共鸣(resonance)与共现领域指标(cooc_span/cooc_purity) ->
-              最终打分。输入输出格式不变：仍返回 (score_map, term_map, idf_map)，key 为 tid 字符串。
+        逻辑：工业锚点激发 -> 边路(SIMILAR_TO)与语境向量路(JD+锚点)候选 -> 0.2/0.8 融合 + 多次命中奖励 ->
+              学术候选池 -> 共鸣/共现指标 -> 最终打分。输入输出格式不变：仍返回 (score_map, term_map, idf_map)。
         """
         regex = domain_regex if domain_regex else ".*"
 
-        # 1. 辅助函数 A：执行图检索，获取初步的学术词候选（tid 列表）
-        # 这一步通过 SIMILAR_TO 建立物理通路
-        raw_results = self._query_expansion_with_topology(core_vids, regex)
+        # 1. 边路：SIMILAR_TO 图检索
+        raw_edge = self._query_expansion_with_topology(core_vids, regex)
+        # 2. 语境向量路：JD 片段 + 锚点 编码后在 vocabulary 索引中检索（仅学术词）
+        raw_ctx = self._query_expansion_by_context_vector(anchor_skills, query_text, regex, topk_per_anchor=5) if query_text else []
+
+        # 3. 按 tid 合并：sim_merged = (0.2*sim_edge + 0.8*sim_ctx) * hit_bonus，src_vids 取并集
+        edge_map = {rec["tid"]: rec for rec in raw_edge}
+        ctx_map = {rec["tid"]: rec for rec in raw_ctx}
+        all_tids = set(edge_map.keys()) | set(ctx_map.keys())
+        raw_merged = []
+        for tid in all_tids:
+            rec_e = edge_map.get(tid)
+            rec_c = ctx_map.get(tid)
+            sim_edge = float(rec_e["sim_score"]) if rec_e else 0.0
+            sim_ctx = float(rec_c["sim_score"]) if rec_c else 0.0
+            src_vids = set()
+            if rec_e:
+                src_vids.update(rec_e.get("src_vids") or [])
+            if rec_c:
+                src_vids.update(rec_c.get("src_vids") or [])
+            hit = len(src_vids)
+            base = self.EDGE_WEIGHT * sim_edge + self.CTX_EDGE_WEIGHT * sim_ctx
+            # 泛词 gate：work_count(=degree_w) 大的词不享受命中奖励；其余 hit 封顶到 5 防止爆炸
+            degree_w = int((rec_e or rec_c).get("degree_w", 0) or 0)
+            if degree_w >= self.HIT_BONUS_DEGREE_GATE:
+                bonus = 1.0
+            else:
+                hit_eff = min(hit, self.HIT_BONUS_HIT_CAP) if hit >= 1 else 1
+                bonus = min(self.HIT_BONUS_CAP, 1.0 + self.HIT_BONUS_BETA * math.log(hit_eff))
+            sim_merged = base * bonus
+            rec = dict(rec_e or rec_c)
+            rec["sim_score"] = sim_merged
+            rec["src_vids"] = sorted(src_vids)
+            rec["hit_count"] = hit
+            raw_merged.append(rec)
+
+        raw_results = raw_merged
         if not raw_results:
             return {}, {}, {}
 
@@ -494,7 +540,7 @@ class LabelRecallPath:
                 target_degree_w = degree_w_expanded
 
             domain_ratio = target_degree_w / degree_w_expanded if degree_w_expanded else 0
-            if domain_ratio < 0.4:
+            if domain_ratio < self.DOMAIN_PURITY_MIN:
                 continue
 
             new_rec = {
@@ -693,6 +739,156 @@ class LabelRecallPath:
                 out[d] = out.get(d, 0) + count
         return out
 
+    def _load_vocab_meta(self):
+        """懒加载：voc_id -> (term, entity_type)，用于语境向量扩展时只保留学术词。"""
+        if getattr(self, '_vocab_meta', None) is not None:
+            return
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                rows = conn.execute("SELECT voc_id, term, entity_type FROM vocabulary").fetchall()
+                self._vocab_meta = {int(r[0]): (r[1] or "", r[2] or "") for r in rows}
+        except Exception:
+            self._vocab_meta = {}
+
+    def _query_expansion_by_context_vector(self, anchor_skills, query_text, regex, topk_per_anchor=5):
+        """
+        用「JD 上下文 + 锚点」编码后在 vocabulary 向量索引中检索，只保留学术词，并与 topology 同结构的 stats 过滤。
+        返回与 _query_expansion_with_topology 同结构的 rec 列表（tid, term, sim_score, src_vids, hit_count, degree_w, ...）。
+        """
+        if not query_text or not anchor_skills:
+            return []
+        self._load_vocab_meta()
+        if not getattr(self, '_query_encoder', None):
+            self._query_encoder = QueryEncoder()
+        encoder = self._query_encoder
+        jd_snippet = (query_text or "").strip()[:500]
+        active_domains = set(re.findall(r'\d+', regex)) if regex and regex != ".*" else set()
+
+        # --- ctx 路策略：禁用动态共振 + 向量加权和 + term 向量缓存 ---
+        # 1) 编码一次 JD snippet（normalize_embeddings=True -> 已归一化）
+        v_jd = encoder.model.encode(
+            [jd_snippet],
+            batch_size=1,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        v_jd = np.asarray(v_jd, dtype=np.float32).reshape(1, -1)
+
+        # 2) 收集 term，并准备缓存（term_lower -> vec）
+        if not hasattr(self, "_term_vec_cache") or self._term_vec_cache is None:
+            self._term_vec_cache = {}
+
+        ctx_src_vids = []
+        terms_lower = []
+        terms_raw = []
+        for vid, info in anchor_skills.items():
+            term = (info.get("term") or "").strip()
+            if not term:
+                continue
+            try:
+                src_vid = int(vid)
+            except Exception:
+                continue
+            ctx_src_vids.append(src_vid)
+            tkey = term.lower()
+            terms_lower.append(tkey)
+            terms_raw.append(term)
+
+        if not terms_lower:
+            return []
+
+        # 3) 批量编码未命中的 term（短文本，禁用动态共振）
+        to_encode = []
+        to_encode_keys = []
+        for tkey, term in zip(terms_lower, terms_raw):
+            if tkey not in self._term_vec_cache:
+                to_encode.append(term)
+                to_encode_keys.append(tkey)
+
+        if to_encode:
+            new_vecs = encoder.model.encode(
+                to_encode,
+                batch_size=64,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            new_vecs = np.asarray(new_vecs, dtype=np.float32)
+            for k, vec in zip(to_encode_keys, new_vecs):
+                self._term_vec_cache[k] = vec
+
+        # 4) 按锚点顺序组装 term 向量矩阵
+        v_terms = np.stack([self._term_vec_cache[tkey] for tkey in terms_lower], axis=0).astype(np.float32)
+        if v_terms.ndim == 1:
+            v_terms = v_terms.reshape(1, -1)
+
+        # 5) 向量加权和生成 ctx 向量并归一化
+        lam = float(self.CTX_MIX_LAMBDA)
+        embs = lam * v_jd + (1.0 - lam) * v_terms
+        faiss.normalize_L2(embs)
+
+        # --- 批量检索 ---
+        k = min(topk_per_anchor * 3, 30)
+        scores, labels = self.vocab_index.search(embs, k)
+
+        # --- 聚合：按 tid 聚合 max(ctx_sim) + src_vids ---
+        by_tid = {}
+        for row_i, src_vid in enumerate(ctx_src_vids):
+            for score, tid in zip(scores[row_i], labels[row_i]):
+                tid = int(tid)
+                if tid <= 0 or tid == int(src_vid):
+                    continue
+                meta = self._vocab_meta.get(tid, ("", ""))
+                if meta[1] not in ("concept", "keyword"):
+                    continue
+                ctx_sim = max(0.0, float(score))
+                if tid not in by_tid:
+                    by_tid[tid] = {"ctx_sim": 0.0, "src_vids": set(), "term": meta[0] or ""}
+                by_tid[tid]["ctx_sim"] = max(by_tid[tid]["ctx_sim"], ctx_sim)
+                by_tid[tid]["src_vids"].add(int(src_vid))
+                if not by_tid[tid]["term"] and meta[0]:
+                    by_tid[tid]["term"] = meta[0]
+
+        tids = list(by_tid.keys())
+        if not tids:
+            return []
+
+        results = []
+        for tid in tids:
+            row = self.stats_conn.execute(
+                "SELECT work_count, domain_span, domain_dist FROM vocabulary_domain_stats WHERE voc_id=?",
+                (tid,),
+            ).fetchone()
+            if not row:
+                continue
+            degree_w, domain_span, dist_json = row
+            if degree_w > VOCAB_P95_PAPER_COUNT:
+                continue
+            try:
+                dist = json.loads(dist_json) if isinstance(dist_json, str) else dist_json
+            except (TypeError, ValueError):
+                dist = {}
+            expanded = self._expand_domain_dist(dist)
+            degree_w_expanded = sum(expanded.values())
+            target_degree_w = sum(expanded.get(str(d), 0) for d in active_domains)
+            domain_ratio = target_degree_w / degree_w_expanded if degree_w_expanded else 0
+            if domain_ratio < self.DOMAIN_PURITY_MIN:
+                continue
+            rec = by_tid[tid]
+            src_vids = sorted(rec["src_vids"])
+            results.append({
+                "tid": tid,
+                "term": rec["term"] or self._vocab_meta.get(tid, ("", None))[0],
+                "sim_score": rec["ctx_sim"],
+                "src_vids": src_vids,
+                "hit_count": len(src_vids),
+                "degree_w": degree_w,
+                "target_degree_w": target_degree_w,
+                "domain_span": domain_span,
+                "cov_j": 0.0,
+                "origin": "context_vector",
+            })
+        return results
+
     def _query_expansion_with_topology(self, v_ids, regex):
         """
         【改造版】SIMILAR_TO 每锚点 top-K、权重下限 + 学术词 paper_count 上限。
@@ -820,9 +1016,9 @@ class LabelRecallPath:
             expanded = self._expand_domain_dist(dist)
             degree_w_expanded = sum(expanded.values())
             target_degree_w = sum(expanded.get(str(d), 0) for d in active_domains)
-            # 领域纯度过滤：三个目标领域合计占比 ≥40%（用展开后的单领域统计，兼容索引中的复合 key 如 "2|7|9"）
+            # 领域纯度过滤：目标领域合计占比 ≥ DOMAIN_PURITY_MIN（用展开后的单领域统计，兼容索引中的复合 key 如 "2|7|9"）
             domain_ratio = target_degree_w / degree_w_expanded if degree_w_expanded else 0
-            if domain_ratio < 0.4:
+            if domain_ratio < self.DOMAIN_PURITY_MIN:
                 pipeline["n_fail_domain_ratio"] += 1
                 if len(pipeline["sample_fail_ratio"]) < 5:
                     pipeline["sample_fail_ratio"].append(tid)
@@ -1113,14 +1309,13 @@ class LabelRecallPath:
                 active_domain_set = set(list(sorted(candidate_5))[: self.ACTIVE_DOMAINS_TOP_K])
         regex_str = DomainProcessor.build_neo4j_regex(active_domain_set)
 
-        # 4. 语义扩展：【核心修复点】
-        # 补齐 query_vector 参数，彻底解决 _calculate_final_weights 报错问题。
-        # 此步骤现在集成：技术共振奖励(Hit Count) + SBERT 语义守门员(Semantic Factor)
+        # 4. 语义扩展：【核心修复点】边路 + 语境向量路融合(0.2/0.8)，多次命中奖励
         score_map, term_map, idf_map = self._expand_semantic_map(
             [int(k) for k in anchor_skills.keys()],
             anchor_skills,
             domain_regex=regex_str,
-            query_vector=query_vector  # <--- 关键修复：补齐此参数传递
+            query_vector=query_vector,
+            query_text=query_text,
         )
 
         # 对诊断用的学术词进行去重展示
@@ -1136,7 +1331,7 @@ class LabelRecallPath:
         final_cypher = f"""
         MATCH (v:Vocabulary) WHERE v.id IN $v_ids
         WITH v, COUNT {{ (v)<-[:HAS_TOPIC]-() }} AS degree_w
-        WHERE (degree_w * 1.0 / $total_w) < 0.02 
+        WHERE (degree_w * 1.0 / $total_w) < 0.01 
         WITH v, log10($total_w / (degree_w + 1)) AS idf_weight
         MATCH (v)<-[:HAS_TOPIC]-(w:Work) 
         WHERE 1=1 {domain_clause} 
@@ -1225,7 +1420,7 @@ if __name__ == "__main__":
             query_vec, _ = encoder.encode(user_input)
             faiss.normalize_L2(query_vec)
 
-            top_ids, search_time = l_path.recall(query_vec, domain_id=domain_choice)
+            top_ids, search_time = l_path.recall(query_vec, domain_id=domain_choice, query_text=user_input)
 
             # --- 核心诊断日志 ---
             db = l_path.last_debug_info
