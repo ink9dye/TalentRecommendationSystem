@@ -673,10 +673,13 @@ class LabelRecallPath:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             ph = ",".join("?" * len(new_vids))
+            # 仅保留 entity_type='concept' 的学术概念，过滤 industry 等工业实体
             rows = conn.execute(
-                f"SELECT voc_id, term FROM vocabulary WHERE voc_id IN ({ph})", new_vids
+                f"SELECT voc_id, term, entity_type FROM vocabulary WHERE voc_id IN ({ph})", new_vids
             ).fetchall()
             for r in rows:
+                if (r["entity_type"] or "").lower() != "concept":
+                    continue
                 term_map[int(r["voc_id"])] = r["term"]
 
         stats_map = {}
@@ -1080,6 +1083,7 @@ class LabelRecallPath:
         UNWIND $v_ids AS vid
         MATCH (v:Vocabulary {id: vid})-[r:SIMILAR_TO]->(v_rel:Vocabulary)
         WHERE r.score >= $min_score
+          AND coalesce(v_rel.type, 'concept') = 'concept'
         WITH vid, v_rel.id AS tid, v_rel.term AS term, r.score AS sim_score
         ORDER BY vid, sim_score DESC
         WITH vid, collect({tid: tid, term: term, sim_score: sim_score})[0..$top_k] AS top3
@@ -1290,17 +1294,6 @@ class LabelRecallPath:
         # 逻辑：目标领域的产出占比（展开后统计），过滤“挂羊头卖狗肉”的词汇
         raw_tag_purity = (rec['target_degree_w'] / degree_w_expanded) if degree_w_expanded else 0.0
         tag_purity = min(1.0, raw_tag_purity)
-        # 记录供诊断
-        if getattr(self, "_last_tag_purity_debug", None) is not None:
-            self._last_tag_purity_debug.append({
-                "tid": rec.get("tid"),
-                "term": (rec.get("term") or "")[:40],
-                "degree_w": degree_w,
-                "degree_w_expanded": degree_w_expanded,
-                "target_degree_w": rec.get("target_degree_w"),
-                "raw_tag_purity": round(raw_tag_purity, 6),
-                "capped_tag_purity": round(tag_purity, 6),
-            })
 
         # 2. 计算基础学术稀缺度 (IDF)
         idf_val = math.log10(self.total_work_count / (degree_w + 1))
@@ -1333,6 +1326,19 @@ class LabelRecallPath:
         if idx is not None and query_vector is not None:
             term_vec = self.all_vocab_vectors[idx]
             cos_sim = float(np.dot(term_vec, query_vector.flatten()))
+
+        # 记录供诊断（包含 cos_sim，用于后续调整 SEMANTIC_MIN 等阈值）
+        if getattr(self, "_last_tag_purity_debug", None) is not None:
+            self._last_tag_purity_debug.append({
+                "tid": rec.get("tid"),
+                "term": (rec.get("term") or "")[:40],
+                "degree_w": degree_w,
+                "degree_w_expanded": degree_w_expanded,
+                "target_degree_w": rec.get("target_degree_w"),
+                "raw_tag_purity": round(raw_tag_purity, 6),
+                "capped_tag_purity": round(tag_purity, 6),
+                "cos_sim": round(cos_sim, 6),
+            })
 
         # 语义硬拦截：低相关词直接置 0，避免稀缺词（高 IDF）“以小博大”带偏召回
         if cos_sim < float(self.SEMANTIC_MIN):
