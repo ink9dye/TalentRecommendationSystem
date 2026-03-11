@@ -532,7 +532,7 @@ class LabelRecallPath:
             return [] if return_raw else ({}, {}, {})
 
         # 1.5 概念簇扩展：在簇内为每个 seed 找少量近邻学术词（top5，且簇内相似度≥0.6），作为次级扩展
-        raw_results = self._expand_with_clusters(raw_results, regex, topk_per_seed=5)
+        raw_results = self._expand_with_clusters(raw_results, regex, topk_per_seed=7)
 
         # --- 2. 【学术共鸣】候选词与本次要搜索的词汇的共现（单词协作）---
         tids = [r['tid'] for r in raw_results]
@@ -1598,6 +1598,7 @@ class LabelRecallPath:
         all_works_count = 0
         for record in author_papers_list:
             author_total_score, best_paper = 0.0, None
+            per_author_papers = []
             for paper in record["papers"]:
                 all_works_count += 1
                 p_score, p_hits = self._compute_contribution(paper, context)
@@ -1607,10 +1608,28 @@ class LabelRecallPath:
                         "title": paper["title"], "year": paper["year"],
                         "contribution": round(p_score, 4), "hits": p_hits,
                     }
+                if p_score > 0:
+                    per_author_papers.append({
+                        "title": paper["title"],
+                        "year": paper["year"],
+                        "contribution": round(p_score, 4),
+                        "hits": p_hits,
+                    })
             if author_total_score > 0:
+                # 多篇代表作：按单篇贡献度排序，取前 3 作为代表作列表
+                per_author_papers.sort(key=lambda x: x.get("contribution", 0.0), reverse=True)
+                top_papers = per_author_papers[:3]
+                # 标签汇总：统计作者所有正贡献论文中的标签命中次数
+                tag_counter = collections.Counter()
+                for p in per_author_papers:
+                    tag_counter.update(p.get("hits") or [])
+                tag_stats = [{"term": t, "count": c} for t, c in tag_counter.most_common(10)]
                 scored_authors.append({
                     "aid": record["aid"], "score": author_total_score,
-                    "top_paper": best_paper, "paper_count": len(record["papers"]),
+                    "top_paper": best_paper,
+                    "paper_count": len(record["papers"]),
+                    "top_papers": top_papers,
+                    "tag_stats": tag_stats,
                 })
         scored_authors.sort(key=lambda x: x["score"], reverse=True)
         sorted_terms = sorted(
@@ -1639,7 +1658,7 @@ class LabelRecallPath:
             "recall_vocab_count": len(score_map),
             "work_count": all_works_count,
             "author_count": len(scored_authors),
-            "top_samples": scored_authors[:20],
+            "top_samples": scored_authors[:50],
         }
         return [a["aid"] for a in scored_authors], self.last_debug_info
 
@@ -1911,22 +1930,47 @@ if __name__ == "__main__":
             else:
                 print(f"【Step 4: 召回规模】检索到 {w_count} 篇学术论文，最终锁定 {a_count} 名垂直领域专家。")
 
-            # --- 专家排名展示（增强：前几条打印原始得分 + 代表作详情）---
+            # --- 专家排名展示（增强：展示前 50 名，多篇代表作与标签统计）---
             print("-" * 115)
             print(f"{'排名':<6} | {'作者 ID':<12} | {'综合得分':<18} | {'学术领域代表作 (命中标签)'}")
             print("-" * 115)
 
             for i, item in enumerate(db.get('top_samples', []), 1):
-                tp = item.get('top_paper', {})
-                title = (tp.get('title') or 'Unknown')[:55]
-                hit_tags = ", ".join(tp.get('hits', []))
                 raw_score = item.get('score', 0)
-                contrib = tp.get('contribution', 0)
                 score_str = f"{raw_score:.4f}" if isinstance(raw_score, (int, float)) else str(raw_score)
-                print(f"#{i:<5} | {item['aid']:<12} | {score_str:<18} | 《{title}》")
-                print(f"{' ':23} ┗━ 核心命中: {hit_tags}")
-                if i <= 5:
-                    print(f"{' ':23}     [调试] 原始得分={raw_score:.6f}, 代表作贡献={contrib:.6f}")
+                paper_count = item.get('paper_count', 0)
+                aid = item.get('aid', '')
+                # 主行：作者整体信息
+                print(f"#{i:<5} | {aid:<12} | {score_str:<18} | 论文数: {paper_count}")
+
+                # 代表作（单篇贡献度最高的一篇）
+                tp = item.get('top_paper', {}) or {}
+                if tp:
+                    title = (tp.get('title') or 'Unknown')[:55]
+                    hit_tags = ", ".join(tp.get('hits', []))
+                    contrib = tp.get('contribution', 0)
+                    print(f"{' ':23} ┗━ 代表作: 《{title}》")
+                    print(f"{' ':23}     年份={tp.get('year', 'Unknown')}, 贡献={contrib:.6f}, 命中标签: {hit_tags}")
+
+                # 多篇代表作：按贡献度排序的前 3 篇
+                top_papers = item.get('top_papers') or []
+                if top_papers:
+                    print(f"{' ':23}     多篇代表作 Top{len(top_papers)}:")
+                    for p in top_papers:
+                        p_title = (p.get('title') or 'Unknown')[:55]
+                        p_hits = ", ".join(p.get('hits', []))
+                        p_contrib = p.get('contribution', 0.0)
+                        print(f"{' ':23}       ● [{p.get('year', 'Unknown')}] 《{p_title}》 | 贡献={p_contrib:.6f} | 命中: {p_hits}")
+
+                # 标签汇总统计：Top10 标签及命中次数
+                tag_stats = item.get('tag_stats') or []
+                if tag_stats:
+                    tags_str = ", ".join(f"{t.get('term', '')}({t.get('count', 0)})" for t in tag_stats)
+                    print(f"{' ':23}     核心标签Top{len(tag_stats)}: {tags_str}")
+
+                # 只展示前 50 名，避免控制台输出过长
+                if i >= 50:
+                    break
 
             print("-" * 115)
             print(f"[*] 诊断完成。全链路耗时: {search_time:.2f}ms")

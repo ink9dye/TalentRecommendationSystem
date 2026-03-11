@@ -39,7 +39,7 @@ COLLAB_DB_PATH = os.path.join(INDEX_DIR, "scholar_collaboration.db")
 VOCAB_STATS_DB_PATH = os.path.join(INDEX_DIR, 'vocab_stats.db')
 
 # --- 6.1 标签路召回参数（学术词过滤与 SIMILAR_TO 约束）---
-VOCAB_P95_PAPER_COUNT = 277   # 学术词 paper_count 上限，过滤泛词（如 machine learning / algorithm）
+VOCAB_P95_PAPER_COUNT = 350   # 学术词 paper_count 上限，过滤泛词（如 machine learning / algorithm）
 SIMILAR_TO_TOP_K = 3         # 每个锚点词最多扩展的学术词数量
 SIMILAR_TO_MIN_SCORE = 0.65   # SIMILAR_TO 边权重下限，防止扩散过强
 
