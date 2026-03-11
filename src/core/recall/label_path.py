@@ -56,7 +56,7 @@ class LabelRecallPath:
     ANCHOR_FREQ_TOP_K = 30
     ANCHOR_FINAL_TOP_K = 20
     ANCHOR_MELT_COV_J = 0.03  # 熔断：全图岗位覆盖率 >= 3% 的技能不参与锚点
-    JD_VOCAB_TOP_K = 15       # 用 JD 向量直接搜 vocabulary 的 top-K 作为补充锚点
+    JD_VOCAB_TOP_K = 20       # 用 JD 向量直接搜 vocabulary 的 top-K 作为补充锚点
     ANCHOR_SIM_MIN = 0.4      # 锚点语义重排的最小相似度阈值（低于直接丢弃）
     ANCHOR_MIN_JOB_FREQ = 2   # 锚点共识门槛：至少出现在 Top20 命中岗位中的 2 个岗位
 
@@ -475,7 +475,7 @@ class LabelRecallPath:
     HIT_BONUS_HIT_CAP = 5
     HIT_BONUS_DEGREE_GATE = 200
     # 领域纯度阈值：目标领域产出占比下限（用于筛掉跨领域泛词）
-    DOMAIN_PURITY_MIN = 0.5
+    DOMAIN_PURITY_MIN = 0.48
     # ctx 路向量加权和参数：v_ctx = normalize(λ*v_jd + (1-λ)*v_term)
     CTX_MIX_LAMBDA = 0.7
     # 语义硬门槛：候选词与 query 的余弦相似度低于阈值时直接置 0（防止稀缺词以高 IDF 带偏）
@@ -715,8 +715,12 @@ class LabelRecallPath:
             else:
                 target_degree_w = degree_w_expanded
 
-            domain_ratio = target_degree_w / degree_w_expanded if degree_w_expanded else 0
-            if domain_ratio < self.DOMAIN_PURITY_MIN:
+            domain_ratio = target_degree_w / degree_w_expanded if degree_w_expanded else 0.0
+            if degree_w <= 40:
+                purity_min = 0.4
+            else:
+                purity_min = float(self.DOMAIN_PURITY_MIN)
+            if domain_ratio < purity_min:
                 continue
 
             new_rec = {
@@ -1045,8 +1049,12 @@ class LabelRecallPath:
             expanded = self._expand_domain_dist(dist)
             degree_w_expanded = sum(expanded.values())
             target_degree_w = sum(expanded.get(str(d), 0) for d in active_domains)
-            domain_ratio = target_degree_w / degree_w_expanded if degree_w_expanded else 0
-            if domain_ratio < self.DOMAIN_PURITY_MIN:
+            domain_ratio = target_degree_w / degree_w_expanded if degree_w_expanded else 0.0
+            if degree_w <= 40:
+                purity_min = 0.4
+            else:
+                purity_min = float(self.DOMAIN_PURITY_MIN)
+            if domain_ratio < purity_min:
                 continue
             rec = by_tid[tid]
             src_vids = sorted(rec["src_vids"])
@@ -1194,9 +1202,13 @@ class LabelRecallPath:
             expanded = self._expand_domain_dist(dist)
             degree_w_expanded = sum(expanded.values())
             target_degree_w = sum(expanded.get(str(d), 0) for d in active_domains)
-            # 领域纯度过滤：目标领域合计占比 ≥ DOMAIN_PURITY_MIN（用展开后的单领域统计，兼容索引中的复合 key 如 "2|7|9"）
-            domain_ratio = target_degree_w / degree_w_expanded if degree_w_expanded else 0
-            if domain_ratio < self.DOMAIN_PURITY_MIN:
+            # 领域纯度过滤（分档）：小词更宽松，大词维持全局阈值
+            domain_ratio = target_degree_w / degree_w_expanded if degree_w_expanded else 0.0
+            if degree_w <= 40:
+                purity_min = 0.4
+            else:
+                purity_min = float(self.DOMAIN_PURITY_MIN)
+            if domain_ratio < purity_min:
                 if degree_w_expanded == 0:
                     pipeline["n_fail_degree_w_expanded_zero"] += 1
                 pipeline["n_fail_domain_ratio"] += 1
@@ -1205,7 +1217,7 @@ class LabelRecallPath:
                 details = pipeline.get("fail_domain_ratio_details", [])
                 if len(details) < 20:
                     all_ratio = {d: round(expanded.get(d, 0) / degree_w_expanded, 4) for d in expanded} if degree_w_expanded else {}
-                    fail_reason = "degree_w_expanded=0" if degree_w_expanded == 0 else "domain_ratio<0.5"
+                    fail_reason = "degree_w_expanded=0" if degree_w_expanded == 0 else f"domain_ratio<{purity_min}"
                     details.append({
                         "tid": tid,
                         "term": by_tid[tid].get("term", ""),
@@ -1344,8 +1356,8 @@ class LabelRecallPath:
         if cos_sim < float(self.SEMANTIC_MIN):
             return 0.0, idf_val
 
-        # 应用 6 次方非线性惩罚，实现对弱相关词的断崖式拦截
-        semantic_factor = math.pow(max(0, cos_sim), 6)
+        # 应用 3 次方非线性惩罚，实现对弱相关词的断崖式拦截
+        semantic_factor = math.pow(max(0, cos_sim), 3)
 
         # --- 6. 【共现领域惩罚与奖励】基于 vocab_stats 的 vocabulary_cooccurrence ---
         # 降权：与各种领域的词都共现 → 万金油 → 共现伙伴平均领域跨度大 → cooc_span 大 → 乘小于 1 的因子
@@ -1566,7 +1578,7 @@ class LabelRecallPath:
         final_cypher = f"""
         MATCH (v:Vocabulary) WHERE v.id IN $v_ids
         WITH v, COUNT {{ (v)<-[:HAS_TOPIC]-() }} AS degree_w
-        WHERE (degree_w * 1.0 / $total_w) < 0.01 
+        WHERE (degree_w * 1.0 / $total_w) < 0.015 
         WITH v, log10($total_w / (degree_w + 1)) AS idf_weight
         MATCH (v)<-[:HAS_TOPIC]-(w:Work) 
         WHERE 1=1 {domain_clause} 
