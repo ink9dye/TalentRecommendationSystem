@@ -69,6 +69,8 @@ class LabelRecallPath:
         self.total_work_count = self._get_node_count("Work")
         self.total_job_count = self._get_node_count("Job")
 
+        # 编码器单例：全流程共用，避免重复加载模型（领域向量、锚点补充、语境扩展、main 均复用）
+        self._query_encoder = QueryEncoder()
         # 领域向量：用于从 Top5 候选领域中按 query 相似度选 Top3
         self.domain_vectors = {}
         self._build_domain_vectors()
@@ -145,9 +147,10 @@ class LabelRecallPath:
         """
         用领域中文名编码得到领域向量（与 QueryEncoder 同空间、已 L2 归一化），
         供 recall 时从 Top5 候选领域中按与 query 的余弦相似度选 Top3。
+        使用 self._query_encoder 单例，不再在此处新建编码器。
         """
         try:
-            encoder = QueryEncoder()
+            encoder = self._query_encoder
             for domain_id, name in DOMAIN_MAP.items():
                 vec, _ = encoder.encode(name)
                 if vec is not None and vec.size > 0:
@@ -401,8 +404,6 @@ class LabelRecallPath:
             return
         total_j = float(total_j or 0) or self.total_job_count
         self._load_vocab_meta()
-        if not getattr(self, "_query_encoder", None):
-            self._query_encoder = QueryEncoder()
         encoder = self._query_encoder
         jd_snippet = (query_text or "").strip()[:500]
         if not jd_snippet:
@@ -474,12 +475,13 @@ class LabelRecallPath:
     # ctx 路向量加权和参数：v_ctx = normalize(λ*v_jd + (1-λ)*v_term)
     CTX_MIX_LAMBDA = 0.7
 
-    def _expand_semantic_map(self, core_vids, anchor_skills, domain_regex=None, query_vector=None, query_text=None):
+    def _expand_semantic_map(self, core_vids, anchor_skills, domain_regex=None, query_vector=None, query_text=None, return_raw=False):
         """
         【学术共鸣 + 共现领域版】语义扩展引擎。
 
         逻辑：工业锚点激发 -> 边路(SIMILAR_TO)与语境向量路(JD+锚点)候选 -> 0.2/0.8 融合 + 多次命中奖励 ->
-              学术候选池 -> 共鸣/共现指标 -> 最终打分。输入输出格式不变：仍返回 (score_map, term_map, idf_map)。
+              学术候选池 -> 共鸣/共现指标 -> [若 return_raw=False] 最终打分。
+        return_raw=True 时仅返回 raw_results（供阶段化流程中 stage2→stage3 拆分）；否则返回 (score_map, term_map, idf_map)。
         """
         regex = domain_regex if domain_regex else ".*"
 
@@ -521,7 +523,7 @@ class LabelRecallPath:
 
         raw_results = raw_merged
         if not raw_results:
-            return {}, {}, {}
+            return [] if return_raw else ({}, {}, {})
 
         # 1.5 概念簇扩展：在簇内为每个 seed 找少量近邻学术词（top5，且簇内相似度≥0.6），作为次级扩展
         raw_results = self._expand_with_clusters(raw_results, regex, topk_per_seed=5)
@@ -550,8 +552,10 @@ class LabelRecallPath:
             rec['cooc_span'] = cooc_metrics.get(tid_key, {}).get('cooc_span', 0.0)
             rec['cooc_purity'] = cooc_metrics.get(tid_key, {}).get('cooc_purity', 0.0)
 
-        # 4. 应用数学公式计算最终动态权重（含共鸣、共现广度惩罚、共现纯度奖励）
+        # 4. 应用数学公式计算最终动态权重（含共鸣、共现广度惩罚、共现纯度奖励）；若 return_raw 则仅返回候选列表供 stage3 统一算权
         self._last_expansion_raw_results = raw_results
+        if return_raw:
+            return raw_results
         return self._calculate_final_weights(raw_results, query_vector)
 
     def _expand_with_clusters(self, raw_results, domain_regex, topk_per_seed=5, weight_decay=0.4):
@@ -922,8 +926,6 @@ class LabelRecallPath:
         if not query_text or not anchor_skills:
             return []
         self._load_vocab_meta()
-        if not getattr(self, '_query_encoder', None):
-            self._query_encoder = QueryEncoder()
         encoder = self._query_encoder
         jd_snippet = (query_text or "").strip()[:500]
         active_domains = set(re.findall(r'\d+', regex)) if regex and regex != ".*" else set()
@@ -1106,6 +1108,7 @@ class LabelRecallPath:
             "n_fail_degree_w": 0,
             "n_fail_target_degree_w": 0,
             "n_fail_domain_ratio": 0,
+            "n_fail_degree_w_expanded_zero": 0,
             "n_final": 0,
             "sample_fail_no_stats": [],
             "sample_fail_degree": [],
@@ -1184,12 +1187,15 @@ class LabelRecallPath:
             # 领域纯度过滤：目标领域合计占比 ≥ DOMAIN_PURITY_MIN（用展开后的单领域统计，兼容索引中的复合 key 如 "2|7|9"）
             domain_ratio = target_degree_w / degree_w_expanded if degree_w_expanded else 0
             if domain_ratio < self.DOMAIN_PURITY_MIN:
+                if degree_w_expanded == 0:
+                    pipeline["n_fail_degree_w_expanded_zero"] += 1
                 pipeline["n_fail_domain_ratio"] += 1
                 if len(pipeline["sample_fail_ratio"]) < 5:
                     pipeline["sample_fail_ratio"].append(tid)
                 details = pipeline.get("fail_domain_ratio_details", [])
                 if len(details) < 20:
                     all_ratio = {d: round(expanded.get(d, 0) / degree_w_expanded, 4) for d in expanded} if degree_w_expanded else {}
+                    fail_reason = "degree_w_expanded=0" if degree_w_expanded == 0 else "domain_ratio<0.5"
                     details.append({
                         "tid": tid,
                         "term": by_tid[tid].get("term", ""),
@@ -1199,6 +1205,7 @@ class LabelRecallPath:
                         "domain_ratio": round(domain_ratio, 4),
                         "target_domains_dist": {str(d): expanded.get(str(d), 0) for d in active_domains},
                         "all_domains_ratio": all_ratio,
+                        "fail_reason": fail_reason,
                     })
                     pipeline["fail_domain_ratio_details"] = details
                 continue
@@ -1221,6 +1228,7 @@ class LabelRecallPath:
                 "hit_count": int(r.get("hit_count", 0) or 0),
                 "src_vids": r.get("src_vids", []),
                 "degree_w": int(r.get("degree_w", 0) or 0),
+                "degree_w_expanded": int(r.get("degree_w_expanded", 0) or 0),
                 "target_degree_w": int(r.get("target_degree_w", 0) or 0),
                 "domain_span": int(r.get("domain_span", 0) or 0),
             }
@@ -1230,21 +1238,24 @@ class LabelRecallPath:
 
     def _calculate_final_weights(self, raw_results, query_vector):
         """
-        【收敛加权版】权重计算调度器。
-        若扩展结果含 sim_score（改造版 SIMILAR_TO + paper_count 过滤），则用 score = sim / log(1+paper_count)。
+        【统一权重】所有候选词一律走 _apply_word_quality_penalty（含领域纯度、共鸣、语义守门等），
+        无 sim_score/degree_w 分支例外，流程清晰、领域占比一致生效。
+        仅当 rec 缺少必要字段时做安全回退，避免异常。
         """
         score_map, term_map, idf_map = {}, {}, {}
+        required = ("degree_w", "cov_j", "domain_span", "target_degree_w")
+        self._last_tag_purity_debug = []
 
         for rec in raw_results:
             tid = str(rec["tid"])
-            if "sim_score" in rec and "degree_w" in rec:
-                # 改造版：score = sim / log(1 + paper_count)，惩罚泛词
-                degree_w = rec["degree_w"]
-                sim_score = rec["sim_score"]
-                dynamic_weight = sim_score / math.log(1.0 + degree_w)
-                idf_val = math.log10(self.total_work_count / (degree_w + 1))
-            else:
+            if all(rec.get(k) is not None for k in required):
                 dynamic_weight, idf_val = self._apply_word_quality_penalty(rec, query_vector)
+            else:
+                # 安全回退：仅当数据不完整时（如某条扩展路径漏写字段）
+                degree_w = rec.get("degree_w") or 1
+                sim_score = rec.get("sim_score") or 0.0
+                dynamic_weight = sim_score / math.log(1.0 + degree_w) if degree_w else 0.0
+                idf_val = math.log10(self.total_work_count / (degree_w + 1))
             score_map[tid] = dynamic_weight
             term_map[tid] = rec.get("term") or ""
             idf_map[tid] = idf_val
@@ -1264,10 +1275,26 @@ class LabelRecallPath:
         degree_w = rec['degree_w']
         cov_j = rec['cov_j']
         domain_span = max(1, rec['domain_span'])
+        # 与边路过滤同一口径：用展开后的总和作分母，purity 自然 ≤ 1
+        degree_w_expanded = rec.get('degree_w_expanded')
+        if degree_w_expanded is None:
+            degree_w_expanded = degree_w
 
-        # 1. 计算语义纯度 (Tag Purity)
-        # 逻辑：目标领域的产出占比，过滤“挂羊头卖狗肉”的词汇
-        tag_purity = rec['target_degree_w'] / degree_w
+        # 1. 计算语义纯度 (Tag Purity)，分母用 degree_w_expanded，与 target_degree_w 同口径，purity 自然 ≤ 1
+        # 逻辑：目标领域的产出占比（展开后统计），过滤“挂羊头卖狗肉”的词汇
+        raw_tag_purity = (rec['target_degree_w'] / degree_w_expanded) if degree_w_expanded else 0.0
+        tag_purity = min(1.0, raw_tag_purity)
+        # 记录供诊断
+        if getattr(self, "_last_tag_purity_debug", None) is not None:
+            self._last_tag_purity_debug.append({
+                "tid": rec.get("tid"),
+                "term": (rec.get("term") or "")[:40],
+                "degree_w": degree_w,
+                "degree_w_expanded": degree_w_expanded,
+                "target_degree_w": rec.get("target_degree_w"),
+                "raw_tag_purity": round(raw_tag_purity, 6),
+                "capped_tag_purity": round(tag_purity, 6),
+            })
 
         # 2. 计算基础学术稀缺度 (IDF)
         idf_val = math.log10(self.total_work_count / (degree_w + 1))
@@ -1432,40 +1459,35 @@ class LabelRecallPath:
         score = rank_score * proximity_bonus * domain_coeff * time_decay * survey_decay * auth_weight
         return score, hit_terms
 
-    def recall(self, query_vector, domain_id=None, query_text=None):
-        """
-        全链路调度：领域探测 → 锚点提取 → 语义扩展（含共现领域指标）→ 图谱反查 → 作者打分。
-        入参 domain_id 与向量路统一；工业词 3% 熔断（含查询词）；学术词 2% 熔断。返回 (author_id_list, duration_ms)。
-        """
-        if not self.graph: return [], 0
-        start_t = time.time()
+    # ---------- 五阶段流程（便于维护与修改） ----------
 
-        # 1. 岗位空间探测：探测当前 JD 所属的主战场领域
+    def _stage1_domain_and_anchors(self, query_vector, query_text=None, domain_id=None):
+        """
+        阶段 1：领域与锚点。确定目标领域、工业侧锚点技能。
+        返回: (active_domain_set, regex_str, anchor_skills, debug_1)。
+        debug_1 含 job_ids, job_previews, anchor_debug, dominance, industrial_kws, anchor_skills 等供阶段 5 诊断用。
+        无锚点时 anchor_skills 为空 dict。
+        """
         job_ids, inferred_domains, dominance = self._detect_domain_context(query_vector)
         job_previews = self._get_job_previews(job_ids)
-
-        # 2. 锚点提取：先熔断(cov_j<3%) -> Top30 -> Top20
         anchor_skills = self._extract_anchor_skills(
             job_ids, query_vector=query_vector, total_j=self.total_job_count
         )
         anchor_debug = self._get_anchor_debug_stats(job_ids[:20], self.total_job_count) if job_ids else {}
-        # 2.5 核心词补充：JD 向量搜 vocabulary Top15，熔断后并入锚点
         if query_text and anchor_skills is not None:
             self._supplement_anchors_from_jd_vector(
                 query_text, anchor_skills, total_j=self.total_job_count, top_k=self.JD_VOCAB_TOP_K
             )
         if not anchor_skills:
-            return [], 0
-        industrial_kws = [v['term'] for v in anchor_skills.values()]
+            return set(), "", {}, {"job_ids": job_ids, "job_previews": job_previews, "anchor_debug": anchor_debug, "dominance": dominance}
 
-        # 3. 领域处理：确定最终过滤范围（正则字符串），domain_id 与向量路命名统一
-        # 若用户指定 domain_id：按原逻辑 to_set 后最多取 3 个；否则从 Top5 候选领域按 query–领域向量相似度取 Top3
+        industrial_kws = [v["term"] for v in anchor_skills.values()]
         if domain_id and str(domain_id) != "0":
             active_domain_set = DomainProcessor.to_set(domain_id)
             if len(active_domain_set) > self.ACTIVE_DOMAINS_TOP_K:
                 active_domain_set = set(list(sorted(active_domain_set))[: self.ACTIVE_DOMAINS_TOP_K])
         else:
-            candidate_5 = inferred_domains  # 来自 _detect_domain_context 的 most_common(5)
+            candidate_5 = inferred_domains
             if self.domain_vectors and len(candidate_5) > self.ACTIVE_DOMAINS_TOP_K:
                 q = np.asarray(query_vector, dtype=np.float32).flatten()
                 if q.size > 0:
@@ -1482,26 +1504,49 @@ class LabelRecallPath:
             else:
                 active_domain_set = set(list(sorted(candidate_5))[: self.ACTIVE_DOMAINS_TOP_K])
         regex_str = DomainProcessor.build_neo4j_regex(active_domain_set)
+        debug_1 = {
+            "job_ids": job_ids,
+            "job_previews": job_previews,
+            "anchor_debug": anchor_debug,
+            "dominance": dominance,
+            "industrial_kws": industrial_kws,
+            "anchor_skills": anchor_skills,
+        }
+        return active_domain_set, regex_str, anchor_skills, debug_1
 
-        # 4. 语义扩展：【核心修复点】边路 + 语境向量路融合(0.2/0.8)，多次命中奖励
-        score_map, term_map, idf_map = self._expand_semantic_map(
+    def _stage2_expand_academic_terms(self, anchor_skills, active_domain_set, regex_str, query_vector, query_text=None):
+        """
+        阶段 2：学术词扩展。边路 + 语境向量路 + 簇扩展 + 共鸣/共现，返回候选列表（不计算最终词权）。
+        返回: raw_candidates，每项含 tid, term, degree_w, target_degree_w, domain_span, cov_j, hit_count 等，供 stage3 统一公式。
+        """
+        return self._expand_semantic_map(
             [int(k) for k in anchor_skills.keys()],
             anchor_skills,
             domain_regex=regex_str,
             query_vector=query_vector,
             query_text=query_text,
+            return_raw=True,
         )
 
-        # 对诊断用的学术词进行去重展示
-        academic_kws = list(set(term_map.values()))
+    def _stage3_word_weights(self, raw_candidates, query_vector):
+        """
+        阶段 3：词权重。统一走复杂公式（领域纯度、共鸣、语义守门等），无分支例外。
+        返回: (score_map, term_map, idf_map)。
+        """
+        if not raw_candidates:
+            return {}, {}, {}
+        return self._calculate_final_weights(raw_candidates, query_vector)
 
-        # 5. 图谱拓扑检索：通过学术词反查 Work 节点
-        params = {"v_ids": [int(k) for k in score_map.keys()], "total_w": self.total_work_count}
+    def _stage4_graph_search(self, vocab_ids, regex_str):
+        """
+        阶段 4：图检索。用学术词 ID 反查 Work 与 Author。
+        返回: list of { 'aid': str, 'papers': [ { wid, hits, weight, title, year, domains }, ... ] }。
+        """
+        params = {"v_ids": vocab_ids, "total_w": self.total_work_count}
         domain_clause = ""
         if regex_str:
             domain_clause = "AND w.domain_ids =~ $regex"
             params["regex"] = regex_str
-
         final_cypher = f"""
         MATCH (v:Vocabulary) WHERE v.id IN $v_ids
         WITH v, COUNT {{ (v)<-[:HAS_TOPIC]-() }} AS degree_w
@@ -1515,75 +1560,118 @@ class LabelRecallPath:
                                      title: w.title, year: w.year, domains: w.domain_ids}}) AS papers
         """
         cursor = self.graph.run(final_cypher, **params)
+        return list(cursor)
 
-        # 6. 打分与上下文构建
+    def _stage5_score_and_rank_authors(self, author_papers_list, score_map, term_map, active_domain_set, dominance, debug_1):
+        """
+        阶段 5：作者打分与排序。按论文贡献度聚合、排序、截断，并组装 last_debug_info。
+        返回: (author_id_list, last_debug_info)。
+        """
+        industrial_kws = debug_1.get("industrial_kws", [])
+        anchor_skills = debug_1.get("anchor_skills", {})
         first_domain = list(active_domain_set)[0] if active_domain_set else "default"
         context = {
-            'score_map': score_map,
-            'term_map': term_map,
-            'anchor_kws': [k.lower() for k in industrial_kws],
-            'active_domain_set': active_domain_set,
-            'dominance': dominance,
-            'decay_rate': DOMAIN_DECAY_RATES.get(first_domain, DEFAULT_DECAY_RATE)
+            "score_map": score_map,
+            "term_map": term_map,
+            "anchor_kws": [k.lower() for k in industrial_kws],
+            "active_domain_set": active_domain_set,
+            "dominance": dominance,
+            "decay_rate": DOMAIN_DECAY_RATES.get(first_domain, DEFAULT_DECAY_RATE),
         }
-
-        scored_authors, all_works_count = [], 0
-        for record in cursor:
+        scored_authors = []
+        all_works_count = 0
+        for record in author_papers_list:
             author_total_score, best_paper = 0.0, None
-            for paper in record['papers']:
+            for paper in record["papers"]:
                 all_works_count += 1
-                # 贡献度计算：内含 4 次方纯度惩罚与负向领域拦截
                 p_score, p_hits = self._compute_contribution(paper, context)
                 author_total_score += p_score
-                if p_score > 0 and (not best_paper or p_score > best_paper['contribution']):
+                if p_score > 0 and (not best_paper or p_score > best_paper["contribution"]):
                     best_paper = {
-                        'title': paper['title'], 'year': paper['year'],
-                        'contribution': round(p_score, 4), 'hits': p_hits
+                        "title": paper["title"], "year": paper["year"],
+                        "contribution": round(p_score, 4), "hits": p_hits,
                     }
-
             if author_total_score > 0:
                 scored_authors.append({
-                    'aid': record['aid'], 'score': author_total_score,
-                    'top_paper': best_paper, 'paper_count': len(record['papers'])
+                    "aid": record["aid"], "score": author_total_score,
+                    "top_paper": best_paper, "paper_count": len(record["papers"]),
                 })
-
-        # 7. 最终排序与诊断封装
-        scored_authors.sort(key=lambda x: x['score'], reverse=True)
-        # 学术词按权重排序，供主函数打印 Top15
+        scored_authors.sort(key=lambda x: x["score"], reverse=True)
         sorted_terms = sorted(
-            [(term_map.get(tid, ''), score_map.get(tid, 0)) for tid in score_map],
+            [(term_map.get(tid, ""), score_map.get(tid, 0)) for tid in score_map],
             key=lambda x: x[1], reverse=True
         )
+        academic_kws = list(set(term_map.values()))
         self.last_debug_info = {
-            'active_domains': list(active_domain_set),
-            'dominance': f"{dominance * 100:.1f}%",
-            'expansion_pipeline': getattr(self, '_last_expansion_pipeline_stats', None),
-            'similar_to_raw': getattr(self, '_last_similar_to_raw_rows', []),
-            'similar_to_agg': getattr(self, '_last_similar_to_agg', []),
-            'similar_to_pass': getattr(self, '_last_similar_to_pass', []),
-            'regex_str': regex_str,
-            'job_ids': job_ids,
-            'job_previews': job_previews,
-            'anchor_debug': anchor_debug,
-            'anchor_melt_stats': getattr(self, '_last_anchor_melt_stats', None),
-            'supplement_anchors': getattr(self, '_last_supplement_anchors', []),
-            'industrial_kws': industrial_kws,
-            'anchor_detail': [f"{k}={v['term']}" for k, v in anchor_skills.items()],
-            'academic_kws': academic_kws,
-            'detailed_kws': getattr(self, '_last_expansion_raw_results', []),
-            'top_scored_terms': sorted_terms,
-            'recall_vocab_count': len(score_map),
-            'work_count': all_works_count,
-            'author_count': len(scored_authors),
-            'top_samples': scored_authors[:20]
+            "active_domains": list(active_domain_set),
+            "dominance": f"{dominance * 100:.1f}%",
+            "expansion_pipeline": getattr(self, "_last_expansion_pipeline_stats", None),
+            "similar_to_raw": getattr(self, "_last_similar_to_raw_rows", []),
+            "similar_to_agg": getattr(self, "_last_similar_to_agg", []),
+            "similar_to_pass": getattr(self, "_last_similar_to_pass", []),
+            "regex_str": debug_1.get("regex_str", ""),
+            "job_ids": debug_1.get("job_ids", []),
+            "job_previews": debug_1.get("job_previews", []),
+            "anchor_debug": debug_1.get("anchor_debug", {}),
+            "anchor_melt_stats": getattr(self, "_last_anchor_melt_stats", None),
+            "supplement_anchors": getattr(self, "_last_supplement_anchors", []),
+            "industrial_kws": industrial_kws,
+            "anchor_detail": [f"{k}={v['term']}" for k, v in anchor_skills.items()],
+            "academic_kws": academic_kws,
+            "detailed_kws": getattr(self, "_last_expansion_raw_results", []),
+            "top_scored_terms": sorted_terms,
+            "recall_vocab_count": len(score_map),
+            "work_count": all_works_count,
+            "author_count": len(scored_authors),
+            "top_samples": scored_authors[:20],
         }
+        return [a["aid"] for a in scored_authors], self.last_debug_info
 
-        return [a['aid'] for a in scored_authors[:self.recall_limit]], (time.time() - start_t) * 1000
+    def recall(self, query_vector, domain_id=None, query_text=None):
+        """
+        全链路调度（五阶段）：领域与锚点 → 学术词扩展 → 词权重（统一复杂公式）→ 图检索 → 作者打分。
+        入参 domain_id 与向量路统一。返回 (author_id_list, duration_ms)。
+        """
+        if not self.graph:
+            return [], 0
+        start_t = time.time()
+
+        # 阶段 1：领域与锚点
+        active_domain_set, regex_str, anchor_skills, debug_1 = self._stage1_domain_and_anchors(
+            query_vector, query_text=query_text, domain_id=domain_id
+        )
+        if not anchor_skills:
+            return [], (time.time() - start_t) * 1000
+
+        # 阶段 2：学术词扩展（仅产出候选，不算权）
+        raw_candidates = self._stage2_expand_academic_terms(
+            anchor_skills, active_domain_set, regex_str, query_vector, query_text=query_text
+        )
+        if not raw_candidates:
+            return [], (time.time() - start_t) * 1000
+
+        # 阶段 3：词权重（统一走复杂公式）
+        score_map, term_map, idf_map = self._stage3_word_weights(raw_candidates, query_vector)
+
+        # 阶段 4：图检索
+        author_papers_list = self._stage4_graph_search(
+            [int(k) for k in score_map.keys()], regex_str
+        )
+
+        # 阶段 5：作者打分与排序（debug_1 中补上 regex_str 供 last_debug_info）
+        debug_1["regex_str"] = regex_str
+        dominance = debug_1.get("dominance", 0.0)
+        author_ids, _ = self._stage5_score_and_rank_authors(
+            author_papers_list, score_map, term_map, active_domain_set, dominance, debug_1
+        )
+
+        elapsed_ms = (time.time() - start_t) * 1000
+        return author_ids[: self.recall_limit], elapsed_ms
 
 
 if __name__ == "__main__":
     l_path = LabelRecallPath(recall_limit=200)
-    encoder = QueryEncoder()
+    encoder = l_path._query_encoder
 
     try:
         domain_choice = input("\n请选择领域编号 (0跳过): ").strip() or "0"
@@ -1728,15 +1816,19 @@ if __name__ == "__main__":
                         sc = float(r.get('sim_score', 0.0) or 0.0)
                         print(f"        - tid={r.get('tid')}  term={r.get('term')}  sim={sc:.4f}  hits={r.get('hit_count')}  src_vids={r.get('src_vids')}  "
                               f"degree_w={deg}  degree_w_exp={deg_exp}  target_w={tgt}  ratio_correct={ratio_correct:.3f}")
+                print(f"      【边路 SIMILAR_TO 领域过滤】")
+                print(f"      去重后候选学术词数: {p.get('n_unique_tids', 0)}")
                 print(f"      无 vocabulary_domain_stats 行: {p.get('n_no_stats', 0)}  (样例 tid: {p.get('sample_fail_no_stats', [])[:5]})")
                 print(f"      work_count > P95(277) 被筛: {p.get('n_fail_degree_w', 0)}  (样例: {p.get('sample_fail_degree', [])[:5]})")
+                print(f"      degree_w_expanded=0 被筛: {p.get('n_fail_degree_w_expanded_zero', 0)}  (归入下方纯度不足明细)")
                 print(f"      目标领域 0 篇(target_degree_w<=0) 被筛: {p.get('n_fail_target_degree_w', 0)}  (样例: {p.get('sample_fail_target', [])[:5]})")
-                print(f"      领域纯度 < 40% 被筛: {p.get('n_fail_domain_ratio', 0)}  (样例: {p.get('sample_fail_ratio', [])[:5]})")
+                print(f"      领域纯度 < 50% 被筛 (含 expanded=0): {p.get('n_fail_domain_ratio', 0)}  (样例: {p.get('sample_fail_ratio', [])[:5]})")
+                print(f"      最终通过边路领域过滤: {p.get('n_final', 0)}")
                 fail_details = p.get("fail_domain_ratio_details", [])
                 if fail_details:
                     print(f"      被筛词纯度明细 (最多展示 20 条):")
-                    print(f"      {'term':<20} | {'tid':<8} | {'deg_w':<8} | {'deg_w_exp':<10} | {'target_w':<10} | {'ratio_correct':<13} | 目标领域分布")
-                    print(f"      {'-' * 20} | {'-' * 8} | {'-' * 8} | {'-' * 10} | {'-' * 10} | {'-' * 13} | ---------")
+                    print(f"      {'term':<20} | {'tid':<8} | {'deg_w':<8} | {'deg_w_exp':<10} | {'target_w':<10} | {'ratio':<8} | {'原因':<18} | 目标领域分布")
+                    print(f"      {'-' * 20} | {'-' * 8} | {'-' * 8} | {'-' * 10} | {'-' * 10} | {'-' * 8} | {'-' * 18} | ---------")
                     for x in fail_details:
                         term_s = (x.get("term") or "")[:20]
                         dist_s = x.get("target_domains_dist") or {}
@@ -1745,7 +1837,8 @@ if __name__ == "__main__":
                         deg_exp = int(x.get("degree_w_expanded", 0) or 0)
                         tgt = int(x.get("target_degree_w", 0) or 0)
                         ratio_correct = (float(tgt) / float(deg_exp)) if deg_exp else 0.0
-                        print(f"      {term_s:<20} | {x.get('tid', ''):<8} | {deg:<8} | {deg_exp:<10} | {tgt:<10} | {ratio_correct:<13.4f} | {dist_str}")
+                        reason = x.get("fail_reason", "")
+                        print(f"      {term_s:<20} | {x.get('tid', ''):<8} | {deg:<8} | {deg_exp:<10} | {tgt:<10} | {ratio_correct:<8.4f} | {reason:<18} | {dist_str}")
                         all_ratio = x.get("all_domains_ratio") or {}
                         if all_ratio:
                             ratio_str = ", ".join(
@@ -1779,6 +1872,20 @@ if __name__ == "__main__":
                 for term, score in top_scored_terms[:15]:
                     print(f"        - {term[:40]:<40}  weight={score:.6f}")
 
+            # 3.6 Tag Purity 诊断（raw>1 时可见统计口径异常）
+            tag_purity_debug = getattr(l_path, "_last_tag_purity_debug", []) or []
+            over_one = [x for x in tag_purity_debug if x.get("raw_tag_purity", 0) > 1.0]
+            print(f"      【Tag Purity 诊断】共 {len(tag_purity_debug)} 个词参与权重计算，其中 raw_tag_purity>1 的共 {len(over_one)} 个")
+            if over_one:
+                print(f"      raw_tag_purity>1 明细 (最多 20 条，口径=target_degree_w/degree_w_expanded):")
+                print(f"      {'term':<20} | {'tid':<6} | {'deg_w':<8} | {'deg_exp':<8} | {'target_w':<10} | {'raw':<8} | {'capped':<6}")
+                print(f"      {'-' * 20} | {'-' * 6} | {'-' * 8} | {'-' * 8} | {'-' * 10} | {'-' * 8} | {'-' * 6}")
+                for x in sorted(over_one, key=lambda t: -t.get("raw_tag_purity", 0))[:20]:
+                    term_s = (x.get("term") or "")[:20]
+                    print(f"      {term_s:<20} | {x.get('tid', ''):<6} | {x.get('degree_w', 0):<8} | {x.get('degree_w_expanded', 0):<8} | {x.get('target_degree_w', 0):<10} | {x.get('raw_tag_purity', 0):<8.4f} | {x.get('capped_tag_purity', 0):<6.4f}")
+            elif tag_purity_debug:
+                print(f"      口径 target_degree_w/degree_w_expanded，purity 自然≤1；raw 范围: [{min(x.get('raw_tag_purity', 0) for x in tag_purity_debug):.4f}, {max(x.get('raw_tag_purity', 0) for x in tag_purity_debug):.4f}]")
+
             # 4. 论文与作者召回
             w_count = db.get('work_count', 0)
             a_count = db.get('author_count', 0)
@@ -1790,7 +1897,7 @@ if __name__ == "__main__":
 
             # --- 专家排名展示（增强：前几条打印原始得分 + 代表作详情）---
             print("-" * 115)
-            print(f"{'排名':<6} | {'作者 ID':<12} | {'综合得分':<15} | {'学术领域代表作 (命中标签)'}")
+            print(f"{'排名':<6} | {'作者 ID':<12} | {'综合得分':<18} | {'学术领域代表作 (命中标签)'}")
             print("-" * 115)
 
             for i, item in enumerate(db.get('top_samples', []), 1):
@@ -1799,7 +1906,8 @@ if __name__ == "__main__":
                 hit_tags = ", ".join(tp.get('hits', []))
                 raw_score = item.get('score', 0)
                 contrib = tp.get('contribution', 0)
-                print(f"#{i:<5} | {item['aid']:<12} | {int(raw_score):<15} | 《{title}》")
+                score_str = f"{raw_score:.4f}" if isinstance(raw_score, (int, float)) else str(raw_score)
+                print(f"#{i:<5} | {item['aid']:<12} | {score_str:<18} | 《{title}》")
                 print(f"{' ':23} ┗━ 核心命中: {hit_tags}")
                 if i <= 5:
                     print(f"{' ':23}     [调试] 原始得分={raw_score:.6f}, 代表作贡献={contrib:.6f}")
