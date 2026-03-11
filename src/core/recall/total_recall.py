@@ -116,7 +116,28 @@ class TotalRecallSystem:
                     rank_map[aid] = {'v': '-', 'l': '-', 'c': '-'}
                 rank_map[aid][p_tag] = rank + 1
 
-        sorted_candidates = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        # --- multi-route bonus：命中多条路径的作者额外加分，强化 V∩L∩C 交集 ---
+        # 1. 统计每个作者被几条路径命中（1/2/3）
+        path_count = {}
+        for aid, ranks in rank_map.items():
+            cnt = 0
+            if ranks["v"] != "-":
+                cnt += 1
+            if ranks["l"] != "-":
+                cnt += 1
+            if ranks["c"] != "-":
+                cnt += 1
+            path_count[aid] = cnt
+
+        # 2. 在 RRF 分基础上增加一个与 path_count 成正比的小 bonus
+        alpha = 0.02  # 可按效果微调：增大则更偏好多路交集，减小则更接近原始 RRF
+        final_score = {}
+        for aid, base in scores.items():
+            pc = path_count.get(aid, 1)
+            bonus = alpha * (pc - 1)  # 1 路: +0, 2 路: +alpha, 3 路: +2alpha
+            final_score[aid] = base + bonus
+
+        sorted_candidates = sorted(final_score.items(), key=lambda x: x[1], reverse=True)
         return [item[0] for item in sorted_candidates[:500]], rank_map
 
 
@@ -160,7 +181,7 @@ if __name__ == "__main__":
             print(f"{'综合排名':<6} | {'作者 ID':<10} | {'各路名次 (V/L/C)':<15} | {'知识图谱核心作 (权重)'}")
             print("-" * 115)
 
-            for rank, aid in enumerate(candidates[:20], 1):
+            for rank, aid in enumerate(candidates[:50], 1):
                 rm = rank_map[aid]
                 # 格式化各路名次显示
                 v_rank = f"{rm['v']}" if rm['v'] != '-' else "-"
@@ -180,7 +201,7 @@ if __name__ == "__main__":
                 print(f"#{rank:<5} | {aid:<10} | {path_ranks:<15} | {info}")
 
             print("-" * 115)
-            print(f"[*] 已召回 {len(candidates)} 名候选人，上方显示前 20 名综合最优解。")
+            print(f"[*] 已召回 {len(candidates)} 名候选人，上方显示前 50 名综合最优解。")
 
     except KeyboardInterrupt:
         print("\n[!] 系统安全退出。")
