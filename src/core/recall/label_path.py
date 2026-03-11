@@ -58,6 +58,7 @@ class LabelRecallPath:
     ANCHOR_MELT_COV_J = 0.03  # 熔断：全图岗位覆盖率 >= 3% 的技能不参与锚点
     JD_VOCAB_TOP_K = 15       # 用 JD 向量直接搜 vocabulary 的 top-K 作为补充锚点
     ANCHOR_SIM_MIN = 0.4      # 锚点语义重排的最小相似度阈值（低于直接丢弃）
+    ANCHOR_MIN_JOB_FREQ = 2   # 锚点共识门槛：至少出现在 Top20 命中岗位中的 2 个岗位
 
     def __init__(self, recall_limit=200, verbose=False):
         self.recall_limit = recall_limit
@@ -346,6 +347,9 @@ class LabelRecallPath:
             if cov_j >= melt_threshold:
                 melted_terms.append((r.get("term") or "", round(cov_j, 4)))
                 continue
+            # 共识门槛：避免“单岗位偏航技能”触发学术扩展
+            if int(r.get("job_freq") or 0) < int(self.ANCHOR_MIN_JOB_FREQ):
+                continue
             rows_with_cov.append((r, cov_j))
 
         self._last_anchor_melt_stats = {
@@ -474,6 +478,8 @@ class LabelRecallPath:
     DOMAIN_PURITY_MIN = 0.5
     # ctx 路向量加权和参数：v_ctx = normalize(λ*v_jd + (1-λ)*v_term)
     CTX_MIX_LAMBDA = 0.7
+    # 语义硬门槛：候选词与 query 的余弦相似度低于阈值时直接置 0（防止稀缺词以高 IDF 带偏）
+    SEMANTIC_MIN = 0.4
 
     def _expand_semantic_map(self, core_vids, anchor_skills, domain_regex=None, query_vector=None, query_text=None, return_raw=False):
         """
@@ -1327,6 +1333,10 @@ class LabelRecallPath:
         if idx is not None and query_vector is not None:
             term_vec = self.all_vocab_vectors[idx]
             cos_sim = float(np.dot(term_vec, query_vector.flatten()))
+
+        # 语义硬拦截：低相关词直接置 0，避免稀缺词（高 IDF）“以小博大”带偏召回
+        if cos_sim < float(self.SEMANTIC_MIN):
+            return 0.0, idf_val
 
         # 应用 6 次方非线性惩罚，实现对弱相关词的断崖式拦截
         semantic_factor = math.pow(max(0, cos_sim), 6)
