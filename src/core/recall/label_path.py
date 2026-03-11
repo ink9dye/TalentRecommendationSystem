@@ -51,6 +51,13 @@ class LabelRecallPath:
     DETECT_JOBS_TOP_K = 20
     CANDIDATE_DOMAINS_TOP_K = 5
     ACTIVE_DOMAINS_TOP_K = 3
+    # 锚点提取：先熔断(cov_j<3%) -> 频次 Top30 -> 语义重排 Top20；核心词补充：JD 向量搜 vocabulary TopK
+    ANCHOR_JOBS_TOP_K = 20
+    ANCHOR_FREQ_TOP_K = 30
+    ANCHOR_FINAL_TOP_K = 20
+    ANCHOR_MELT_COV_J = 0.03  # 熔断：全图岗位覆盖率 >= 3% 的技能不参与锚点
+    JD_VOCAB_TOP_K = 15       # 用 JD 向量直接搜 vocabulary 的 top-K 作为补充锚点
+    ANCHOR_SIM_MIN = 0.4      # 锚点语义重排的最小相似度阈值（低于直接丢弃）
 
     def __init__(self, recall_limit=200, verbose=False):
         self.recall_limit = recall_limit
@@ -263,17 +270,26 @@ class LabelRecallPath:
             out.add(t.lower())
         return out
 
-    # --- 第二阶段：锚点技能提取 ---
-    def _extract_anchor_skills(self, target_job_ids):
+    # --- 第二阶段：锚点技能提取（先熔断 -> Top30 -> Top20）---
+    def _extract_anchor_skills(self, target_job_ids, query_vector=None, total_j=None):
         """
-        【工业侧：岗位技能提取】先做技能清洗，再 3% 熔断（cov_j < 0.03）。
-        逻辑：从命中岗位取 raw skills -> 清洗 -> 仅保留在图谱 REQUIRE_SKILL 中且 term 在清洗结果中的词，上限 50。
+        【工业侧：岗位技能提取】先熔断 -> Top30 -> Top20。
+        逻辑：
+          - 从 Top20 岗位的 REQUIRE_SKILL 得到 (vid, term, job_freq)；
+          - 熔断：仅保留 cov_j < ANCHOR_MELT_COV_J 的技能（全图岗位覆盖率，编程语言等泛词被滤掉）；
+          - 在熔断后按 job_freq 降序取 Top30；
+          - 可选：用清洗出的 raw skills 过滤；
+          - 若有 query_vector：语义重排后取 Top20；否则直接取前 20。
         """
+        total_j = float(total_j or 0)
+        if total_j <= 0:
+            total_j = self.total_job_count
+
         cleaned_terms = set()
         try:
             cursor = self.graph.run(
                 "MATCH (j:Job) WHERE j.id IN $j_ids RETURN j.skills AS skills",
-                j_ids=target_job_ids[:20]
+                j_ids=target_job_ids[: self.ANCHOR_JOBS_TOP_K]
             )
             for row in cursor:
                 if row.get("skills"):
@@ -281,23 +297,170 @@ class LabelRecallPath:
         except Exception:
             pass
         if not cleaned_terms:
-            cleaned_terms = None  # 无清洗结果时不按词过滤，退化为原逻辑
+            cleaned_terms = None
 
-        cypher = """
+        # 1) Top20 岗位内所有 (vid, term, job_freq)，不先 limit
+        cypher1 = """
         MATCH (j:Job) WHERE j.id IN $j_ids
         MATCH (j)-[:REQUIRE_SKILL]->(v:Vocabulary)
-        WITH v, (COUNT { (v)<-[:REQUIRE_SKILL]-() } * 1.0 / $total_j) AS cov_j
-        WHERE cov_j < 0.03
-        WITH v.id AS vid, v.term AS term, cov_j
-        RETURN DISTINCT vid, term, cov_j
-        ORDER BY cov_j ASC
-        LIMIT 50
+        WITH v.id AS vid, v.term AS term, count(DISTINCT j.id) AS job_freq
+        RETURN vid, term, job_freq
+        ORDER BY job_freq DESC
         """
-        cursor = self.graph.run(cypher, j_ids=target_job_ids[:20], total_j=self.total_job_count)
-        rows = [r for r in cursor if r["term"] and len(r["term"]) > 1]
+        rows = []
+        try:
+            for r in self.graph.run(cypher1, j_ids=target_job_ids[: self.ANCHOR_JOBS_TOP_K]):
+                if r.get("term") and len(str(r.get("term") or "")) > 1:
+                    rows.append(dict(r))
+        except Exception:
+            rows = []
+
+        if not rows:
+            self._last_anchor_melt_stats = {"before_melt": 0, "after_melt": 0, "after_top30": 0, "melted_sample": []}
+            return {}
+
+        # 2) 查全图每个 vid 的 global_job_count，算 cov_j，熔断
+        v_ids = list({int(r["vid"]) for r in rows})
+        global_count = {}
+        try:
+            cypher2 = """
+            UNWIND $v_ids AS vid
+            MATCH (v:Vocabulary {id: vid})<-[:REQUIRE_SKILL]-(j:Job)
+            RETURN vid, count(j) AS cnt
+            """
+            for r in self.graph.run(cypher2, v_ids=v_ids):
+                global_count[int(r["vid"])] = int(r.get("cnt") or 0)
+        except Exception:
+            pass
+
+        melt_threshold = float(self.ANCHOR_MELT_COV_J)
+        rows_with_cov = []
+        melted_terms = []
+        for r in rows:
+            vid = int(r.get("vid"))
+            g = global_count.get(vid, 0)
+            cov_j = (g / total_j) if total_j else 0
+            if cov_j >= melt_threshold:
+                melted_terms.append((r.get("term") or "", round(cov_j, 4)))
+                continue
+            rows_with_cov.append((r, cov_j))
+
+        self._last_anchor_melt_stats = {
+            "before_melt": len(rows),
+            "after_melt": len(rows_with_cov),
+            "melted_sample": melted_terms[:25],
+            "melt_threshold": melt_threshold,
+        }
+
+        # 3) 熔断后按 job_freq 取 Top30
+        rows_with_cov.sort(key=lambda x: (x[0].get("job_freq") or 0), reverse=True)
+        rows = [x[0] for x in rows_with_cov[: self.ANCHOR_FREQ_TOP_K]]
+        self._last_anchor_melt_stats["after_top30"] = len(rows)
+
+        # 4) 可选：清洗词过滤
         if cleaned_terms is not None:
-            rows = [r for r in rows if (r["term"] or "").lower() in cleaned_terms]
-        return {str(r["vid"]): {"term": r["term"]} for r in rows}
+            rows = [r for r in rows if (r.get("term") or "").lower() in cleaned_terms]
+
+        if not rows:
+            return {}
+
+        # 5) 语义重排取 Top20
+        if query_vector is not None:
+            q = np.asarray(query_vector, dtype=np.float32).flatten()
+            scored = []
+            for r in rows:
+                vid = str(r.get("vid"))
+                idx = self.vocab_to_idx.get(vid)
+                sim = -1.0
+                if idx is not None and q.size > 0:
+                    try:
+                        sim = float(np.dot(self.all_vocab_vectors[idx], q))
+                    except Exception:
+                        sim = -1.0
+                scored.append((sim, int(r.get("job_freq") or 0), r))
+            scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            # 相似度阈值：低于阈值直接丢弃（避免与当前 JD 偏离的岗位技能锚点混入）
+            sim_min = float(self.ANCHOR_SIM_MIN)
+            scored_keep = [x for x in scored if (x[0] is not None and float(x[0]) >= sim_min)]
+            self._last_anchor_melt_stats["sim_min"] = sim_min
+            self._last_anchor_melt_stats["sim_kept"] = len(scored_keep)
+            self._last_anchor_melt_stats["sim_dropped"] = max(0, len(scored) - len(scored_keep))
+            rows = [x[2] for x in scored_keep[: self.ANCHOR_FINAL_TOP_K]]
+        else:
+            rows = rows[: self.ANCHOR_FINAL_TOP_K]
+
+        return {str(r.get("vid")): {"term": r.get("term")} for r in rows}
+
+    def _supplement_anchors_from_jd_vector(self, query_text, anchor_skills, total_j=None, top_k=15):
+        """
+        用 JD 向量直接搜 vocabulary，取与当前 JD 语义最接近的 top_k 个词作为补充锚点（不硬编码强词）。
+        补充词也做熔断：仅当 cov_j < ANCHOR_MELT_COV_J 时才并入。返回本次新增的 [(vid, term), ...] 供调试。
+        """
+        if not query_text or not getattr(self, "vocab_index", None):
+            self._last_supplement_anchors = []
+            return
+        total_j = float(total_j or 0) or self.total_job_count
+        self._load_vocab_meta()
+        if not getattr(self, "_query_encoder", None):
+            self._query_encoder = QueryEncoder()
+        encoder = self._query_encoder
+        jd_snippet = (query_text or "").strip()[:500]
+        if not jd_snippet:
+            self._last_supplement_anchors = []
+            return
+
+        v_jd = encoder.model.encode(
+            [jd_snippet],
+            batch_size=1,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        v_jd = np.asarray(v_jd, dtype=np.float32).reshape(1, -1)
+        k = min(int(top_k), 30)
+        scores, labels = self.vocab_index.search(v_jd, k)
+        added = []
+        melt_threshold = float(self.ANCHOR_MELT_COV_J)
+        v_ids_to_check = []
+        candidates = []
+        for score, tid in zip(scores[0], labels[0]):
+            tid = int(tid)
+            if tid <= 0:
+                continue
+            if str(tid) in anchor_skills:
+                continue
+            term, _ = self._vocab_meta.get(tid, ("", ""))
+            if not term or len(term) < 2:
+                continue
+            candidates.append((tid, term, float(score)))
+            v_ids_to_check.append(tid)
+
+        if not v_ids_to_check:
+            self._last_supplement_anchors = []
+            return
+
+        global_count = {}
+        try:
+            cypher = """
+            UNWIND $v_ids AS vid
+            MATCH (v:Vocabulary {id: vid})<-[:REQUIRE_SKILL]-(j:Job)
+            RETURN vid, count(j) AS cnt
+            """
+            for r in self.graph.run(cypher, v_ids=v_ids_to_check):
+                global_count[int(r["vid"])] = int(r.get("cnt") or 0)
+        except Exception:
+            global_count = {vid: 0 for vid in v_ids_to_check}
+
+        for tid, term, score in candidates:
+            g = global_count.get(tid, 0)
+            cov_j = (g / total_j) if total_j else 0
+            if cov_j >= melt_threshold:
+                continue
+            anchor_skills[str(tid)] = {"term": term}
+            added.append((tid, term, round(score, 4), round(cov_j, 4)))
+
+        self._last_supplement_anchors = added
+        self._cached_v_jd = v_jd
+
     # --- 第三阶段：语义扩展 ---
     # 融合权重：相似边 0.2，语境向量 0.8；多次命中奖励：泛词(work_count大)不奖励，其余按 ln(min(hit,5)) 计算并封顶
     CTX_EDGE_WEIGHT = 0.8
@@ -307,7 +470,7 @@ class LabelRecallPath:
     HIT_BONUS_HIT_CAP = 5
     HIT_BONUS_DEGREE_GATE = 200
     # 领域纯度阈值：目标领域产出占比下限（用于筛掉跨领域泛词）
-    DOMAIN_PURITY_MIN = 0.6
+    DOMAIN_PURITY_MIN = 0.5
     # ctx 路向量加权和参数：v_ctx = normalize(λ*v_jd + (1-λ)*v_term)
     CTX_MIX_LAMBDA = 0.7
 
@@ -550,6 +713,7 @@ class LabelRecallPath:
                 "hit_count": agg["support"],
                 "seed_vids": sorted(list(agg.get("seed_vids") or [])),
                 "degree_w": degree_w,
+                "degree_w_expanded": degree_w_expanded,
                 "target_degree_w": target_degree_w,
                 "domain_span": domain_span,
                 "cov_j": 0.0,
@@ -882,6 +1046,7 @@ class LabelRecallPath:
                 "src_vids": src_vids,
                 "hit_count": len(src_vids),
                 "degree_w": degree_w,
+                "degree_w_expanded": degree_w_expanded,
                 "target_degree_w": target_degree_w,
                 "domain_span": domain_span,
                 "cov_j": 0.0,
@@ -1029,6 +1194,7 @@ class LabelRecallPath:
                         "tid": tid,
                         "term": by_tid[tid].get("term", ""),
                         "degree_w": degree_w,
+                        "degree_w_expanded": degree_w_expanded,
                         "target_degree_w": target_degree_w,
                         "domain_ratio": round(domain_ratio, 4),
                         "target_domains_dist": {str(d): expanded.get(str(d), 0) for d in active_domains},
@@ -1039,6 +1205,7 @@ class LabelRecallPath:
             pipeline["n_final"] += 1
             rec = by_tid[tid]
             rec["degree_w"] = degree_w
+            rec["degree_w_expanded"] = degree_w_expanded
             rec["target_degree_w"] = target_degree_w
             rec["domain_span"] = domain_span
             rec["cov_j"] = 0.0
@@ -1277,9 +1444,16 @@ class LabelRecallPath:
         job_ids, inferred_domains, dominance = self._detect_domain_context(query_vector)
         job_previews = self._get_job_previews(job_ids)
 
-        # 2. 锚点提取：工业词 3% 熔断（对查询词也熔断，python 等高频词会被熔掉）
-        anchor_skills = self._extract_anchor_skills(job_ids)
+        # 2. 锚点提取：先熔断(cov_j<3%) -> Top30 -> Top20
+        anchor_skills = self._extract_anchor_skills(
+            job_ids, query_vector=query_vector, total_j=self.total_job_count
+        )
         anchor_debug = self._get_anchor_debug_stats(job_ids[:20], self.total_job_count) if job_ids else {}
+        # 2.5 核心词补充：JD 向量搜 vocabulary Top15，熔断后并入锚点
+        if query_text and anchor_skills is not None:
+            self._supplement_anchors_from_jd_vector(
+                query_text, anchor_skills, total_j=self.total_job_count, top_k=self.JD_VOCAB_TOP_K
+            )
         if not anchor_skills:
             return [], 0
         industrial_kws = [v['term'] for v in anchor_skills.values()]
@@ -1391,6 +1565,8 @@ class LabelRecallPath:
             'job_ids': job_ids,
             'job_previews': job_previews,
             'anchor_debug': anchor_debug,
+            'anchor_melt_stats': getattr(self, '_last_anchor_melt_stats', None),
+            'supplement_anchors': getattr(self, '_last_supplement_anchors', []),
             'industrial_kws': industrial_kws,
             'anchor_detail': [f"{k}={v['term']}" for k, v in anchor_skills.items()],
             'academic_kws': academic_kws,
@@ -1458,7 +1634,27 @@ if __name__ == "__main__":
                 after_melt = anchor_debug.get('skills_after_melt', 0)
                 melted_sample = anchor_debug.get('melted_terms_sample', [])
                 print(f"      参与锚点提取的岗位 (Top5) 每岗 REQUIRE_SKILL 数: {per_job}")
-                print(f"      3% 熔断: 熔断前 {before_melt} 个技能词，熔断后保留 {after_melt} 个；被熔断词样例: {melted_sample[:15]}")
+                print(f"      3% 熔断(统计用): 熔断前 {before_melt} 个，熔断后 {after_melt} 个；被熔断词样例: {melted_sample[:15]}")
+            # 先熔断 -> Top30 -> Top20 实际执行统计
+            melt_stats = db.get('anchor_melt_stats')
+            if melt_stats:
+                print(f"      【先熔断】实际: 熔断前={melt_stats.get('before_melt', 0)} 熔断后={melt_stats.get('after_melt', 0)} "
+                      f"Top30后={melt_stats.get('after_top30', 0)} 阈值={melt_stats.get('melt_threshold', 0.03)}")
+                melted_sample = melt_stats.get('melted_sample', [])
+                if melted_sample:
+                    print(f"      被熔断词及 cov_j (最多 20 条): {melted_sample[:20]}")
+            # 核心词补充（JD 向量搜 vocabulary）
+            supp = db.get('supplement_anchors', [])
+            if supp:
+                print(f"      【核心词补充】JD 向量搜 vocabulary 新增 {len(supp)} 个锚点 (vid, term, sim, cov_j):")
+                for x in supp[:20]:
+                    print(f"        - vid={x[0]} term={x[1]} sim={x[2]} cov_j={x[3]}")
+                if len(supp) > 20:
+                    print(f"        ... 共 {len(supp)} 条")
+            else:
+                print(f"      【核心词补充】本次未新增锚点（已存在或熔断过滤）")
+            anchor_detail_final = db.get('anchor_detail', [])
+            print(f"      合并后锚点总数: {len(anchor_detail_final)} (岗位熔断Top20 + 核心词补充)")
 
             # 3. 学术语义扩展与“学术共鸣”校验
             # 2.5 语义扩展管道（Step 3 前置）：看清在哪个环节被筛光
@@ -1526,9 +1722,12 @@ if __name__ == "__main__":
                     )[:30]:
                         deg = int(r.get('degree_w', 0) or 0)
                         tgt = int(r.get('target_degree_w', 0) or 0)
-                        ratio = (float(tgt) / float(deg)) if deg else 0.0
+                        deg_exp = int(r.get('degree_w_expanded', 0) or 0)
+                        # 正确口径：用展开后的单领域计数总和作分母（兼容 domain_dist 中存在复合 key）
+                        ratio_correct = (float(tgt) / float(deg_exp)) if deg_exp else 0.0
                         sc = float(r.get('sim_score', 0.0) or 0.0)
-                        print(f"        - tid={r.get('tid')}  term={r.get('term')}  sim={sc:.4f}  hits={r.get('hit_count')}  src_vids={r.get('src_vids')}  degree_w={deg}  target_w={tgt}  ratio={ratio:.3f}")
+                        print(f"        - tid={r.get('tid')}  term={r.get('term')}  sim={sc:.4f}  hits={r.get('hit_count')}  src_vids={r.get('src_vids')}  "
+                              f"degree_w={deg}  degree_w_exp={deg_exp}  target_w={tgt}  ratio_correct={ratio_correct:.3f}")
                 print(f"      无 vocabulary_domain_stats 行: {p.get('n_no_stats', 0)}  (样例 tid: {p.get('sample_fail_no_stats', [])[:5]})")
                 print(f"      work_count > P95(277) 被筛: {p.get('n_fail_degree_w', 0)}  (样例: {p.get('sample_fail_degree', [])[:5]})")
                 print(f"      目标领域 0 篇(target_degree_w<=0) 被筛: {p.get('n_fail_target_degree_w', 0)}  (样例: {p.get('sample_fail_target', [])[:5]})")
@@ -1536,13 +1735,17 @@ if __name__ == "__main__":
                 fail_details = p.get("fail_domain_ratio_details", [])
                 if fail_details:
                     print(f"      被筛词纯度明细 (最多展示 20 条):")
-                    print(f"      {'term':<20} | {'tid':<8} | {'degree_w':<10} | {'target_degree_w':<16} | {'domain_ratio':<12} | 目标领域分布")
-                    print(f"      {'-' * 20} | {'-' * 8} | {'-' * 10} | {'-' * 16} | {'-' * 12} | ---------")
+                    print(f"      {'term':<20} | {'tid':<8} | {'deg_w':<8} | {'deg_w_exp':<10} | {'target_w':<10} | {'ratio_correct':<13} | 目标领域分布")
+                    print(f"      {'-' * 20} | {'-' * 8} | {'-' * 8} | {'-' * 10} | {'-' * 10} | {'-' * 13} | ---------")
                     for x in fail_details:
                         term_s = (x.get("term") or "")[:20]
                         dist_s = x.get("target_domains_dist") or {}
                         dist_str = ", ".join(f"{k}:{v}" for k, v in sorted(dist_s.items()))
-                        print(f"      {term_s:<20} | {x.get('tid', ''):<8} | {x.get('degree_w', 0):<10} | {x.get('target_degree_w', 0):<16} | {x.get('domain_ratio', 0):<12} | {dist_str}")
+                        deg = int(x.get("degree_w", 0) or 0)
+                        deg_exp = int(x.get("degree_w_expanded", 0) or 0)
+                        tgt = int(x.get("target_degree_w", 0) or 0)
+                        ratio_correct = (float(tgt) / float(deg_exp)) if deg_exp else 0.0
+                        print(f"      {term_s:<20} | {x.get('tid', ''):<8} | {deg:<8} | {deg_exp:<10} | {tgt:<10} | {ratio_correct:<13.4f} | {dist_str}")
                         all_ratio = x.get("all_domains_ratio") or {}
                         if all_ratio:
                             ratio_str = ", ".join(
