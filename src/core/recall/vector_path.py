@@ -98,9 +98,12 @@ class VectorPath:
 # 修改 vector_path.py 最后的 if __name__ == "__main__": 部分
 if __name__ == "__main__":
     from src.core.recall.input_to_vector import QueryEncoder  # 确保路径正确
+    from src.core.recall.label_path import LabelRecallPath
 
     v_path = VectorPath(recall_limit=300)
     encoder = QueryEncoder()
+    # 复用标签路的领域探测逻辑，用于在 domain_choice=0 时自动推断目标领域
+    l_path = LabelRecallPath(recall_limit=150)
 
     fields = {
         "1": "计算机科学", "2": "医学", "3": "政治学", "4": "工程学", "5": "物理学",
@@ -137,18 +140,42 @@ if __name__ == "__main__":
 
         while True:
             user_input = input(f"\n[{current_field}] 请输入岗位需求 (q退出): ").strip()
-            if not user_input or user_input.lower() == 'q': break
+            if not user_input or user_input.lower() == 'q':
+                break
 
-            # 1. 文本转向量
+            # 1. 文本转向量（基础向量，用于向量检索与自动领域探测）
             query_vec, _ = encoder.encode(user_input)
             faiss.normalize_L2(query_vec)
 
-            # 2. 执行召回
-            author_ids, duration = v_path.recall(query_vec,
-                                                 target_domains=domain_choice if domain_choice != "0" else None)
+            # 2. 领域口径：若用户选择 1-17 则使用用户领域，否则启用自动领域探测
+            target_domains = None
+            applied_domains_str = "全领域"
+            if domain_choice != "0":
+                # 用户显式指定领域时，直接使用该领域进行过滤
+                target_domains = domain_choice
+                applied_domains_str = fields.get(domain_choice, f"领域{domain_choice}")
+            else:
+                # 未指定领域：调用标签路的领域探测逻辑，自动推断目标领域集合
+                try:
+                    active_set, _, _, _ = l_path._stage1_domain_and_anchors(
+                        query_vec, query_text=user_input, domain_id=None
+                    )
+                    active_domains = sorted(str(d) for d in (active_set or []))
+                    if active_domains:
+                        target_domains = "|".join(active_domains)
+                        applied_domains_str = "自动领域: " + "|".join(
+                            f"{d}:{fields.get(d, '未知')}" for d in active_domains
+                        )
+                except Exception:
+                    # 自动探测失败时退化为全领域检索
+                    target_domains = None
+                    applied_domains_str = "全领域(自动探测失败)"
+
+            # 3. 执行召回（根据 target_domains 做领域硬过滤）
+            author_ids, duration = v_path.recall(query_vec, target_domains=target_domains)
 
             # 3. 打印报告
-            print(f"\n[召回报告] 耗时: {duration:.2f}ms | 命中人数: {len(author_ids)}")
+            print(f"\n[召回报告] 耗时: {duration:.2f}ms | 命中人数: {len(author_ids)} | 应用领域: {applied_domains_str}")
             print("-" * 115)
             print(f"{'排名':<6} | {'作者 ID':<12} | {'检索路径':<15} | {'代表作标题 (数据源: SQLite)'}")
             print("-" * 115)

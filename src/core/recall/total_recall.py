@@ -9,6 +9,7 @@ from src.core.recall.input_to_vector import QueryEncoder
 from src.core.recall.vector_path import VectorPath
 from src.core.recall.label_path import LabelRecallPath
 from src.core.recall.collaboration_path import CollaborativeRecallPath
+from src.utils.domain_utils import DomainProcessor
 from config import DB_PATH
 
 # 限制底层模型并行，防止多线程冲突
@@ -30,10 +31,10 @@ class TotalRecallSystem:
     def __init__(self):
         print("[*] 正在初始化全量召回系统 (Training-Safe Mode)...", flush=True)
         self.encoder = QueryEncoder()
-        # 增加召回上限，为后续精排留足空间
-        self.v_path = VectorPath(recall_limit=500)
-        self.l_path = LabelRecallPath(recall_limit=500)
-        self.c_path = CollaborativeRecallPath(recall_limit=500)
+        # 各路召回上限：每路最多保留 150 名候选人，后续在多路融合阶段统一精排
+        self.v_path = VectorPath(recall_limit=150)
+        self.l_path = LabelRecallPath(recall_limit=150)
+        self.c_path = CollaborativeRecallPath(recall_limit=150)
         self.executor = ThreadPoolExecutor(max_workers=3)
 
     def _get_author_works(self, author_id, top_n=2):
@@ -56,29 +57,58 @@ class TotalRecallSystem:
         """
         start_time = time.time()
 
-        # --- 1. 领域过滤逻辑预处理 ---
-        # 统一处理 domain_id：如果是 "0" 或 空字符串，设为 None 以触发各路径的“全召回”逻辑
-        processed_domain = None
+        # --- 1. 用户领域口径 ---
+        # user_domain：用户显式指定的领域（1-17），为 None 表示“未指定/全领域”
+        user_domain = None
         if domain_id and str(domain_id).strip() not in ["0", ""]:
-            processed_domain = str(domain_id).strip()
+            user_domain = str(domain_id).strip()
 
-        # --- 2. 语义增强 (Query Expansion) ---
+        # --- 2. 基础向量编码（原始 JD 文本，用于自动领域探测）---
+        raw_vec, _ = self.encoder.encode(query_text)
+        faiss.normalize_L2(raw_vec)
+
+        # --- 3. 自动领域探测（仅在用户未指定 domain 且非训练模式时启用）---
+        auto_active_domains = set()
+        if user_domain is None and not is_training:
+            try:
+                active_set, _, _, _ = self.l_path._stage1_domain_and_anchors(
+                    raw_vec, query_text=query_text, domain_id=None
+                )
+                auto_active_domains = set(active_set or [])
+            except Exception:
+                auto_active_domains = set()
+
+        # --- 4. 为向量路构造领域过滤 ID（字符串形式，如 "1|4|14"）---
+        vector_domains = None
+        if user_domain is not None:
+            vector_domains = user_domain
+        elif auto_active_domains:
+            vector_domains = "|".join(sorted(str(d) for d in auto_active_domains))
+
+        # --- 5. 为向量路构造最终 Query（自动/手动领域 bias）---
         final_query = query_text
-        if processed_domain and not is_training:
-            # 只有在指定了有效领域时，才在 Query 后面挂载语义锚点，增强向量路的准确性
-            if processed_domain in self.DOMAIN_PROMPTS:
-                bias = self.DOMAIN_PROMPTS[processed_domain]
-                final_query = f"{query_text} | Area: {bias}"
+        if vector_domains and not is_training:
+            domain_set = DomainProcessor.to_set(vector_domains)
+            if domain_set:
+                primary_domain = sorted(domain_set)[0]
+                if primary_domain in self.DOMAIN_PROMPTS:
+                    bias = self.DOMAIN_PROMPTS[primary_domain]
+                    final_query = f"{query_text} | Area: {bias}"
 
-        # 向量转换
+        # --- 6. 向量转换（供向量路与标签路共用同一编码空间）---
         query_vec, _ = self.encoder.encode(final_query)
         faiss.normalize_L2(query_vec)
 
         # --- 3. 并行召回分发 ---
-        # 将 processed_domain 传递给底层，底层 LabelRecallPath 会据此拼接 Cypher
-        # 注意：这里参数名对齐为你修改后的 domain_ids
-        future_v = self.executor.submit(self.v_path.recall, query_vec, target_domains=processed_domain)
-        future_l = self.executor.submit(self.l_path.recall, query_vec, domain_id=processed_domain, query_text=query_text)
+        # 向量路：使用自动/手动推断的 vector_domains 进行领域过滤
+        # 标签路：若用户指定了 domain，则使用用户口径；否则内部按自动探测结果执行
+        future_v = self.executor.submit(self.v_path.recall, query_vec, target_domains=vector_domains)
+        future_l = self.executor.submit(
+            self.l_path.recall,
+            query_vec,
+            domain_id=user_domain,
+            query_text=query_text,
+        )
 
         v_list, v_cost = future_v.result()
         l_list, l_cost = future_l.result()
@@ -87,25 +117,37 @@ class TotalRecallSystem:
         seeds = list(set(v_list[:100] + l_list[:100]))
         c_list, c_cost = self.c_path.recall(seeds)
 
-        # --- 5. RRF 结果融合 ---
+        # --- 5. RRF 结果融合（多路各 150 上限，融合后整体再截断为约 200 人候选池） ---
         final_list, rank_map = self._fuse_results(v_list, l_list, c_list)
 
+        # applied_domains：优先展示用户指定的领域；若无则展示自动探测到的领域集合；再无则标记为全领域
+        if user_domain is not None:
+            applied_domains = user_domain
+        elif auto_active_domains:
+            applied_domains = "|".join(sorted(str(d) for d in auto_active_domains))
+        else:
+            applied_domains = "All Fields"
+
         return {
-            "final_top_500": final_list,
+            # 三路融合后的全局候选池（约 200 人，用于后续精排）
+            "final_top_200": final_list,
             "rank_map": rank_map,
             "total_ms": (time.time() - start_time) * 1000,
-            "applied_domains": processed_domain if processed_domain else "All Fields",
+            "applied_domains": applied_domains,
             "details": {"v_cost": v_cost, "l_cost": l_cost, "cost_c": c_cost}
         }
 
     def _fuse_results(self, v_res, l_res, c_res):
-        """RRF (Reciprocal Rank Fusion) 融合"""
+        """
+        RRF (Reciprocal Rank Fusion) 多路融合。
+        输入：各路最多 150 名候选人；输出：按融合分数排序后的前 200 名作者 ID。
+        """
         rrf_k = 60
         scores = {}
         rank_map = {}
 
-        # 赋予不同召回路径不同的基础权重
-        paths = [("v", v_res, 1.2), ("l", l_res, 1.0), ("c", c_res, 0.6)]
+        # 赋予不同召回路径不同的基础权重（V:L:C = 2:3:1）
+        paths = [("v", v_res, 2.0), ("l", l_res, 3.0), ("c", c_res, 1.0)]
 
         for p_tag, res_list, weight in paths:
             for rank, aid in enumerate(res_list):
@@ -129,8 +171,8 @@ class TotalRecallSystem:
                 cnt += 1
             path_count[aid] = cnt
 
-        # 2. 在 RRF 分基础上增加一个与 path_count 成正比的小 bonus
-        alpha = 0.02  # 可按效果微调：增大则更偏好多路交集，减小则更接近原始 RRF
+        # 2. 在 RRF 分基础上增加一个与 path_count 成正比的小 bonus（柔性多路交集加分）
+        alpha = 0.05  # 可按效果微调：增大则更偏好多路交集，减小则更接近原始 RRF
         final_score = {}
         for aid, base in scores.items():
             pc = path_count.get(aid, 1)
@@ -138,7 +180,12 @@ class TotalRecallSystem:
             final_score[aid] = base + bonus
 
         sorted_candidates = sorted(final_score.items(), key=lambda x: x[1], reverse=True)
-        return [item[0] for item in sorted_candidates[:500]], rank_map
+
+        # 3. 柔性多路交集优先：不强制过滤单路，但命中多路的作者在排序上天然占优
+        # 若你想进一步收紧，也可以在这里加入硬过滤逻辑（例如只保留至少命中 L 或 path_count>=2 的作者）
+
+        # 最终多路融合候选池：全局最多保留 200 名作者供下游精排
+        return [item[0] for item in sorted_candidates[:200]], rank_map
 
 
 if __name__ == "__main__":
@@ -172,7 +219,8 @@ if __name__ == "__main__":
 
             # 3. 执行系统召回
             results = system.execute(user_input, domain_id=domain_choice)
-            candidates = results['final_top_500']
+            # 多路融合后的全局候选池（约 200 名作者），此处交由终端 Demo 打印前 50 名
+            candidates = results['final_top_200']
             rank_map = results['rank_map']
 
             # 4. 打印报告
