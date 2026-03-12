@@ -1379,8 +1379,11 @@ class LabelRecallPath:
         raw_tag_purity = (rec['target_degree_w'] / degree_w_expanded) if degree_w_expanded else 0.0
         tag_purity = min(1.0, raw_tag_purity)
 
-        # 2. 计算基础学术稀缺度 (IDF)
-        idf_val = math.log10(self.total_work_count / (degree_w + 1))
+        # 2. 计算基础学术稀缺度 (IDF)（轻化版：压缩 + 开根号，避免极端放大/压制）
+        idf_raw = math.log10(self.total_work_count / (degree_w + 1))
+        # 将 IDF 压到 [0.2, 2.0] 区间，再做 0.5 次方，弱化影响
+        idf_clamped = min(2.0, max(0.2, idf_raw))
+        idf_val = math.pow(idf_clamped, 0.5)
 
         # 3. 计算断崖式岗位惩罚 (Suppression of generic job terms)
         job_penalty = 1.0 + math.exp(300.0 * (cov_j - 0.005))
@@ -1452,6 +1455,13 @@ class LabelRecallPath:
                 bucket_factor = 1.0
         semantic_factor *= bucket_factor
 
+        # 基础骨架：sim * log(1+hits) * purity / log(1+paper_count)
+        sim_term = semantic_factor
+        hits_term = math.log1p(hit_count)
+        purity_term = tag_purity
+        freq_term = math.log1p(degree_w)
+        term_backbone = (sim_term * hits_term * purity_term) / max(1e-6, freq_term)
+
         # --- 6. 【共现领域惩罚与奖励】基于 vocab_stats 的 vocabulary_cooccurrence ---
         # 降权：与各种领域的词都共现 → 万金油 → 共现伙伴平均领域跨度大 → cooc_span 大 → 乘小于 1 的因子
         cooc_span = rec.get('cooc_span', 0.0)
@@ -1461,13 +1471,14 @@ class LabelRecallPath:
         purity_bonus = (1.0 + math.log1p(cooc_purity)) if cooc_purity > 0 else 1.0
 
         # 7. 【最终公式：立体的评价体系】
-        # 在原有公式上再乘 span_penalty（万金油降权）与 purity_bonus（领域专精加权），输入输出格式不变
+        # 骨架：sim * log(1+hits) * purity / log(1+paper_count)
+        # 细节：轻化 IDF + 岗位惩罚 + 领域跨度 + 共鸣/共现修正
         dynamic_weight = (
-                (idf_val / job_penalty)
-                * math.pow(tag_purity, 4)  # 纯度 4 次方，整体压泛词（跨多领域词得分断崖式下降）
-                / domain_span  # 跨度降权压制万金油
+                term_backbone
+                * idf_val  # 轻化后的 IDF，只做微调
+                / job_penalty
+                / domain_span
                 * convergence_bonus  # 学术共鸣（与本次搜索词共现）加成
-                * semantic_factor  # SBERT 语义守门员
                 * span_penalty  # 共现伙伴跨多领域 → 降权
                 * purity_bonus  # 共现伙伴集中目标领域 → 加权
         )
@@ -1575,6 +1586,20 @@ class LabelRecallPath:
         # 6. 时序衰减：统一调用工具层 compute_time_decay（按领域配置 decay_rate）
         time_decay = compute_time_decay(paper.get('year', 2000), context['active_domain_set'])
 
+        # 6.5 跨簇奖励：命中多个 topic cluster 的论文略微加成
+        cluster_ids = set()
+        for vid in valid_hids:
+            try:
+                clusters = self.voc_to_clusters.get(int(vid), [])
+            except Exception:
+                clusters = []
+            if clusters:
+                # 取该词所属得分最高的簇作为其主簇
+                cid, _ = max(clusters, key=lambda x: x[1])
+                cluster_ids.add(cid)
+        cluster_count = len(cluster_ids)
+        cluster_bonus = math.log1p(cluster_count) if cluster_count > 0 else 1.0
+
         # 7. 命中标签数量归一化：防止“命中标签越多 → 单论文贡献爆炸”主导作者排序
         # 采用次线性归一：log(2 + hit_count)，保证 1 标签与多标签论文在同一量级
         if hit_count > 0:
@@ -1582,8 +1607,16 @@ class LabelRecallPath:
         else:
             coverage_norm = 1.0
 
-        # 最终组合：按词权重 + 语义紧密度 + 领域纯度 + 时间/文本类型 + 命中数归一化 综合计算论文本身贡献度
-        score = rank_score * coverage_norm * proximity_bonus * domain_coeff * time_decay * survey_decay
+        # 最终组合：按词权重 + 语义紧密度 + 领域纯度 + 时间/文本类型 + 命中数归一化 + 跨簇奖励 综合计算论文本身贡献度
+        score = (
+            rank_score
+            * coverage_norm
+            * cluster_bonus
+            * proximity_bonus
+            * domain_coeff
+            * time_decay
+            * survey_decay
+        )
         return score, hit_terms
 
     # ---------- 五阶段流程（便于维护与修改） ----------
@@ -1757,8 +1790,8 @@ class LabelRecallPath:
                 }
             )
 
-        # 3) 统一调用 works_to_authors 进行“论文 → 作者”分摊与聚合
-        agg_result = accumulate_author_scores(papers_for_agg, top_k_per_author=None)
+        # 3) 统一调用 works_to_authors 进行“论文 → 作者”分摊与聚合（仅保留每位作者贡献最高的 Top3 论文）
+        agg_result = accumulate_author_scores(papers_for_agg, top_k_per_author=3)
         author_scores = agg_result.author_scores
         author_top_works = agg_result.author_top_works  # aid -> [(wid, contrib_score), ...]
 
@@ -1793,11 +1826,18 @@ class LabelRecallPath:
                 tag_counter.update(p.get("hits") or [])
             tag_stats = [{"term": t, "count": c} for t, c in tag_counter.most_common(10)]
 
+            # 作者总论文数（未截断，用于轻量奖励“持续贡献”）
+            paper_cnt_author = author_raw_paper_cnt.get(aid, len(per_author_papers))
+            # Author-level bonus：log(1 + paper_count_author)，在 Top3 代表作总分上做轻量放大
+            author_bonus = math.log1p(paper_cnt_author)
+            final_score = total_score * author_bonus
+
             scored_authors.append({
                 "aid": aid,
-                "score": total_score,
+                "score": final_score,
+                "raw_score": total_score,
                 "top_paper": best_paper,
-                "paper_count": author_raw_paper_cnt.get(aid, len(per_author_papers)),
+                "paper_count": paper_cnt_author,
                 "top_papers": top_papers,
                 "tag_stats": tag_stats,
             })
