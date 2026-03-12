@@ -2,6 +2,8 @@ import faiss
 import json
 import sqlite3
 import time
+import re
+from collections import defaultdict
 from config import ABSTRACT_INDEX_PATH, ABSTRACT_MAP_PATH, DB_PATH, JOB_INDEX_PATH, JOB_MAP_PATH
 from src.utils.domain_utils import DomainProcessor
 
@@ -33,59 +35,170 @@ class VectorPath:
         """
         start_t = time.time()
         conn = sqlite3.connect(DB_PATH)
+        # 供 CLI 调试：当 verbose=True 时写入
+        self._last_debug = None
+        survey_re = re.compile(r"\b(survey|overview|review|handbook)\b", re.IGNORECASE)
+        survey_decay = 0.1
 
         # --- 【修改 1】：统一使用 DomainProcessor 处理 target_domains 格式 ---
         # 无论是 '1|4' 还是 ['1', '4']，统一转化为 set({'1', '4'})
         target_set = DomainProcessor.to_set(target_domains) if target_domains else None
+        purity_min = 1.0  # 领域纯度门槛
 
         try:
             # --- 步骤 1: 语义检索相似论文 (Faiss 获取最相关的论文 ID 序列) ---
-            _, indices = self.index.search(query_vector, self.search_k)
-            raw_work_ids = [self.id_map[idx] for idx in indices[0] if 0 <= idx < len(self.id_map)]
+            scores, indices = self.index.search(query_vector, self.search_k)
+
+            # 兼容不同 Faiss 度量：Inner Product(越大越相似) / L2(越小越相似)
+            def _to_similarity(x: float) -> float:
+                mt = getattr(self.index, "metric_type", None)
+                if mt == faiss.METRIC_L2:
+                    return 1.0 / (1.0 + max(0.0, x))
+                return float(x)
+
+            raw_work_ids = []
+            faiss_score_map = {}
+            for i, idx in enumerate(indices[0]):
+                if 0 <= idx < len(self.id_map):
+                    wid = self.id_map[idx]
+                    raw_work_ids.append(wid)
+                    # 保留最靠前的那次分数
+                    if wid not in faiss_score_map:
+                        faiss_score_map[wid] = _to_similarity(float(scores[0][i]))
 
             if not raw_work_ids:
                 return [], (time.time() - start_t) * 1000
 
-            # --- 步骤 2: 获取论文的领域标签用于过滤 ---
+            # --- 步骤 2: 获取论文的领域标签与元信息用于过滤与调试 ---
             placeholders = ','.join(['?'] * len(raw_work_ids))
-            sql = f"SELECT work_id, domain_ids FROM works WHERE work_id IN ({placeholders})"
+            sql = f"SELECT work_id, domain_ids, title, year FROM works WHERE work_id IN ({placeholders})"
             work_data = conn.execute(sql, raw_work_ids).fetchall()
             domain_dict = {row[0]: row[1] for row in work_data}
+            meta_dict = {row[0]: {"title": row[2], "year": row[3]} for row in work_data}
 
             # --- 步骤 3: 领域硬过滤（只有对应领域的论文才能发挥作用） ---
             filtered_work_ids = []
+            work_score_map = {}
+            work_debug_map = {}
             for wid in raw_work_ids:
                 if wid not in domain_dict:
                     continue
 
-                # --- 【修改 2】：使用 DomainProcessor.has_intersect 执行交集校验 ---
                 if target_set:
                     work_domains_raw = domain_dict[wid]
-                    # 只有当论文所属领域与目标领域有交集时才保留
-                    # 工具类会自动处理 split('|') 或 split(',') 逻辑
+
+                    # 1) 交集校验（无标签在 has_intersect 中会被拦截）
                     if not DomainProcessor.has_intersect(work_domains_raw, target_set):
                         continue
 
+                    # 2) 纯度过滤：|intersect| / |paper_domains|
+                    paper_set = DomainProcessor.to_set(work_domains_raw)
+                    purity = len(paper_set & target_set) / max(1, len(paper_set))
+                    if purity < purity_min:
+                        continue
+                    domain_coeff = purity ** 4  # 标签路同款“断崖式专精惩罚”
+                else:
+                    domain_coeff = 1.0
+                    purity = None
+
                 filtered_work_ids.append(wid)
+                # work_score：语义相似度 × 领域专精 × 文献类型衰减（综述/手册降权）
+                base_sim = faiss_score_map.get(wid, 0.0)
+                work_score = base_sim * domain_coeff
+
+                title = (meta_dict.get(wid, {}).get("title") or "")
+                if title and survey_re.search(title):
+                    work_score *= survey_decay
+
+                work_score_map[wid] = work_score
+
+                if verbose:
+                    work_debug_map[wid] = {
+                        "faiss_sim": float(base_sim),
+                        "purity": None if purity is None else float(purity),
+                        "domain_coeff": float(domain_coeff),
+                        "work_score": float(work_score),
+                        "domain_ids": domain_dict.get(wid),
+                        "title": title,
+                        "year": meta_dict.get(wid, {}).get("year"),
+                    }
 
             if not filtered_work_ids:
                 return [], (time.time() - start_t) * 1000
 
-            # --- 步骤 4: 映射到作者，并保持原始论文的语义排名顺序 ---
+            # --- 步骤 4: 映射到作者，并按作者聚合分排序（sum(top3 work_score)）---
             work_placeholders = ','.join(['?'] * len(filtered_work_ids))
-            ordered_work_str = ",".join(filtered_work_ids)
-
-            # SQL 解析：按该作者关联的最高质量(排名最靠前)论文进行排序
-            author_query = f"""
-                SELECT author_id 
-                FROM authorships 
+            pairs_query = f"""
+                SELECT author_id, work_id
+                FROM authorships
                 WHERE work_id IN ({work_placeholders})
-                GROUP BY author_id
-                ORDER BY MIN(instr(?, work_id))
             """
+            pairs = conn.execute(pairs_query, filtered_work_ids).fetchall()
 
-            query_params = [ordered_work_str] + filtered_work_ids
-            author_ids = [row[0] for row in conn.execute(author_query, query_params).fetchall()]
+            # 去重：同一作者的同一篇论文只计一次（取最高分）
+            author_to_work_best = defaultdict(dict)  # aid -> {wid: best_score}
+            for aid, wid in pairs:
+                s = work_score_map.get(wid)
+                if s is None:
+                    continue
+                prev = author_to_work_best[aid].get(wid)
+                if prev is None or float(s) > float(prev):
+                    author_to_work_best[aid][wid] = float(s)
+
+            author_scored = []
+            author_top3 = {}
+            for aid, w_map in author_to_work_best.items():
+                if not w_map:
+                    continue
+                w_list = list(w_map.items())  # (wid, score)
+                w_list.sort(key=lambda x: x[1], reverse=True)
+                author_score = sum([s for _, s in w_list[:3]])
+                author_scored.append((aid, author_score))
+                if verbose:
+                    author_top3[aid] = w_list[:3]
+
+            author_scored.sort(key=lambda x: x[1], reverse=True)
+            author_ids = [aid for aid, _ in author_scored]
+
+            if verbose:
+                top20 = author_scored[:20]
+                # 批量取 Top20 作者的 Top3 work 元信息
+                top_work_ids = []
+                for aid, _ in top20:
+                    for wid, _ in author_top3.get(aid, []):
+                        top_work_ids.append(wid)
+                top_work_ids = list(dict.fromkeys(top_work_ids))  # 去重且保序
+
+                work_meta = {}
+                if top_work_ids:
+                    ph = ",".join(["?"] * len(top_work_ids))
+                    rows = conn.execute(
+                        f"SELECT work_id, title, year FROM works WHERE work_id IN ({ph})",
+                        top_work_ids,
+                    ).fetchall()
+                    work_meta = {r[0]: {"title": r[1], "year": r[2]} for r in rows}
+
+                self._last_debug = {
+                    "target_domains": target_domains,
+                    "target_set": sorted(list(target_set)) if target_set else [],
+                    "purity_min": purity_min,
+                    "survey_decay": survey_decay,
+                    "top20": [
+                        {
+                            "author_id": aid,
+                            "author_score": float(a_score),
+                            "top3_works": [
+                                {
+                                    "work_id": wid,
+                                    **(work_meta.get(wid, {})),
+                                    **(work_debug_map.get(wid, {})),
+                                }
+                                for wid, _ in author_top3.get(aid, [])
+                            ],
+                        }
+                        for aid, a_score in top20
+                    ],
+                }
 
         finally:
             conn.close()
@@ -160,7 +273,7 @@ if __name__ == "__main__":
             target_domains = "|".join(sorted(active_domains)) if active_domains else None
 
             # 3. 执行召回（根据 target_domains 做领域硬过滤）
-            author_ids, duration = v_path.recall(query_vec, target_domains=target_domains)
+            author_ids, duration = v_path.recall(query_vec, target_domains=target_domains, verbose=True)
 
             # 3. 打印报告
             print(f"\n[召回报告] 耗时: {duration:.2f}ms | 命中人数: {len(author_ids)} | 应用领域: {applied_domains_str}")
@@ -172,6 +285,27 @@ if __name__ == "__main__":
                 title = get_work_title(aid)
                 if len(title) > 70: title = title[:67] + "..."
                 print(f"#{rank:<5} | {aid:<12} | {'Vector (V)':<15} | {title}")
+
+            dbg = getattr(v_path, "_last_debug", None)
+            if dbg and dbg.get("top20"):
+                print("\n[Top20 Debug] author_score 与 Top3 work 贡献明细")
+                print("-" * 115)
+                for i, item in enumerate(dbg["top20"], 1):
+                    aid = item["author_id"]
+                    a_score = item["author_score"]
+                    print(f"#{i:<3} {aid} | author_score={a_score:.6f}")
+                    for w in item.get("top3_works", []):
+                        w_title = (w.get("title") or "N/A").strip()
+                        if len(w_title) > 90:
+                            w_title = w_title[:87] + "..."
+                        print(
+                            f"    - {w.get('work_id')} ({w.get('year')})"
+                            f" | work_score={w.get('work_score', 0.0):.6f}"
+                            f" | faiss={w.get('faiss_sim', 0.0):.6f}"
+                            f" | purity={w.get('purity')}"
+                            f" | domains={w.get('domain_ids')}"
+                            f" | {w_title}"
+                        )
 
             print("-" * 115)
 

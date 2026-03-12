@@ -65,7 +65,7 @@ class DomainProcessor:
         if not active_domain_set:
             return True
         paper_set = DomainProcessor.to_set(paper_domain_input)
-        # 如果论文没标签，为了召回率通常设为 True，或者根据需求设为 False
+        # 启用领域过滤时：论文没领域标签 => 不通过（你的缺失率极低，可强约束以减少噪声）
         if not paper_set:
-            return True
+            return False
         return bool(paper_set & active_domain_set)
