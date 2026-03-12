@@ -36,7 +36,7 @@ from src.utils.domain_config import (
     DEFAULT_DECAY_RATE,
     DOMAIN_MAP,
 )
-from src.utils.tools import apply_text_decay, get_decay_rate_for_domains
+from src.utils.tools import apply_text_decay, get_decay_rate_for_domains, compute_time_decay
 
 
 class LabelRecallPath:
@@ -1546,9 +1546,8 @@ class LabelRecallPath:
         proximity = self._calculate_proximity(valid_hids)
         proximity_bonus = math.pow(1.0 + proximity, hit_count)
 
-        # 6. 时序衰减（作者层拆分交由 works_to_authors 统一处理，这里不再乘作者权重）
-        year_diff = max(0, self.current_year - int(paper.get('year', 2000)))
-        time_decay = math.pow(context['decay_rate'], year_diff)
+        # 6. 时序衰减：统一调用工具层 compute_time_decay（按领域配置 decay_rate）
+        time_decay = compute_time_decay(paper.get('year', 2000), context['active_domain_set'])
 
         # 最终组合：仅按论文语义/领域/时间/文本类型等因素计算“论文本身”的贡献度
         score = rank_score * proximity_bonus * domain_coeff * time_decay * survey_decay
@@ -1645,7 +1644,7 @@ class LabelRecallPath:
         final_cypher = f"""
         MATCH (v:Vocabulary) WHERE v.id IN $v_ids
         WITH v, COUNT {{ (v)<-[:HAS_TOPIC]-() }} AS degree_w
-        WHERE (degree_w * 1.0 / $total_w) < 0.015 
+        WHERE (degree_w * 1.0 / $total_w) < 0.02 
         WITH v, log10($total_w / (degree_w + 1)) AS idf_weight
         MATCH (v)<-[:HAS_TOPIC]-(w:Work) 
         WHERE 1=1 {domain_clause} 

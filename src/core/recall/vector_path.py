@@ -7,7 +7,7 @@ from datetime import datetime
 from collections import defaultdict
 from config import ABSTRACT_INDEX_PATH, ABSTRACT_MAP_PATH, DB_PATH, JOB_INDEX_PATH, JOB_MAP_PATH
 from src.utils.domain_utils import DomainProcessor
-from src.utils.tools import apply_text_decay, get_decay_rate_for_domains
+from src.utils.tools import apply_text_decay, get_decay_rate_for_domains, compute_time_decay
 from src.core.recall.works_to_authors import accumulate_author_scores
 
 class VectorPath:
@@ -114,15 +114,8 @@ class VectorPath:
                 # 1) 文本类型衰减：survey/overview/review/handbook + data from:/dataset:/supplementary data
                 type_decay = apply_text_decay(title)
 
-                # 2) 时间衰减：按领域 decay_rate 与发表年份
-                time_decay = 1.0
-                try:
-                    y = int(year_val) if year_val is not None else None
-                    if y:
-                        year_diff = max(0, current_year - y)
-                        time_decay = decay_rate ** year_diff
-                except Exception:
-                    time_decay = 1.0
+                # 2) 时间衰减：统一通过工具层 compute_time_decay（内部使用领域配置的 decay_rate）
+                time_decay = compute_time_decay(year_val, target_set or [])
 
                 work_score = base_sim * domain_coeff * type_decay * time_decay
                 work_score_map[wid] = work_score
