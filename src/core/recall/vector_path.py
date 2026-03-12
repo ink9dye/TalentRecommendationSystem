@@ -8,6 +8,7 @@ from collections import defaultdict
 from config import ABSTRACT_INDEX_PATH, ABSTRACT_MAP_PATH, DB_PATH, JOB_INDEX_PATH, JOB_MAP_PATH
 from src.utils.domain_utils import DomainProcessor
 from src.utils.tools import apply_text_decay, get_decay_rate_for_domains
+from src.core.recall.works_to_authors import accumulate_author_scores
 
 class VectorPath:
     """
@@ -142,46 +143,53 @@ class VectorPath:
             if not filtered_work_ids:
                 return [], (time.time() - start_t) * 1000
 
-            # --- 步骤 4: 映射到作者，并按作者聚合分排序（sum(top3 work_score)）---
-            work_placeholders = ','.join(['?'] * len(filtered_work_ids))
+            # --- 步骤 4: 统一走“论文 → 作者”分摊聚合逻辑 ---
+            # 构造每篇论文的作者列表（此处 SQLite authorships 若无 pos_weight 字段，则等价于 1/n 均分）
+            work_placeholders = ",".join(["?"] * len(filtered_work_ids))
             pairs_query = f"""
                 SELECT author_id, work_id
                 FROM authorships
                 WHERE work_id IN ({work_placeholders})
             """
-            pairs = conn.execute(pairs_query, filtered_work_ids).fetchall()
+            rows = conn.execute(pairs_query, filtered_work_ids).fetchall()
 
-            # 去重：同一作者的同一篇论文只计一次（取最高分）
-            author_to_work_best = defaultdict(dict)  # aid -> {wid: best_score}
-            for aid, wid in pairs:
-                s = work_score_map.get(wid)
-                if s is None:
+            # 1) 为每篇论文建立骨架
+            papers_by_wid = {
+                wid: {"wid": wid, "score": float(work_score_map.get(wid, 0.0)), "authors": []}
+                for wid in filtered_work_ids
+                if wid in work_score_map
+            }
+
+            # 2) 填充作者；SQLite 若无作者级权重，则默认 pos_weight=1.0，后续在同篇内做 1/n 均分
+            for aid, wid in rows:
+                p = papers_by_wid.get(wid)
+                if p is None:
                     continue
-                prev = author_to_work_best[aid].get(wid)
-                if prev is None or float(s) > float(prev):
-                    author_to_work_best[aid][wid] = float(s)
+                p["authors"].append(
+                    {
+                        "aid": str(aid),
+                        "pos_weight": 1.0,
+                    }
+                )
 
-            author_scored = []
-            author_top3 = {}
-            for aid, w_map in author_to_work_best.items():
-                if not w_map:
-                    continue
-                w_list = list(w_map.items())  # (wid, score)
-                w_list.sort(key=lambda x: x[1], reverse=True)
-                author_score = sum([s for _, s in w_list[:3]])
-                author_scored.append((aid, author_score))
-                if verbose:
-                    author_top3[aid] = w_list[:3]
+            papers = [p for p in papers_by_wid.values() if p["authors"]]
 
-            author_scored.sort(key=lambda x: x[1], reverse=True)
-            author_ids = [aid for aid, _ in author_scored]
+            # 3) 聚合为作者分数：每个作者取自己 Top3 论文贡献度之和（与原逻辑保持一致语义）
+            agg_result = accumulate_author_scores(papers, top_k_per_author=3)
+            author_scores = agg_result.author_scores
+            author_ids = agg_result.sorted_authors()
 
             if verbose:
-                top20 = author_scored[:20]
-                # 批量取 Top20 作者的 Top3 work 元信息
+                # 构造 Top20 调试信息：对齐原有 _last_debug 结构
+                top20_items = sorted(author_scores.items(), key=lambda x: x[1], reverse=True)[:20]
+
+                # 收集 Top20 作者的 Top3 论文 ID
                 top_work_ids = []
-                for aid, _ in top20:
-                    for wid, _ in author_top3.get(aid, []):
+                author_top3 = {}
+                for aid, _ in top20_items:
+                    works = agg_result.author_top_works.get(aid, [])[:3]
+                    author_top3[aid] = works
+                    for wid, _ in works:
                         top_work_ids.append(wid)
                 top_work_ids = list(dict.fromkeys(top_work_ids))  # 去重且保序
 
@@ -212,7 +220,7 @@ class VectorPath:
                                 for wid, _ in author_top3.get(aid, [])
                             ],
                         }
-                        for aid, a_score in top20
+                        for aid, a_score in top20_items
                     ],
                 }
 

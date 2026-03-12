@@ -24,6 +24,7 @@ import traceback
 from datetime import datetime
 from py2neo import Graph
 from src.core.recall.input_to_vector import QueryEncoder
+from src.core.recall.works_to_authors import accumulate_author_scores
 from src.utils.domain_utils import DomainProcessor
 from config import (
     CONFIG_DICT, JOB_INDEX_PATH, JOB_MAP_PATH,
@@ -1545,13 +1546,12 @@ class LabelRecallPath:
         proximity = self._calculate_proximity(valid_hids)
         proximity_bonus = math.pow(1.0 + proximity, hit_count)
 
-        # 6. 时序衰减与署名权重
+        # 6. 时序衰减（作者层拆分交由 works_to_authors 统一处理，这里不再乘作者权重）
         year_diff = max(0, self.current_year - int(paper.get('year', 2000)))
         time_decay = math.pow(context['decay_rate'], year_diff)
-        auth_weight = float(paper.get('weight') or 0.001)
 
-        # 最终组合
-        score = rank_score * proximity_bonus * domain_coeff * time_decay * survey_decay * auth_weight
+        # 最终组合：仅按论文语义/领域/时间/文本类型等因素计算“论文本身”的贡献度
+        score = rank_score * proximity_bonus * domain_coeff * time_decay * survey_decay
         return score, hit_terms
 
     # ---------- 五阶段流程（便于维护与修改） ----------
@@ -1672,43 +1672,104 @@ class LabelRecallPath:
             "dominance": dominance,
             "decay_rate": get_decay_rate_for_domains(active_domain_set),
         }
-        scored_authors = []
-        all_works_count = 0
+
+        # ---------- 统一“论文 → 作者”聚合逻辑 ----------
+        # 1) 先按论文维度重组成 {wid -> 论文信息 + 全体作者列表} 结构
+        paper_map = {}  # wid -> {wid, hits, title, year, domains, authors: [{aid, pos_weight}, ...]}
+        author_raw_paper_cnt = collections.Counter()  # aid -> 原始论文数量（用于 debug 中的 paper_count）
+
         for record in author_papers_list:
-            author_total_score, best_paper = 0.0, None
-            per_author_papers = []
+            aid = record["aid"]
             for paper in record["papers"]:
-                all_works_count += 1
-                p_score, p_hits = self._compute_contribution(paper, context)
-                author_total_score += p_score
-                if p_score > 0 and (not best_paper or p_score > best_paper["contribution"]):
-                    best_paper = {
-                        "title": paper["title"], "year": paper["year"],
-                        "contribution": round(p_score, 4), "hits": p_hits,
-                    }
-                if p_score > 0:
-                    per_author_papers.append({
+                wid = paper["wid"]
+                entry = paper_map.setdefault(
+                    wid,
+                    {
+                        "wid": wid,
+                        "hits": paper["hits"],
                         "title": paper["title"],
                         "year": paper["year"],
-                        "contribution": round(p_score, 4),
-                        "hits": p_hits,
-                    })
-            if author_total_score > 0:
-                # 多篇代表作：按单篇贡献度排序，取前 3 作为代表作列表
-                per_author_papers.sort(key=lambda x: x.get("contribution", 0.0), reverse=True)
-                top_papers = per_author_papers[:3]
-                # 标签汇总：统计作者所有正贡献论文中的标签命中次数
-                tag_counter = collections.Counter()
-                for p in per_author_papers:
-                    tag_counter.update(p.get("hits") or [])
-                tag_stats = [{"term": t, "count": c} for t, c in tag_counter.most_common(10)]
-                scored_authors.append({
-                    "aid": record["aid"], "score": author_total_score,
-                    "top_paper": best_paper,
-                    "paper_count": len(record["papers"]),
-                    "top_papers": top_papers,
-                    "tag_stats": tag_stats,
-                })
+                        "domains": paper["domains"],
+                        "authors": [],
+                    },
+                )
+                entry["authors"].append(
+                    {"aid": aid, "pos_weight": float(paper.get("weight") or 1.0)}
+                )
+                author_raw_paper_cnt[aid] += 1
+
+        # 2) 对每篇论文计算“论文本身”的贡献度（不含作者拆分），并为公共聚合函数准备输入
+        papers_for_agg = []
+        paper_hit_terms = {}  # wid -> 命中标签列表（用于后续 per-author 代表作与标签统计）
+        all_works_count = 0
+
+        for wid, info in paper_map.items():
+            paper_struct = {
+                "wid": wid,
+                "hits": info["hits"],
+                "title": info["title"],
+                "year": info["year"],
+                "domains": info["domains"],
+            }
+            p_score, p_hits = self._compute_contribution(paper_struct, context)
+            all_works_count += 1
+            if p_score <= 0:
+                continue
+            paper_hit_terms[wid] = p_hits
+            info["score"] = float(p_score)
+            papers_for_agg.append(
+                {
+                    "wid": wid,
+                    "score": float(p_score),
+                    "authors": info["authors"],
+                }
+            )
+
+        # 3) 统一调用 works_to_authors 进行“论文 → 作者”分摊与聚合
+        agg_result = accumulate_author_scores(papers_for_agg, top_k_per_author=None)
+        author_scores = agg_result.author_scores
+        author_top_works = agg_result.author_top_works  # aid -> [(wid, contrib_score), ...]
+
+        # 4) 重建 per-author 调试与展示结构（代表作、标签统计等）
+        scored_authors = []
+        for aid, total_score in sorted(author_scores.items(), key=lambda x: x[1], reverse=True):
+            works = author_top_works.get(aid, [])
+            if not works:
+                continue
+
+            per_author_papers = []
+            for wid, contrib in works:
+                meta = paper_map.get(wid, {})
+                hits = paper_hit_terms.get(wid, [])
+                per_author_papers.append(
+                    {
+                        "title": meta.get("title"),
+                        "year": meta.get("year"),
+                        "contribution": round(contrib, 4),
+                        "hits": hits,
+                    }
+                )
+
+            # 多篇代表作：按贡献度排序，取前 3 作为代表作列表
+            per_author_papers.sort(key=lambda x: x.get("contribution", 0.0), reverse=True)
+            top_papers = per_author_papers[:3]
+            best_paper = top_papers[0] if top_papers else None
+
+            # 标签汇总：统计作者所有正贡献论文中的标签命中次数
+            tag_counter = collections.Counter()
+            for p in per_author_papers:
+                tag_counter.update(p.get("hits") or [])
+            tag_stats = [{"term": t, "count": c} for t, c in tag_counter.most_common(10)]
+
+            scored_authors.append({
+                "aid": aid,
+                "score": total_score,
+                "top_paper": best_paper,
+                "paper_count": author_raw_paper_cnt.get(aid, len(per_author_papers)),
+                "top_papers": top_papers,
+                "tag_stats": tag_stats,
+            })
+
         scored_authors.sort(key=lambda x: x["score"], reverse=True)
         sorted_terms = sorted(
             [(term_map.get(tid, ""), score_map.get(tid, 0)) for tid in score_map],
