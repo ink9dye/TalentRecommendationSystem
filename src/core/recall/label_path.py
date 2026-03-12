@@ -1457,7 +1457,8 @@ class LabelRecallPath:
                 if cos_sim >= p80:
                     bucket_factor = 1.5
                 elif cos_sim <= p20:
-                    bucket_factor = 0.5
+                    # 对语义处于底部 20% 的词更强惩罚，防止“同领域但偏题”的标签抢占权重
+                    bucket_factor = 0.3
             except Exception:
                 bucket_factor = 1.0
         semantic_factor *= bucket_factor
@@ -1484,6 +1485,10 @@ class LabelRecallPath:
         # anchor_ratio 较低且整体共鸣不小 → 典型“纯 ML 抽象词”，如 supervised learning / Perceptron
         if anchor_ratio < 0.3 and resonance > 0:
             term_backbone *= 0.3
+
+        # 单锚点且几乎不与核心第一层共现的词，只作为 supporting 标签存在，进一步削弱其主导排序能力
+        if hit_count == 1 and anchor_ratio < 0.2:
+            term_backbone *= 0.1
 
         # --- 6. 【共现领域惩罚与奖励】基于 vocab_stats 的 vocabulary_cooccurrence ---
         # 降权：与各种领域的词都共现 → 万金油 → 共现伙伴平均领域跨度大 → cooc_span 大 → 乘小于 1 的因子
@@ -1848,8 +1853,26 @@ class LabelRecallPath:
 
             for aid, base_score in list(author_scores.items()):
                 years = years_by_author.get(aid, [])
-                _, _, time_weight = compute_author_time_features(years)
-                author_scores[aid] = float(base_score) * float(time_weight)
+                activity, momentum, time_weight = compute_author_time_features(years)
+                score = float(base_score) * float(time_weight)
+
+                # 近 5 年无论文的作者整体降一个数量级，优先突出近期有持续产出的专家
+                papers_last_5y = 0
+                if years:
+                    current_year = self.current_year
+                    last_5_start = current_year - 4
+                    for y in years:
+                        try:
+                            yi = int(y)
+                        except (TypeError, ValueError):
+                            continue
+                        if yi >= last_5_start:
+                            papers_last_5y += 1
+
+                if papers_last_5y == 0:
+                    score *= 0.1
+
+                author_scores[aid] = score
 
         scored_authors = []
         for aid, total_score in sorted(author_scores.items(), key=lambda x: x[1], reverse=True):
