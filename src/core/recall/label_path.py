@@ -37,7 +37,11 @@ from src.utils.domain_config import (
     DOMAIN_MAP,
 )
 from src.utils.tools import apply_text_decay, get_decay_rate_for_domains
-from src.utils.time_features import compute_paper_recency, compute_author_time_features
+from src.utils.time_features import (
+    compute_paper_recency,
+    compute_author_time_features,
+    compute_author_recency_by_latest
+)
 
 
 class LabelRecallPath:
@@ -1853,26 +1857,20 @@ class LabelRecallPath:
 
             for aid, base_score in list(author_scores.items()):
                 years = years_by_author.get(aid, [])
+                # activity/momentum 由 time_features 统一计算
                 activity, momentum, time_weight = compute_author_time_features(years)
-                score = float(base_score) * float(time_weight)
-
-                # 近 5 年无论文的作者整体降一个数量级，优先突出近期有持续产出的专家
-                papers_last_5y = 0
-                if years:
-                    current_year = self.current_year
-                    last_5_start = current_year - 4
-                    for y in years:
-                        try:
-                            yi = int(y)
-                        except (TypeError, ValueError):
-                            continue
-                        if yi >= last_5_start:
-                            papers_last_5y += 1
-
-                if papers_last_5y == 0:
-                    score *= 0.1
+                # 基于最近代表作年龄的平滑衰减也集中在 time_features 中
+                recency_by_latest = compute_author_recency_by_latest(years)
+                score = float(base_score) * float(time_weight) * float(recency_by_latest)
 
                 author_scores[aid] = score
+
+        # 对作者得分做一次归一化，使最高分为 1.0，便于诊断与对比，不改变排序结果
+        if author_scores:
+            max_score = max(author_scores.values())
+            if max_score > 0:
+                for aid in author_scores:
+                    author_scores[aid] = author_scores[aid] / max_score
 
         scored_authors = []
         for aid, total_score in sorted(author_scores.items(), key=lambda x: x[1], reverse=True):
