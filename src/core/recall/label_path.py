@@ -1394,6 +1394,10 @@ class LabelRecallPath:
         resonance = rec.get('resonance', 0.0)
         anchor_resonance = rec.get('anchor_resonance', 0.0)
 
+        # 【强孤立点熔断】若既无学术共鸣、又无锚点共鸣且仅被单锚点击中，则视为噪声标签，直接舍弃
+        if anchor_resonance <= 0 and resonance <= 0 and hit_count <= 1:
+            return 0.0, idf_val
+
         # 【共鸣熔断器】：必须与第一层学术词有共现才给满分，否则 0.1 惩罚
         if anchor_resonance > 0:
             resonance_factor = 1.0 + math.log1p(resonance)
@@ -1571,8 +1575,15 @@ class LabelRecallPath:
         # 6. 时序衰减：统一调用工具层 compute_time_decay（按领域配置 decay_rate）
         time_decay = compute_time_decay(paper.get('year', 2000), context['active_domain_set'])
 
-        # 最终组合：仅按论文语义/领域/时间/文本类型等因素计算“论文本身”的贡献度
-        score = rank_score * proximity_bonus * domain_coeff * time_decay * survey_decay
+        # 7. 命中标签数量归一化：防止“命中标签越多 → 单论文贡献爆炸”主导作者排序
+        # 采用次线性归一：log(2 + hit_count)，保证 1 标签与多标签论文在同一量级
+        if hit_count > 0:
+            coverage_norm = 1.0 / math.log(2.0 + hit_count)
+        else:
+            coverage_norm = 1.0
+
+        # 最终组合：按词权重 + 语义紧密度 + 领域纯度 + 时间/文本类型 + 命中数归一化 综合计算论文本身贡献度
+        score = rank_score * coverage_norm * proximity_bonus * domain_coeff * time_decay * survey_decay
         return score, hit_terms
 
     # ---------- 五阶段流程（便于维护与修改） ----------
