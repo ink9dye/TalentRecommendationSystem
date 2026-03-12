@@ -30,7 +30,12 @@ from config import (
     VOCAB_INDEX_PATH, VOCAB_MAP_PATH, DB_PATH, VOCAB_STATS_DB_PATH,
     VOCAB_P95_PAPER_COUNT, SIMILAR_TO_TOP_K, SIMILAR_TO_MIN_SCORE,
 )
-from src.utils.domain_config import DOMAIN_DECAY_RATES, DEFAULT_DECAY_RATE, DOMAIN_MAP
+from src.utils.domain_config import (
+    DOMAIN_DECAY_RATES,
+    DEFAULT_DECAY_RATE,
+    DOMAIN_MAP,
+)
+from src.utils.tools import apply_text_decay, get_decay_rate_for_domains
 
 
 class LabelRecallPath:
@@ -1468,11 +1473,12 @@ class LabelRecallPath:
         if rank_score == 0:
             return 0, []
 
-        # 4. 综述降权 (原样保留你的 1/n^2 逻辑)
+        # 4. 综述降权 + 文本类型降权（统一规则）
         hit_count = len(valid_hids)
         survey_decay = (1.0 / math.pow(hit_count, 2)) if hit_count > 1 else 1.0
-        if any(k in raw_title.lower() for k in ['survey', 'overview', 'review']):
-            survey_decay *= 0.1
+        # 标题文本降权：survey/overview/review/handbook + data from:/dataset:/supplementary data
+        text_decay = apply_text_decay(raw_title)
+        survey_decay *= text_decay
 
         # 5. 指数级紧密度加成 (1+prox)^n
         proximity = self._calculate_proximity(valid_hids)
@@ -1597,14 +1603,13 @@ class LabelRecallPath:
         """
         industrial_kws = debug_1.get("industrial_kws", [])
         anchor_skills = debug_1.get("anchor_skills", {})
-        first_domain = list(active_domain_set)[0] if active_domain_set else "default"
         context = {
             "score_map": score_map,
             "term_map": term_map,
             "anchor_kws": [k.lower() for k in industrial_kws],
             "active_domain_set": active_domain_set,
             "dominance": dominance,
-            "decay_rate": DOMAIN_DECAY_RATES.get(first_domain, DEFAULT_DECAY_RATE),
+            "decay_rate": get_decay_rate_for_domains(active_domain_set),
         }
         scored_authors = []
         all_works_count = 0

@@ -3,9 +3,11 @@ import json
 import sqlite3
 import time
 import re
+from datetime import datetime
 from collections import defaultdict
 from config import ABSTRACT_INDEX_PATH, ABSTRACT_MAP_PATH, DB_PATH, JOB_INDEX_PATH, JOB_MAP_PATH
 from src.utils.domain_utils import DomainProcessor
+from src.utils.tools import apply_text_decay, get_decay_rate_for_domains
 
 class VectorPath:
     """
@@ -37,13 +39,14 @@ class VectorPath:
         conn = sqlite3.connect(DB_PATH)
         # 供 CLI 调试：当 verbose=True 时写入
         self._last_debug = None
-        survey_re = re.compile(r"\b(survey|overview|review|handbook)\b", re.IGNORECASE)
-        survey_decay = 0.1
 
         # --- 【修改 1】：统一使用 DomainProcessor 处理 target_domains 格式 ---
         # 无论是 '1|4' 还是 ['1', '4']，统一转化为 set({'1', '4'})
         target_set = DomainProcessor.to_set(target_domains) if target_domains else None
+        # 统一时间衰减策略：根据目标领域集合选取 decay_rate
+        decay_rate = get_decay_rate_for_domains(target_set or [])
         purity_min = 1.0  # 领域纯度门槛
+        current_year = datetime.now().year
 
         try:
             # --- 步骤 1: 语义检索相似论文 (Faiss 获取最相关的论文 ID 序列) ---
@@ -102,14 +105,25 @@ class VectorPath:
                     purity = None
 
                 filtered_work_ids.append(wid)
-                # work_score：语义相似度 × 领域专精 × 文献类型衰减（综述/手册降权）
+                # work_score：语义相似度 × 领域专精 × 文献类型衰减 × 时间衰减
                 base_sim = faiss_score_map.get(wid, 0.0)
-                work_score = base_sim * domain_coeff
-
                 title = (meta_dict.get(wid, {}).get("title") or "")
-                if title and survey_re.search(title):
-                    work_score *= survey_decay
+                year_val = meta_dict.get(wid, {}).get("year")
 
+                # 1) 文本类型衰减：survey/overview/review/handbook + data from:/dataset:/supplementary data
+                type_decay = apply_text_decay(title)
+
+                # 2) 时间衰减：按领域 decay_rate 与发表年份
+                time_decay = 1.0
+                try:
+                    y = int(year_val) if year_val is not None else None
+                    if y:
+                        year_diff = max(0, current_year - y)
+                        time_decay = decay_rate ** year_diff
+                except Exception:
+                    time_decay = 1.0
+
+                work_score = base_sim * domain_coeff * type_decay * time_decay
                 work_score_map[wid] = work_score
 
                 if verbose:
@@ -120,7 +134,9 @@ class VectorPath:
                         "work_score": float(work_score),
                         "domain_ids": domain_dict.get(wid),
                         "title": title,
-                        "year": meta_dict.get(wid, {}).get("year"),
+                        "year": year_val,
+                        "type_decay": float(type_decay),
+                        "time_decay": float(time_decay),
                     }
 
             if not filtered_work_ids:
@@ -182,7 +198,7 @@ class VectorPath:
                     "target_domains": target_domains,
                     "target_set": sorted(list(target_set)) if target_set else [],
                     "purity_min": purity_min,
-                    "survey_decay": survey_decay,
+                    "decay_rate": decay_rate,
                     "top20": [
                         {
                             "author_id": aid,

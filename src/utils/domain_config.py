@@ -5,10 +5,11 @@
 所有领域相关常量由此模块导出，避免在 config、total_recall、label_path 等处重复定义。
 config 仅做兼容性 re-export（DOMAIN_MAP、NAME_TO_DOMAIN_ID），其余模块直接从本模块导入。
 """
-from typing import Dict
+import re
+from typing import Dict, Iterable, List, Dict as _Dict, Pattern
 
 # --- 唯一数据源：领域 ID -> 中文名、时序衰减率 ---
-# 中文名：前端/业务展示；衰减率：标签路论文时序衰减。仅用 domain_id 做过滤，不做 Query 文本增强。
+# 中文名：前端/业务展示；衰减率：标签路/向量路论文时序衰减。
 DOMAIN_TABLE: Dict[str, Dict[str, object]] = {
     "1":  {"name": "计算机科学", "decay_rate": 0.90},
     "2":  {"name": "医学",       "decay_rate": 0.94},
@@ -36,3 +37,20 @@ DOMAIN_DECAY_RATES: Dict[str, float] = {k: v["decay_rate"] for k, v in DOMAIN_TA
 
 # 默认衰减率（未在表中配置的领域使用）
 DEFAULT_DECAY_RATE = 0.95
+
+
+# --- 标题降权规则（统一供 Label / Vector 使用）---
+
+TEXT_DECAY_RULES: List[_Dict[str, object]] = [
+    {
+        "id": "survey",
+        "pattern": re.compile(r"(survey|overview|review|handbook|textbook)", re.IGNORECASE),
+        "factor": 0.1,
+    },
+    {
+        "id": "data",
+        "pattern": re.compile(r"(data from:|dataset:|supplementary data)", re.IGNORECASE),
+        "factor": 0.05,
+    },
+]
+
