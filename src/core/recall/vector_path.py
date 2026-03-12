@@ -7,7 +7,8 @@ from datetime import datetime
 from collections import defaultdict
 from config import ABSTRACT_INDEX_PATH, ABSTRACT_MAP_PATH, DB_PATH, JOB_INDEX_PATH, JOB_MAP_PATH
 from src.utils.domain_utils import DomainProcessor
-from src.utils.tools import apply_text_decay, get_decay_rate_for_domains, compute_time_decay
+from src.utils.tools import apply_text_decay, get_decay_rate_for_domains
+from src.utils.time_features import compute_paper_recency, compute_author_time_features
 from src.core.recall.works_to_authors import accumulate_author_scores
 
 class VectorPath:
@@ -114,8 +115,8 @@ class VectorPath:
                 # 1) 文本类型衰减：survey/overview/review/handbook + data from:/dataset:/supplementary data
                 type_decay = apply_text_decay(title)
 
-                # 2) 时间衰减：统一通过工具层 compute_time_decay（内部使用领域配置的 decay_rate）
-                time_decay = compute_time_decay(year_val, target_set or [])
+                # 2) 时间衰减：统一通过 time_features.compute_paper_recency（阶梯式 bucket）
+                time_decay = compute_paper_recency(year_val, target_set or [])
 
                 work_score = base_sim * domain_coeff * type_decay * time_decay
                 work_score_map[wid] = work_score
@@ -170,7 +171,34 @@ class VectorPath:
             # 3) 聚合为作者分数：每个作者取自己 Top3 论文贡献度之和（与原逻辑保持一致语义）
             agg_result = accumulate_author_scores(papers, top_k_per_author=3)
             author_scores = agg_result.author_scores
+
+            # ---- 作者层时间特征：活跃度 + 动量（统一 time_features）----
             author_ids = agg_result.sorted_authors()
+            if author_ids:
+                # 为每个作者收集其所有论文年份，用于计算 author-level activity & momentum
+                placeholders = ",".join(["?"] * len(author_ids))
+                year_rows = conn.execute(
+                    f"""
+                    SELECT a.author_id, w.year
+                    FROM authorships a
+                    JOIN works w ON a.work_id = w.work_id
+                    WHERE a.author_id IN ({placeholders})
+                    """,
+                    author_ids,
+                ).fetchall()
+
+                years_by_author = defaultdict(list)
+                for aid, year in year_rows:
+                    years_by_author[str(aid)].append(year)
+
+                for aid in author_ids:
+                    base_score = float(author_scores.get(aid, 0.0))
+                    years = years_by_author.get(str(aid), [])
+                    _, _, time_weight = compute_author_time_features(years)
+                    author_scores[aid] = base_score * float(time_weight)
+
+            # 重新按时间加权后的得分排序
+            author_ids = [aid for aid, _ in sorted(author_scores.items(), key=lambda x: x[1], reverse=True)]
 
             if verbose:
                 # 构造 Top20 调试信息：对齐原有 _last_debug 结构

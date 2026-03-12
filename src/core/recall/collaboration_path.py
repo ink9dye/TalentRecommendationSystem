@@ -1,7 +1,9 @@
 import sqlite3
 import time
 import json
-from config import COLLAB_DB_PATH
+from collections import defaultdict
+from config import COLLAB_DB_PATH, DB_PATH
+from src.utils.time_features import compute_author_time_features
 
 
 class CollaborativeRecallPath:
@@ -30,7 +32,7 @@ class CollaborativeRecallPath:
         # 将种子转为 set，确保在循环内过滤时的极速响应
         seed_set = set(seed_author_ids)
 
-        # 建立连接并启用性能预调优
+        # 建立协作索引连接并启用性能预调优
         conn = sqlite3.connect(self.collab_db_path)
         # 增加内存缓存页，确保索引常驻内存
         conn.execute("PRAGMA cache_size = -100000")
@@ -68,6 +70,38 @@ class CollaborativeRecallPath:
 
         finally:
             conn.close()
+
+        if not aggregated_results:
+            duration = (time.time() - start_time) * 1000
+            return [], duration
+
+        # ---- 作者层时间特征：对协作得分进行活跃度 + 动量加权 ----
+        candidate_ids = list(aggregated_results.keys())
+
+        # 从主学术库中拉取作者的论文年份
+        main_conn = sqlite3.connect(DB_PATH)
+        try:
+            placeholders = ",".join(["?"] * len(candidate_ids))
+            year_rows = main_conn.execute(
+                f"""
+                SELECT a.author_id, w.year
+                FROM authorships a
+                JOIN works w ON a.work_id = w.work_id
+                WHERE a.author_id IN ({placeholders})
+                """,
+                candidate_ids,
+            ).fetchall()
+        finally:
+            main_conn.close()
+
+        years_by_author = defaultdict(list)
+        for aid, year in year_rows:
+            years_by_author[aid].append(year)
+
+        for aid, base_score in list(aggregated_results.items()):
+            years = years_by_author.get(aid, [])
+            _, _, time_weight = compute_author_time_features(years)
+            aggregated_results[aid] = float(base_score) * float(time_weight)
 
         # 排序并返回得分最高的候选人
         sorted_res = sorted(aggregated_results.items(), key=lambda x: x[1], reverse=True)

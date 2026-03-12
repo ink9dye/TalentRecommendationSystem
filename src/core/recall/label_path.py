@@ -36,7 +36,8 @@ from src.utils.domain_config import (
     DEFAULT_DECAY_RATE,
     DOMAIN_MAP,
 )
-from src.utils.tools import apply_text_decay, get_decay_rate_for_domains, compute_time_decay
+from src.utils.tools import apply_text_decay, get_decay_rate_for_domains
+from src.utils.time_features import compute_paper_recency, compute_author_time_features
 
 
 class LabelRecallPath:
@@ -1605,8 +1606,8 @@ class LabelRecallPath:
         proximity = self._calculate_proximity(valid_hids)
         proximity_bonus = math.pow(1.0 + proximity, hit_count)
 
-        # 6. 时序衰减：统一调用工具层 compute_time_decay（按领域配置 decay_rate）
-        time_decay = compute_time_decay(paper.get('year', 2000), context['active_domain_set'])
+        # 6. 时序衰减：统一调用 time_features.compute_paper_recency（阶梯式 bucket）
+        time_decay = compute_paper_recency(paper.get('year', 2000), context['active_domain_set'])
 
         # 6.5 跨簇奖励：命中多个 topic cluster 的论文略微加成
         cluster_ids = set()
@@ -1834,6 +1835,22 @@ class LabelRecallPath:
         author_top_works = agg_result.author_top_works  # aid -> [(wid, contrib_score), ...]
 
         # 4) 重建 per-author 调试与展示结构（代表作、标签统计等）
+        # ---- 作者层时间特征：活跃度 + 动量（统一 time_features）----
+        if author_scores:
+            # 为每个作者收集其论文年份列表（基于 paper_map）
+            years_by_author = {}
+            for aid in author_scores.keys():
+                years = []
+                for wid, _ in author_top_works.get(aid, []):
+                    meta = paper_map.get(wid, {})
+                    years.append(meta.get("year"))
+                years_by_author[aid] = years
+
+            for aid, base_score in list(author_scores.items()):
+                years = years_by_author.get(aid, [])
+                _, _, time_weight = compute_author_time_features(years)
+                author_scores[aid] = float(base_score) * float(time_weight)
+
         scored_authors = []
         for aid, total_score in sorted(author_scores.items(), key=lambda x: x[1], reverse=True):
             works = author_top_works.get(aid, [])
@@ -1864,11 +1881,11 @@ class LabelRecallPath:
                 tag_counter.update(p.get("hits") or [])
             tag_stats = [{"term": t, "count": c} for t, c in tag_counter.most_common(10)]
 
-            # 作者总论文数（未截断，用于轻量奖励“持续贡献”）
+            # 作者总论文数（未截断，仅用于 debug 展示）
             paper_cnt_author = author_raw_paper_cnt.get(aid, len(per_author_papers))
-            # Author-level bonus：log(1 + paper_count_author)，在 Top3 代表作总分上做轻量放大
-            author_bonus = math.log1p(paper_cnt_author)
-            final_score = total_score * author_bonus
+
+            # 最终作者得分：论文贡献 + 作者时间特征（activity/momentum）
+            final_score = author_scores.get(aid, total_score)
 
             scored_authors.append({
                 "aid": aid,
@@ -2186,7 +2203,7 @@ if __name__ == "__main__":
 
             for i, item in enumerate(db.get('top_samples', []), 1):
                 raw_score = item.get('score', 0)
-                score_str = f"{raw_score:.4f}" if isinstance(raw_score, (int, float)) else str(raw_score)
+                score_str = f"{raw_score:.6f}" if isinstance(raw_score, (int, float)) else str(raw_score)
                 paper_count = item.get('paper_count', 0)
                 aid = item.get('aid', '')
                 # 主行：作者整体信息
