@@ -1,16 +1,13 @@
 import time
-import json
-import numpy as np
 import faiss
 import os
-import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from src.core.recall.input_to_vector import QueryEncoder
 from src.core.recall.vector_path import VectorPath
 from src.core.recall.label_path import LabelRecallPath
 from src.core.recall.collaboration_path import CollaborativeRecallPath
+from src.utils.domain_detector import DomainDetector
 from src.utils.domain_utils import DomainProcessor
-from config import DB_PATH
 
 # 限制底层模型并行，防止多线程冲突
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -36,6 +33,8 @@ class TotalRecallSystem:
         self.l_path = LabelRecallPath(recall_limit=150)
         self.c_path = CollaborativeRecallPath(recall_limit=150)
         self.executor = ThreadPoolExecutor(max_workers=3)
+        # 统一的领域探测服务：供向量路 / 标签路调用
+        self.domain_detector = DomainDetector(self.l_path)
 
     def _get_author_works(self, author_id, top_n=2):
         """利用知识图谱获取作者贡献度最高的代表作"""
@@ -57,33 +56,26 @@ class TotalRecallSystem:
         """
         start_time = time.time()
 
-        # --- 1. 用户领域口径 ---
-        # user_domain：用户显式指定的领域（1-17），为 None 表示“未指定/全领域”
+        # --- 1. 基础向量编码（原始 JD 文本）---
+        raw_vec, _ = self.encoder.encode(query_text)
+        faiss.normalize_L2(raw_vec)
+
+        # --- 2. 统一领域探测逻辑 ---
+        # user_domain：用户显式指定的领域；为 None 表示“未指定/全领域”
         user_domain = None
         if domain_id and str(domain_id).strip() not in ["0", ""]:
             user_domain = str(domain_id).strip()
 
-        # --- 2. 基础向量编码（原始 JD 文本，用于自动领域探测）---
-        raw_vec, _ = self.encoder.encode(query_text)
-        faiss.normalize_L2(raw_vec)
-
-        # --- 3. 自动领域探测（仅在用户未指定 domain 且非训练模式时启用）---
-        auto_active_domains = set()
-        if user_domain is None and not is_training:
-            try:
-                active_set, _, _, _ = self.l_path._stage1_domain_and_anchors(
-                    raw_vec, query_text=query_text, domain_id=None
-                )
-                auto_active_domains = set(active_set or [])
-            except Exception:
-                auto_active_domains = set()
+        active_domains, applied_domain_str, domain_debug = self.domain_detector.detect(
+            raw_vec,
+            query_text=query_text,
+            user_domain=user_domain if not is_training else user_domain,
+        )
 
         # --- 4. 为向量路构造领域过滤 ID（字符串形式，如 "1|4|14"）---
         vector_domains = None
-        if user_domain is not None:
-            vector_domains = user_domain
-        elif auto_active_domains:
-            vector_domains = "|".join(sorted(str(d) for d in auto_active_domains))
+        if active_domains:
+            vector_domains = "|".join(sorted(active_domains))
 
         # --- 5. 为向量路构造最终 Query（自动/手动领域 bias）---
         final_query = query_text
@@ -120,21 +112,18 @@ class TotalRecallSystem:
         # --- 5. RRF 结果融合（多路各 150 上限，融合后整体再截断为约 200 人候选池） ---
         final_list, rank_map = self._fuse_results(v_list, l_list, c_list)
 
-        # applied_domains：优先展示用户指定的领域；若无则展示自动探测到的领域集合；再无则标记为全领域
-        if user_domain is not None:
-            applied_domains = user_domain
-        elif auto_active_domains:
-            applied_domains = "|".join(sorted(str(d) for d in auto_active_domains))
-        else:
-            applied_domains = "All Fields"
-
         return {
             # 三路融合后的全局候选池（约 200 人，用于后续精排）
             "final_top_200": final_list,
             "rank_map": rank_map,
             "total_ms": (time.time() - start_time) * 1000,
-            "applied_domains": applied_domains,
-            "details": {"v_cost": v_cost, "l_cost": l_cost, "cost_c": c_cost}
+            "applied_domains": applied_domain_str,
+            "details": {
+                "v_cost": v_cost,
+                "l_cost": l_cost,
+                "cost_c": c_cost,
+                "domain_debug": domain_debug,
+            },
         }
 
     def _fuse_results(self, v_res, l_res, c_res):
