@@ -1273,6 +1273,50 @@ class LabelRecallPath:
         required = ("degree_w", "cov_j", "domain_span", "target_degree_w")
         self._last_tag_purity_debug = []
 
+        # --- 预计算语义相似度分布，用于 Top20/中60/底20 分段加权 ---
+        # 说明：
+        #  - 仍然保留 SEMANTIC_MIN 作为硬门槛，只对 >= 阈值的词做分位数统计；
+        #  - 若当次查询候选词过少或全部低于阈值，则退化为无分段（bucket_factor=1）。
+        self._semantic_p20 = None
+        self._semantic_p80 = None
+        if query_vector is not None and raw_results:
+            sims = []
+            try:
+                q = np.asarray(query_vector, dtype=np.float32).flatten()
+                if q.size > 0:
+                    for rec in raw_results:
+                        tid = rec.get("tid")
+                        if tid is None:
+                            continue
+                        idx = self.vocab_to_idx.get(str(tid))
+                        if idx is None:
+                            continue
+                        try:
+                            term_vec = self.all_vocab_vectors[idx]
+                        except Exception:
+                            continue
+                        cos_sim = float(np.dot(term_vec, q))
+                        if cos_sim >= float(self.SEMANTIC_MIN):
+                            sims.append(cos_sim)
+            except Exception:
+                sims = []
+
+            if sims:
+                sims.sort()
+                n = len(sims)
+                # 简单的分位实现：使用排序后第 k 个元素近似 20% / 80%
+                def _pick_percentile(p: float) -> float:
+                    if n == 1:
+                        return sims[0]
+                    k = int(p * (n - 1))
+                    k = max(0, min(n - 1, k))
+                    return sims[k]
+
+                # 仅当样本数足够大时才启用分段，以避免极小样本下的过度放大
+                if n >= 5:
+                    self._semantic_p20 = _pick_percentile(0.2)
+                    self._semantic_p80 = _pick_percentile(0.8)
+
         for rec in raw_results:
             tid = str(rec["tid"])
             if all(rec.get(k) is not None for k in required):
@@ -1363,6 +1407,23 @@ class LabelRecallPath:
 
         # 应用 3 次方非线性惩罚，实现对弱相关词的断崖式拦截
         semantic_factor = math.pow(max(0, cos_sim), 3)
+
+        # 基于本次查询的语义相似度分布做 Top20% / 中60% / 底20% 分段加权：
+        # - Top 20%: 语义最贴近 JD 的学术词，适度放大（×1.5）；
+        # - 中间 60%: 语义相关但非核心，保持原权重（×1.0）；
+        # - 底部 20%: 勉强过阈值的边缘词，略微压制（×0.5），避免“跑题但同领域”的词抢占过多权重。
+        bucket_factor = 1.0
+        p20 = getattr(self, "_semantic_p20", None)
+        p80 = getattr(self, "_semantic_p80", None)
+        if p20 is not None and p80 is not None:
+            try:
+                if cos_sim >= p80:
+                    bucket_factor = 1.5
+                elif cos_sim <= p20:
+                    bucket_factor = 0.5
+            except Exception:
+                bucket_factor = 1.0
+        semantic_factor *= bucket_factor
 
         # --- 6. 【共现领域惩罚与奖励】基于 vocab_stats 的 vocabulary_cooccurrence ---
         # 降权：与各种领域的词都共现 → 万金油 → 共现伙伴平均领域跨度大 → cooc_span 大 → 乘小于 1 的因子
