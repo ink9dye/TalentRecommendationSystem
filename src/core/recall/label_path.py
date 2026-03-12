@@ -1379,11 +1379,17 @@ class LabelRecallPath:
         raw_tag_purity = (rec['target_degree_w'] / degree_w_expanded) if degree_w_expanded else 0.0
         tag_purity = min(1.0, raw_tag_purity)
 
-        # 2. 计算基础学术稀缺度 (IDF)（轻化版：压缩 + 开根号，避免极端放大/压制）
-        idf_raw = math.log10(self.total_work_count / (degree_w + 1))
-        # 将 IDF 压到 [0.2, 2.0] 区间，再做 0.5 次方，弱化影响
-        idf_clamped = min(2.0, max(0.2, idf_raw))
-        idf_val = math.pow(idf_clamped, 0.5)
+        # 2. 平滑 IDF：仅在“正常 topic 区间(10~50 篇)”略微加权，两端趋近 1，避免极端放大/压制
+        # 小词：不额外奖励；中等词：适度 >1；大词：略微扣一点，细节交给 purity/span 处理
+        if degree_w < 10:
+            idf_val = 1.0
+        elif degree_w < 50:
+            # 线性插值：10 篇 ->1.0，50 篇 ->1.5
+            t = (float(degree_w) - 10.0) / 40.0
+            idf_val = 1.0 + 0.5 * max(0.0, min(1.0, t))
+        else:
+            # 大词略微扣一点，由 purity/span/cooc_span 继续约束
+            idf_val = 0.9
 
         # 3. 计算断崖式岗位惩罚 (Suppression of generic job terms)
         job_penalty = 1.0 + math.exp(300.0 * (cov_j - 0.005))
@@ -1435,8 +1441,8 @@ class LabelRecallPath:
         if cos_sim < float(self.SEMANTIC_MIN):
             return 0.0, idf_val
 
-        # 应用 3 次方非线性惩罚，实现对弱相关词的断崖式拦截
-        semantic_factor = math.pow(max(0, cos_sim), 3)
+        # 应用 4次方非线性惩罚，实现对弱相关词的断崖式拦截
+        semantic_factor = math.pow(max(0, cos_sim), 4)
 
         # 基于本次查询的语义相似度分布做 Top20% / 中60% / 底20% 分段加权：
         # - Top 20%: 语义最贴近 JD 的学术词，适度放大（×1.5）；
@@ -1461,6 +1467,22 @@ class LabelRecallPath:
         purity_term = tag_purity
         freq_term = math.log1p(degree_w)
         term_backbone = (sim_term * hits_term * purity_term) / max(1e-6, freq_term)
+
+        # 5.5 极小词削顶：仅出现在极少论文中的“小众词”不允许压过大 topic
+        if degree_w < 10:
+            # 1 篇 ≈ 0.32, 5 篇 ≈ 0.71, 10 篇 ≈ 1.0
+            tiny_penalty = math.sqrt(max(1.0, float(degree_w)) / 10.0)
+            term_backbone *= tiny_penalty
+
+        # 5.6 软 supporting：更多与“其它 ML 抽象词”共现、而非机器人簇核心词的 term，仅作为辅助标签
+        total_res = resonance + anchor_resonance
+        if total_res > 0:
+            anchor_ratio = float(anchor_resonance) / float(total_res)
+        else:
+            anchor_ratio = 0.0
+        # anchor_ratio 较低且整体共鸣不小 → 典型“纯 ML 抽象词”，如 supervised learning / Perceptron
+        if anchor_ratio < 0.3 and resonance > 0:
+            term_backbone *= 0.3
 
         # --- 6. 【共现领域惩罚与奖励】基于 vocab_stats 的 vocabulary_cooccurrence ---
         # 降权：与各种领域的词都共现 → 万金油 → 共现伙伴平均领域跨度大 → cooc_span 大 → 乘小于 1 的因子
@@ -1789,6 +1811,22 @@ class LabelRecallPath:
                     "authors": info["authors"],
                 }
             )
+
+        # 2.5 论文软上限：按本次查询下论文得分分布的 95 分位构造 τ，用 tanh 做平滑压缩
+        if papers_for_agg:
+            paper_scores = [p["score"] for p in papers_for_agg]
+            try:
+                tau = float(np.percentile(paper_scores, 95))
+            except Exception:
+                tau = 0.0
+
+            if tau > 0:
+                def _compress(s: float) -> float:
+                    # τ * tanh(s/τ)：中小论文几乎不变，极强论文逐渐被压到 τ 附近
+                    return float(tau * math.tanh(s / tau))
+
+                for p in papers_for_agg:
+                    p["score"] = _compress(float(p["score"]))
 
         # 3) 统一调用 works_to_authors 进行“论文 → 作者”分摊与聚合（仅保留每位作者贡献最高的 Top3 论文）
         agg_result = accumulate_author_scores(papers_for_agg, top_k_per_author=3)
