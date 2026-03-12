@@ -481,7 +481,7 @@ class LabelRecallPath:
     HIT_BONUS_HIT_CAP = 5
     HIT_BONUS_DEGREE_GATE = 200
     # 领域纯度阈值：目标领域产出占比下限（用于筛掉跨领域泛词）
-    DOMAIN_PURITY_MIN = 0.48
+    DOMAIN_PURITY_MIN = 0.5
     # ctx 路向量加权和参数：v_ctx = normalize(λ*v_jd + (1-λ)*v_term)
     CTX_MIX_LAMBDA = 0.7
     # 语义硬门槛：候选词与 query 的余弦相似度低于阈值时直接置 0（防止稀缺词以高 IDF 带偏）
@@ -706,8 +706,6 @@ class LabelRecallPath:
             degree_w, domain_span, dist_json = stats_map[vid]
             if degree_w <= 0:
                 continue
-            if degree_w > VOCAB_P95_PAPER_COUNT:
-                continue
 
             try:
                 dist = json.loads(dist_json) if isinstance(dist_json, str) else dist_json
@@ -721,18 +719,25 @@ class LabelRecallPath:
             else:
                 target_degree_w = degree_w_expanded
 
+            # 领域纯度与大词惩罚：改为软上限（次方惩罚），不再直接过滤
             domain_ratio = target_degree_w / degree_w_expanded if degree_w_expanded else 0.0
-            if degree_w <= 40:
-                purity_min = 0.4
+            # 大词 size_penalty：degree_w 超过 P95 后按 (T/degree_w)^2 衰减，最多按 4 倍截断
+            T = float(VOCAB_P95_PAPER_COUNT)
+            if degree_w > T:
+                x = min(float(degree_w) / T, 4.0)
+                size_penalty = (1.0 / x) ** 2
             else:
-                purity_min = float(self.DOMAIN_PURITY_MIN)
-            if domain_ratio < purity_min:
-                continue
+                size_penalty = 1.0
+
+            # 领域纯度次方惩罚：越偏离目标领域，惩罚越重
+            eps = 0.05
+            r = max(domain_ratio, eps)
+            domain_penalty = r ** 2
 
             new_rec = {
                 "tid": vid,
                 "term": term_map[vid],
-                "sim_score": agg["sim_score"],
+                "sim_score": agg["sim_score"] * size_penalty * domain_penalty,
                 "hit_count": agg["support"],
                 "seed_vids": sorted(list(agg.get("seed_vids") or [])),
                 "degree_w": degree_w,
@@ -1046,8 +1051,6 @@ class LabelRecallPath:
             if not row:
                 continue
             degree_w, domain_span, dist_json = row
-            if degree_w > VOCAB_P95_PAPER_COUNT:
-                continue
             try:
                 dist = json.loads(dist_json) if isinstance(dist_json, str) else dist_json
             except (TypeError, ValueError):
@@ -1056,18 +1059,24 @@ class LabelRecallPath:
             degree_w_expanded = sum(expanded.values())
             target_degree_w = sum(expanded.get(str(d), 0) for d in active_domains)
             domain_ratio = target_degree_w / degree_w_expanded if degree_w_expanded else 0.0
-            if degree_w <= 40:
-                purity_min = 0.4
+
+            # 大词与领域纯度软惩罚（不再直接过滤）
+            T = float(VOCAB_P95_PAPER_COUNT)
+            if degree_w > T:
+                x = min(float(degree_w) / T, 4.0)
+                size_penalty = (1.0 / x) ** 2
             else:
-                purity_min = float(self.DOMAIN_PURITY_MIN)
-            if domain_ratio < purity_min:
-                continue
+                size_penalty = 1.0
+
+            eps = 0.05
+            r = max(domain_ratio, eps)
+            domain_penalty = r ** 2
             rec = by_tid[tid]
             src_vids = sorted(rec["src_vids"])
             results.append({
                 "tid": tid,
                 "term": rec["term"] or self._vocab_meta.get(tid, ("", None))[0],
-                "sim_score": rec["ctx_sim"],
+                "sim_score": rec["ctx_sim"] * size_penalty * domain_penalty,
                 "src_vids": src_vids,
                 "hit_count": len(src_vids),
                 "degree_w": degree_w,
@@ -1200,7 +1209,6 @@ class LabelRecallPath:
                 pipeline["n_fail_degree_w"] += 1
                 if len(pipeline["sample_fail_degree"]) < 5:
                     pipeline["sample_fail_degree"].append(tid)
-                continue
             try:
                 dist = json.loads(dist_json) if isinstance(dist_json, str) else dist_json
             except (TypeError, ValueError):
@@ -1208,7 +1216,7 @@ class LabelRecallPath:
             expanded = self._expand_domain_dist(dist)
             degree_w_expanded = sum(expanded.values())
             target_degree_w = sum(expanded.get(str(d), 0) for d in active_domains)
-            # 领域纯度过滤（分档）：小词更宽松，大词维持全局阈值
+            # 领域纯度过滤（分档）：由硬过滤改为软惩罚（次方形式）
             domain_ratio = target_degree_w / degree_w_expanded if degree_w_expanded else 0.0
             if degree_w <= 40:
                 purity_min = 0.4
@@ -1236,7 +1244,19 @@ class LabelRecallPath:
                         "fail_reason": fail_reason,
                     })
                     pipeline["fail_domain_ratio_details"] = details
-                continue
+
+            # 大词 size_penalty 与领域纯度 domain_penalty（软上限，次方惩罚）
+            T = float(VOCAB_P95_PAPER_COUNT)
+            if degree_w > T:
+                x = min(float(degree_w) / T, 4.0)
+                size_penalty = (1.0 / x) ** 2
+            else:
+                size_penalty = 1.0
+
+            eps = 0.05
+            r = max(domain_ratio, eps)
+            domain_penalty = r ** 2
+
             pipeline["n_final"] += 1
             rec = by_tid[tid]
             rec["degree_w"] = degree_w
@@ -1244,6 +1264,8 @@ class LabelRecallPath:
             rec["target_degree_w"] = target_degree_w
             rec["domain_span"] = domain_span
             rec["cov_j"] = 0.0
+            # 将惩罚作用在 sim_score 上，避免大词/低纯度词完全统治排序
+            rec["sim_score"] = float(rec.get("sim_score", 0.0) or 0.0) * size_penalty * domain_penalty
             results.append(rec)
         self._last_expansion_pipeline_stats = pipeline
 
@@ -1644,7 +1666,7 @@ class LabelRecallPath:
         final_cypher = f"""
         MATCH (v:Vocabulary) WHERE v.id IN $v_ids
         WITH v, COUNT {{ (v)<-[:HAS_TOPIC]-() }} AS degree_w
-        WHERE (degree_w * 1.0 / $total_w) < 0.02 
+        WHERE (degree_w * 1.0 / $total_w) < 0.03 
         WITH v, log10($total_w / (degree_w + 1)) AS idf_weight
         MATCH (v)<-[:HAS_TOPIC]-(w:Work) 
         WHERE 1=1 {domain_clause} 
