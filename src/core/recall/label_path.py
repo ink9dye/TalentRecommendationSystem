@@ -1386,9 +1386,18 @@ class LabelRecallPath:
         anchor_vids = [int(k) for k in anchor_skills.keys()] if anchor_skills else None
         score_map, term_map, idf_map = self._stage3_word_weights(raw_candidates, query_vector, anchor_vids=anchor_vids)
 
+        # 精检：仅选取少量高质量学术词参与论文检索（其余用于打分与 debug），避免大泛词统治图检索规模
+        final_term_ids_for_paper = self._select_terms_for_paper(score_map, term_map, max_terms=16)
+        # 将闭环信息提前挂到 debug_1，供 stage5_author_rank 复用/补全
+        filter_closed_loop = debug_1.get("filter_closed_loop") or {}
+        filter_closed_loop["final_term_ids_for_paper"] = final_term_ids_for_paper
+        filter_closed_loop["final_term_count"] = len(final_term_ids_for_paper)
+        debug_1["filter_closed_loop"] = filter_closed_loop
+
         # 阶段 4：图检索
         author_papers_list = self._stage4_graph_search(
-            [int(k) for k in score_map.keys()], regex_str
+            final_term_ids_for_paper,
+            regex_str,
         )
 
         # 阶段 5：作者打分与排序（debug_1 中补上 regex_str、query_vector 供 last_debug_info 与 paper semantic gate）
