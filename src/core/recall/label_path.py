@@ -46,6 +46,13 @@ from src.core.recall.label_means.simple_factors import (
 )
 from src.core.recall.label_means import advanced_metrics as label_means_adv, label_anchors, label_expansion
 from src.core.recall.label_means.infra import LabelMeansInfra
+from src.core.recall.label_pipeline import (
+    stage1_domain_anchors,
+    stage2_expansion,
+    stage3_term_filtering,
+    stage4_paper_recall,
+    stage5_author_rank,
+)
 
 
 @dataclass
@@ -1657,90 +1664,7 @@ class LabelRecallPath:
     # ---------- 五阶段流程（便于维护与修改） ----------
 
     def _stage1_domain_and_anchors(self, query_vector, query_text=None, domain_id=None):
-        """
-        阶段 1：领域与锚点。确定目标领域、工业侧锚点技能。
-        返回: (active_domain_set, regex_str, anchor_skills, debug_1)。
-        debug_1 含 job_ids, job_previews, anchor_debug, dominance, industrial_kws, anchor_skills 等供阶段 5 诊断用。
-        无锚点时 anchor_skills 为空 dict。
-        """
-        # 1) 领域与岗位：统一通过 utils.DomainDetector 完成 Job 空间领域探测与预览
-        job_ids = []
-        inferred_domains = []
-        dominance = 0.0
-        job_previews = []
-        anchor_debug = {}
-
-        if getattr(self, "domain_detector", None) is not None:
-            active_set, _, debug = self.domain_detector.detect(
-                query_vector,
-                query_text=query_text,
-                user_domain=None,  # Label 内部的 domain_id 仍由后续逻辑处理
-            )
-            sd = debug.get("stage1_debug", {}) if isinstance(debug, dict) else {}
-            job_ids = sd.get("job_ids", []) or []
-            inferred_domains = sd.get("candidate_domains", []) or list(active_set or [])
-            dominance = sd.get("dominance", 0.0) or 0.0
-            job_previews = sd.get("job_previews", []) or []
-            anchor_debug = sd.get("anchor_debug", {}) or {}
-        else:
-            # 回退：使用 Label 内部原有实现（兼容性兜底）
-            job_ids, inferred_domains, dominance = self._detect_domain_context(query_vector)
-            job_previews = self._get_job_previews(job_ids)
-            anchor_debug = self._get_anchor_debug_stats(job_ids[:20], self.total_job_count) if job_ids else {}
-
-        # 2) 工业锚点：复用现有锚点抽取与 JD 语义补充逻辑
-        anchor_skills = label_anchors.extract_anchor_skills(self, job_ids, query_vector=query_vector, total_j=self.total_job_count)
-        if query_text and anchor_skills is not None:
-            label_anchors.supplement_anchors_from_jd_vector(
-                self, query_text, anchor_skills, total_j=self.total_job_count, top_k=self.JD_VOCAB_TOP_K
-            )
-        if not anchor_skills:
-            return set(), "", {}, {"job_ids": job_ids, "job_previews": job_previews, "anchor_debug": anchor_debug, "dominance": dominance}
-
-        industrial_kws = [v["term"] for v in anchor_skills.values()]
-        if domain_id and str(domain_id) != "0":
-            active_domain_set = DomainProcessor.to_set(domain_id)
-            if len(active_domain_set) > self.ACTIVE_DOMAINS_TOP_K:
-                active_domain_set = set(list(sorted(active_domain_set))[: self.ACTIVE_DOMAINS_TOP_K])
-        else:
-            candidate_5 = inferred_domains
-            if self.domain_vectors and len(candidate_5) > self.ACTIVE_DOMAINS_TOP_K:
-                q = np.asarray(query_vector, dtype=np.float32).flatten()
-                if q.size > 0:
-                    scores = []
-                    for d in candidate_5:
-                        dv = self.domain_vectors.get(str(d))
-                        if dv is not None and dv.size == q.size:
-                            sc = float(np.dot(q, dv))
-                            scores.append((d, sc))
-                    scores.sort(key=lambda x: x[1], reverse=True)
-                    active_domain_set = set(x[0] for x in scores[: self.ACTIVE_DOMAINS_TOP_K])
-                else:
-                    active_domain_set = set(list(sorted(candidate_5))[: self.ACTIVE_DOMAINS_TOP_K])
-            else:
-                active_domain_set = set(list(sorted(candidate_5))[: self.ACTIVE_DOMAINS_TOP_K])
-        regex_str = DomainProcessor.build_neo4j_regex(active_domain_set)
-        debug_1 = {
-            "job_ids": job_ids,
-            "job_previews": job_previews,
-            "anchor_debug": anchor_debug,
-            "dominance": dominance,
-            "industrial_kws": industrial_kws,
-            "anchor_skills": anchor_skills,
-        }
-
-        # 结构化阶段 1 结果，供后续解耦使用（当前仅存储，不改变返回签名）
-        self._last_stage1_result = Stage1Result(
-            active_domains=set(active_domain_set),
-            domain_regex=regex_str,
-            anchor_skills=dict(anchor_skills or {}),
-            job_ids=list(job_ids),
-            job_previews=list(job_previews),
-            dominance=float(dominance),
-            anchor_debug=dict(anchor_debug or {}),
-        )
-
-        return active_domain_set, regex_str, anchor_skills, debug_1
+        return stage1_domain_anchors.run_stage1(self, query_vector, query_text=query_text, domain_id=domain_id)
 
     def _stage2_expand_academic_terms(self, anchor_skills, active_domain_set, regex_str, query_vector, query_text=None):
         """
