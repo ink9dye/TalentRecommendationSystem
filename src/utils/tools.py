@@ -168,9 +168,24 @@ def normalize_skill(term: str):
 # 判断是否是垃圾 skill
 # -------------------------------------------------
 
+TASK_PHRASE_WHITELIST = {
+    "轨迹规划",
+    "运动规划",
+    "状态估计",
+    "最优控制",
+    "实时控制",
+    "全身控制",
+    "运动控制",
+}
+
+
 def is_bad_skill(term: str):
     if not term:
         return True
+
+    # 机器人控制等任务核心短语：无论后续通用噪声规则如何，优先保活
+    if term in TASK_PHRASE_WHITELIST:
+        return False
 
     if term in FORBIDDEN:
         return True

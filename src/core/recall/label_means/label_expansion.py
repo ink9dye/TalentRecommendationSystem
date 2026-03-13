@@ -437,13 +437,13 @@ def query_expansion_by_context_vector(label, anchor_skills, query_text, regex, t
         print(f"[Bridge Debug] query_expansion_by_context_vector 收到 query_text 片段: {jd_snippet[:120]}")
     active_domains = set(re.findall(r"\d+", regex)) if regex and regex != ".*" else set()
 
-    v_jd = encoder.model.encode(
-        [jd_snippet],
-        batch_size=1,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
+    # 同步主召回的文本预处理/桥接逻辑：优先走 QueryEncoder.encode，再做 L2 归一化，
+    # 避免 ctx 扩展与主 query 的表示不一致。
+    v_jd, _ = encoder.encode(jd_snippet)
+    if v_jd is None:
+        return []
     v_jd = np.asarray(v_jd, dtype=np.float32).reshape(1, -1)
+    faiss.normalize_L2(v_jd)
 
     if not hasattr(label, "_term_vec_cache") or label._term_vec_cache is None:
         label._term_vec_cache = {}

@@ -1237,8 +1237,14 @@ class LabelRecallPath:
 
     # ---------- 五阶段流程（便于维护与修改） ----------
 
-    def _stage1_domain_and_anchors(self, query_vector, query_text=None, domain_id=None):
-        return stage1_domain_anchors.run_stage1(self, query_vector, query_text=query_text, domain_id=domain_id)
+    def _stage1_domain_and_anchors(self, query_vector, query_text=None, semantic_query_text=None, domain_id=None):
+        return stage1_domain_anchors.run_stage1(
+            self,
+            query_vector,
+            query_text=query_text,
+            semantic_query_text=semantic_query_text,
+            domain_id=domain_id,
+        )
 
     def _stage2_expand_academic_terms(self, anchor_skills, active_domain_set, regex_str, query_vector, query_text=None):
         """
@@ -1355,7 +1361,7 @@ class LabelRecallPath:
         )
 
 
-    def recall(self, query_vector, domain_id=None, query_text=None):
+    def recall(self, query_vector, domain_id=None, query_text=None, semantic_query_text=None):
         """
         全链路调度（五阶段）：领域与锚点 → 学术词扩展 → 词权重（统一复杂公式）→ 图检索 → 作者打分。
         入参 domain_id 与向量路统一。返回 (author_id_list, duration_ms)。
@@ -1366,14 +1372,21 @@ class LabelRecallPath:
 
         # 阶段 1：领域与锚点
         active_domain_set, regex_str, anchor_skills, debug_1 = self._stage1_domain_and_anchors(
-            query_vector, query_text=query_text, domain_id=domain_id
+            query_vector,
+            query_text=query_text,
+            semantic_query_text=semantic_query_text,
+            domain_id=domain_id,
         )
         if not anchor_skills:
             return [], (time.time() - start_t) * 1000
 
         # 阶段 2：学术词扩展（仅产出候选，不算权）
         raw_candidates = self._stage2_expand_academic_terms(
-            anchor_skills, active_domain_set, regex_str, query_vector, query_text=query_text
+            anchor_skills,
+            active_domain_set,
+            regex_str,
+            query_vector,
+            query_text=semantic_query_text or query_text,
         )
         if not raw_candidates:
             return [], (time.time() - start_t) * 1000

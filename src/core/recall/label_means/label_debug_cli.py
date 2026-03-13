@@ -18,10 +18,20 @@ def run_label_debug_cli() -> None:
             if not user_input or user_input.lower() == "q":
                 break
 
-            query_vec, _ = encoder.encode(user_input)
+            raw_text = user_input
+            # 当前先使用原始 JD 作为 semantic_query_text，占位以便后续 bridge 逻辑增强；
+            # 二者差异可通过 Bridge Debug 面板观测。
+            semantic_text = raw_text
+
+            query_vec, _ = encoder.encode(semantic_text)
             faiss.normalize_L2(query_vec)
 
-            top_ids, search_time = l_path.recall(query_vec, domain_id=domain_choice, query_text=user_input)
+            top_ids, search_time = l_path.recall(
+                query_vec,
+                domain_id=domain_choice,
+                query_text=raw_text,
+                semantic_query_text=semantic_text,
+            )
 
             db = l_path.last_debug_info
             print("\n" + "🔍 [深度诊断流水线]" + "-" * 98)
@@ -37,12 +47,13 @@ def run_label_debug_cli() -> None:
 
             i_kws = db.get("industrial_kws", [])
             melt_stats = db.get("anchor_melt_stats") or {}
+            final_anchor_count = len(i_kws)
             print(
                 f"【Step 2: 工业锚点】技能数: {len(i_kws)}  熔断前={melt_stats.get('before_melt', 0)} 熔断后={melt_stats.get('after_melt', 0)} "
-                f"Top30后={melt_stats.get('after_top30', 0)} 最终锚点数: {len(db.get('anchor_detail', []))}"
+                f"Top30后={melt_stats.get('after_top30', 0)} 最终锚点数: {final_anchor_count}"
             )
 
-            CORE_KEYWORDS = ["动力学", "运动学", "轨迹规划", "状态估计", "最优控制"]
+            CORE_KEYWORDS = ["动力学", "运动学", "轨迹规划", "状态估计", "最优控制", "运动控制", "实时控制", "机械臂"]
             print("【锚点主干词存活检查】")
             for kw in CORE_KEYWORDS:
                 in_cleaned = any(kw in t for t in melt_stats.get("cleaned_terms_sample", []))
@@ -51,19 +62,18 @@ def run_label_debug_cli() -> None:
                 in_after_top30 = any(kw in t for t in melt_stats.get("terms_after_top30", []))
                 in_after_sim = any(kw in t for t in melt_stats.get("terms_after_sim", []))
                 in_final = any(kw in t for t in i_kws)
-                reason = (
-                    "in_final"
-                    if in_final
-                    else (
-                        "sim_drop"
-                        if in_after_top30 and not in_after_sim
-                        else (
-                            "topk_drop"
-                            if in_after_melt and not in_after_top30
-                            else ("melt_fail" if in_before and not in_after_melt else ("clean_fail" if not in_before else "?"))
-                        )
-                    )
-                )
+                if in_final:
+                    reason = "in_final"
+                elif in_after_top30 and not in_after_sim:
+                    reason = "sim_drop"
+                elif in_after_melt and not in_after_top30:
+                    reason = "topk_drop"
+                elif in_before and not in_after_melt:
+                    reason = "melt_fail"
+                elif not in_before:
+                    reason = "clean_fail"
+                else:
+                    reason = "?"
                 print(
                     f"  {kw}: cleaned={in_cleaned} before_melt={in_before} after_melt={in_after_melt} after_top30={in_after_top30} "
                     f"after_sim={in_after_sim} final_anchor={in_final} 原因={reason}"

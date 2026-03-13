@@ -11,6 +11,7 @@ def run_stage1(
     recall,
     query_vector,
     query_text: str | None = None,
+    semantic_query_text: str | None = None,
     domain_id: str | None = None,
 ) -> Tuple[Set[int], str, Dict[str, Any], Dict[str, Any]]:
     """
@@ -54,10 +55,10 @@ def run_stage1(
         query_vector=query_vector,
         total_j=recall.total_job_count,
     )
-    if query_text and anchor_skills is not None:
+    if (semantic_query_text or query_text) and anchor_skills is not None:
         label_anchors.supplement_anchors_from_jd_vector(
             recall,
-            query_text,
+            semantic_query_text or query_text,
             anchor_skills,
             total_j=recall.total_job_count,
             top_k=recall.JD_VOCAB_TOP_K,

@@ -100,6 +100,7 @@ class TotalRecallSystem:
             query_vec,
             domain_id=user_domain,
             query_text=query_text,
+            semantic_query_text=query_text,
         )
 
         v_list, v_cost = future_v.result()

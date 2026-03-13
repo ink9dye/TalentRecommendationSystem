@@ -2,6 +2,7 @@ import json
 import sqlite3
 from typing import Dict, Any, Set
 
+import faiss
 import numpy as np
 
 from config import DB_PATH, VOCAB_P95_PAPER_COUNT
@@ -90,11 +91,38 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
     except Exception:
         pass
 
+    # 额外加载锚点候选的领域跨度（domain_span），用于对“长尾高纯度技术词”做统计型保活
+    stats_span: dict[int, int] = {}
+    try:
+        if v_ids:
+            ph = ",".join("?" * len(v_ids))
+            rows_stats = label.stats_conn.execute(
+                f"SELECT voc_id, domain_span FROM vocabulary_domain_stats WHERE voc_id IN ({ph})",
+                v_ids,
+            ).fetchall()
+            for s in rows_stats:
+                stats_span[int(s[0])] = int(s[1] or 0)
+    except Exception:
+        stats_span = {}
+
     melt_threshold = float(label.ANCHOR_MELT_COV_J)
     terms_before_melt = [r.get("term") or "" for r in rows]
     rows_with_cov = []
     melted_terms = []
     dropped_terms = []
+    # 结合 JD 语境做轻量保活：在清洗后的 JD 短语中出现的“长尾技术词”在机器人/控制语境下不应轻易被熔断。
+    # 这里通过 cleaned_terms + 领域跨度(domain_span) 共同决定是否放宽 job_freq 门槛。
+    core_context_terms = {
+        "运动学",
+        "轨迹规划",
+        "状态估计",
+        "最优控制",
+        "实时控制",
+        "运动控制",
+        "机器人运动控制",
+        "机械臂",
+    }
+
     for r in rows:
         vid = int(r.get("vid"))
         g = global_count.get(vid, 0)
@@ -103,9 +131,25 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
             melted_terms.append((r.get("term") or "", round(cov_j, 4)))
             dropped_terms.append((r.get("term") or "", "cov_j", round(cov_j, 4)))
             continue
-        if int(r.get("job_freq") or 0) < int(label.ANCHOR_MIN_JOB_FREQ):
-            dropped_terms.append((r.get("term") or "", "job_freq", int(r.get("job_freq") or 0)))
+
+        job_freq = int(r.get("job_freq") or 0)
+        # 对“长尾但领域跨度较小、且在当前 JD 语境中出现的技术词”做统计型保活：
+        # 仅当 term 确实出现在 JD cleaned_terms 中，且 domain_span 不大时，才放宽 job_freq 门槛。
+        span = stats_span.get(vid)
+        term_text = (r.get("term") or "").strip()
+        lowered = term_text.lower()
+        in_jd_context = cleaned_terms is not None and lowered in cleaned_terms
+        is_core_context = any(kw in term_text for kw in core_context_terms)
+
+        if job_freq < int(label.ANCHOR_MIN_JOB_FREQ):
+            if span is not None and span <= 3 and in_jd_context:
+                rows_with_cov.append((r, cov_j))
+            elif is_core_context and in_jd_context:
+                rows_with_cov.append((r, cov_j))
+            else:
+                dropped_terms.append((term_text, "job_freq", job_freq))
             continue
+
         rows_with_cov.append((r, cov_j))
 
     terms_after_melt = [x[0].get("term") or "" for x in rows_with_cov]
@@ -242,13 +286,17 @@ def supplement_anchors_from_jd_vector(label, query_text, anchor_skills, total_j=
         label._last_supplement_anchors_report = label.debug_info.supplement_anchors_report
         return
 
-    v_jd = encoder.model.encode(
-        [jd_snippet],
-        batch_size=1,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
+    # 通过 QueryEncoder.encode 复用与主召回一致的文本预处理/桥接逻辑，再手动做 L2 归一化，
+    # 避免 supplement 链路绕开 input_to_vector 的增强。
+    v_jd, _ = encoder.encode(jd_snippet)
+    if v_jd is None:
+        label.debug_info.supplement_anchors = []
+        label.debug_info.supplement_anchors_report = []
+        label._last_supplement_anchors = label.debug_info.supplement_anchors
+        label._last_supplement_anchors_report = label.debug_info.supplement_anchors_report
+        return
     v_jd = np.asarray(v_jd, dtype=np.float32).reshape(1, -1)
+    faiss.normalize_L2(v_jd)
     k = min(int(top_k or label.SUPPLEMENT_TOP_K), 30)
     scores, labels = label.vocab_index.search(v_jd, k)
     added = []
