@@ -21,6 +21,8 @@ import math
 import collections
 import numpy as np
 import traceback
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Set
 from datetime import datetime
 from py2neo import Graph
 from src.core.recall.input_to_vector import QueryEncoder
@@ -44,6 +46,61 @@ from src.utils.time_features import (
     compute_author_time_features,
     compute_author_recency_by_latest
 )
+
+
+@dataclass
+class Stage1Result:
+    """
+    阶段 1 结构化结果壳，用于逐步解耦领域与锚点阶段的中间状态。
+    当前仅在内部存储与调试使用，不改变外部调用签名。
+    """
+    active_domains: Set[int]
+    domain_regex: str
+    anchor_skills: Dict[Any, Any]
+    job_ids: List[int]
+    job_previews: List[Dict[str, Any]]
+    dominance: float
+    anchor_debug: Dict[str, Any]
+
+
+@dataclass
+class RecallContext:
+    """
+    全链路召回上下文壳，后续供 label_means 等模块统一访问查询级别信息。
+    目前仅作为占位结构体存在，不改变已有评分逻辑的数据结构类型。
+    """
+    query_text: str
+    query_vector: Any
+    active_domains: Set[int]
+    dominance: float
+    term_score_map: Dict[str, float] = field(default_factory=dict)
+    term_meta_map: Dict[str, Any] = field(default_factory=dict)
+
+
+class RecallDebugInfo:
+    """
+    统一存放调试相关的中间状态，收拢原本散落在类上的 _last_* 字段。
+    第一层拆解阶段仅做聚合，不改变调试信息的具体内容与使用方式。
+    """
+
+    def __init__(self) -> None:
+        # 锚点熔断与语义重排过程的统计信息
+        self.anchor_melt_stats: Dict[str, Any] = {}
+        # JD 向量补充锚点的明细与报告
+        self.supplement_anchors: List[Any] = []
+        self.supplement_anchors_report: List[Dict[str, Any]] = []
+        # 语义扩展阶段的原始候选与流水线统计
+        self.expansion_raw_results: List[Dict[str, Any]] = []
+        self.expansion_pipeline_stats: Dict[str, Any] = {}
+        # SIMILAR_TO 各阶段调试信息
+        self.similar_to_raw_rows: List[Dict[str, Any]] = []
+        self.similar_to_agg: List[Dict[str, Any]] = []
+        self.similar_to_pass: List[Dict[str, Any]] = []
+        self.raw_candidate_tids: List[int] = []
+        # 词级标签纯度与簇衰减调试信息
+        self.tag_purity_debug: List[Dict[str, Any]] = []
+        self.cluster_rank_factors: Dict[str, float] = {}
+        self.cluster_expansion_log: List[Dict[str, Any]] = []
 
 
 class LabelRecallPath:
@@ -86,6 +143,8 @@ class LabelRecallPath:
         self.recall_limit = recall_limit
         self.verbose = verbose
         self.current_year = datetime.now().year
+        # 统一调试信息容器：收拢原本散落的 _last_* 状态
+        self.debug_info = RecallDebugInfo()
         self._init_resources()
 
         # 预载入统计数据，用于计算后续 IDF 与 熔断率
@@ -448,7 +507,10 @@ class LabelRecallPath:
             rows = []
 
         if not rows:
-            self._last_anchor_melt_stats = {"before_melt": 0, "after_melt": 0, "after_top30": 0, "melted_sample": []}
+            stats = {"before_melt": 0, "after_melt": 0, "after_top30": 0, "melted_sample": []}
+            self.debug_info.anchor_melt_stats = stats
+            # 保留旧字段，兼容外部可能的直接访问
+            self._last_anchor_melt_stats = stats
             return {}
 
         # 2) 查全图每个 vid 的 global_job_count，算 cov_j，熔断
@@ -482,7 +544,7 @@ class LabelRecallPath:
             rows_with_cov.append((r, cov_j))
 
         terms_after_melt = [x[0].get("term") or "" for x in rows_with_cov]
-        self._last_anchor_melt_stats = {
+        stats = {
             "before_melt": len(rows),
             "after_melt": len(rows_with_cov),
             "melted_sample": melted_terms[:25],
@@ -491,17 +553,19 @@ class LabelRecallPath:
             "terms_after_melt": terms_after_melt,
             "cleaned_terms_sample": list(cleaned_terms)[:50] if cleaned_terms else [],
         }
+        self.debug_info.anchor_melt_stats = stats
+        self._last_anchor_melt_stats = stats
 
         # 3) 熔断后按 job_freq 取 Top30
         rows_with_cov.sort(key=lambda x: (x[0].get("job_freq") or 0), reverse=True)
         rows = [x[0] for x in rows_with_cov[: self.ANCHOR_FREQ_TOP_K]]
-        self._last_anchor_melt_stats["after_top30"] = len(rows)
-        self._last_anchor_melt_stats["terms_after_top30"] = [r.get("term") or "" for r in rows]
+        self.debug_info.anchor_melt_stats["after_top30"] = len(rows)
+        self.debug_info.anchor_melt_stats["terms_after_top30"] = [r.get("term") or "" for r in rows]
 
         # 4) 可选：清洗词过滤
         if cleaned_terms is not None:
             rows = [r for r in rows if (r.get("term") or "").lower() in cleaned_terms]
-        self._last_anchor_melt_stats["terms_after_cleaned"] = [r.get("term") or "" for r in rows]
+        self.debug_info.anchor_melt_stats["terms_after_cleaned"] = [r.get("term") or "" for r in rows]
 
         if not rows:
             return {}
@@ -524,13 +588,13 @@ class LabelRecallPath:
             # 相似度阈值：低于阈值直接丢弃（避免与当前 JD 偏离的岗位技能锚点混入）
             sim_min = float(self.ANCHOR_SIM_MIN)
             scored_keep = [x for x in scored if (x[0] is not None and float(x[0]) >= sim_min)]
-            self._last_anchor_melt_stats["sim_min"] = sim_min
-            self._last_anchor_melt_stats["sim_kept"] = len(scored_keep)
-            self._last_anchor_melt_stats["sim_dropped"] = max(0, len(scored) - len(scored_keep))
+            self.debug_info.anchor_melt_stats["sim_min"] = sim_min
+            self.debug_info.anchor_melt_stats["sim_kept"] = len(scored_keep)
+            self.debug_info.anchor_melt_stats["sim_dropped"] = max(0, len(scored) - len(scored_keep))
             rows = [x[2] for x in scored_keep[: self.ANCHOR_FINAL_TOP_K]]
         else:
             rows = rows[: self.ANCHOR_FINAL_TOP_K]
-        self._last_anchor_melt_stats["terms_after_sim"] = [r.get("term") or "" for r in rows]
+        self.debug_info.anchor_melt_stats["terms_after_sim"] = [r.get("term") or "" for r in rows]
 
         return {str(r.get("vid")): {"term": r.get("term")} for r in rows}
 
@@ -540,16 +604,20 @@ class LabelRecallPath:
         补充词也做熔断：仅当 cov_j < ANCHOR_MELT_COV_J 时才并入。返回本次新增的 [(vid, term), ...] 供调试。
         """
         if not query_text or not getattr(self, "vocab_index", None):
-            self._last_supplement_anchors = []
-            self._last_supplement_anchors_report = []
+            self.debug_info.supplement_anchors = []
+            self.debug_info.supplement_anchors_report = []
+            self._last_supplement_anchors = self.debug_info.supplement_anchors
+            self._last_supplement_anchors_report = self.debug_info.supplement_anchors_report
             return
         total_j = float(total_j or 0) or self.total_job_count
         self._load_vocab_meta()
         encoder = self._query_encoder
         jd_snippet = (query_text or "").strip()[:500]
         if not jd_snippet:
-            self._last_supplement_anchors = []
-            self._last_supplement_anchors_report = []
+            self.debug_info.supplement_anchors = []
+            self.debug_info.supplement_anchors_report = []
+            self._last_supplement_anchors = self.debug_info.supplement_anchors
+            self._last_supplement_anchors_report = self.debug_info.supplement_anchors_report
             return
 
         v_jd = encoder.model.encode(
@@ -564,7 +632,7 @@ class LabelRecallPath:
         scores, labels = self.vocab_index.search(v_jd, k)
         added = []
         # 记录详细候选及过滤原因，便于调试
-        self._last_supplement_anchors_report = []
+        self.debug_info.supplement_anchors_report = []
         melt_threshold = float(self.ANCHOR_MELT_COV_J)
         v_ids_to_check = []
         candidates = []
@@ -580,7 +648,7 @@ class LabelRecallPath:
                 continue
             # 仅允许 concept / keyword 进入补充锚点候选
             if etype and etype not in self.SUPPLEMENT_ALLOW_ENTITY_TYPES:
-                self._last_supplement_anchors_report.append({
+                self.debug_info.supplement_anchors_report.append({
                     "tid": tid,
                     "term": term,
                     "etype": etype,
@@ -592,8 +660,10 @@ class LabelRecallPath:
             v_ids_to_check.append(tid)
 
         if not v_ids_to_check:
-            self._last_supplement_anchors = []
-            self._last_supplement_anchors_report = []
+            self.debug_info.supplement_anchors = []
+            self.debug_info.supplement_anchors_report = []
+            self._last_supplement_anchors = self.debug_info.supplement_anchors
+            self._last_supplement_anchors_report = self.debug_info.supplement_anchors_report
             return
 
         global_count = {}
@@ -657,7 +727,7 @@ class LabelRecallPath:
                 "domain_ratio": float(domain_ratio),
                 "reason": reason or "candidate",
             }
-            self._last_supplement_anchors_report.append(report_row)
+            self.debug_info.supplement_anchors_report.append(report_row)
 
             if reason is None:
                 ranked.append(report_row)
@@ -671,7 +741,9 @@ class LabelRecallPath:
             anchor_skills[str(tid)] = {"term": term}
             added.append((tid, term, round(item["score"], 4), round(cov_j, 4), round(item["domain_ratio"], 4)))
 
-        self._last_supplement_anchors = added
+        self.debug_info.supplement_anchors = added
+        self._last_supplement_anchors = self.debug_info.supplement_anchors
+        self._last_supplement_anchors_report = self.debug_info.supplement_anchors_report
         self._cached_v_jd = v_jd
 
     # --- 第三阶段：语义扩展 ---
@@ -772,7 +844,7 @@ class LabelRecallPath:
             rec['cooc_purity'] = cooc_metrics.get(tid_key, {}).get('cooc_purity', 0.0)
 
         # 4. 应用数学公式计算最终动态权重（含共鸣、共现广度惩罚、共现纯度奖励）；若 return_raw 则仅返回候选列表供 stage3 统一算权
-        self._last_expansion_raw_results = raw_results
+        self.debug_info.expansion_raw_results = raw_results
         if return_raw:
             return raw_results
         return self._calculate_final_weights(raw_results, query_vector)
@@ -976,7 +1048,7 @@ class LabelRecallPath:
             raw_results.append(new_rec)
 
         # 日志 2：簇扩展来源表（便于判断坏词由谁带进）
-        self._last_cluster_expansion_log = expansion_log
+        self.debug_info.cluster_expansion_log = expansion_log
         if self.verbose and expansion_log:
             print("\n【簇扩展来源表】term(tid) | seed_term(seed_vid) | sim_in_cluster | seed_sim | contrib")
             for entry in expansion_log[:50]:  # 最多 50 条
@@ -1361,13 +1433,13 @@ class LabelRecallPath:
         rows = self.graph.run(cypher, **params).data()
         if not rows:
             # 记录空的 raw，便于诊断
-            self._last_similar_to_raw_rows = []
-            self._last_similar_to_agg = []
-            self._last_similar_to_pass = []
+            self.debug_info.similar_to_raw_rows = []
+            self.debug_info.similar_to_agg = []
+            self.debug_info.similar_to_pass = []
             return []
 
         # 缓存 SIMILAR_TO 原始扩展行（仅保留必要字段，避免 debug 体积过大）
-        self._last_similar_to_raw_rows = [
+        self.debug_info.similar_to_raw_rows = [
             {
                 "src_vid": r.get("src_vid"),
                 "tid": r.get("tid"),
@@ -1427,7 +1499,7 @@ class LabelRecallPath:
         pipeline["n_unique_tids"] = len(tids)
 
         # 保存“去重聚合后的候选（尚未做 stats/领域过滤）”供诊断
-        self._last_similar_to_agg = [
+        self.debug_info.similar_to_agg = [
             {
                 "tid": v.get("tid"),
                 "term": v.get("term", ""),
@@ -1510,10 +1582,10 @@ class LabelRecallPath:
             # 仅保留大词 size_penalty，不再额外按领域纯度降权（低纯度已在上方丢弃）
             rec["sim_score"] = float(rec.get("sim_score", 0.0) or 0.0) * size_penalty
             results.append(rec)
-        self._last_expansion_pipeline_stats = pipeline
+        self.debug_info.expansion_pipeline_stats = pipeline
 
         # 保存“stats/领域过滤后”的第一层学术词（similar_to 通过项）供诊断
-        self._last_similar_to_pass = [
+        self.debug_info.similar_to_pass = [
             {
                 "tid": r.get("tid"),
                 "term": r.get("term", ""),
@@ -1537,7 +1609,9 @@ class LabelRecallPath:
         """
         score_map, term_map, idf_map = {}, {}, {}
         required = ("degree_w", "cov_j", "domain_span", "target_degree_w")
-        self._last_tag_purity_debug = []
+        self.debug_info.tag_purity_debug = []
+        # 保持与旧字段名的兼容，便于现有 getattr(self, "_last_tag_purity_debug", ...) 逻辑复用
+        self._last_tag_purity_debug = self.debug_info.tag_purity_debug
 
         # --- 预计算锚点向量，供 _apply_word_quality_penalty 中锚点距离门控使用 ---
         # 同时基于本次 JD 语义，将锚点划分为 task_anchors 与 carrier_anchors 两个子集：
@@ -1657,7 +1731,7 @@ class LabelRecallPath:
             return []
 
         debug_rows = {}
-        for row in (getattr(self, "_last_tag_purity_debug", None) or []):
+        for row in (getattr(self, "_last_tag_purity_debug", None) or self.debug_info.tag_purity_debug or []):
             tid = row.get("tid")
             if tid is not None:
                 debug_rows[str(tid)] = row
@@ -1804,7 +1878,7 @@ class LabelRecallPath:
 
         # 记录供诊断（cos_sim、anchor_sim 便于调参与 Top20 打印）
         if getattr(self, "_last_tag_purity_debug", None) is not None:
-            self._last_tag_purity_debug.append({
+            self.debug_info.tag_purity_debug.append({
                 "tid": rec.get("tid"),
                 "term": (rec.get("term") or "")[:40],
                 "hit_count": int(rec.get("hit_count", 1) or 1),
@@ -2005,9 +2079,9 @@ class LabelRecallPath:
         )
 
         # 记录更多分解项与角色信息，便于定位“谁在压权重”（尽可能把影响的都写入供观测面板打印）
-        if getattr(self, "_last_tag_purity_debug", None) is not None and self._last_tag_purity_debug:
+        if getattr(self, "_last_tag_purity_debug", None) is not None and self.debug_info.tag_purity_debug:
             try:
-                last_row = self._last_tag_purity_debug[-1]
+                last_row = self.debug_info.tag_purity_debug[-1]
                 if str(last_row.get("tid")) == str(rec.get("tid")):
                     last_row.update({
                         # 语义与分段
@@ -2295,6 +2369,18 @@ class LabelRecallPath:
             "industrial_kws": industrial_kws,
             "anchor_skills": anchor_skills,
         }
+
+        # 结构化阶段 1 结果，供后续解耦使用（当前仅存储，不改变返回签名）
+        self._last_stage1_result = Stage1Result(
+            active_domains=set(active_domain_set),
+            domain_regex=regex_str,
+            anchor_skills=dict(anchor_skills or {}),
+            job_ids=list(job_ids),
+            job_previews=list(job_previews),
+            dominance=float(dominance),
+            anchor_debug=dict(anchor_debug or {}),
+        )
+
         return active_domain_set, regex_str, anchor_skills, debug_1
 
     def _stage2_expand_academic_terms(self, anchor_skills, active_domain_set, regex_str, query_vector, query_text=None):
@@ -2327,7 +2413,7 @@ class LabelRecallPath:
         if not getattr(self, "voc_to_clusters", None) or not score_map:
             return
 
-        self._last_cluster_rank_factors = {}
+        self.debug_info.cluster_rank_factors = {}
 
         debug_list = getattr(self, "_last_tag_purity_debug", None) or []
         anchor_sim_by_tid = {}
@@ -2357,7 +2443,7 @@ class LabelRecallPath:
         for cid, tids in cluster_to_tids.items():
             if len(tids) <= 3:
                 for tid_str in tids:
-                    self._last_cluster_rank_factors[tid_str] = 1.0
+                    self.debug_info.cluster_rank_factors[tid_str] = 1.0
                 continue
 
             # 簇内排序：以 score 为主键，task_anchor_sim 为次关键字，弱化载体词对簇头的干扰
@@ -2382,7 +2468,7 @@ class LabelRecallPath:
                     factor = 0.85 ** (rank - 4)
 
                 score_map[tid_str] *= factor
-                self._last_cluster_rank_factors[tid_str] = float(factor)
+                self.debug_info.cluster_rank_factors[tid_str] = float(factor)
 
     def _stage3_word_weights(self, raw_candidates, query_vector, anchor_vids=None):
         """
@@ -2396,9 +2482,9 @@ class LabelRecallPath:
         )
         # 调试：打印 Top 学术词的全部影响因子与最终权重，便于观测“谁在影响得分”
         if self.verbose and score_map and getattr(self, "_last_tag_purity_debug", None):
-            debug_by_tid = {str(d["tid"]): d for d in self._last_tag_purity_debug if d.get("tid") is not None}
+            debug_by_tid = {str(d["tid"]): d for d in self.debug_info.tag_purity_debug if d.get("tid") is not None}
             top_tids = sorted(score_map.keys(), key=lambda t: score_map.get(t, 0.0), reverse=True)
-            cluster_factors = getattr(self, "_last_cluster_rank_factors", {}) or {}
+            cluster_factors = getattr(self, "_last_cluster_rank_factors", {}) or self.debug_info.cluster_rank_factors or {}
 
             def _fv(d, key, default=None):
                 v = d.get(key, default)
@@ -2767,8 +2853,8 @@ class LabelRecallPath:
         # Top20 学术词调试：term / cos_sim(JB) / anchor_sim / final_weight，便于观察谁在抢权重
         top20_term_debug = []
         if score_map and getattr(self, "_last_tag_purity_debug", None):
-            debug_by_tid = {str(d["tid"]): d for d in self._last_tag_purity_debug if d.get("tid") is not None}
-            rank_factors = getattr(self, "_last_cluster_rank_factors", {}) or {}
+            debug_by_tid = {str(d["tid"]): d for d in self.debug_info.tag_purity_debug if d.get("tid") is not None}
+            rank_factors = getattr(self, "_last_cluster_rank_factors", {}) or self.debug_info.cluster_rank_factors or {}
             for tid in sorted(score_map.keys(), key=lambda t: score_map.get(t, 0.0), reverse=True)[:20]:
                 row = debug_by_tid.get(str(tid), {}) or {}
                 top20_term_debug.append({
@@ -2787,9 +2873,9 @@ class LabelRecallPath:
                 })
         academic_kws = list(set(term_map.values()))
         # 过滤闭环：三份集合 + 指定 tid 是否在最终集合
-        similar_to_pass = getattr(self, "_last_similar_to_pass", [])
+        similar_to_pass = getattr(self, "_last_similar_to_pass", []) or self.debug_info.similar_to_pass
         similar_to_pass_tids = sorted(set(r["tid"] for r in similar_to_pass if r.get("tid") is not None))
-        similar_to_raw_tids = getattr(self, "_last_raw_candidate_tids", [])
+        similar_to_raw_tids = getattr(self, "_last_raw_candidate_tids", []) or self.debug_info.raw_candidate_tids
         # 精检：仅选取少量高质量学术词参与论文检索
         final_term_ids_for_paper = self._select_terms_for_paper(score_map, term_map, max_terms=16)
         debug_check_tids = [(2280, "supervised learning"), (4045, "robot learning"), (152, "control (management)")]
@@ -2801,7 +2887,11 @@ class LabelRecallPath:
             "contains_check": {f"{name}({tid})": tid in final_term_ids_for_paper for tid, name in debug_check_tids},
         }
         # Top term 最终贡献表（Top20）：term, tid, final_weight, main_role, role_penalty, paper_count_hit, top_paper_contrib, total_paper_contrib
-        debug_by_tid = {str(d["tid"]): d for d in (getattr(self, "_last_tag_purity_debug", None) or []) if d.get("tid") is not None}
+        debug_by_tid = {
+            str(d["tid"]): d
+            for d in (getattr(self, "_last_tag_purity_debug", None) or self.debug_info.tag_purity_debug or [])
+            if d.get("tid") is not None
+        }
         top_tids_by_weight = sorted(score_map.keys(), key=lambda t: score_map.get(t, 0.0), reverse=True)[:20]
         top_terms_final_contrib = []
         for tid in top_tids_by_weight:
@@ -2828,20 +2918,20 @@ class LabelRecallPath:
         self.last_debug_info = {
             "active_domains": list(active_domain_set),
             "dominance": f"{dominance * 100:.1f}%",
-            "expansion_pipeline": getattr(self, "_last_expansion_pipeline_stats", None),
-            "similar_to_raw": getattr(self, "_last_similar_to_raw_rows", []),
-            "similar_to_agg": getattr(self, "_last_similar_to_agg", []),
+            "expansion_pipeline": getattr(self, "_last_expansion_pipeline_stats", None) or self.debug_info.expansion_pipeline_stats or None,
+            "similar_to_raw": getattr(self, "_last_similar_to_raw_rows", []) or self.debug_info.similar_to_raw_rows or [],
+            "similar_to_agg": getattr(self, "_last_similar_to_agg", []) or self.debug_info.similar_to_agg or [],
             "similar_to_pass": similar_to_pass,
             "regex_str": debug_1.get("regex_str", ""),
             "job_ids": debug_1.get("job_ids", []),
             "job_previews": debug_1.get("job_previews", []),
             "anchor_debug": debug_1.get("anchor_debug", {}),
-            "anchor_melt_stats": getattr(self, "_last_anchor_melt_stats", None),
-            "supplement_anchors": getattr(self, "_last_supplement_anchors", []),
+            "anchor_melt_stats": getattr(self, "_last_anchor_melt_stats", None) or self.debug_info.anchor_melt_stats or None,
+            "supplement_anchors": getattr(self, "_last_supplement_anchors", []) or self.debug_info.supplement_anchors or [],
             "industrial_kws": industrial_kws,
             "anchor_detail": [f"{k}={v['term']}" for k, v in anchor_skills.items()],
             "academic_kws": academic_kws,
-            "detailed_kws": getattr(self, "_last_expansion_raw_results", []),
+            "detailed_kws": getattr(self, "_last_expansion_raw_results", []) or self.debug_info.expansion_raw_results or [],
             "top_scored_terms": sorted_terms,
             "top20_term_debug": top20_term_debug,
             "recall_vocab_count": len(score_map),
@@ -2875,7 +2965,10 @@ class LabelRecallPath:
         )
         if not raw_candidates:
             return [], (time.time() - start_t) * 1000
-        self._last_raw_candidate_tids = sorted(set(r.get("tid") for r in raw_candidates if r.get("tid") is not None))
+        self.debug_info.raw_candidate_tids = sorted(
+            set(r.get("tid") for r in raw_candidates if r.get("tid") is not None)
+        )
+        self._last_raw_candidate_tids = self.debug_info.raw_candidate_tids
 
         # 阶段 3：词权重（统一走复杂公式，传入锚点 ID 供锚点距离门控）
         anchor_vids = [int(k) for k in anchor_skills.keys()] if anchor_skills else None
