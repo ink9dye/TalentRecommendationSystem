@@ -75,6 +75,11 @@ class LabelRecallPath:
     ANCHOR_TERM_SIM_MIN = 0.45
     # 作者过滤：最佳论文贡献低于全局最大论文贡献的此比例则不出现在排序中
     AUTHOR_BEST_PAPER_MIN_RATIO = 0.05
+    # Step3 词权重：语义次方、锚点系数、span 惩罚指数（(1+domain_span)^exp 做分母，折中压制泛词）
+    SEMANTIC_POWER = 3
+    ANCHOR_BASE = 0.35
+    ANCHOR_GAIN = 0.65
+    SPAN_PENALTY_EXPONENT = 0.35
 
     def __init__(self, recall_limit=200, verbose=False):
         self.recall_limit = recall_limit
@@ -1397,7 +1402,12 @@ class LabelRecallPath:
         self._last_tag_purity_debug = []
 
         # --- 预计算锚点向量，供 _apply_word_quality_penalty 中锚点距离门控使用 ---
+        # 同时基于本次 JD 语义，将锚点划分为 task_anchors 与 carrier_anchors 两个子集：
+        # - task_anchors：更贴近“控制/规划/动力学”等任务意图；
+        # - carrier_anchors：更贴近“机器人/机械臂/robotics”等载体语义。
         self._anchor_vectors = None
+        self._task_anchor_vectors = None
+        self._carrier_anchor_vectors = None
         if anchor_vids and getattr(self, "vocab_to_idx", None) is not None and getattr(self, "all_vocab_vectors", None) is not None:
             idxs = []
             for vid in anchor_vids:
@@ -1408,7 +1418,35 @@ class LabelRecallPath:
                 vecs = np.asarray(self.all_vocab_vectors[idxs], dtype=np.float32)
                 norms = np.linalg.norm(vecs, axis=1, keepdims=True)
                 norms = np.where(norms > 1e-9, norms, 1.0)
-                self._anchor_vectors = (vecs / norms)
+                anchor_vecs = (vecs / norms)
+                self._anchor_vectors = anchor_vecs
+
+                # 基于本次 JD 的语义方向（query_vector）在锚点集合内部做一次 task/carrier 软划分：
+                # 仅使用向量语义，不依赖人工词表，避免过度硬编码。
+                if query_vector is not None:
+                    try:
+                        q = np.asarray(query_vector, dtype=np.float32).flatten()
+                        if q.size > 0:
+                            qn = np.linalg.norm(q)
+                            if qn > 1e-9:
+                                q = q / qn
+                                sims = np.dot(anchor_vecs, q)
+                                n_anchor = anchor_vecs.shape[0]
+                                # 锚点数较少时不做拆分，统一作为 task_anchors 使用
+                                if n_anchor < 4:
+                                    self._task_anchor_vectors = anchor_vecs
+                                else:
+                                    median_sim = float(np.median(sims))
+                                    task_mask = sims >= median_sim
+                                    carrier_mask = sims < median_sim
+                                    if np.any(task_mask):
+                                        self._task_anchor_vectors = anchor_vecs[task_mask]
+                                    if np.any(carrier_mask):
+                                        self._carrier_anchor_vectors = anchor_vecs[carrier_mask]
+                    except Exception:
+                        # 语义划分失败时退化为单一锚点集合，不影响主流程
+                        self._task_anchor_vectors = None
+                        self._carrier_anchor_vectors = None
 
         # --- 预计算语义相似度分布，用于 Top20/中60/底20 分段加权 ---
         # 说明：
@@ -1544,17 +1582,34 @@ class LabelRecallPath:
             term_vec = self.all_vocab_vectors[idx]
             cos_sim = float(np.dot(term_vec, query_vector.flatten()))
 
-        # 预计算与锚点的最大余弦（供诊断与锚点门控用）
+        # 预计算与锚点的余弦相似度（供诊断与锚点门控用），同时区分 task_anchors 与 carrier_anchors
         max_anchor_sim = None
+        task_anchor_sim = None
+        carrier_anchor_sim = None
         anchor_vecs = getattr(self, "_anchor_vectors", None)
-        if anchor_vecs is not None and anchor_vecs.size > 0 and idx is not None:
+        task_anchor_vecs = getattr(self, "_task_anchor_vectors", None)
+        carrier_anchor_vecs = getattr(self, "_carrier_anchor_vectors", None)
+        if idx is not None:
             try:
                 tvec = np.asarray(self.all_vocab_vectors[idx], dtype=np.float32).flatten()
                 tn = np.linalg.norm(tvec)
                 if tn > 1e-9:
-                    max_anchor_sim = float(np.max(np.dot(anchor_vecs, (tvec / tn))))
+                    t_unit = tvec / tn
+                    if anchor_vecs is not None and anchor_vecs.size > 0:
+                        max_anchor_sim = float(np.max(np.dot(anchor_vecs, t_unit)))
+                    if task_anchor_vecs is not None and task_anchor_vecs.size > 0:
+                        task_anchor_sim = float(np.max(np.dot(task_anchor_vecs, t_unit)))
+                    if carrier_anchor_vecs is not None and carrier_anchor_vecs.size > 0:
+                        carrier_anchor_sim = float(np.max(np.dot(carrier_anchor_vecs, t_unit)))
             except Exception:
                 pass
+
+        # task_advantage：任务锚点 vs 载体锚点的相对优势（用于后续角色判断）
+        task_advantage = None
+        if task_anchor_sim is not None or carrier_anchor_sim is not None:
+            ta_raw = task_anchor_sim or 0.0
+            ca_raw = carrier_anchor_sim or 0.0
+            task_advantage = ta_raw - ca_raw
 
         # 记录供诊断（cos_sim、anchor_sim 便于调参与 Top20 打印）
         if getattr(self, "_last_tag_purity_debug", None) is not None:
@@ -1569,16 +1624,31 @@ class LabelRecallPath:
                 "capped_tag_purity": round(tag_purity, 6),
                 "cos_sim": round(cos_sim, 6),
                 "anchor_sim": round(max_anchor_sim, 6) if max_anchor_sim is not None else None,
+                "task_anchor_sim": round(task_anchor_sim, 6) if task_anchor_sim is not None else None,
+                "carrier_anchor_sim": round(carrier_anchor_sim, 6) if carrier_anchor_sim is not None else None,
+                "task_advantage": round(task_advantage, 6) if task_advantage is not None else None,
                 "idf_term": round(idf_term, 6),
                 "cov_j": round(float(cov_j), 6) if cov_j is not None else None,
+                # 以下字段在后续 supporting / generic 逻辑中补充
+                "supporting_action": None,
+                "generic_action": None,
+                # 角色诊断相关字段占位，稍后更新
+                "task_core_strength": None,
+                "abstract_strength": None,
+                "carrier_strength": None,
+                "noise_penalty": None,
+                "main_role": None,
+                "role_margin": None,
+                "role_penalty": None,
+                "base_score": None,
             })
 
         # 语义硬拦截：低相关词直接置 0，避免稀缺词（高 IDF）“以小博大”带偏召回
         if cos_sim < float(self.SEMANTIC_MIN):
             return 0.0, idf_val
 
-        # 应用 6 次方非线性惩罚，进一步拉开“贴 JD”与“擦边”词的差距（无硬编码）
-        semantic_factor = math.pow(max(0, cos_sim), 6)
+        # 语义次方：cos^SEMANTIC_POWER，3 次方在压泛词与保留控制类词间折中（原 6 次方过陡）
+        semantic_factor = math.pow(max(0.0, cos_sim), float(self.SEMANTIC_POWER))
 
         # 基于本次查询的语义相似度分布做 Top20% / 中60% / 底20% 分段加权：
         # - Top 20%: 语义最贴近 JD 的学术词，适度放大（×1.5）；
@@ -1605,28 +1675,119 @@ class LabelRecallPath:
         term_backbone = sim_term * idf_term * hits_term * purity_term
 
         # 5.5 极小词削顶：仅出现在极少论文中的“小众词”不允许压过大 topic
+        tiny_penalty = 1.0
         if degree_w < 10:
             # 1 篇 ≈ 0.32, 5 篇 ≈ 0.71, 10 篇 ≈ 1.0
             tiny_penalty = math.sqrt(max(1.0, float(degree_w)) / 10.0)
             term_backbone *= tiny_penalty
-
-        # 5.6 软 supporting：更多与“其它 ML 抽象词”共现、而非机器人簇核心词的 term，仅作为辅助标签
+        # 5.6 角色分层：task_core / abstract_method / carrier_platform + noise 门控
         total_res = resonance + anchor_resonance
         if total_res > 0:
             anchor_ratio = float(anchor_resonance) / float(total_res)
         else:
             anchor_ratio = 0.0
-        # anchor_ratio 较低且整体共鸣不小 → 典型“纯 ML 抽象词”，如 supervised learning / Perceptron
-        if anchor_ratio < 0.3 and resonance > 0:
-            term_backbone *= 0.3
 
-        # 单锚点且几乎不与核心第一层共现的词，只作为 supporting 标签存在，进一步削弱其主导排序能力
-        if hit_count == 1 and anchor_ratio < 0.2:
-            term_backbone *= 0.1
+        # 归一化/截断一些基础信号，供角色打分使用
+        ta_sim = max(0.0, min(1.0, task_anchor_sim or 0.0)) if task_anchor_sim is not None else 0.0
+        ca_sim = max(0.0, min(1.0, carrier_anchor_sim or 0.0)) if carrier_anchor_sim is not None else 0.0
+        cos_pos = max(0.0, min(1.0, cos_sim))
+        deg_norm = math.tanh(float(degree_w_expanded) / 100.0) if degree_w_expanded > 0 else 0.0
+        purity_norm = max(0.0, min(1.0, tag_purity))
 
-        # 5.7 锚点距离门控（平滑因子）：anchor_factor = 0.3 + 0.7 * anchor_sim，贴近锚点权重大、远离逐渐变小
-        if max_anchor_sim is not None:
-            anchor_factor = 0.3 + 0.7 * max(0.0, min(1.0, max_anchor_sim))
+        # 5.6.1 task_core_strength：主轴（带 task_advantage 护栏）
+        task_adv = task_advantage or 0.0
+        base_task = 0.5 * ta_sim + 0.3 * cos_pos + 0.2 * anchor_ratio
+        if task_adv > 0:
+            base_task += 0.2 * min(1.0, task_adv)  # 仅当 task 明显优于 carrier 时放大
+        task_core_strength = max(0.0, min(1.0, base_task))
+
+        # 5.6.2 abstract_method_tendency：方法/范式词（仅在“非主任务”部分生效）
+        method_raw = (0.4 * cos_pos + 0.3 * deg_norm + 0.3 * purity_norm) * (1.0 - ca_sim)
+        method_raw = max(0.0, min(1.0, method_raw))
+        abstract_strength = method_raw * (1.0 - task_core_strength)
+
+        # 5.6.3 carrier_platform_tendency：载体/平台/场景词（同样只在“非主任务”部分生效）
+        carrier_raw = 0.6 * ca_sim + 0.4 * deg_norm
+        carrier_raw = max(0.0, min(1.0, carrier_raw))
+        carrier_strength = carrier_raw * (1.0 - task_core_strength)
+
+        # 高 task_core_strength 的词视为“铁主干”，不再施加强 generic/abstract 压制，只走轻噪声门
+        if task_core_strength >= 0.8:
+            abstract_strength = 0.0
+            carrier_strength = 0.0
+
+        # 5.6.4 噪声门：仅做温和削弱，防止误杀小而准的控制词
+        few_hits = 1.0 - min(1.0, float(hit_count) / 5.0)
+        low_task = 1.0 - ta_sim
+        low_cos = 1.0 - cos_pos
+        low_anc = 1.0 - anchor_ratio
+        noise_strength = 0.25 * (low_task + low_cos + low_anc + few_hits)
+        noise_strength = max(0.0, min(1.0, noise_strength))
+        # 噪声 penalty 范围先保守设为 [0.5, 1.0]
+        noise_penalty = 1.0 - 0.5 * noise_strength
+
+        # 5.6.5 角色合成：主角色主导 + 次角色微调
+        total_role = task_core_strength + abstract_strength + carrier_strength
+        if total_role > 0:
+            norm_task = task_core_strength / total_role
+            norm_abs = abstract_strength / total_role
+            norm_car = carrier_strength / total_role
+        else:
+            norm_task = norm_abs = norm_car = 0.0
+
+        roles = {
+            "task_core": norm_task,
+            "abstract_method": norm_abs,
+            "carrier_platform": norm_car,
+        }
+        main_role = max(roles.items(), key=lambda x: x[1])[0] if roles else "none"
+        sorted_scores = sorted(roles.values(), reverse=True)
+        top1 = sorted_scores[0] if sorted_scores else 0.0
+        top2 = sorted_scores[1] if len(sorted_scores) > 1 else 0.0
+        role_margin = max(0.0, top1 - top2)
+
+        # 基础角色 penalty（先用保守值，后续可按 JD 调参）
+        base_role_penalties = {
+            "task_core": 1.0,
+            "abstract_method": 0.65,
+            "carrier_platform": 0.75,
+        }
+
+        main_penalty = base_role_penalties.get(main_role, 1.0)
+        # 次角色平均 penalty
+        aux_weight_sum = 0.0
+        aux_penalty_mix = 0.0
+        for r, s in roles.items():
+            if r == main_role or s <= 0:
+                continue
+            aux_weight_sum += s
+            aux_penalty_mix += s * base_role_penalties.get(r, 1.0)
+        aux_penalty_avg = aux_penalty_mix / aux_weight_sum if aux_weight_sum > 0 else main_penalty
+
+        # margin 越大，主角色占比越高；越小，次角色略多一点话语权（但依然是“小修正”）
+        alpha = 0.8 + 0.2 * role_margin  # ∈ [0.8, 1.0]
+        beta = 1.0 - alpha
+        role_penalty_without_noise = alpha * main_penalty + beta * aux_penalty_avg
+        role_penalty = role_penalty_without_noise * noise_penalty
+        role_penalty = max(0.05, min(1.5, role_penalty))
+
+        # 在骨架上应用角色 penalty（其余 cooc / cluster / job_penalty 等逻辑保持不变）
+        base_score_before_role = term_backbone
+        term_backbone *= role_penalty
+
+        # 5.7 锚点距离门控：优先依赖 task_anchor_sim，其次 carrier_anchor_sim，退化时回退到 max_anchor_sim
+        ta = task_anchor_sim if task_anchor_sim is not None else max_anchor_sim
+        ca = carrier_anchor_sim if carrier_anchor_sim is not None else max_anchor_sim
+        anchor_factor = 1.0
+        if ta is not None or ca is not None:
+            ta_clamped = max(0.0, min(1.0, ta or 0.0))
+            ca_clamped = max(0.0, min(1.0, ca or 0.0))
+            # 任务优先：task_anchor_sim 权重更高，carrier_anchor_sim 作为辅助兜底，采用温和的非线性放大
+            anchor_factor = (
+                0.20
+                + 0.65 * math.pow(ta_clamped, 1.5)
+                + 0.15 * math.pow(ca_clamped, 1.1)
+            )
             term_backbone *= anchor_factor
 
         # --- 6. 【共现领域惩罚与奖励】基于 vocab_stats 的 vocabulary_cooccurrence ---
@@ -1638,35 +1799,70 @@ class LabelRecallPath:
         purity_bonus = (1.0 + math.log1p(cooc_purity)) if cooc_purity > 0 else 1.0
 
         # 7. 【最终公式：立体的评价体系】
-        # 骨架：sim * log(1+hits) * purity / log(1+paper_count)
-        # 细节：轻化 IDF + 岗位惩罚 + 领域跨度 + 共鸣/共现修正
+        # 骨架：... / (job_penalty * domain_span_penalty)； (1+span)^0.35 折中压制大簇泛词、不压死核心词
+        domain_span_penalty = math.pow(1.0 + domain_span, float(self.SPAN_PENALTY_EXPONENT))
         cluster_factor = self._get_cluster_factor_for_term(rec['tid'])
         dynamic_weight = (
                 term_backbone
                 * idf_val  # 轻化后的 IDF，只做微调
                 / job_penalty
-                / domain_span
+                / max(1e-8, domain_span_penalty)  # (1+domain_span)^0.35，区分小/中/大簇
                 * convergence_bonus  # 学术共鸣（与本次搜索词共现）加成
                 * span_penalty  # 共现伙伴跨多领域 → 降权
                 * purity_bonus  # 共现伙伴集中目标领域 → 加权
                 * cluster_factor  # JD–簇 语义 gating
         )
 
-        # 记录更多分解项，便于定位“谁在压权重”
+        # 记录更多分解项与角色信息，便于定位“谁在压权重”（尽可能把影响的都写入供观测面板打印）
         if getattr(self, "_last_tag_purity_debug", None) is not None and self._last_tag_purity_debug:
             try:
                 last_row = self._last_tag_purity_debug[-1]
                 if str(last_row.get("tid")) == str(rec.get("tid")):
                     last_row.update({
+                        # 语义与分段
+                        "semantic_factor": round(float(semantic_factor), 6),
                         "bucket_factor": round(float(bucket_factor), 6),
+                        "hits_term": round(float(hits_term), 6),
+                        "purity_term": round(float(purity_term), 6),
+                        "tiny_penalty": round(float(tiny_penalty), 6),
+                        # 共鸣与收敛
+                        "resonance": round(float(resonance), 6),
+                        "anchor_resonance": round(float(anchor_resonance), 6),
+                        "anchor_ratio": round(float(anchor_ratio), 6),
+                        "resonance_factor": round(float(resonance_factor), 6),
+                        "hit_count_factor": round(float(hit_count_factor), 6),
+                        "convergence_bonus": round(float(convergence_bonus), 6),
+                        # 角色输入与噪声
+                        "noise_strength": round(float(noise_strength), 6),
+                        "norm_task": round(float(norm_task), 6),
+                        "norm_abs": round(float(norm_abs), 6),
+                        "norm_car": round(float(norm_car), 6),
+                        "main_penalty": round(float(main_penalty), 6),
+                        "aux_penalty_avg": round(float(aux_penalty_avg), 6),
+                        "alpha": round(float(alpha), 6),
+                        "role_penalty_without_noise": round(float(role_penalty_without_noise), 6),
+                        # 共现与领域
+                        "cooc_span": round(float(cooc_span), 6),
+                        "cooc_purity": round(float(cooc_purity), 6),
+                        "domain_span_penalty": round(float(domain_span_penalty), 6),
                         "job_penalty": round(float(job_penalty), 6),
                         "domain_span": int(domain_span),
-                        "convergence_bonus": round(float(convergence_bonus), 6),
                         "span_penalty": round(float(span_penalty), 6),
                         "purity_bonus": round(float(purity_bonus), 6),
+                        "anchor_factor": round(float(anchor_factor), 6),
                         "cluster_factor": round(float(cluster_factor), 6),
                         "term_backbone": round(float(term_backbone), 6),
+                        "idf_val": round(float(idf_val), 6),
                         "dynamic_weight": round(float(dynamic_weight), 6),
+                        # 角色诊断字段
+                        "task_core_strength": round(float(task_core_strength), 6),
+                        "abstract_strength": round(float(abstract_strength), 6),
+                        "carrier_strength": round(float(carrier_strength), 6),
+                        "noise_penalty": round(float(noise_penalty), 6),
+                        "main_role": main_role,
+                        "role_margin": round(float(role_margin), 6),
+                        "role_penalty": round(float(role_penalty), 6),
+                        "base_score": round(float(base_score_before_role), 6),
                     })
             except Exception:
                 pass
@@ -1916,10 +2112,16 @@ class LabelRecallPath:
 
         debug_list = getattr(self, "_last_tag_purity_debug", None) or []
         anchor_sim_by_tid = {}
+        task_sim_by_tid = {}
         for d in debug_list:
             tid = d.get("tid")
-            if tid is not None and d.get("anchor_sim") is not None:
-                anchor_sim_by_tid[str(tid)] = float(d["anchor_sim"])
+            if tid is None:
+                continue
+            tid_str = str(tid)
+            if d.get("anchor_sim") is not None:
+                anchor_sim_by_tid[tid_str] = float(d["anchor_sim"])
+            if d.get("task_anchor_sim") is not None:
+                task_sim_by_tid[tid_str] = float(d["task_anchor_sim"])
 
         cluster_to_tids = {}
         for tid_str in score_map.keys():
@@ -1939,7 +2141,18 @@ class LabelRecallPath:
                     self._last_cluster_rank_factors[tid_str] = 1.0
                 continue
 
-            tids_sorted = sorted(tids, key=lambda x: score_map.get(x, 0.0), reverse=True)
+            # 簇内排序：以 score 为主键，task_anchor_sim 为次关键字，弱化载体词对簇头的干扰
+            if len(tids) >= 5:
+                tids_sorted = sorted(
+                    tids,
+                    key=lambda x: (
+                        score_map.get(x, 0.0),
+                        task_sim_by_tid.get(x, 0.0),
+                    ),
+                    reverse=True,
+                )
+            else:
+                tids_sorted = sorted(tids, key=lambda x: score_map.get(x, 0.0), reverse=True)
             for rank, tid_str in enumerate(tids_sorted):
                 anchor_sim = anchor_sim_by_tid.get(tid_str)
                 if anchor_sim is not None and anchor_sim >= 0.9:
@@ -1962,21 +2175,85 @@ class LabelRecallPath:
         score_map, term_map, idf_map = self._calculate_final_weights(
             raw_candidates, query_vector, anchor_vids=anchor_vids
         )
-        # 调试：打印 Top20 学术词及其 cos_sim、anchor_sim、final_weight，便于观察谁在抢权重
+        # 调试：打印 Top 学术词的全部影响因子与最终权重，便于观测“谁在影响得分”
         if self.verbose and score_map and getattr(self, "_last_tag_purity_debug", None):
             debug_by_tid = {str(d["tid"]): d for d in self._last_tag_purity_debug if d.get("tid") is not None}
-            top_tids = sorted(score_map.keys(), key=lambda t: score_map.get(t, 0.0), reverse=True)[:20]
-            lines = ["【Step 3 调试】Top20 学术词 | cos_sim(JB) | anchor_sim | final_weight"]
-            for i, tid in enumerate(top_tids, 1):
+            top_tids = sorted(score_map.keys(), key=lambda t: score_map.get(t, 0.0), reverse=True)
+            cluster_factors = getattr(self, "_last_cluster_rank_factors", {}) or {}
+
+            def _fv(d, key, default=None):
+                v = d.get(key, default)
+                if v is None:
+                    return None
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return v
+
+            def _f(v, w=6, ndec=4):
+                if v is None:
+                    return "-".rjust(w)
+                if isinstance(v, (int, float)):
+                    return f"{float(v):.{min(ndec, w-2)}f}".rjust(w)
+                return str(v)[:w].rjust(w)
+
+            head30 = top_tids[:30]
+
+            # A. 主调试表：Top20 学术词的语义与最终权重（简短）
+            lines = ["【Step 3 调试】Top20 学术词 | cos_sim(JD) | anchor_sim | final_weight"]
+            for i, tid in enumerate(head30[:20], 1):
                 term = term_map.get(tid, "")
                 w = score_map.get(tid, 0.0)
                 d = debug_by_tid.get(str(tid), {})
-                cs = d.get("cos_sim")
-                ans = d.get("anchor_sim")
+                cs = d.get("cos_sim"); ans = d.get("anchor_sim")
                 cs_s = f"{cs:.4f}" if cs is not None else "-"
                 ans_s = f"{ans:.4f}" if ans is not None else "-"
                 lines.append(f"  #{i:2d}  {term[:36]:36s}  cos={cs_s:6s}  anchor={ans_s:6s}  weight={w:.6f}")
             print("\n".join(lines))
+
+            # B. 观测面板 1/4：基础与语义（Top30）
+            print("\n【观测面板 1/4】基础与语义 (Top30)")
+            print("  #   term                            hits deg_w deg_exp tgt_w  raw_pur cap_pur  cos_sim anc_sim ta_sim  ca_sim  ta_adv  idf_term  cov_j")
+            for i, tid in enumerate(head30, 1):
+                d = debug_by_tid.get(str(tid), {})
+                term = (d.get("term") or term_map.get(tid, ""))[:32]
+                print(f"  {i:2d}  {term:32s}  {_f(d.get('hit_count'),4,0):>4} {_f(d.get('degree_w'),5,0):>5} {_f(d.get('degree_w_expanded'),6,0):>6} {_f(d.get('target_degree_w'),5,0):>5} {_f(d.get('raw_tag_purity'),7):>7} {_f(d.get('capped_tag_purity'),7):>7} {_f(d.get('cos_sim'),7):>7} {_f(d.get('anchor_sim'),7):>7} {_f(d.get('task_anchor_sim'),6):>6} {_f(d.get('carrier_anchor_sim'),6):>6} {_f(d.get('task_advantage'),6):>6} {_f(d.get('idf_term'),8):>8} {_f(d.get('cov_j'),6):>6}")
+
+            # C. 观测面板 2/4：骨架与共鸣（Top30）
+            print("\n【观测面板 2/4】骨架与共鸣 (Top30)")
+            print("  #   term                            sem_fac buck_f hit_t  pur_t  tiny_p  base_sc  res   anc_res anc_rat res_fac hit_fac conv_bonus")
+            for i, tid in enumerate(head30, 1):
+                d = debug_by_tid.get(str(tid), {})
+                term = (d.get("term") or term_map.get(tid, ""))[:32]
+                print(f"  {i:2d}  {term:32s}  {_f(d.get('semantic_factor'),6):>6} {_f(d.get('bucket_factor'),6):>6} {_f(d.get('hits_term'),6):>6} {_f(d.get('purity_term'),6):>6} {_f(d.get('tiny_penalty'),6):>6} {_f(d.get('base_score'),7):>7} {_f(d.get('resonance'),5):>5} {_f(d.get('anchor_resonance'),7):>7} {_f(d.get('anchor_ratio'),6):>6} {_f(d.get('resonance_factor'),6):>6} {_f(d.get('hit_count_factor'),6):>6} {_f(d.get('convergence_bonus'),9):>9}")
+
+            # D. 观测面板 3/4：角色 (Top30)
+            print("\n【观测面板 3/4】角色 (Top30)")
+            print("  #   term                            tc_str  ab_str  car_str nz_str  nz_pen  norm_t  norm_a  norm_c  main_role        margin  main_p  aux_p   alpha  rp_wo_nz role_pen")
+            for i, tid in enumerate(head30, 1):
+                d = debug_by_tid.get(str(tid), {})
+                term = (d.get("term") or term_map.get(tid, ""))[:32]
+                main_role = (d.get("main_role") or "none")[:14]
+                print(f"  {i:2d}  {term:32s}  {_f(d.get('task_core_strength'),6):>6} {_f(d.get('abstract_strength'),6):>6} {_f(d.get('carrier_strength'),6):>6} {_f(d.get('noise_strength'),6):>6} {_f(d.get('noise_penalty'),6):>6} {_f(d.get('norm_task'),6):>6} {_f(d.get('norm_abs'),6):>6} {_f(d.get('norm_car'),6):>6}  {main_role:14s}  {_f(d.get('role_margin'),6):>6} {_f(d.get('main_penalty'),6):>6} {_f(d.get('aux_penalty_avg'),6):>6} {_f(d.get('alpha'),5):>5} {_f(d.get('role_penalty_without_noise'),7):>7} {_f(d.get('role_penalty'),6):>6}")
+
+            # E. 观测面板 4/4：最终公式与得分 (Top30)
+            print("\n【观测面板 4/4】最终公式与得分 (Top30)")
+            print("  #   term                            anc_f  job_pen d_span d_span_pen cooc_s  cooc_p  span_pen pur_bon clu_fac  term_bb  idf_val  dyn_w    clu_rank  final_score")
+            for i, tid in enumerate(head30, 1):
+                d = debug_by_tid.get(str(tid), {})
+                term = (d.get("term") or term_map.get(tid, ""))[:32]
+                final_score = score_map.get(tid, 0.0)
+                clu_rank = cluster_factors.get(str(tid), 1.0)
+                print(f"  {i:2d}  {term:32s}  {_f(d.get('anchor_factor'),5):>5} {_f(d.get('job_penalty'),6):>6} {_f(d.get('domain_span'),5,0):>5} {_f(d.get('domain_span_penalty'),9):>9} {_f(d.get('cooc_span'),6):>6} {_f(d.get('cooc_purity'),6):>6} {_f(d.get('span_penalty'),7):>7} {_f(d.get('purity_bonus'),7):>7} {_f(d.get('cluster_factor'),7):>7} {_f(d.get('term_backbone'),7):>7} {_f(d.get('idf_val'),7):>7} {_f(d.get('dynamic_weight'),7):>7}  {_f(clu_rank,7):>7}  {final_score:.6f}")
+
+            # F. 一行汇总：角色 + 关键差异量 + 最终分（便于快速扫一眼）
+            print("\n【观测面板 汇总】Top30: term | base_score | task_core | abstract | carrier | noise_pen | main_role | role_margin | role_penalty | ta-ca | task_adv | final_score")
+            for i, tid in enumerate(head30, 1):
+                d = debug_by_tid.get(str(tid), {})
+                term = (d.get("term") or term_map.get(tid, ""))[:24]
+                ta = _fv(d, "task_anchor_sim"); ca = _fv(d, "carrier_anchor_sim")
+                ta_ca = (ta - ca) if (ta is not None and ca is not None) else None
+                print(f"  #{i:2d}  {term:24s}  base={_f(d.get('base_score'),7):>7}  tc={_f(d.get('task_core_strength'),5):>5}  ab={_f(d.get('abstract_strength'),5):>5}  car={_f(d.get('carrier_strength'),5):>5}  nz_pen={_f(d.get('noise_penalty'),5):>5}  role={(d.get('main_role') or 'none'):16s}  margin={_f(d.get('role_margin'),5):>5}  r_pen={_f(d.get('role_penalty'),5):>5}  ta-ca={_f(ta_ca,6):>6}  adv={_f(d.get('task_advantage'),5):>5}  final={score_map.get(tid, 0.0):.6f}")
         return score_map, term_map, idf_map
 
     def _stage4_graph_search(self, vocab_ids, regex_str):
