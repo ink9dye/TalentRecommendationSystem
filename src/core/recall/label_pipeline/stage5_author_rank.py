@@ -8,8 +8,8 @@ from src.utils.time_features import (
     compute_author_time_features,
     compute_author_recency_by_latest,
 )
-from src.utils.time_features import get_decay_rate_for_domains as _get_decay_rate_for_domains
-from src.utils.work_author_agg import accumulate_author_scores
+from src.utils.tools import get_decay_rate_for_domains as _get_decay_rate_for_domains
+from src.core.recall.works_to_authors import accumulate_author_scores
 
 
 def run_stage5(
@@ -37,8 +37,8 @@ def run_stage5(
         "query_vector": debug_1.get("query_vector"),
     }
 
-    paper_map = {}
-    author_raw_paper_cnt = collections.Counter()
+    paper_map: Dict[str, Dict[str, Any]] = {}
+    author_raw_paper_cnt: Dict[str, int] = collections.Counter()
 
     for record in author_papers_list:
         aid = record["aid"]
@@ -58,8 +58,8 @@ def run_stage5(
             entry["authors"].append({"aid": aid, "pos_weight": float(paper.get("weight") or 1.0)})
             author_raw_paper_cnt[aid] += 1
 
-    papers_for_agg = []
-    paper_hit_terms = {}
+    papers_for_agg: List[Dict[str, Any]] = []
+    paper_hit_terms: Dict[str, List[str]] = {}
     all_works_count = 0
 
     for wid, info in paper_map.items():
@@ -108,15 +108,22 @@ def run_stage5(
     author_top_works = agg_result.author_top_works
     paper_scores_by_wid = {p["wid"]: float(p["score"]) for p in papers_for_agg}
 
-    term_paper_contrib = collections.defaultdict(list)
+    term_paper_contrib: Dict[str, List[Tuple[str, float]]] = collections.defaultdict(list)
     for p in papers_for_agg:
-        wid, s_final, r_score, tw = p["wid"], p["score"], p.get("rank_score") or 1.0, p.get("term_weights") or {}
+        wid, s_final, r_score, tw = (
+            p["wid"],
+            p["score"],
+            p.get("rank_score") or 1.0,
+            p.get("term_weights") or {},
+        )
         if r_score <= 0:
             continue
         for vid_s, w in tw.items():
             term_paper_contrib[vid_s].append((wid, (w / r_score) * s_final))
 
-    author_term_contrib = collections.defaultdict(lambda: collections.defaultdict(float))
+    author_term_contrib: Dict[str, Dict[str, float]] = collections.defaultdict(
+        lambda: collections.defaultdict(float)
+    )
     for aid, works in author_top_works.items():
         for wid, contrib in works:
             info = paper_map.get(wid, {})
@@ -128,9 +135,9 @@ def run_stage5(
                 author_term_contrib[aid][vid_s] += contrib * (w / r_score)
 
     if author_scores:
-        years_by_author = {}
+        years_by_author: Dict[str, List[Any]] = {}
         for aid in author_scores.keys():
-            years = []
+            years: List[Any] = []
             for wid, _ in author_top_works.get(aid, []):
                 meta = paper_map.get(wid, {})
                 years.append(meta.get("year"))
@@ -166,13 +173,13 @@ def run_stage5(
             for aid in author_scores:
                 author_scores[aid] = author_scores[aid] / max_score
 
-    scored_authors = []
+    scored_authors: List[Dict[str, Any]] = []
     for aid, total_score in sorted(author_scores.items(), key=lambda x: x[1], reverse=True):
         works = author_top_works.get(aid, [])
         if not works:
             continue
 
-        per_author_papers = []
+        per_author_papers: List[Dict[str, Any]] = []
         for wid, contrib in works:
             meta = paper_map.get(wid, {})
             hits = paper_hit_terms.get(wid, [])
@@ -218,12 +225,12 @@ def run_stage5(
 
     scored_authors.sort(key=lambda x: x["score"], reverse=True)
     sorted_terms = sorted(
-        [(term_map.get(tid, ""), score_map.get(tid, 0)) for tid in score_map],
+        [(term_map.get(tid, ""), score_map.get(tid, 0.0)) for tid in score_map],
         key=lambda x: x[1],
         reverse=True,
     )
 
-    top20_term_debug = []
+    top20_term_debug: List[Dict[str, Any]] = []
     if score_map and getattr(recall, "_last_tag_purity_debug", None):
         debug_by_tid = {str(d["tid"]): d for d in recall.debug_info.tag_purity_debug if d.get("tid") is not None}
         rank_factors = getattr(recall, "_last_cluster_rank_factors", {}) or recall.debug_info.cluster_rank_factors or {}
@@ -260,7 +267,10 @@ def run_stage5(
 
     filter_closed_loop.setdefault("similar_to_raw_tids", [r.get("tid") for r in similar_to_raw])
     filter_closed_loop.setdefault("similar_to_pass_tids", [r.get("tid") for r in similar_to_pass])
-    filter_closed_loop.setdefault("final_term_ids_for_paper", sorted(score_map.keys(), key=lambda t: score_map.get(t, 0.0), reverse=True))
+    filter_closed_loop.setdefault(
+        "final_term_ids_for_paper",
+        sorted(score_map.keys(), key=lambda t: score_map.get(t, 0.0), reverse=True),
+    )
     filter_closed_loop.setdefault("final_term_count", len(score_map))
 
     for kw in (debug_1.get("industrial_kws") or []):
@@ -271,7 +281,9 @@ def run_stage5(
     for tid in (anchor_skills or {}).keys():
         label = f"anchor_tid:{tid}"
         filter_closed_loop.setdefault("contains_check", {})
-        filter_closed_loop["contains_check"][label] = any(str(tid) == str(t_id) for t_id, _ in sorted_terms[:50])
+        filter_closed_loop["contains_check"][label] = any(
+            str(tid) == str(t_id) for t_id, _ in sorted_terms[:50]
+        )
 
     recall.debug_info.filter_closed_loop = filter_closed_loop
     recall.debug_info.recall_vocab_count = len(score_map)
@@ -279,6 +291,7 @@ def run_stage5(
     recall.debug_info.author_count = len(scored_authors)
     recall.debug_info.top_terms_final_contrib = top20_term_debug
     recall.debug_info.top_samples = scored_authors[:50]
+
     recall.last_debug_info = {
         "active_domains": [str(d) for d in sorted(active_domain_set)],
         "dominance": float(dominance),
@@ -286,7 +299,7 @@ def run_stage5(
         "anchor_skills": anchor_skills,
         "score_map": score_map,
         "term_map": term_map,
-        "idf_map": idf_map_from_score(score_map, term_map),
+        "idf_map": {},  # 目前 idf_map 结构壳，由 score_map/tag_purity_debug 中可推导
         "filter_closed_loop": filter_closed_loop,
         "top_terms_final_contrib": top20_term_debug,
         "top_samples": scored_authors[:50],
@@ -296,9 +309,4 @@ def run_stage5(
     }
 
     return [a["aid"] for a in scored_authors], recall.last_debug_info
-
-
-def idf_map_from_score(score_map: Dict[str, float], term_map: Dict[str, str]) -> Dict[str, float]:
-    # 占位：目前还没有单独的 idf_map 计算，这里保持结构壳，后续可根据需要填充
-    return {tid: 0.0 for tid in score_map.keys()}
 
