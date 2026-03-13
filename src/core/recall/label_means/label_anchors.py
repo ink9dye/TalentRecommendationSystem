@@ -227,7 +227,7 @@ def supplement_anchors_from_jd_vector(label, query_text, anchor_skills, total_j=
     encoder = label._query_encoder
     jd_snippet = (query_text or "").strip()[:500]
     if getattr(label, "verbose", False):
-        print(f"[Bridge Debug] supplement_anchors_from_jd_vector 收到 query_text 片段: {jd_snippet[:120]}")
+        print(f"[Bridge Debug] semantic_query_text 片段: {jd_snippet[:120]}")
     if not jd_snippet:
         label.debug_info.supplement_anchors = []
         label.debug_info.supplement_anchors_report = []

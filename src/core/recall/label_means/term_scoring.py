@@ -138,6 +138,67 @@ def calculate_final_weights(
     return score_map, term_map, idf_map
 
 
+def _genericity_penalty(rec: Dict[str, Any]) -> float:
+    """
+    对“跨领域且高频”的大泛词做轻量降权，同时避免过度伤害细分技术词。
+
+    仅依赖通用统计特征：
+      - domain_span: 领域跨度，越大越接近“万金油”；
+      - work_count/degree_w_expanded: 论文覆盖规模，越大越容易成为通用词。
+
+    额外对形如 "*control*" 的广义控制词，在缺少明显机器人/轨迹/最优控制修饰时，做一档通用惩罚。
+    """
+    term_text = (rec.get("term") or "").strip()
+    if not term_text:
+        return 1.0
+
+    t_low = term_text.lower()
+    try:
+        span = int(rec.get("domain_span") or 0)
+    except (TypeError, ValueError):
+        span = 0
+    span = max(1, span)
+
+    # work_count 在部分链路中可能缺失，回退到 degree_w_expanded / degree_w
+    try:
+        work_count = int(rec.get("work_count") or rec.get("degree_w_expanded") or rec.get("degree_w") or 0)
+    except (TypeError, ValueError):
+        work_count = 0
+
+    penalty = 1.0
+
+    # 1) 纯统计角度：跨很多领域、且论文量巨大的词，易为通用大词
+    if span >= 6 and work_count >= 200:
+        penalty *= 0.4
+    elif span >= 4 and work_count >= 100:
+        penalty *= 0.6
+
+    # 2) 形态角度：大类“control”词，缺少明显机器人/轨迹/最优控制等技术前缀时再降一档
+    if "control" in t_low:
+        robotics_hints = (
+            "robot",
+            "uav",
+            "ugv",
+            "arm",
+            "manipulator",
+            "kinematic",
+            "trajectory",
+            "motion",
+            "mpc",
+            "lqr",
+            "ilqr",
+            "ddp",
+            "state estimation",
+            "real-time",
+            "realtime",
+        )
+        if not any(h in t_low for h in robotics_hints):
+            penalty *= 0.5
+
+    # 避免数值完全归零，保留一定可逆空间
+    return max(0.1, float(penalty))
+
+
 def _apply_word_quality_penalty(label, rec: Dict[str, Any], query_vector):
     """
     从 LabelRecallPath._apply_word_quality_penalty 迁移而来，内部使用 label 访问资源与超参。
@@ -209,7 +270,8 @@ def _apply_word_quality_penalty(label, rec: Dict[str, Any], query_vector):
         max_anchor_sim=max_anchor_sim,
     )
 
-    dynamic_weight = term_backbone * extra_factor
+    generic_penalty = _genericity_penalty(rec)
+    dynamic_weight = term_backbone * extra_factor * generic_penalty
 
     if label.debug_info.tag_purity_debug is not None:
         try:
@@ -236,6 +298,7 @@ def _apply_word_quality_penalty(label, rec: Dict[str, Any], query_vector):
                     "semantic_factor": round(semantic_factor, 6),
                     "purity_term": round(purity_term, 6),
                     "term_backbone": round(term_backbone, 6),
+                    "generic_penalty": round(generic_penalty, 6),
                     "dynamic_weight": round(dynamic_weight, 6),
                 }
             )

@@ -3,6 +3,7 @@ import traceback
 import faiss
 
 from src.core.recall.label_path import LabelRecallPath
+from src.utils.tools import extract_skills, SKILL_SPLIT_PATTERN, normalize_skill, split_space_terms, is_bad_skill
 
 
 def run_label_debug_cli() -> None:
@@ -22,6 +23,26 @@ def run_label_debug_cli() -> None:
             # 当前先使用原始 JD 作为 semantic_query_text，占位以便后续 bridge 逻辑增强；
             # 二者差异可通过 Bridge Debug 面板观测。
             semantic_text = raw_text
+
+            # ---- 打印 1：从 JD 文本到技能短语的清洗过程（raw / normalized / final）----
+            parts = [p for p in SKILL_SPLIT_PATTERN.split(raw_text) if p and p.strip()]
+            normalized_terms = []
+            final_skills = []
+            for p in parts:
+                norm = normalize_skill(p)
+                if not norm:
+                    continue
+                normalized_terms.append(norm)
+                for sub in split_space_terms(norm):
+                    if is_bad_skill(sub):
+                        continue
+                    final_skills.append(sub)
+            final_skills = list(set(final_skills))
+
+            print("【JD 技能清洗链路】")
+            print(f"  raw_phrases 样本({min(30, len(parts))}/{len(parts)}): {parts[:30]}")
+            print(f"  normalized_phrases 样本({min(30, len(normalized_terms))}/{len(normalized_terms)}): {normalized_terms[:30]}")
+            print(f"  cleaned_skills(最终技能短语) 样本({min(50, len(final_skills))}/{len(final_skills)}): {final_skills[:50]}")
 
             query_vec, _ = encoder.encode(semantic_text)
             faiss.normalize_L2(query_vec)
