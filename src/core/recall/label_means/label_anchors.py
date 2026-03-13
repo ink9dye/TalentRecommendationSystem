@@ -28,21 +28,27 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
     if total_j <= 0:
         total_j = label.total_job_count
 
-    cleaned_terms = set()
-    try:
-        cursor = label.graph.run(
-            "MATCH (j:Job) WHERE j.id IN $j_ids RETURN j.skills AS skills",
-            j_ids=target_job_ids[: label.ANCHOR_JOBS_TOP_K],
-        )
-        for row in cursor:
-            if row.get("skills"):
-                cleaned_terms |= clean_job_skills(str(row["skills"]))
-    except Exception:
-        pass
-    if not cleaned_terms:
-        cleaned_terms = None
+    # 优先使用基于当前 JD 文本抽取的技能短语集合（由 stage1_domain_anchors 预先挂载），
+    # 保证锚点过滤与本次查询语境强绑定；若不存在则回退到岗位 skills 字段的清洗结果。
+    cleaned_terms = getattr(label, "_jd_cleaned_terms", None)
+    if cleaned_terms:
+        cleaned_terms = {str(t).lower() for t in cleaned_terms}
+    else:
+        cleaned_terms = set()
+        try:
+            cursor = label.graph.run(
+                "MATCH (j:Job) WHERE j.id IN $j_ids RETURN j.skills AS skills",
+                j_ids=target_job_ids[: label.ANCHOR_JOBS_TOP_K],
+            )
+            for row in cursor:
+                if row.get("skills"):
+                    cleaned_terms |= clean_job_skills(str(row["skills"]))
+        except Exception:
+            cleaned_terms = set()
+        if not cleaned_terms:
+            cleaned_terms = None
 
-    # 打印 1：JD 清洗后的短语样本，便于观察岗位技能清洗效果
+    # 打印 1：JD 清洗后的短语样本（若有），便于观察与本次查询语境相关的技能集合
     sample_cleaned = list(cleaned_terms)[:50] if cleaned_terms else []
     if getattr(label, "verbose", False):
         print(f"[Step2 Debug] JD 清洗后技能短语样本({len(sample_cleaned)}): {sample_cleaned}")
@@ -126,6 +132,9 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
         lowered = term_text.lower()
         in_jd_context = cleaned_terms is not None and lowered in cleaned_terms
 
+        # 对“长尾但与当前 JD 语境高度相关、且领域跨度有限”的技术词做保活：
+        # - 常规规则：job_freq >= ANCHOR_MIN_JOB_FREQ；
+        # - 例外：若 job_freq 较低，但在本次 JD 清洗结果中出现且 domain_span 不大，则视作稀疏任务锚点保留。
         if job_freq < int(label.ANCHOR_MIN_JOB_FREQ):
             if span is not None and span <= 3 and in_jd_context:
                 rows_with_cov.append((r, cov_j))

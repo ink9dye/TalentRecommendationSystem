@@ -6,6 +6,107 @@ import numpy as np
 from src.core.recall.label_means import advanced_metrics as label_means_adv
 
 
+def _task_core_text_factor(term: str) -> float:
+    """
+    仅基于 term 文本形态，对“任务骨干”类词做轻量增强，避免完全依赖复杂指标。
+    目标是优先扶起运动学/动力学/规划/控制/估计/仿真等核心技术词。
+    """
+    if not term:
+        return 1.0
+    t = term.lower()
+
+    core_hints = [
+        # 英文任务骨干
+        "kinematic",
+        "dynamic",
+        "motion",
+        "trajectory",
+        "planning",
+        "optimization",
+        "optimal control",
+        "mpc",
+        "lqr",
+        "ilqr",
+        "ddp",
+        "state estimation",
+        "estimation",
+        "observer",
+        "whole-body",
+        "whole body",
+        "sim-to-real",
+        "simulation",
+        # 中文任务骨干
+        "运动学",
+        "动力学",
+        "轨迹",
+        "规划",
+        "最优控制",
+        "状态估计",
+        "全身控制",
+        "仿真",
+        "仿真到实机",
+    ]
+    if any(h in t for h in core_hints):
+        return 1.2
+
+    # 次一级：robot + control/kinematics/trajectory 组合
+    if "robot" in t and any(x in t for x in ["control", "kinematic", "trajectory"]):
+        return 1.1
+
+    return 1.0
+
+
+def _robot_entity_text_penalty(term: str) -> float:
+    """
+    对“泛机器人实体词”（robot hand / modular robot / UGV / Robot vision 等）
+    做一档纯形态降权，避免其在缺乏任务骨干修饰时占据 Top。
+    """
+    if not term:
+        return 1.0
+    t = term.lower()
+
+    robot_like = any(x in t for x in ["robot", "robotic", "robotics", "vehicle", "arm", "hand", "ugv", "uav"])
+    task_like = any(
+        x in t
+        for x in [
+            "kinematic",
+            "dynamic",
+            "motion",
+            "trajectory",
+            "planning",
+            "optimization",
+            "control",
+            "estimation",
+            "whole-body",
+            "whole body",
+            "sim-to-real",
+            "仿真",
+            "运动学",
+            "动力学",
+            "轨迹",
+            "规划",
+            "最优控制",
+            "状态估计",
+        ]
+    )
+
+    # 机器人/载具实体，但缺少任务骨干修饰 → 视作泛实体
+    if robot_like and not task_like:
+        return 0.4
+
+    # 明显噪声控制词
+    noisy_control = [
+        "industrial control system",
+        "emotional control",
+        "psychological control",
+        "chemical control",
+    ]
+    if any(x in t for x in noisy_control):
+        return 0.3
+
+    return 1.0
+
+
 def calculate_final_weights(
     label,
     raw_results: List[Dict[str, Any]],
@@ -123,6 +224,7 @@ def calculate_final_weights(
     # --- 主循环：逐 term 计算动态权重 ---
     for rec in raw_results:
         tid_str = str(rec["tid"])
+        term_text = rec.get("term") or ""
         if all(rec.get(k) is not None for k in required):
             dynamic_weight, idf_val = _apply_word_quality_penalty(label, rec, query_vector)
         else:
@@ -130,8 +232,15 @@ def calculate_final_weights(
             sim_score = rec.get("sim_score") or 0.0
             dynamic_weight = sim_score / math.log(1.0 + degree_w) if degree_w else 0.0
             idf_val = math.log10(label.total_work_count / (degree_w + 1))
+
+        # 纯文本形态上的轻量调整：优先扶起任务骨干词，压制泛机器人实体词，
+        # 避免完全依赖复杂统计/向量指标。
+        if dynamic_weight > 0.0:
+            dynamic_weight *= _task_core_text_factor(term_text)
+            dynamic_weight *= _robot_entity_text_penalty(term_text)
+
         score_map[tid_str] = dynamic_weight
-        term_map[tid_str] = rec.get("term") or ""
+        term_map[tid_str] = term_text
         idf_map[tid_str] = idf_val
 
     _apply_cluster_rank_decay(label, score_map)

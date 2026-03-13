@@ -4,6 +4,7 @@ import numpy as np
 
 from src.core.recall.label_means import label_anchors
 from src.utils.domain_utils import DomainProcessor
+from src.utils.tools import extract_skills
 from src.core.recall.label_path import Stage1Result
 
 
@@ -29,6 +30,18 @@ def run_stage1(
     dominance: float = 0.0
     job_previews: list[dict[str, Any]] = []
     anchor_debug: Dict[str, Any] = {}
+
+    # 0) 预清洗当前 JD 的技能短语，供 Step2 稀疏锚点保活使用
+    # 使用 extract_skills 保持与 JD 技能抽取链路一致，只在本次查询作用域内生效。
+    text_for_skills = semantic_query_text or query_text
+    jd_terms_cleaned = None
+    if text_for_skills:
+        try:
+            jd_terms_cleaned = {s.lower() for s in extract_skills(text_for_skills) if s}
+        except Exception:
+            jd_terms_cleaned = None
+    # 每次调用都覆盖上一轮缓存，避免跨查询串扰
+    setattr(recall, "_jd_cleaned_terms", jd_terms_cleaned)
 
     # 1) 领域与岗位：优先使用 DomainDetector，缺失时回退到旧实现
     if getattr(recall, "domain_detector", None) is not None:
