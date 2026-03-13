@@ -2186,6 +2186,61 @@ class LabelRecallPath:
         base_score = 1.0 + (dominance * 5.0) if intersect else 0.5
         return base_score * math.pow(purity_ratio, 6)
 
+    # ---------- 论文级评分因子（第二轮：因子接口抽取，仅封装现有逻辑） ----------
+
+    def _survey_decay_factor(self, hit_count: int, raw_title: str) -> float:
+        """
+        综述 / 文本类型统一衰减因子。
+        封装原有：hit_count^(-2) + apply_text_decay(title) 的组合逻辑。
+        """
+        survey_decay = (1.0 / math.pow(hit_count, 2)) if hit_count > 1 else 1.0
+        text_decay = apply_text_decay(raw_title or "")
+        return survey_decay * text_decay
+
+    def _coverage_norm_factor(self, hit_count: int) -> float:
+        """
+        命中标签数量归一化因子。
+        封装原有：1 / log(2 + hit_count) 逻辑。
+        """
+        if hit_count > 0:
+            return 1.0 / math.log(2.0 + hit_count)
+        return 1.0
+
+    def _paper_cluster_bonus(self, cluster_ids) -> float:
+        """
+        论文跨 topic cluster 奖励因子。
+        封装原有：log1p(cluster_count) 逻辑。
+        """
+        cluster_count = len(cluster_ids) if cluster_ids else 0
+        return math.log1p(cluster_count) if cluster_count > 0 else 1.0
+
+    def _paper_jd_semantic_gate_factor(self, raw_title: str, jd_vec, encoder) -> float:
+        """
+        论文标题与 JD 的语义相似度门控因子。
+        封装原有：cos<0.3 ->0.1, cos<0.5->0.4, 否则 1.0 的分段逻辑。
+        """
+        if jd_vec is None or not raw_title or encoder is None:
+            return 1.0
+        try:
+            paper_vec, _ = encoder.encode(raw_title)
+            if paper_vec is None or paper_vec.size == 0:
+                return 1.0
+            jd_flat = np.asarray(jd_vec, dtype=np.float32).flatten()
+            pf = np.asarray(paper_vec, dtype=np.float32).flatten()
+            jd_norm = np.linalg.norm(jd_flat)
+            pf_norm = np.linalg.norm(pf)
+            if jd_norm <= 1e-9 or pf_norm <= 1e-9:
+                return 1.0
+            cos = float(np.dot(jd_flat / jd_norm, pf / pf_norm))
+            cos = max(-1.0, min(1.0, cos))
+            if cos < 0.3:
+                return 0.1
+            if cos < 0.5:
+                return 0.4
+            return 1.0
+        except Exception:
+            return 1.0
+
     def _compute_contribution(self, paper, context):
         """
         【主评分函数】量化贡献度计算
@@ -2226,10 +2281,7 @@ class LabelRecallPath:
 
         # 4. 综述降权 + 文本类型降权（统一规则）
         hit_count = len(valid_hids)
-        survey_decay = (1.0 / math.pow(hit_count, 2)) if hit_count > 1 else 1.0
-        # 标题文本降权：survey/overview/review/handbook + data from:/dataset:/supplementary data
-        text_decay = apply_text_decay(raw_title)
-        survey_decay *= text_decay
+        survey_decay = self._survey_decay_factor(hit_count, raw_title)
 
         # 5. 指数级紧密度加成 (1+prox)^n
         proximity = self._calculate_proximity(valid_hids)
@@ -2249,15 +2301,11 @@ class LabelRecallPath:
                 # 取该词所属得分最高的簇作为其主簇
                 cid, _ = max(clusters, key=lambda x: x[1])
                 cluster_ids.add(cid)
-        cluster_count = len(cluster_ids)
-        cluster_bonus = math.log1p(cluster_count) if cluster_count > 0 else 1.0
+        cluster_bonus = self._paper_cluster_bonus(cluster_ids)
 
         # 7. 命中标签数量归一化：防止“命中标签越多 → 单论文贡献爆炸”主导作者排序
         # 采用次线性归一：log(2 + hit_count)，保证 1 标签与多标签论文在同一量级
-        if hit_count > 0:
-            coverage_norm = 1.0 / math.log(2.0 + hit_count)
-        else:
-            coverage_norm = 1.0
+        coverage_norm = self._coverage_norm_factor(hit_count)
 
         # 最终组合：按词权重 + 语义紧密度 + 领域纯度 + 时间/文本类型 + 命中数归一化 + 跨簇奖励 综合计算论文本身贡献度
         score = (
@@ -2272,24 +2320,12 @@ class LabelRecallPath:
 
         # 7.5 paper-level JD semantic gate：论文标题与 JD 的语义相似度门控，压制跨领域噪声（如教育/农业推荐被误召）
         jd_vec = context.get("query_vector")
-        if jd_vec is not None and raw_title and getattr(self, "_query_encoder", None):
-            try:
-                paper_vec, _ = self._query_encoder.encode(raw_title)
-                if paper_vec is not None and paper_vec.size > 0:
-                    jd_flat = np.asarray(jd_vec, dtype=np.float32).flatten()
-                    pf = np.asarray(paper_vec, dtype=np.float32).flatten()
-                    jd_norm = np.linalg.norm(jd_flat)
-                    pf_norm = np.linalg.norm(pf)
-                    if jd_norm > 1e-9 and pf_norm > 1e-9:
-                        cos = float(np.dot(jd_flat / jd_norm, pf / pf_norm))
-                        cos = max(-1.0, min(1.0, cos))
-                        if cos < 0.3:
-                            score *= 0.1
-                        elif cos < 0.5:
-                            score *= 0.4
-                        # else cos >= 0.5: factor 1.0
-            except Exception:
-                pass
+        gate_factor = self._paper_jd_semantic_gate_factor(
+            raw_title,
+            jd_vec,
+            getattr(self, "_query_encoder", None),
+        )
+        score *= gate_factor
 
         return score, hit_terms, rank_score, term_weights
 
