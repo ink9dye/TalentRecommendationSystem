@@ -1800,27 +1800,19 @@ class LabelRecallPath:
 
         # 标准 IDF（IR 口径）：用展开后的 paper_count（degree_w_expanded）做分母，统一口径
         # idf = log(1 + total_work / (1 + paper_count))
-        idf_term = math.log(1.0 + float(self.total_work_count) / (1.0 + float(degree_w_expanded)))
+        idf_term = self._idf_backbone(degree_w_expanded)
 
         # 2. 平滑 IDF：仅在“正常 topic 区间(10~50 篇)”略微加权，两端趋近 1，避免极端放大/压制
         # 小词：不额外奖励；中等词：适度 >1；大词：略微扣一点，细节交给 purity/span 处理
-        if degree_w < 10:
-            idf_val = 1.0
-        elif degree_w < 50:
-            # 线性插值：10 篇 ->1.0，50 篇 ->1.5
-            t = (float(degree_w) - 10.0) / 40.0
-            idf_val = 1.0 + 0.5 * max(0.0, min(1.0, t))
-        else:
-            # 大词略微扣一点，由 purity/span/cooc_span 继续约束
-            idf_val = 0.9
+        idf_val = self._smoothed_idf(degree_w, idf_term)
 
         # 3. 计算断崖式岗位惩罚 (Suppression of generic job terms)
-        job_penalty = 1.0 + math.exp(300.0 * (cov_j - 0.005))
+        job_penalty = self._job_penalty_factor(cov_j)
 
         # --- 4. 【核心修改：学术共鸣与共振奖励 + hit_count 直接加权】 ---
         # 逻辑 A：hit_count 代表有多少工业锚点支撑这个词；单锚点(hit_count=1)多为 python 等扩出的噪音，直接降权
         hit_count = rec.get('hit_count', 1)
-        hit_count_factor = 0.4 if hit_count == 1 else 1.0  # 单锚点 0.4x，多锚点共识保持 1.0
+        hit_count_factor = self._hit_count_factor(hit_count)
 
         # 逻辑 B：resonance 代表该词与当前其他候选词的共现；anchor_resonance 代表与第一层学术词的共现
         resonance = rec.get('resonance', 0.0)
@@ -1831,13 +1823,10 @@ class LabelRecallPath:
             return 0.0, idf_val
 
         # 【共鸣熔断器】：必须与第一层学术词有共现才给满分，否则 0.1 惩罚
-        if anchor_resonance > 0:
-            resonance_factor = 1.0 + math.log1p(resonance)
-        else:
-            resonance_factor = 0.1
+        resonance_factor = self._resonance_factor(resonance, anchor_resonance)
 
         # 综合收敛奖惩：技术簇共鸣 + hit_count 直接加权（多锚点共识词得分更高）
-        convergence_bonus = hit_count_factor * math.log1p(hit_count) * resonance_factor
+        convergence_bonus = self._convergence_bonus(hit_count_factor, hit_count, resonance_factor)
 
         # --- 5. SBERT 语义守门员 ---
         # 逻辑：计算学术词向量与当前 JD 整体语义的余弦相似度
@@ -2043,29 +2032,20 @@ class LabelRecallPath:
         # 5.7 锚点距离门控：优先依赖 task_anchor_sim，其次 carrier_anchor_sim，退化时回退到 max_anchor_sim
         ta = task_anchor_sim if task_anchor_sim is not None else max_anchor_sim
         ca = carrier_anchor_sim if carrier_anchor_sim is not None else max_anchor_sim
-        anchor_factor = 1.0
-        if ta is not None or ca is not None:
-            ta_clamped = max(0.0, min(1.0, ta or 0.0))
-            ca_clamped = max(0.0, min(1.0, ca or 0.0))
-            # 任务优先：task_anchor_sim 权重更高，carrier_anchor_sim 作为辅助兜底，采用温和的非线性放大
-            anchor_factor = (
-                0.20
-                + 0.65 * math.pow(ta_clamped, 1.5)
-                + 0.15 * math.pow(ca_clamped, 1.1)
-            )
-            term_backbone *= anchor_factor
+        anchor_factor = self._anchor_factor(ta, ca)
+        term_backbone *= anchor_factor
 
         # --- 6. 【共现领域惩罚与奖励】基于 vocab_stats 的 vocabulary_cooccurrence ---
         # 降权：与各种领域的词都共现 → 万金油 → 共现伙伴平均领域跨度大 → cooc_span 大 → 乘小于 1 的因子
         cooc_span = rec.get('cooc_span', 0.0)
-        span_penalty = 1.0 / (1.0 + math.log1p(cooc_span)) if cooc_span > 0 else 1.0
+        span_penalty = self._cooc_span_penalty(cooc_span)
         # 加权：只跟特定领域的词共现 → 专精 → 共现伙伴目标领域占比高 → cooc_purity 大 → 乘大于 1 的因子
         cooc_purity = rec.get('cooc_purity', 0.0)
-        purity_bonus = (1.0 + math.log1p(cooc_purity)) if cooc_purity > 0 else 1.0
+        purity_bonus = self._cooc_purity_bonus(cooc_purity)
 
         # 7. 【最终公式：立体的评价体系】
         # 骨架：... / (job_penalty * domain_span_penalty)； (1+span)^0.35 折中压制大簇泛词、不压死核心词
-        domain_span_penalty = math.pow(1.0 + domain_span, float(self.SPAN_PENALTY_EXPONENT))
+        domain_span_penalty = self._domain_span_penalty(domain_span)
         cluster_factor = self._get_cluster_factor_for_term(rec['tid'])
         dynamic_weight = (
                 term_backbone
@@ -2133,6 +2113,91 @@ class LabelRecallPath:
                 pass
 
         return dynamic_weight, idf_val
+
+    # ---------- 词级权重因子（第二轮：因子接口抽取，仅封装现有逻辑） ----------
+
+    def _idf_backbone(self, degree_w_expanded: float) -> float:
+        """
+        标准 IDF（IR 口径）：idf = log(1 + total_work / (1 + paper_count))。
+        """
+        return math.log(1.0 + float(self.total_work_count) / (1.0 + float(degree_w_expanded)))
+
+    def _smoothed_idf(self, degree_w: int, idf_backbone_val: float) -> float:
+        """
+        平滑 IDF：小词/大词略做约束，中等区间略微加权。
+        逻辑与原实现完全一致，只做封装。
+        """
+        if degree_w < 10:
+            return 1.0
+        if degree_w < 50:
+            t = (float(degree_w) - 10.0) / 40.0
+            return 1.0 + 0.5 * max(0.0, min(1.0, t))
+        return 0.9
+
+    def _job_penalty_factor(self, cov_j: float) -> float:
+        """
+        岗位泛词惩罚因子：复用了原有 exp(300*(cov_j-0.005)) 公式。
+        """
+        return 1.0 + math.exp(300.0 * (float(cov_j) - 0.005))
+
+    def _hit_count_factor(self, hit_count: int) -> float:
+        """
+        支持锚点数量因子：单锚点 0.4，多锚点 1.0。
+        """
+        return 0.4 if int(hit_count or 0) == 1 else 1.0
+
+    def _resonance_factor(self, resonance: float, anchor_resonance: float) -> float:
+        """
+        共鸣因子：与第一层学术词有共现时 1+log1p(resonance)，否则 0.1。
+        """
+        if anchor_resonance > 0:
+            return 1.0 + math.log1p(resonance)
+        return 0.1
+
+    def _convergence_bonus(self, hit_count_factor: float, hit_count: int, resonance_factor: float) -> float:
+        """
+        收敛奖励：hit_count_factor * log1p(hit_count) * resonance_factor。
+        """
+        return float(hit_count_factor) * math.log1p(int(hit_count or 0)) * float(resonance_factor)
+
+    def _anchor_factor(self, ta: float, ca: float) -> float:
+        """
+        锚点距离门控因子：task_anchor_sim 优先，其次 carrier_anchor_sim。
+        封装原有 0.20 + 0.65*ta^1.5 + 0.15*ca^1.1 逻辑。
+        """
+        if ta is None and ca is None:
+            return 1.0
+        ta_clamped = max(0.0, min(1.0, ta or 0.0))
+        ca_clamped = max(0.0, min(1.0, ca or 0.0))
+        return (
+            0.20
+            + 0.65 * math.pow(ta_clamped, 1.5)
+            + 0.15 * math.pow(ca_clamped, 1.1)
+        )
+
+    def _cooc_span_penalty(self, cooc_span: float) -> float:
+        """
+        共现领域跨度惩罚：cooc_span 大 → 万金油 → 乘小于 1 的因子。
+        等价于 1 / (1 + log1p(cooc_span))。
+        """
+        if cooc_span and cooc_span > 0:
+            return 1.0 / (1.0 + math.log1p(cooc_span))
+        return 1.0
+
+    def _cooc_purity_bonus(self, cooc_purity: float) -> float:
+        """
+        共现目标领域纯度奖励：cooc_purity 大 → 专精 → 乘大于 1 的因子。
+        等价于 1 + log1p(cooc_purity)。
+        """
+        if cooc_purity and cooc_purity > 0:
+            return 1.0 + math.log1p(cooc_purity)
+        return 1.0
+
+    def _domain_span_penalty(self, domain_span: int) -> float:
+        """
+        领域跨度惩罚：根据 (1 + domain_span)^SPAN_PENALTY_EXPONENT 计算。
+        """
+        return math.pow(1.0 + float(domain_span), float(self.SPAN_PENALTY_EXPONENT))
 
     # --- 第四阶段：向量紧密度计算 ---
     def _calculate_proximity(self, hit_ids):
