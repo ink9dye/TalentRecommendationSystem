@@ -53,30 +53,21 @@ def run_label_debug_cli() -> None:
                 f"Top30后={melt_stats.get('after_top30', 0)} 最终锚点数: {final_anchor_count}"
             )
 
-            CORE_KEYWORDS = ["动力学", "运动学", "轨迹规划", "状态估计", "最优控制", "运动控制", "实时控制", "机械臂"]
-            print("【锚点主干词存活检查】")
-            for kw in CORE_KEYWORDS:
-                in_cleaned = any(kw in t for t in melt_stats.get("cleaned_terms_sample", []))
-                in_before = any(kw in t for t in melt_stats.get("terms_before_melt", []))
-                in_after_melt = any(kw in t for t in melt_stats.get("terms_after_melt", []))
-                in_after_top30 = any(kw in t for t in melt_stats.get("terms_after_top30", []))
-                in_after_sim = any(kw in t for t in melt_stats.get("terms_after_sim", []))
-                in_final = any(kw in t for t in i_kws)
-                if in_final:
-                    reason = "in_final"
-                elif in_after_top30 and not in_after_sim:
-                    reason = "sim_drop"
-                elif in_after_melt and not in_after_top30:
-                    reason = "topk_drop"
-                elif in_before and not in_after_melt:
-                    reason = "melt_fail"
-                elif not in_before:
-                    reason = "clean_fail"
-                else:
-                    reason = "?"
+            # 通用版锚点存活简表：展示前若干个最终锚点在各阶段的流转情况，便于跨领域观察
+            cleaned_sample = melt_stats.get("cleaned_terms_sample", [])
+            before_melt = melt_stats.get("terms_before_melt", [])
+            after_melt = melt_stats.get("terms_after_melt", [])
+            after_top30 = melt_stats.get("terms_after_top30", [])
+            after_sim = melt_stats.get("terms_after_sim", [])
+            print("【锚点存活简表】term | cleaned | before_melt | after_melt | after_top30 | after_sim | final_anchor")
+            for term in i_kws[: min(10, len(i_kws))]:
+                cleaned = any(term == t for t in cleaned_sample)
+                b = any(term == t for t in before_melt)
+                am = any(term == t for t in after_melt)
+                at = any(term == t for t in after_top30)
+                s = any(term == t for t in after_sim)
                 print(
-                    f"  {kw}: cleaned={in_cleaned} before_melt={in_before} after_melt={in_after_melt} after_top30={in_after_top30} "
-                    f"after_sim={in_after_sim} final_anchor={in_final} 原因={reason}"
+                    f"  {term[:24]:24s} | {cleaned!s:>6} | {b!s:>11} | {am!s:>11} | {at!s:>12} | {s!s:>9} | {True:>12}"
                 )
 
             fcl = db.get("filter_closed_loop") or {}
@@ -103,6 +94,22 @@ def run_label_debug_cli() -> None:
                         f"  {(r.get('term') or '')[:28]:28s} | {r.get('tid')} | {r.get('final_weight', 0):.4f} | "
                         f"{(r.get('main_role') or '')[:12]:12s} | {r.get('role_penalty') or 0:.3f} | {r.get('paper_count_hit', 0)} | "
                         f"{r.get('top_paper_contrib', 0):.6f} | {ta_s}"
+                    )
+
+                # 学术 Top term 命运表：查看这些学术词在 Stage2/Stage3 各环节的流转情况
+                fcl = db.get("filter_closed_loop") or {}
+                raw_tids = set(fcl.get("similar_to_raw_tids", []) or [])
+                pass_tids = set(fcl.get("similar_to_pass_tids", []) or [])
+                final_tids = set(fcl.get("final_term_ids_for_paper", []) or [])
+                print("【学术词命运表】tid | term | in_similar_raw | in_similar_pass | in_final_paper")
+                for r in top_contrib[:20]:
+                    tid = r.get("tid")
+                    term = (r.get("term") or "")[:28]
+                    in_raw = tid in raw_tids
+                    in_pass = tid in pass_tids
+                    in_final = tid in final_tids
+                    print(
+                        f"  {tid:<6} | {term:28s} | {str(in_raw):>13} | {str(in_pass):>15} | {str(in_final):>13}"
                     )
 
             vocab_count = db.get("recall_vocab_count", 0)

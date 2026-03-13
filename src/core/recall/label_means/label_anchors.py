@@ -42,14 +42,10 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
     if not cleaned_terms:
         cleaned_terms = None
 
-    # 打印 1：JD 清洗后的短语（含关键机器人词是否存活在清洗阶段）
+    # 打印 1：JD 清洗后的短语样本，便于观察岗位技能清洗效果
     sample_cleaned = list(cleaned_terms)[:50] if cleaned_terms else []
     if getattr(label, "verbose", False):
         print(f"[Step2 Debug] JD 清洗后技能短语样本({len(sample_cleaned)}): {sample_cleaned}")
-        core_cn_keywords = ["运动学", "动力学", "轨迹规划", "状态估计", "最优控制", "运动控制", "机械臂", "实时控制"]
-        for kw in core_cn_keywords:
-            in_cleaned = any(kw in t for t in sample_cleaned)
-            print(f"[Step2 Debug] 清洗阶段关键短语是否存在: {kw} -> in_cleaned={in_cleaned}")
 
     cypher1 = """
     MATCH (j:Job) WHERE j.id IN $j_ids
@@ -110,18 +106,8 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
     rows_with_cov = []
     melted_terms = []
     dropped_terms = []
-    # 结合 JD 语境做轻量保活：在清洗后的 JD 短语中出现的“长尾技术词”在机器人/控制语境下不应轻易被熔断。
-    # 这里通过 cleaned_terms + 领域跨度(domain_span) 共同决定是否放宽 job_freq 门槛。
-    core_context_terms = {
-        "运动学",
-        "轨迹规划",
-        "状态估计",
-        "最优控制",
-        "实时控制",
-        "运动控制",
-        "机器人运动控制",
-        "机械臂",
-    }
+    # 结合 JD 语境做轻量保活：在清洗后的 JD 短语中出现、且领域跨度较小的“长尾技术词”不应轻易被熔断。
+    # 这里通过 cleaned_terms + 领域跨度(domain_span) 共同决定是否放宽 job_freq 门槛，而不依赖具体词面。
 
     for r in rows:
         vid = int(r.get("vid"))
@@ -139,12 +125,9 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
         term_text = (r.get("term") or "").strip()
         lowered = term_text.lower()
         in_jd_context = cleaned_terms is not None and lowered in cleaned_terms
-        is_core_context = any(kw in term_text for kw in core_context_terms)
 
         if job_freq < int(label.ANCHOR_MIN_JOB_FREQ):
             if span is not None and span <= 3 and in_jd_context:
-                rows_with_cov.append((r, cov_j))
-            elif is_core_context and in_jd_context:
                 rows_with_cov.append((r, cov_j))
             else:
                 dropped_terms.append((term_text, "job_freq", job_freq))
@@ -218,41 +201,7 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
 
     anchors = {str(r.get("vid")): {"term": r.get("term")} for r in rows}
 
-    # 打印 1 的补充：关键机器人词在各阶段的存活情况
     if getattr(label, "verbose", False):
-        core_cn_keywords = ["运动学", "动力学", "轨迹规划", "状态估计", "最优控制", "运动控制", "机械臂", "实时控制"]
-        stats = label.debug_info.anchor_melt_stats or {}
-        cleaned_sample = stats.get("cleaned_terms_sample", [])
-        before_melt = stats.get("terms_before_melt", [])
-        after_melt = stats.get("terms_after_melt", [])
-        after_top30 = stats.get("terms_after_top30", [])
-        after_sim = stats.get("terms_after_sim", [])
-        final_terms = [v["term"] for v in anchors.values()]
-        for kw in core_cn_keywords:
-            in_cleaned = any(kw in t for t in cleaned_sample)
-            in_before = any(kw in t for t in before_melt)
-            in_after_melt = any(kw in t for t in after_melt)
-            in_after_top30 = any(kw in t for t in after_top30)
-            in_after_sim = any(kw in t for t in after_sim)
-            in_final = any(kw in t for t in final_terms)
-            if in_final:
-                reason = "in_final"
-            elif in_after_top30 and not in_after_sim:
-                reason = "sim_drop"
-            elif in_after_melt and not in_after_top30:
-                reason = "topk_drop"
-            elif in_before and not in_after_melt:
-                reason = "melt_fail"
-            elif not in_before:
-                reason = "clean_fail"
-            else:
-                reason = "unknown"
-            print(
-                f"[Step2 Debug] 关键词链路 {kw}: "
-                f"cleaned={in_cleaned} before_melt={in_before} after_melt={in_after_melt} "
-                f"after_top30={in_after_top30} after_sim={in_after_sim} final_anchor={in_final} 原因={reason}"
-            )
-
         print(f"[Step2 Debug] 最终 industrial anchors 数量: {len(anchors)}")
         print(
             "[Step2 Debug] 最终 anchors 词样本:",
