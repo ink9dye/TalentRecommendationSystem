@@ -26,6 +26,7 @@ from py2neo import Graph
 from src.core.recall.input_to_vector import QueryEncoder
 from src.core.recall.works_to_authors import accumulate_author_scores
 from src.utils.domain_utils import DomainProcessor
+from src.utils.domain_detector import DomainDetector
 from config import (
     CONFIG_DICT, JOB_INDEX_PATH, JOB_MAP_PATH,
     VOCAB_INDEX_PATH, VOCAB_MAP_PATH, DB_PATH, VOCAB_STATS_DB_PATH,
@@ -96,6 +97,20 @@ class LabelRecallPath:
         # 领域向量：用于从 Top5 候选领域中按 query 相似度选 Top3
         self.domain_vectors = {}
         self._build_domain_vectors()
+
+        # 统一领域探测组件：基于 Job 索引 + Neo4j
+        try:
+            self.domain_detector = DomainDetector(
+                label_path=None,
+                graph=self.graph,
+                job_index=self.job_index,
+                job_id_map=self.job_id_map,
+                detect_jobs_top_k=self.DETECT_JOBS_TOP_K,
+                candidate_domains_top_k=self.CANDIDATE_DOMAINS_TOP_K,
+                active_domains_top_k=self.ACTIVE_DOMAINS_TOP_K,
+            )
+        except Exception:
+            self.domain_detector = None
 
     def _init_resources(self):
         """
@@ -2213,12 +2228,35 @@ class LabelRecallPath:
         debug_1 含 job_ids, job_previews, anchor_debug, dominance, industrial_kws, anchor_skills 等供阶段 5 诊断用。
         无锚点时 anchor_skills 为空 dict。
         """
-        job_ids, inferred_domains, dominance = self._detect_domain_context(query_vector)
-        job_previews = self._get_job_previews(job_ids)
+        # 1) 领域与岗位：统一通过 utils.DomainDetector 完成 Job 空间领域探测与预览
+        job_ids = []
+        inferred_domains = []
+        dominance = 0.0
+        job_previews = []
+        anchor_debug = {}
+
+        if getattr(self, "domain_detector", None) is not None:
+            active_set, _, debug = self.domain_detector.detect(
+                query_vector,
+                query_text=query_text,
+                user_domain=None,  # Label 内部的 domain_id 仍由后续逻辑处理
+            )
+            sd = debug.get("stage1_debug", {}) if isinstance(debug, dict) else {}
+            job_ids = sd.get("job_ids", []) or []
+            inferred_domains = sd.get("candidate_domains", []) or list(active_set or [])
+            dominance = sd.get("dominance", 0.0) or 0.0
+            job_previews = sd.get("job_previews", []) or []
+            anchor_debug = sd.get("anchor_debug", {}) or {}
+        else:
+            # 回退：使用 Label 内部原有实现（兼容性兜底）
+            job_ids, inferred_domains, dominance = self._detect_domain_context(query_vector)
+            job_previews = self._get_job_previews(job_ids)
+            anchor_debug = self._get_anchor_debug_stats(job_ids[:20], self.total_job_count) if job_ids else {}
+
+        # 2) 工业锚点：复用现有锚点抽取与 JD 语义补充逻辑
         anchor_skills = self._extract_anchor_skills(
             job_ids, query_vector=query_vector, total_j=self.total_job_count
         )
-        anchor_debug = self._get_anchor_debug_stats(job_ids[:20], self.total_job_count) if job_ids else {}
         if query_text and anchor_skills is not None:
             self._supplement_anchors_from_jd_vector(
                 query_text, anchor_skills, total_j=self.total_job_count, top_k=self.JD_VOCAB_TOP_K
