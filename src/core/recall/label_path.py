@@ -46,6 +46,13 @@ from src.utils.time_features import (
     compute_author_time_features,
     compute_author_recency_by_latest
 )
+from src.core.recall.label_means.simple_factors import (
+    survey_decay_factor,
+    coverage_norm_factor,
+    paper_cluster_bonus,
+    paper_jd_semantic_gate_factor,
+)
+from src.core.recall.label_means import advanced_metrics as label_means_adv
 
 
 @dataclass
@@ -2150,15 +2157,13 @@ class LabelRecallPath:
         """
         共鸣因子：与第一层学术词有共现时 1+log1p(resonance)，否则 0.1。
         """
-        if anchor_resonance > 0:
-            return 1.0 + math.log1p(resonance)
-        return 0.1
+        return label_means_adv.term_resonance_factor(resonance, anchor_resonance)
 
     def _convergence_bonus(self, hit_count_factor: float, hit_count: int, resonance_factor: float) -> float:
         """
         收敛奖励：hit_count_factor * log1p(hit_count) * resonance_factor。
         """
-        return float(hit_count_factor) * math.log1p(int(hit_count or 0)) * float(resonance_factor)
+        return label_means_adv.term_convergence_bonus(hit_count_factor, hit_count, resonance_factor)
 
     def _anchor_factor(self, ta: float, ca: float) -> float:
         """
@@ -2180,18 +2185,14 @@ class LabelRecallPath:
         共现领域跨度惩罚：cooc_span 大 → 万金油 → 乘小于 1 的因子。
         等价于 1 / (1 + log1p(cooc_span))。
         """
-        if cooc_span and cooc_span > 0:
-            return 1.0 / (1.0 + math.log1p(cooc_span))
-        return 1.0
+        return label_means_adv.term_cooc_span_penalty(cooc_span)
 
     def _cooc_purity_bonus(self, cooc_purity: float) -> float:
         """
         共现目标领域纯度奖励：cooc_purity 大 → 专精 → 乘大于 1 的因子。
         等价于 1 + log1p(cooc_purity)。
         """
-        if cooc_purity and cooc_purity > 0:
-            return 1.0 + math.log1p(cooc_purity)
-        return 1.0
+        return label_means_adv.term_cooc_purity_bonus(cooc_purity)
 
     def _domain_span_penalty(self, domain_span: int) -> float:
         """
@@ -2258,53 +2259,28 @@ class LabelRecallPath:
         综述 / 文本类型统一衰减因子。
         封装原有：hit_count^(-2) + apply_text_decay(title) 的组合逻辑。
         """
-        survey_decay = (1.0 / math.pow(hit_count, 2)) if hit_count > 1 else 1.0
-        text_decay = apply_text_decay(raw_title or "")
-        return survey_decay * text_decay
+        return survey_decay_factor(hit_count, raw_title)
 
     def _coverage_norm_factor(self, hit_count: int) -> float:
         """
         命中标签数量归一化因子。
         封装原有：1 / log(2 + hit_count) 逻辑。
         """
-        if hit_count > 0:
-            return 1.0 / math.log(2.0 + hit_count)
-        return 1.0
+        return coverage_norm_factor(hit_count)
 
     def _paper_cluster_bonus(self, cluster_ids) -> float:
         """
         论文跨 topic cluster 奖励因子。
         封装原有：log1p(cluster_count) 逻辑。
         """
-        cluster_count = len(cluster_ids) if cluster_ids else 0
-        return math.log1p(cluster_count) if cluster_count > 0 else 1.0
+        return paper_cluster_bonus(cluster_ids)
 
     def _paper_jd_semantic_gate_factor(self, raw_title: str, jd_vec, encoder) -> float:
         """
         论文标题与 JD 的语义相似度门控因子。
         封装原有：cos<0.3 ->0.1, cos<0.5->0.4, 否则 1.0 的分段逻辑。
         """
-        if jd_vec is None or not raw_title or encoder is None:
-            return 1.0
-        try:
-            paper_vec, _ = encoder.encode(raw_title)
-            if paper_vec is None or paper_vec.size == 0:
-                return 1.0
-            jd_flat = np.asarray(jd_vec, dtype=np.float32).flatten()
-            pf = np.asarray(paper_vec, dtype=np.float32).flatten()
-            jd_norm = np.linalg.norm(jd_flat)
-            pf_norm = np.linalg.norm(pf)
-            if jd_norm <= 1e-9 or pf_norm <= 1e-9:
-                return 1.0
-            cos = float(np.dot(jd_flat / jd_norm, pf / pf_norm))
-            cos = max(-1.0, min(1.0, cos))
-            if cos < 0.3:
-                return 0.1
-            if cos < 0.5:
-                return 0.4
-            return 1.0
-        except Exception:
-            return 1.0
+        return paper_jd_semantic_gate_factor(raw_title, jd_vec, encoder)
 
     def _compute_contribution(self, paper, context):
         """
