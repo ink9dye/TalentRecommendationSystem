@@ -449,6 +449,7 @@ class LabelRecallPath:
             pass
 
         melt_threshold = float(self.ANCHOR_MELT_COV_J)
+        terms_before_melt = [r.get("term") or "" for r in rows]
         rows_with_cov = []
         melted_terms = []
         for r in rows:
@@ -463,21 +464,27 @@ class LabelRecallPath:
                 continue
             rows_with_cov.append((r, cov_j))
 
+        terms_after_melt = [x[0].get("term") or "" for x in rows_with_cov]
         self._last_anchor_melt_stats = {
             "before_melt": len(rows),
             "after_melt": len(rows_with_cov),
             "melted_sample": melted_terms[:25],
             "melt_threshold": melt_threshold,
+            "terms_before_melt": terms_before_melt,
+            "terms_after_melt": terms_after_melt,
+            "cleaned_terms_sample": list(cleaned_terms)[:50] if cleaned_terms else [],
         }
 
         # 3) 熔断后按 job_freq 取 Top30
         rows_with_cov.sort(key=lambda x: (x[0].get("job_freq") or 0), reverse=True)
         rows = [x[0] for x in rows_with_cov[: self.ANCHOR_FREQ_TOP_K]]
         self._last_anchor_melt_stats["after_top30"] = len(rows)
+        self._last_anchor_melt_stats["terms_after_top30"] = [r.get("term") or "" for r in rows]
 
         # 4) 可选：清洗词过滤
         if cleaned_terms is not None:
             rows = [r for r in rows if (r.get("term") or "").lower() in cleaned_terms]
+        self._last_anchor_melt_stats["terms_after_cleaned"] = [r.get("term") or "" for r in rows]
 
         if not rows:
             return {}
@@ -506,6 +513,7 @@ class LabelRecallPath:
             rows = [x[2] for x in scored_keep[: self.ANCHOR_FINAL_TOP_K]]
         else:
             rows = rows[: self.ANCHOR_FINAL_TOP_K]
+        self._last_anchor_melt_stats["terms_after_sim"] = [r.get("term") or "" for r in rows]
 
         return {str(r.get("vid")): {"term": r.get("term")} for r in rows}
 
@@ -1940,21 +1948,24 @@ class LabelRecallPath:
             context['dominance']
         )
         if domain_coeff <= 0:
-            return 0, []
+            return 0, [], 0.0, {}, 0.0, {}
 
         # 3. 标签匹配与动态权重累加
         # 这里的 score_map 已经包含了之前修改的“词级领域跨度惩罚”
         rank_score = 0
+        term_weights = {}  # vid_s -> score_map[vid]*idf，供调试与作者来源拆解
         valid_hids, hit_terms = [], []
         for hit in paper['hits']:
             vid_s = str(hit['vid'])
             if vid_s in context['score_map']:
-                rank_score += context['score_map'][vid_s] * hit['idf']
+                w = context['score_map'][vid_s] * hit['idf']
+                rank_score += w
+                term_weights[vid_s] = w
                 valid_hids.append(hit['vid'])
                 hit_terms.append(context['term_map'][vid_s])
 
         if rank_score == 0:
-            return 0, []
+            return 0, [], 0.0, {}
 
         # 4. 综述降权 + 文本类型降权（统一规则）
         hit_count = len(valid_hids)
@@ -2023,7 +2034,7 @@ class LabelRecallPath:
             except Exception:
                 pass
 
-        return score, hit_terms
+        return score, hit_terms, rank_score, term_weights
 
     # ---------- 五阶段流程（便于维护与修改） ----------
 
@@ -2336,16 +2347,20 @@ class LabelRecallPath:
                 "year": info["year"],
                 "domains": info["domains"],
             }
-            p_score, p_hits = self._compute_contribution(paper_struct, context)
+            p_score, p_hits, p_rank_score, p_term_weights = self._compute_contribution(paper_struct, context)
             all_works_count += 1
             if p_score <= 0:
                 continue
             paper_hit_terms[wid] = p_hits
             info["score"] = float(p_score)
+            info["rank_score"] = float(p_rank_score or 0)
+            info["term_weights"] = dict(p_term_weights or {})
             papers_for_agg.append(
                 {
                     "wid": wid,
                     "score": float(p_score),
+                    "rank_score": float(p_rank_score or 0),
+                    "term_weights": dict(p_term_weights or {}),
                     "authors": info["authors"],
                 }
             )
@@ -2370,6 +2385,27 @@ class LabelRecallPath:
         agg_result = accumulate_author_scores(papers_for_agg, top_k_per_author=3)
         author_scores = agg_result.author_scores
         author_top_works = agg_result.author_top_works  # aid -> [(wid, contrib_score), ...]
+        paper_scores_by_wid = {p["wid"]: float(p["score"]) for p in papers_for_agg}
+
+        # 3.5) 每 term 对论文的贡献（用于 Top term 最终贡献表）与每作者来源 term 拆解
+        term_paper_contrib = collections.defaultdict(list)  # tid -> [(wid, contrib), ...]
+        for p in papers_for_agg:
+            wid, s_final, r_score, tw = p["wid"], p["score"], p.get("rank_score") or 1.0, p.get("term_weights") or {}
+            if r_score <= 0:
+                continue
+            for vid_s, w in tw.items():
+                term_paper_contrib[vid_s].append((wid, (w / r_score) * s_final))
+
+        author_term_contrib = collections.defaultdict(lambda: collections.defaultdict(float))  # aid -> tid -> contrib
+        for aid, works in author_top_works.items():
+            for wid, contrib in works:
+                info = paper_map.get(wid, {})
+                r_score = info.get("rank_score") or 1.0
+                tw = info.get("term_weights") or {}
+                if r_score <= 0:
+                    continue
+                for vid_s, w in tw.items():
+                    author_term_contrib[aid][vid_s] += contrib * (w / r_score)
 
         # 4) 重建 per-author 调试与展示结构（代表作、标签统计等）
         # ---- 作者层时间特征：活跃度 + 动量（统一 time_features）----
@@ -2451,6 +2487,12 @@ class LabelRecallPath:
 
             # 最终作者得分：论文贡献 + 作者时间特征（activity/momentum）
             final_score = author_scores.get(aid, total_score)
+            # 作者来源 term 拆解：按贡献排序取前 5
+            atc = author_term_contrib.get(aid, {})
+            top_terms_contrib = sorted(
+                [(term_map.get(tid, ""), round(float(c), 6)) for tid, c in atc.items() if c > 0],
+                key=lambda x: -x[1],
+            )[:5]
 
             scored_authors.append({
                 "aid": aid,
@@ -2460,6 +2502,7 @@ class LabelRecallPath:
                 "paper_count": paper_cnt_author,
                 "top_papers": top_papers,
                 "tag_stats": tag_stats,
+                "top_terms_by_contribution": top_terms_contrib,
             })
 
         scored_authors.sort(key=lambda x: x["score"], reverse=True)
@@ -2489,13 +2532,51 @@ class LabelRecallPath:
                     "weight": round(score_map.get(tid, 0.0), 6),
                 })
         academic_kws = list(set(term_map.values()))
+        # 过滤闭环：三份集合 + 指定 tid 是否在最终集合
+        similar_to_pass = getattr(self, "_last_similar_to_pass", [])
+        similar_to_pass_tids = sorted(set(r["tid"] for r in similar_to_pass if r.get("tid") is not None))
+        similar_to_raw_tids = getattr(self, "_last_raw_candidate_tids", [])
+        final_term_ids_for_paper = sorted([int(k) for k in score_map.keys()])
+        debug_check_tids = [(2280, "supervised learning"), (4045, "robot learning"), (152, "control (management)")]
+        filter_closed_loop = {
+            "similar_to_raw_tids": similar_to_raw_tids[:50],
+            "similar_to_pass_tids": similar_to_pass_tids[:50],
+            "final_term_ids_for_paper": final_term_ids_for_paper[:50],
+            "final_term_count": len(final_term_ids_for_paper),
+            "contains_check": {f"{name}({tid})": tid in final_term_ids_for_paper for tid, name in debug_check_tids},
+        }
+        # Top term 最终贡献表（Top20）：term, tid, final_weight, main_role, role_penalty, paper_count_hit, top_paper_contrib, total_paper_contrib
+        debug_by_tid = {str(d["tid"]): d for d in (getattr(self, "_last_tag_purity_debug", None) or []) if d.get("tid") is not None}
+        top_tids_by_weight = sorted(score_map.keys(), key=lambda t: score_map.get(t, 0.0), reverse=True)[:20]
+        top_terms_final_contrib = []
+        for tid in top_tids_by_weight:
+            tid_s = str(tid)
+            lst = term_paper_contrib.get(tid_s, [])
+            pc = len(lst)
+            top_c = max((c for _, c in lst), default=0.0)
+            total_c = sum(c for _, c in lst)
+            row = debug_by_tid.get(tid_s, {})
+            top_terms_final_contrib.append({
+                "term": term_map.get(tid_s, ""),
+                "tid": int(tid) if tid_s.isdigit() else tid_s,
+                "final_weight": round(score_map.get(tid_s, 0.0), 6),
+                "main_role": row.get("main_role") or "none",
+                "role_penalty": row.get("role_penalty"),
+                "paper_count_hit": pc,
+                "top_paper_contrib": round(top_c, 6),
+                "total_paper_contrib": round(total_c, 6),
+                "task_anchor_sim": row.get("task_anchor_sim"),
+                "carrier_anchor_sim": row.get("carrier_anchor_sim"),
+                "task_advantage": row.get("task_advantage"),
+            })
+
         self.last_debug_info = {
             "active_domains": list(active_domain_set),
             "dominance": f"{dominance * 100:.1f}%",
             "expansion_pipeline": getattr(self, "_last_expansion_pipeline_stats", None),
             "similar_to_raw": getattr(self, "_last_similar_to_raw_rows", []),
             "similar_to_agg": getattr(self, "_last_similar_to_agg", []),
-            "similar_to_pass": getattr(self, "_last_similar_to_pass", []),
+            "similar_to_pass": similar_to_pass,
             "regex_str": debug_1.get("regex_str", ""),
             "job_ids": debug_1.get("job_ids", []),
             "job_previews": debug_1.get("job_previews", []),
@@ -2512,6 +2593,8 @@ class LabelRecallPath:
             "work_count": all_works_count,
             "author_count": len(scored_authors),
             "top_samples": scored_authors[:50],
+            "filter_closed_loop": filter_closed_loop,
+            "top_terms_final_contrib": top_terms_final_contrib,
         }
         return [a["aid"] for a in scored_authors], self.last_debug_info
 
@@ -2537,6 +2620,7 @@ class LabelRecallPath:
         )
         if not raw_candidates:
             return [], (time.time() - start_t) * 1000
+        self._last_raw_candidate_tids = sorted(set(r.get("tid") for r in raw_candidates if r.get("tid") is not None))
 
         # 阶段 3：词权重（统一走复杂公式，传入锚点 ID 供锚点距离门控）
         anchor_vids = [int(k) for k in anchor_skills.keys()] if anchor_skills else None
@@ -2576,286 +2660,88 @@ if __name__ == "__main__":
 
             top_ids, search_time = l_path.recall(query_vec, domain_id=domain_choice, query_text=user_input)
 
-            # --- 核心诊断日志 ---
+            # --- 核心诊断日志（收缩为闭环可验证）---
             db = l_path.last_debug_info
             print("\n" + "🔍 [深度诊断流水线]" + "-" * 98)
 
-            # 1. 领域探测（增强：打印命中的岗位 ID + Top20 岗位名称与描述片段）
             domains = db.get('active_domains', [])
             domain_str = " | ".join(domains) if domains else "未限制"
-            print(f"【Step 1: 领域探测】目标领域并集: [{domain_str}] (置信度: {db.get('dominance')})")
-            job_ids = db.get('job_ids', [])
-            if job_ids:
-                print(f"      命中岗位 ID (Top20): {[jid[:50]+'...' if len(jid)>50 else jid for jid in job_ids[:20]]}")
+            print(f"【Step 1: 领域探测】目标领域: [{domain_str}] 置信度: {db.get('dominance')}")
             job_previews = db.get('job_previews', [])
             if job_previews:
-                print(f"      Top20 岗位名称与描述片段（用于判断是否匹配）:")
-                for i, jp in enumerate(job_previews[:10], 1):
-                    name = (jp.get('name') or '')[:60]
-                    snippet = (jp.get('description_snippet') or '')[:120]
-                    print(f"        #{i} 名称: {name}")
-                    print(f"            描述: {snippet}...")
+                print("      Top5 岗位名称:")
+                for i, jp in enumerate(job_previews[:5], 1):
+                    print(f"        #{i} {(jp.get('name') or '')[:55]}")
 
-            # 2. 工业锚点（增强：每个岗位 REQUIRE_SKILL 数、熔断前/后、被熔断词样例）
             i_kws = db.get('industrial_kws', [])
-            anchor_detail = db.get('anchor_detail', [])
-            print(f"【Step 2: 工业锚点】从 JD 提取的核心技能 (共 {len(i_kws)} 个): {i_kws}")
-            if anchor_detail:
-                max_show = 200  # 想全量可调大；避免控制台刷屏导致难定位
-                print(f"      锚点明细 (vid -> term) (展示 {min(len(anchor_detail), max_show)}/{len(anchor_detail)}):")
-                for s in anchor_detail[:max_show]:
-                    print(f"        - {s}")
-            anchor_debug = db.get('anchor_debug', {})
-            if anchor_debug:
-                per_job = anchor_debug.get('per_job_skill_count', [])
-                before_melt = anchor_debug.get('skills_before_melt', 0)
-                after_melt = anchor_debug.get('skills_after_melt', 0)
-                melted_sample = anchor_debug.get('melted_terms_sample', [])
-                print(f"      参与锚点提取的岗位 (Top5) 每岗 REQUIRE_SKILL 数: {per_job}")
-                print(f"      3% 熔断(统计用): 熔断前 {before_melt} 个，熔断后 {after_melt} 个；被熔断词样例: {melted_sample[:15]}")
-            # 先熔断 -> Top30 -> Top20 实际执行统计
-            melt_stats = db.get('anchor_melt_stats')
-            if melt_stats:
-                print(f"      【先熔断】实际: 熔断前={melt_stats.get('before_melt', 0)} 熔断后={melt_stats.get('after_melt', 0)} "
-                      f"Top30后={melt_stats.get('after_top30', 0)} 阈值={melt_stats.get('melt_threshold', 0.03)}")
-                melted_sample = melt_stats.get('melted_sample', [])
-                if melted_sample:
-                    print(f"      被熔断词及 cov_j (最多 20 条): {melted_sample[:20]}")
-            # 核心词补充（JD 向量搜 vocabulary）
-            supp = db.get('supplement_anchors', [])
-            if supp:
-                print(f"      【核心词补充】JD 向量搜 vocabulary 新增 {len(supp)} 个锚点 (vid, term, sim, cov_j):")
-                for x in supp[:20]:
-                    print(f"        - vid={x[0]} term={x[1]} sim={x[2]} cov_j={x[3]}")
-                if len(supp) > 20:
-                    print(f"        ... 共 {len(supp)} 条")
-            else:
-                print(f"      【核心词补充】本次未新增锚点（已存在或熔断过滤）")
-            anchor_detail_final = db.get('anchor_detail', [])
-            print(f"      合并后锚点总数: {len(anchor_detail_final)} (岗位熔断Top20 + 核心词补充)")
+            melt_stats = db.get('anchor_melt_stats') or {}
+            print(f"【Step 2: 工业锚点】技能数: {len(i_kws)}  熔断前={melt_stats.get('before_melt', 0)} 熔断后={melt_stats.get('after_melt', 0)} Top30后={melt_stats.get('after_top30', 0)} 最终锚点数: {len(db.get('anchor_detail', []))}")
 
-            # 3. 学术语义扩展与“学术共鸣”校验
-            # 2.5 语义扩展管道（Step 3 前置）：看清在哪个环节被筛光
-            expansion_pipeline = db.get('expansion_pipeline')
-            regex_str = db.get('regex_str', '')
-            if expansion_pipeline:
-                p = expansion_pipeline
-                print(f"【Step 3 前置: 语义扩展管道】")
-                print(f"      目标领域 ID: {p.get('active_domains', [])}")
-                print(f"      领域正则(regex): {regex_str}")
-                print(f"      SIMILAR_TO 原始行数: {p.get('n_similar_to_rows', 0)}")
-                print(f"      去重后候选学术词数: {p.get('n_unique_tids', 0)}")
+            # 锚点主干词存活检查
+            CORE_KEYWORDS = ["动力学", "运动学", "轨迹规划", "状态估计", "最优控制"]
+            print("【锚点主干词存活检查】")
+            for kw in CORE_KEYWORDS:
+                in_cleaned = any(kw in t for t in melt_stats.get("cleaned_terms_sample", []))
+                in_before = any(kw in t for t in melt_stats.get("terms_before_melt", []))
+                in_after_melt = any(kw in t for t in melt_stats.get("terms_after_melt", []))
+                in_after_top30 = any(kw in t for t in melt_stats.get("terms_after_top30", []))
+                in_after_sim = any(kw in t for t in melt_stats.get("terms_after_sim", []))
+                in_final = any(kw in t for t in i_kws)
+                reason = "in_final" if in_final else ("sim_drop" if in_after_top30 and not in_after_sim else "topk_drop" if in_after_melt and not in_after_top30 else "melt_fail" if in_before and not in_after_melt else "clean_fail" if not in_before else "?")
+                print(f"  {kw}: cleaned={in_cleaned} before_melt={in_before} after_melt={in_after_melt} after_top30={in_after_top30} after_sim={in_after_sim} final_anchor={in_final} 原因={reason}")
 
-                # 打印 SIMILAR_TO 原始扩展：按“源锚点(src_vid)”分组，展示每个锚点的 top 扩展
-                similar_to_raw = db.get('similar_to_raw', []) or []
-                if similar_to_raw:
-                    src_map = collections.defaultdict(list)  # src_vid -> [(tid, term, sim)]
-                    for r in similar_to_raw:
-                        src = r.get('src_vid')
-                        if src is None:
-                            continue
-                        src_map[int(src)].append(
-                            (r.get('tid'), r.get('term'), float(r.get('sim_score', 0.0) or 0.0))
-                        )
+            # 过滤闭环
+            fcl = db.get('filter_closed_loop') or {}
+            raw_tids = fcl.get('similar_to_raw_tids', [])
+            pass_tids = fcl.get('similar_to_pass_tids', [])
+            final_tids = fcl.get('final_term_ids_for_paper', [])
+            n_final = fcl.get('final_term_count', 0)
+            print("【词过滤闭环】")
+            print(f"  similar_to_raw_tids 数量: {len(raw_tids)}  前30: {raw_tids[:30]}")
+            print(f"  similar_to_pass_tids 数量: {len(pass_tids)}  前30: {pass_tids[:30]}")
+            print(f"  final_term_ids_for_paper 数量: {n_final}  前30: {final_tids[:30]}")
+            for label, in_final in (fcl.get('contains_check') or {}).items():
+                print(f"  contains {label}: {in_final}")
 
-                    # 用锚点明细做 src_vid -> src_term 映射（形如 "167211=wbc"）
-                    src_term_map = {}
-                    for s in db.get('anchor_detail', []) or []:
-                        if isinstance(s, str) and "=" in s:
-                            k, v = s.split("=", 1)
-                            if k.strip().isdigit():
-                                src_term_map[int(k.strip())] = v.strip()
+            # Top term 最终贡献表（Top20）
+            top_contrib = db.get('top_terms_final_contrib') or []
+            if top_contrib:
+                print("【Top term 最终贡献表】term | tid | final_weight | main_role | role_penalty | paper_count_hit | top_paper_contrib | task_advantage")
+                for r in top_contrib[:20]:
+                    ta = r.get('task_advantage')
+                    ta_s = f"{ta:.3f}" if ta is not None else "-"
+                    print(f"  {(r.get('term') or '')[:28]:28s} | {r.get('tid')} | {r.get('final_weight', 0):.4f} | {(r.get('main_role') or '')[:12]:12s} | {r.get('role_penalty') or 0:.3f} | {r.get('paper_count_hit', 0)} | {r.get('top_paper_contrib', 0):.6f} | {ta_s}")
 
-                    print("      SIMILAR_TO 原始扩展（按源锚点分组，每个锚点展示 Top3）:")
-                    for src_vid in sorted(src_map.keys()):
-                        items = sorted(src_map[src_vid], key=lambda x: x[2], reverse=True)[:3]
-                        src_term = src_term_map.get(src_vid, "")
-                        head = f"        - src_vid={src_vid}" + (f"({src_term})" if src_term else "")
-                        print(head)
-                        for tid, term, sc in items:
-                            print(f"            -> tid={tid}  term={term}  sim={sc:.4f}")
-
-                # 打印聚合后的候选（去重后，带 hit_count 与 src_vids）
-                sim_agg = db.get('similar_to_agg', []) or []
-                if sim_agg:
-                    top_show = 20
-                    sim_agg_sorted = sorted(
-                        sim_agg,
-                        key=lambda x: (int(x.get('hit_count', 0) or 0), float(x.get('sim_score', 0.0) or 0.0)),
-                        reverse=True
-                    )
-                    print(f"      SIMILAR_TO 聚合后候选 Top{top_show}（按 hits、sim_score 排序）:")
-                    for r in sim_agg_sorted[:top_show]:
-                        sc = float(r.get('sim_score', 0.0) or 0.0)
-                        print(f"        - tid={r.get('tid')}  term={r.get('term')}  sim={sc:.4f}  hits={r.get('hit_count')}  src_vids={r.get('src_vids')}")
-
-                # 打印“通过 stats/领域过滤”的第一层学术词
-                sim_pass = db.get('similar_to_pass', []) or []
-                if sim_pass:
-                    print("      通过过滤的第一层学术词（similar_to_pass）:")
-                    for r in sorted(
-                        sim_pass,
-                        key=lambda x: (int(x.get('hit_count', 0) or 0), float(x.get('sim_score', 0.0) or 0.0)),
-                        reverse=True
-                    )[:30]:
-                        deg = int(r.get('degree_w', 0) or 0)
-                        tgt = int(r.get('target_degree_w', 0) or 0)
-                        deg_exp = int(r.get('degree_w_expanded', 0) or 0)
-                        # 正确口径：用展开后的单领域计数总和作分母（兼容 domain_dist 中存在复合 key）
-                        ratio_correct = (float(tgt) / float(deg_exp)) if deg_exp else 0.0
-                        sc = float(r.get('sim_score', 0.0) or 0.0)
-                        print(f"        - tid={r.get('tid')}  term={r.get('term')}  sim={sc:.4f}  hits={r.get('hit_count')}  src_vids={r.get('src_vids')}  "
-                              f"degree_w={deg}  degree_w_exp={deg_exp}  target_w={tgt}  ratio_correct={ratio_correct:.3f}")
-                print(f"      【边路 SIMILAR_TO 领域过滤】")
-                print(f"      去重后候选学术词数: {p.get('n_unique_tids', 0)}")
-                print(f"      无 vocabulary_domain_stats 行: {p.get('n_no_stats', 0)}  (样例 tid: {p.get('sample_fail_no_stats', [])[:5]})")
-                print(f"      work_count > P95(277) 被筛: {p.get('n_fail_degree_w', 0)}  (样例: {p.get('sample_fail_degree', [])[:5]})")
-                print(f"      degree_w_expanded=0 被筛: {p.get('n_fail_degree_w_expanded_zero', 0)}  (归入下方纯度不足明细)")
-                print(f"      目标领域 0 篇(target_degree_w<=0) 被筛: {p.get('n_fail_target_degree_w', 0)}  (样例: {p.get('sample_fail_target', [])[:5]})")
-                print(f"      领域纯度 < 50% 被筛 (含 expanded=0): {p.get('n_fail_domain_ratio', 0)}  (样例: {p.get('sample_fail_ratio', [])[:5]})")
-                print(f"      最终通过边路领域过滤: {p.get('n_final', 0)}")
-                fail_details = p.get("fail_domain_ratio_details", [])
-                if fail_details:
-                    print(f"      被筛词纯度明细 (最多展示 20 条):")
-                    print(f"      {'term':<20} | {'tid':<8} | {'deg_w':<8} | {'deg_w_exp':<10} | {'target_w':<10} | {'ratio':<8} | {'原因':<18} | 目标领域分布")
-                    print(f"      {'-' * 20} | {'-' * 8} | {'-' * 8} | {'-' * 10} | {'-' * 10} | {'-' * 8} | {'-' * 18} | ---------")
-                    for x in fail_details:
-                        term_s = (x.get("term") or "")[:20]
-                        dist_s = x.get("target_domains_dist") or {}
-                        dist_str = ", ".join(f"{k}:{v}" for k, v in sorted(dist_s.items()))
-                        deg = int(x.get("degree_w", 0) or 0)
-                        deg_exp = int(x.get("degree_w_expanded", 0) or 0)
-                        tgt = int(x.get("target_degree_w", 0) or 0)
-                        ratio_correct = (float(tgt) / float(deg_exp)) if deg_exp else 0.0
-                        reason = x.get("fail_reason", "")
-                        print(f"      {term_s:<20} | {x.get('tid', ''):<8} | {deg:<8} | {deg_exp:<10} | {tgt:<10} | {ratio_correct:<8.4f} | {reason:<18} | {dist_str}")
-                        all_ratio = x.get("all_domains_ratio") or {}
-                        if all_ratio:
-                            ratio_str = ", ".join(
-                                f"{DOMAIN_MAP.get(d, d)}({d}):{all_ratio[d]*100:.1f}%" for d in sorted(all_ratio.keys(), key=lambda d: -all_ratio[d])
-                            )
-                            print(f"        各领域占比: {ratio_str}")
-                print(f"      最终通过进入 Step 3 的学术词数: {p.get('n_final', 0)}")
-            else:
-                print(f"【Step 3 前置: 语义扩展管道】无数据（未执行或未记录）")
-
-            print(f"【Step 3: 语义扩展与实证校验】学术词质量评估:")
-            print(f"      {'学术词 (Term)':<25} | {'收敛(Hits)':<10} | {'共鸣(Resonance)':<15} | {'状态'}")
-            print(f"      {'-' * 25} | {'-' * 10} | {'-' * 15} | {'-' * 10}")
-
-            detailed_kws = db.get('detailed_kws', [])
-            if not detailed_kws:
-                print("      （无数据）")
-            for kw in sorted(detailed_kws, key=lambda x: x.get('resonance', 0), reverse=True)[:15]:
-                hits = kw.get('hit_count', 1)
-                res = kw.get('resonance', 0)
-                status = "✅ 核心簇" if res > 0 and hits > 1 else "⚠️ 孤立点"
-                if res == 0:
-                    status = "❌ 已熔断"
-                term_str = (kw.get('term') or '')[:25]
-                print(f"      {term_str:<25} | {hits:<10} | {int(res):<15} | {status}")
-
-            # 3.5 参与召回的学术词及权重 Top15（便于发现 stub file、folklore 等噪音）
-            top_scored_terms = db.get('top_scored_terms', [])
-            if top_scored_terms:
-                print(f"      参与召回的学术词权重 Top15:")
-                for term, score in top_scored_terms[:15]:
-                    print(f"        - {term[:40]:<40}  weight={score:.6f}")
-            # 3.5b Top20 学术词调试：分解项（定位谁在压权重）
-            top20_debug = db.get('top20_term_debug', [])
-            if top20_debug:
-                print(f"      【Step 3 调试】Top20 学术词（分解项）")
-                print(f"        字段: cos_sim | anchor_sim | idf | deg/deg_exp | hits | rank_factor | cluster_factor | job_penalty | span | weight")
-                for i, row in enumerate(top20_debug[:20], 1):
-                    term = (row.get('term') or '')[:36]
-                    cs = row.get('cos_sim')
-                    ans = row.get('anchor_sim')
-                    idf = row.get('idf_term')
-                    deg = row.get('degree_w')
-                    deg_exp = row.get('degree_w_expanded')
-                    hits = row.get('hit_count')
-                    rf = row.get('cluster_rank_factor')
-                    cf = row.get('cluster_factor')
-                    jp = row.get('job_penalty')
-                    ds = row.get('domain_span')
-                    w = row.get('weight', 0)
-                    cs_s = f"{cs:.4f}" if cs is not None else "-"
-                    ans_s = f"{ans:.4f}" if ans is not None else "-"
-                    idf_s = f"{float(idf):.3f}" if idf is not None else "-"
-                    deg_s = f"{deg}/{deg_exp}" if deg is not None and deg_exp is not None else "-"
-                    hits_s = f"{hits}" if hits is not None else "-"
-                    rf_s = f"{float(rf):.4f}" if rf is not None else "-"
-                    cf_s = f"{float(cf):.3f}" if cf is not None else "-"
-                    jp_s = f"{float(jp):.2f}" if jp is not None else "-"
-                    ds_s = f"{ds}" if ds is not None else "-"
-                    print(f"        #{i:2d}  {term:<36}  cos={cs_s:>6}  anchor={ans_s:>6}  idf={idf_s:>6}  deg={deg_s:>9}  hits={hits_s:>3}  rf={rf_s:>6}  cf={cf_s:>5}  jp={jp_s:>6}  span={ds_s:>3}  w={w:.6f}")
-
-            # 3.6 Tag Purity 诊断（raw>1 时可见统计口径异常）
-            tag_purity_debug = getattr(l_path, "_last_tag_purity_debug", []) or []
-            over_one = [x for x in tag_purity_debug if x.get("raw_tag_purity", 0) > 1.0]
-            print(f"      【Tag Purity 诊断】共 {len(tag_purity_debug)} 个词参与权重计算，其中 raw_tag_purity>1 的共 {len(over_one)} 个")
-            if over_one:
-                print(f"      raw_tag_purity>1 明细 (最多 20 条，口径=target_degree_w/degree_w_expanded):")
-                print(f"      {'term':<20} | {'tid':<6} | {'deg_w':<8} | {'deg_exp':<8} | {'target_w':<10} | {'raw':<8} | {'capped':<6}")
-                print(f"      {'-' * 20} | {'-' * 6} | {'-' * 8} | {'-' * 8} | {'-' * 10} | {'-' * 8} | {'-' * 6}")
-                for x in sorted(over_one, key=lambda t: -t.get("raw_tag_purity", 0))[:20]:
-                    term_s = (x.get("term") or "")[:20]
-                    print(f"      {term_s:<20} | {x.get('tid', ''):<6} | {x.get('degree_w', 0):<8} | {x.get('degree_w_expanded', 0):<8} | {x.get('target_degree_w', 0):<10} | {x.get('raw_tag_purity', 0):<8.4f} | {x.get('capped_tag_purity', 0):<6.4f}")
-            elif tag_purity_debug:
-                print(f"      口径 target_degree_w/degree_w_expanded，purity 自然≤1；raw 范围: [{min(x.get('raw_tag_purity', 0) for x in tag_purity_debug):.4f}, {max(x.get('raw_tag_purity', 0) for x in tag_purity_debug):.4f}]")
-
-            # 4. 论文与作者召回
+            vocab_count = db.get('recall_vocab_count', 0)
             w_count = db.get('work_count', 0)
             a_count = db.get('author_count', 0)
-            vocab_count = db.get('recall_vocab_count', 0)
-            if vocab_count:
-                print(f"【Step 4: 召回规模】参与检索的学术词数: {vocab_count}，检索到 {w_count} 篇学术论文，最终锁定 {a_count} 名垂直领域专家。")
-            else:
-                print(f"【Step 4: 召回规模】检索到 {w_count} 篇学术论文，最终锁定 {a_count} 名垂直领域专家。")
+            print(f"【Step 4: 召回规模】参与检索学术词数: {vocab_count}  检索论文: {w_count}  锁定作者: {a_count}")
 
-            # --- 专家排名展示（增强：展示前 50 名，多篇代表作与标签统计）---
-            print("-" * 115)
-            print(f"{'排名':<6} | {'作者 ID':<12} | {'综合得分':<18} | {'学术领域代表作 (命中标签)'}")
-            print("-" * 115)
-
-            for i, item in enumerate(db.get('top_samples', []), 1):
-                raw_score = item.get('score', 0)
-                score_str = f"{raw_score:.6f}" if isinstance(raw_score, (int, float)) else str(raw_score)
-                paper_count = item.get('paper_count', 0)
+            # Top20 作者来源表
+            print("【Top20 作者来源】author_id | final_score | top_terms_by_contribution(前3) | best_paper | best_paper_terms")
+            for i, item in enumerate(db.get('top_samples', [])[:20], 1):
                 aid = item.get('aid', '')
-                # 主行：作者整体信息
-                print(f"#{i:<5} | {aid:<12} | {score_str:<18} | 论文数: {paper_count}")
-
-                # 代表作（单篇贡献度最高的一篇）
+                score = item.get('score', 0)
+                top_terms = item.get('top_terms_by_contribution', [])[:3]
+                terms_s = ", ".join(f"{t}({c})" for t, c in top_terms) if top_terms else "-"
                 tp = item.get('top_paper', {}) or {}
-                if tp:
-                    title = (tp.get('title') or 'Unknown')[:55]
-                    hit_tags = ", ".join(tp.get('hits', []))
-                    contrib = tp.get('contribution', 0)
-                    print(f"{' ':23} ┗━ 代表作: 《{title}》")
-                    print(f"{' ':23}     年份={tp.get('year', 'Unknown')}, 贡献={contrib:.6f}, 命中标签: {hit_tags}")
+                best_title = (tp.get('title') or '')[:40]
+                best_hits = ", ".join((tp.get('hits') or [])[:3])
+                print(f"  #{i:2d} {aid} | {score:.4f} | {terms_s} | 《{best_title}》 | {best_hits}")
 
-                # 多篇代表作：按贡献度排序的前 3 篇
-                top_papers = item.get('top_papers') or []
-                if top_papers:
-                    print(f"{' ':23}     多篇代表作 Top{len(top_papers)}:")
-                    for p in top_papers:
-                        p_title = (p.get('title') or 'Unknown')[:55]
-                        p_hits = ", ".join(p.get('hits', []))
-                        p_contrib = p.get('contribution', 0.0)
-                        print(f"{' ':23}       ● [{p.get('year', 'Unknown')}] 《{p_title}》 | 贡献={p_contrib:.6f} | 命中: {p_hits}")
-
-                # 标签汇总统计：Top10 标签及命中次数
-                tag_stats = item.get('tag_stats') or []
-                if tag_stats:
-                    tags_str = ", ".join(f"{t.get('term', '')}({t.get('count', 0)})" for t in tag_stats)
-                    print(f"{' ':23}     核心标签Top{len(tag_stats)}: {tags_str}")
-
-                # 只展示前 50 名，避免控制台输出过长
-                if i >= 50:
-                    break
-
-            print("-" * 115)
+            print("-" * 98)
+            print(f"{'排名':<6} | {'作者 ID':<14} | {'得分':<10} | {'代表作 (命中标签)'}")
+            print("-" * 98)
+            for i, item in enumerate(db.get('top_samples', [])[:30], 1):
+                aid = item.get('aid', '')
+                score = item.get('score', 0)
+                tp = item.get('top_paper', {}) or {}
+                title = (tp.get('title') or '')[:45]
+                hit_tags = ", ".join((tp.get('hits') or [])[:4])
+                top_terms = item.get('top_terms_by_contribution', [])[:2]
+                src = ", ".join(f"{t}({c})" for t, c in top_terms) if top_terms else ""
+                print(f"#{i:<5} | {aid:<14} | {score:.4f}    | 《{title}》 命中: {hit_tags}  来源: {src}")
+            print("-" * 98)
             print(f"[*] 诊断完成。全链路耗时: {search_time:.2f}ms")
 
     except Exception as e:
