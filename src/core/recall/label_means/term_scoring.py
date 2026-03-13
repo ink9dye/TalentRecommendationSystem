@@ -153,8 +153,8 @@ def _apply_word_quality_penalty(label, rec: Dict[str, Any], query_vector):
     tag_purity = min(1.0, raw_tag_purity)
     purity_term = tag_purity
 
-    idf_term = label._idf_backbone(degree_w_expanded)
-    idf_val = label._smoothed_idf(degree_w, idf_term)
+    idf_term = _idf_backbone(label.total_work_count, degree_w_expanded)
+    idf_val = _smoothed_idf(degree_w, idf_term)
 
     cos_sim = 0.5
     idx = label.vocab_to_idx.get(str(rec["tid"]))
@@ -190,7 +190,7 @@ def _apply_word_quality_penalty(label, rec: Dict[str, Any], query_vector):
 
     ta = task_anchor_sim if task_anchor_sim is not None else max_anchor_sim
     ca = carrier_anchor_sim if carrier_anchor_sim is not None else max_anchor_sim
-    anchor_factor = label._anchor_factor(ta, ca)
+    anchor_factor = _anchor_factor(ta, ca, base=getattr(label, "ANCHOR_BASE", 0.35), gain=getattr(label, "ANCHOR_GAIN", 0.65))
 
     size_penalty = label_means_adv.size_penalty_factor(degree_w, degree_w_expanded)
     sim_term = semantic_factor
@@ -308,4 +308,40 @@ def _apply_cluster_rank_decay(label, score_map: Dict[str, float]) -> None:
 
             score_map[tid_str] *= factor
             label.debug_info.cluster_rank_factors[tid_str] = float(factor)
+
+
+def _idf_backbone(total_work_count: float, degree_w_expanded: float) -> float:
+    """
+    标准 IDF（IR 口径）：idf = log(1 + total_work / (1 + paper_count))。
+    """
+    return math.log(1.0 + float(total_work_count) / (1.0 + float(degree_w_expanded)))
+
+
+def _smoothed_idf(degree_w: int, idf_backbone_val: float) -> float:
+    """
+    平滑 IDF：小词/大词略做约束，中等区间略微加权。
+    """
+    if degree_w < 10:
+        return 1.0
+    if degree_w < 50:
+        t = (float(degree_w) - 10.0) / 40.0
+        return 1.0 + 0.5 * max(0.0, min(1.0, t))
+    return 0.9
+
+
+def _anchor_factor(ta: float, ca: float, base: float, gain: float) -> float:
+    """
+    锚点距离门控因子：task_anchor_sim 优先，其次 carrier_anchor_sim。
+    等价于 LabelRecallPath._anchor_factor 的逻辑，只是参数从 label 提取。
+    """
+    if ta is None and ca is None:
+        return 1.0
+    ta_clamped = max(0.0, min(1.0, ta or 0.0))
+    ca_clamped = max(0.0, min(1.0, ca or 0.0))
+    # 原先 ANCHOR_BASE 固定为 0.35，gain 分成 0.65 + 0.15
+    return (
+        base
+        + gain * math.pow(ta_clamped, 1.5)
+        + 0.15 * math.pow(ca_clamped, 1.1)
+    )
 
