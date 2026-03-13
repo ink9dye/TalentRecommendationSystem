@@ -14,33 +14,25 @@ score=sim/log(1+paper_count) → Paper → Author」的图谱召回。
 import faiss
 import json
 import re
-import os
 import sqlite3
 import time
 import math
 import collections
 import numpy as np
-import traceback
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Set
 from datetime import datetime
-from py2neo import Graph
 from src.core.recall.input_to_vector import QueryEncoder
 from src.core.recall.works_to_authors import accumulate_author_scores
 from src.utils.domain_utils import DomainProcessor
 from src.utils.domain_detector import DomainDetector
 from config import (
-    CONFIG_DICT, JOB_INDEX_PATH, JOB_MAP_PATH,
-    VOCAB_INDEX_PATH, VOCAB_MAP_PATH, DB_PATH, VOCAB_STATS_DB_PATH,
-    VOCAB_P95_PAPER_COUNT, SIMILAR_TO_TOP_K, SIMILAR_TO_MIN_SCORE,
-    INDEX_DIR,
+    DB_PATH, VOCAB_P95_PAPER_COUNT, SIMILAR_TO_TOP_K, SIMILAR_TO_MIN_SCORE,
 )
 from src.utils.domain_config import (
-    DOMAIN_DECAY_RATES,
-    DEFAULT_DECAY_RATE,
     DOMAIN_MAP,
 )
-from src.utils.tools import apply_text_decay, get_decay_rate_for_domains
+from src.utils.tools import get_decay_rate_for_domains
 from src.utils.time_features import (
     compute_paper_recency,
     compute_author_time_features,
@@ -52,7 +44,8 @@ from src.core.recall.label_means.simple_factors import (
     paper_cluster_bonus,
     paper_jd_semantic_gate_factor,
 )
-from src.core.recall.label_means import advanced_metrics as label_means_adv
+from src.core.recall.label_means import advanced_metrics as label_means_adv, label_anchors, label_expansion
+from src.core.recall.label_means.infra import LabelMeansInfra
 
 
 @dataclass
@@ -152,11 +145,25 @@ class LabelRecallPath:
         self.current_year = datetime.now().year
         # 统一调试信息容器：收拢原本散落的 _last_* 状态
         self.debug_info = RecallDebugInfo()
-        self._init_resources()
+        # 底层资源由 label_means.infra 统一管理
+        self.infra = LabelMeansInfra()
+        self.infra.init_resources()
+
+        # 将 Infra 中的资源别名到实例属性，尽量不改动下游逻辑
+        self.graph = self.infra.graph
+        self.job_index = self.infra.job_index
+        self.job_id_map = self.infra.job_id_map
+        self.vocab_index = self.infra.vocab_index
+        self.all_vocab_vectors = self.infra.all_vocab_vectors
+        self.vocab_to_idx = self.infra.vocab_to_idx
+        self.stats_conn = self.infra.stats_conn
+        self.cluster_members = self.infra.cluster_members
+        self.voc_to_clusters = self.infra.voc_to_clusters
+        self.cluster_centroids = self.infra.cluster_centroids
 
         # 预载入统计数据，用于计算后续 IDF 与 熔断率
-        self.total_work_count = self._get_node_count("Work")
-        self.total_job_count = self._get_node_count("Job")
+        self.total_work_count = self.infra.get_node_count("Work")
+        self.total_job_count = self.infra.get_node_count("Job")
 
         # 编码器单例：全流程共用，避免重复加载模型（领域向量、锚点补充、语境扩展、main 均复用）
         self._query_encoder = QueryEncoder()
@@ -177,82 +184,6 @@ class LabelRecallPath:
             )
         except Exception:
             self.domain_detector = None
-
-    def _init_resources(self):
-        """
-        【资源初始化】解决 Faiss ID 与 向量矩阵的同步问题
-        1. Faiss 索引：仅用于快速 Top-K 检索。
-        2. .npy 矩阵：存储原始归一化向量，用于计算词汇间的语义紧密度（Proximity）。
-        3. SQLite 映射：确保矩阵行号(Index)与数据库 voc_id 严格对齐。
-        """
-        try:
-            # A. 初始化图数据库连接
-            self.graph = Graph(
-                CONFIG_DICT["NEO4J_URI"],
-                auth=(CONFIG_DICT["NEO4J_USER"], CONFIG_DICT["NEO4J_PASSWORD"]),
-                name=CONFIG_DICT["NEO4J_DATABASE"]
-            )
-
-            # B. 加载岗位描述索引（用于第一阶段：领域探测）
-            self.job_index = faiss.read_index(JOB_INDEX_PATH)
-            with open(JOB_MAP_PATH, 'r', encoding='utf-8') as f:
-                self.job_id_map = json.load(f)
-
-            # C. 加载词汇索引与向量快照
-            self.vocab_index = faiss.read_index(VOCAB_INDEX_PATH)
-            vec_path = VOCAB_INDEX_PATH.replace('.faiss', '_vectors.npy')
-            if not os.path.exists(vec_path):
-                raise FileNotFoundError(f"未发现向量快照: {vec_path}，请先运行 build_vector_index.py。")
-
-            # 直接加载原始向量矩阵，避开 IndexIDMap 不支持 reconstruct 的局限
-            self.all_vocab_vectors = np.load(vec_path).astype('float32')
-
-            # D. 建立 { 'voc_id': 矩阵行下标 } 映射
-            # 必须 ORDER BY voc_id 以匹配向量编码时的顺序
-            with sqlite3.connect(DB_PATH) as conn:
-                rows = conn.execute("SELECT voc_id FROM vocabulary ORDER BY voc_id ASC").fetchall()
-                self.vocab_to_idx = {str(r[0]): i for i, r in enumerate(rows)}
-            self.stats_conn = sqlite3.connect(VOCAB_STATS_DB_PATH, check_same_thread=False)
-
-            # E. 概念簇缓存：cluster_id -> [voc_id]，voc_id -> [(cluster_id, score)]
-            self.cluster_members = collections.defaultdict(list)
-            self.voc_to_clusters = collections.defaultdict(list)
-            try:
-                cur = self.stats_conn.execute(
-                    "SELECT cluster_id, voc_id FROM cluster_members"
-                )
-                for cid, vid in cur:
-                    self.cluster_members[int(cid)].append(int(vid))
-                cur = self.stats_conn.execute(
-                    "SELECT voc_id, cluster_id, score FROM vocabulary_cluster"
-                )
-                for vid, cid, sc in cur:
-                    self.voc_to_clusters[int(vid)].append((int(cid), float(sc)))
-            except Exception:
-                # 概念簇索引缺失时退化为无簇模式
-                self.cluster_members = collections.defaultdict(list)
-                self.voc_to_clusters = collections.defaultdict(list)
-
-            # F. 概念簇中心向量：供 JD 语义 gating 使用
-            try:
-                centroids_path = os.path.join(INDEX_DIR, "cluster_centroids.npy")
-                if os.path.exists(centroids_path):
-                    centroids = np.load(centroids_path).astype(np.float32)
-                    if centroids.ndim == 2 and centroids.size > 0:
-                        norms = np.linalg.norm(centroids, axis=1, keepdims=True)
-                        norms[norms == 0] = 1.0
-                        self.cluster_centroids = centroids / norms
-                    else:
-                        self.cluster_centroids = None
-                else:
-                    self.cluster_centroids = None
-            except Exception:
-                self.cluster_centroids = None
-
-            print("[OK] 标签路资源初始化完成")
-        except Exception as e:
-            print(f"[Error] 资源加载失败: {e}")
-            self.graph = None
 
     def _compute_cluster_task_factors(self, query_vector):
         """
@@ -329,14 +260,6 @@ class LabelRecallPath:
         if den <= 0:
             return 1.0
         return num / den
-
-    def _get_node_count(self, label):
-        """统计图谱节点总数，作为计算 IDF 的分母"""
-        try:
-            res = self.graph.run(f"MATCH (n:{label}) RETURN count(n) AS c").data()
-            return float(res[0]['c']) if res else 1000000.0
-        except:
-            return 1000000.0
 
     def _build_domain_vectors(self):
         """
@@ -448,310 +371,21 @@ class LabelRecallPath:
             return {}
 
     def _clean_job_skills(self, skills_text):
-        """
-        【Step 1 技能清洗】从岗位技能文本中提取并过滤，去除 HR 描述词与泛词。
-        规则：拆分后删除含「经验|竞赛|获奖|发表|能力|熟悉|了解」的片段、
-        删除「不限」「其他」、删除长度 < 2，返回小写集合（与图谱 term 对齐）。
-        """
-        if not skills_text or not isinstance(skills_text, str):
-            return set()
-        stop_substrings = re.compile(r"经验|竞赛|获奖|发表|能力|熟悉|了解", re.I)
-        forbidden = {"不限", "其他"}
-        raw = re.split(r"[,，、；;|\s]+", skills_text)
-        out = set()
-        for s in raw:
-            t = s.strip()
-            if not t or len(t) < 2:
-                continue
-            if stop_substrings.search(t) or t in forbidden:
-                continue
-            out.add(t.lower())
-        return out
+        return label_anchors.clean_job_skills(skills_text)
 
     # --- 第二阶段：锚点技能提取（先熔断 -> Top30 -> Top20）---
     def _extract_anchor_skills(self, target_job_ids, query_vector=None, total_j=None):
-        """
-        【工业侧：岗位技能提取】先熔断 -> Top30 -> Top20。
-        逻辑：
-          - 从 Top20 岗位的 REQUIRE_SKILL 得到 (vid, term, job_freq)；
-          - 熔断：仅保留 cov_j < ANCHOR_MELT_COV_J 的技能（全图岗位覆盖率，编程语言等泛词被滤掉）；
-          - 在熔断后按 job_freq 降序取 Top30；
-          - 可选：用清洗出的 raw skills 过滤；
-          - 若有 query_vector：语义重排后取 Top20；否则直接取前 20。
-        """
-        total_j = float(total_j or 0)
-        if total_j <= 0:
-            total_j = self.total_job_count
-
-        cleaned_terms = set()
-        try:
-            cursor = self.graph.run(
-                "MATCH (j:Job) WHERE j.id IN $j_ids RETURN j.skills AS skills",
-                j_ids=target_job_ids[: self.ANCHOR_JOBS_TOP_K]
-            )
-            for row in cursor:
-                if row.get("skills"):
-                    cleaned_terms |= self._clean_job_skills(str(row["skills"]))
-        except Exception:
-            pass
-        if not cleaned_terms:
-            cleaned_terms = None
-
-        # 1) Top20 岗位内所有 (vid, term, job_freq)，不先 limit
-        cypher1 = """
-        MATCH (j:Job) WHERE j.id IN $j_ids
-        MATCH (j)-[:REQUIRE_SKILL]->(v:Vocabulary)
-        WITH v.id AS vid, v.term AS term, count(DISTINCT j.id) AS job_freq
-        RETURN vid, term, job_freq
-        ORDER BY job_freq DESC
-        """
-        rows = []
-        try:
-            for r in self.graph.run(cypher1, j_ids=target_job_ids[: self.ANCHOR_JOBS_TOP_K]):
-                if r.get("term") and len(str(r.get("term") or "")) > 1:
-                    rows.append(dict(r))
-        except Exception:
-            rows = []
-
-        if not rows:
-            stats = {"before_melt": 0, "after_melt": 0, "after_top30": 0, "melted_sample": []}
-            self.debug_info.anchor_melt_stats = stats
-            # 保留旧字段，兼容外部可能的直接访问
-            self._last_anchor_melt_stats = stats
-            return {}
-
-        # 2) 查全图每个 vid 的 global_job_count，算 cov_j，熔断
-        v_ids = list({int(r["vid"]) for r in rows})
-        global_count = {}
-        try:
-            cypher2 = """
-            UNWIND $v_ids AS vid
-            MATCH (v:Vocabulary {id: vid})<-[:REQUIRE_SKILL]-(j:Job)
-            RETURN vid, count(j) AS cnt
-            """
-            for r in self.graph.run(cypher2, v_ids=v_ids):
-                global_count[int(r["vid"])] = int(r.get("cnt") or 0)
-        except Exception:
-            pass
-
-        melt_threshold = float(self.ANCHOR_MELT_COV_J)
-        terms_before_melt = [r.get("term") or "" for r in rows]
-        rows_with_cov = []
-        melted_terms = []
-        for r in rows:
-            vid = int(r.get("vid"))
-            g = global_count.get(vid, 0)
-            cov_j = (g / total_j) if total_j else 0
-            if cov_j >= melt_threshold:
-                melted_terms.append((r.get("term") or "", round(cov_j, 4)))
-                continue
-            # 共识门槛：避免“单岗位偏航技能”触发学术扩展
-            if int(r.get("job_freq") or 0) < int(self.ANCHOR_MIN_JOB_FREQ):
-                continue
-            rows_with_cov.append((r, cov_j))
-
-        terms_after_melt = [x[0].get("term") or "" for x in rows_with_cov]
-        stats = {
-            "before_melt": len(rows),
-            "after_melt": len(rows_with_cov),
-            "melted_sample": melted_terms[:25],
-            "melt_threshold": melt_threshold,
-            "terms_before_melt": terms_before_melt,
-            "terms_after_melt": terms_after_melt,
-            "cleaned_terms_sample": list(cleaned_terms)[:50] if cleaned_terms else [],
-        }
-        self.debug_info.anchor_melt_stats = stats
-        self._last_anchor_melt_stats = stats
-
-        # 3) 熔断后按 job_freq 取 Top30
-        rows_with_cov.sort(key=lambda x: (x[0].get("job_freq") or 0), reverse=True)
-        rows = [x[0] for x in rows_with_cov[: self.ANCHOR_FREQ_TOP_K]]
-        self.debug_info.anchor_melt_stats["after_top30"] = len(rows)
-        self.debug_info.anchor_melt_stats["terms_after_top30"] = [r.get("term") or "" for r in rows]
-
-        # 4) 可选：清洗词过滤
-        if cleaned_terms is not None:
-            rows = [r for r in rows if (r.get("term") or "").lower() in cleaned_terms]
-        self.debug_info.anchor_melt_stats["terms_after_cleaned"] = [r.get("term") or "" for r in rows]
-
-        if not rows:
-            return {}
-
-        # 5) 语义重排取 Top20
-        if query_vector is not None:
-            q = np.asarray(query_vector, dtype=np.float32).flatten()
-            scored = []
-            for r in rows:
-                vid = str(r.get("vid"))
-                idx = self.vocab_to_idx.get(vid)
-                sim = -1.0
-                if idx is not None and q.size > 0:
-                    try:
-                        sim = float(np.dot(self.all_vocab_vectors[idx], q))
-                    except Exception:
-                        sim = -1.0
-                scored.append((sim, int(r.get("job_freq") or 0), r))
-            scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-            # 相似度阈值：低于阈值直接丢弃（避免与当前 JD 偏离的岗位技能锚点混入）
-            sim_min = float(self.ANCHOR_SIM_MIN)
-            scored_keep = [x for x in scored if (x[0] is not None and float(x[0]) >= sim_min)]
-            self.debug_info.anchor_melt_stats["sim_min"] = sim_min
-            self.debug_info.anchor_melt_stats["sim_kept"] = len(scored_keep)
-            self.debug_info.anchor_melt_stats["sim_dropped"] = max(0, len(scored) - len(scored_keep))
-            rows = [x[2] for x in scored_keep[: self.ANCHOR_FINAL_TOP_K]]
-        else:
-            rows = rows[: self.ANCHOR_FINAL_TOP_K]
-        self.debug_info.anchor_melt_stats["terms_after_sim"] = [r.get("term") or "" for r in rows]
-
-        return {str(r.get("vid")): {"term": r.get("term")} for r in rows}
+        return label_anchors.extract_anchor_skills(self, target_job_ids, query_vector=query_vector, total_j=total_j)
 
     def _supplement_anchors_from_jd_vector(self, query_text, anchor_skills, total_j=None, top_k=None, active_domain_ids=None):
-        """
-        用 JD 向量直接搜 vocabulary，取与当前 JD 语义最接近的 top_k 个词作为补充锚点（不硬编码强词）。
-        补充词也做熔断：仅当 cov_j < ANCHOR_MELT_COV_J 时才并入。返回本次新增的 [(vid, term), ...] 供调试。
-        """
-        if not query_text or not getattr(self, "vocab_index", None):
-            self.debug_info.supplement_anchors = []
-            self.debug_info.supplement_anchors_report = []
-            self._last_supplement_anchors = self.debug_info.supplement_anchors
-            self._last_supplement_anchors_report = self.debug_info.supplement_anchors_report
-            return
-        total_j = float(total_j or 0) or self.total_job_count
-        self._load_vocab_meta()
-        encoder = self._query_encoder
-        jd_snippet = (query_text or "").strip()[:500]
-        if not jd_snippet:
-            self.debug_info.supplement_anchors = []
-            self.debug_info.supplement_anchors_report = []
-            self._last_supplement_anchors = self.debug_info.supplement_anchors
-            self._last_supplement_anchors_report = self.debug_info.supplement_anchors_report
-            return
-
-        v_jd = encoder.model.encode(
-            [jd_snippet],
-            batch_size=1,
-            normalize_embeddings=True,
-            show_progress_bar=False,
+        return label_anchors.supplement_anchors_from_jd_vector(
+            self,
+            query_text,
+            anchor_skills,
+            total_j=total_j,
+            top_k=top_k,
+            active_domain_ids=active_domain_ids,
         )
-        v_jd = np.asarray(v_jd, dtype=np.float32).reshape(1, -1)
-        # 入口 top-K：统一由 SUPPLEMENT_TOP_K 控制，避免一次补过多锚点
-        k = min(int(top_k or self.SUPPLEMENT_TOP_K), 30)
-        scores, labels = self.vocab_index.search(v_jd, k)
-        added = []
-        # 记录详细候选及过滤原因，便于调试
-        self.debug_info.supplement_anchors_report = []
-        melt_threshold = float(self.ANCHOR_MELT_COV_J)
-        v_ids_to_check = []
-        candidates = []
-        for score, tid in zip(scores[0], labels[0]):
-            tid = int(tid)
-            if tid <= 0:
-                continue
-            if str(tid) in anchor_skills:
-                continue
-            term, etype = self._vocab_meta.get(tid, ("", ""))
-            etype = (etype or "").lower()
-            if not term or len(term) < 2:
-                continue
-            # 仅允许 concept / keyword 进入补充锚点候选
-            if etype and etype not in self.SUPPLEMENT_ALLOW_ENTITY_TYPES:
-                self.debug_info.supplement_anchors_report.append({
-                    "tid": tid,
-                    "term": term,
-                    "etype": etype,
-                    "score": float(score),
-                    "reason": "etype_not_allowed",
-                })
-                continue
-            candidates.append((tid, term, etype, float(score)))
-            v_ids_to_check.append(tid)
-
-        if not v_ids_to_check:
-            self.debug_info.supplement_anchors = []
-            self.debug_info.supplement_anchors_report = []
-            self._last_supplement_anchors = self.debug_info.supplement_anchors
-            self._last_supplement_anchors_report = self.debug_info.supplement_anchors_report
-            return
-
-        global_count = {}
-        stats_map = {}
-        try:
-            cypher = """
-            UNWIND $v_ids AS vid
-            MATCH (v:Vocabulary {id: vid})<-[:REQUIRE_SKILL]-(j:Job)
-            RETURN vid, count(j) AS cnt
-            """
-            for r in self.graph.run(cypher, v_ids=v_ids_to_check):
-                global_count[int(r["vid"])] = int(r.get("cnt") or 0)
-        except Exception:
-            global_count = {vid: 0 for vid in v_ids_to_check}
-        try:
-            ph = ",".join("?" * len(v_ids_to_check))
-            rows = self.stats_conn.execute(
-                f"SELECT voc_id, work_count, domain_dist FROM vocabulary_domain_stats WHERE voc_id IN ({ph})",
-                v_ids_to_check,
-            ).fetchall()
-            for r in rows:
-                stats_map[int(r[0])] = (int(r[1] or 0), r[2])
-        except Exception:
-            stats_map = {}
-
-        active_domains = set(str(d) for d in (active_domain_ids or []))
-        ranked = []
-        for tid, term, etype, score in candidates:
-            g = global_count.get(tid, 0)
-            cov_j = (g / total_j) if total_j else 0.0
-            reason = None
-            if cov_j >= melt_threshold:
-                reason = "cov_j_melt"
-            row = stats_map.get(tid)
-            degree_w = 0
-            domain_ratio = 0.0
-            if row:
-                degree_w, dist_json = row
-                try:
-                    dist = json.loads(dist_json) if isinstance(dist_json, str) else (dist_json or {})
-                except (TypeError, ValueError):
-                    dist = {}
-                expanded = self._expand_domain_dist(dist)
-                degree_w_expanded = sum(expanded.values())
-                if active_domains:
-                    target_degree_w = sum(expanded.get(str(d), 0) for d in active_domains)
-                else:
-                    target_degree_w = degree_w_expanded
-                domain_ratio = (target_degree_w / degree_w_expanded) if degree_w_expanded else 0.0
-                if active_domains and domain_ratio < float(self.SUPPLEMENT_DOMAIN_RATIO_MIN):
-                    reason = "low_domain_ratio"
-            else:
-                reason = reason or "no_stats"
-
-            report_row = {
-                "tid": tid,
-                "term": term,
-                "etype": etype,
-                "score": float(score),
-                "cov_j": float(cov_j),
-                "domain_ratio": float(domain_ratio),
-                "reason": reason or "candidate",
-            }
-            self.debug_info.supplement_anchors_report.append(report_row)
-
-            if reason is None:
-                ranked.append(report_row)
-
-        # 仅从通过全部门槛的候选中选取少量最高分补充锚点
-        ranked.sort(key=lambda x: (x["domain_ratio"], x["score"]), reverse=True)
-        for item in ranked[: self.SUPPLEMENT_MAX_ADD]:
-            tid = item["tid"]
-            term = item["term"]
-            cov_j = item["cov_j"]
-            anchor_skills[str(tid)] = {"term": term}
-            added.append((tid, term, round(item["score"], 4), round(cov_j, 4), round(item["domain_ratio"], 4)))
-
-        self.debug_info.supplement_anchors = added
-        self._last_supplement_anchors = self.debug_info.supplement_anchors
-        self._last_supplement_anchors_report = self.debug_info.supplement_anchors_report
-        self._cached_v_jd = v_jd
 
     # --- 第三阶段：语义扩展 ---
     # 融合权重：相似边 0.4，语境向量 0.6；多次命中奖励：泛词(work_count大)不奖励，其余按 ln(min(hit,5)) 计算并封顶
@@ -774,87 +408,15 @@ class LabelRecallPath:
     SUPPLEMENT_ALLOW_ENTITY_TYPES = {"concept", "keyword"}
 
     def _expand_semantic_map(self, core_vids, anchor_skills, domain_regex=None, query_vector=None, query_text=None, return_raw=False):
-        """
-        【学术共鸣 + 共现领域版】语义扩展引擎。
-
-        逻辑：工业锚点激发 -> 边路(SIMILAR_TO)与语境向量路(JD+锚点)候选 -> 0.2/0.8 融合 + 多次命中奖励 ->
-              学术候选池 -> 共鸣/共现指标 -> [若 return_raw=False] 最终打分。
-        return_raw=True 时仅返回 raw_results（供阶段化流程中 stage2→stage3 拆分）；否则返回 (score_map, term_map, idf_map)。
-        """
-        regex = domain_regex if domain_regex else ".*"
-
-        # 1. 边路：SIMILAR_TO 图检索
-        raw_edge = self._query_expansion_with_topology(core_vids, regex)
-        # 2. 语境向量路：JD 片段 + 锚点 编码后在 vocabulary 索引中检索（仅学术词）
-        raw_ctx = self._query_expansion_by_context_vector(anchor_skills, query_text, regex, topk_per_anchor=3) if query_text else []
-
-        # 3. 按 tid 合并：sim_merged = (0.2*sim_edge + 0.8*sim_ctx) * hit_bonus，src_vids 取并集
-        edge_map = {rec["tid"]: rec for rec in raw_edge}
-        ctx_map = {rec["tid"]: rec for rec in raw_ctx}
-        all_tids = set(edge_map.keys()) | set(ctx_map.keys())
-        raw_merged = []
-        for tid in all_tids:
-            rec_e = edge_map.get(tid)
-            rec_c = ctx_map.get(tid)
-            sim_edge = float(rec_e["sim_score"]) if rec_e else 0.0
-            sim_ctx = float(rec_c["sim_score"]) if rec_c else 0.0
-            src_vids = set()
-            if rec_e:
-                src_vids.update(rec_e.get("src_vids") or [])
-            if rec_c:
-                src_vids.update(rec_c.get("src_vids") or [])
-            hit = len(src_vids)
-            base = self.EDGE_WEIGHT * sim_edge + self.CTX_EDGE_WEIGHT * sim_ctx
-            # 泛词 gate：work_count(=degree_w) 大的词不享受命中奖励；其余 hit 封顶到 5 防止爆炸
-            degree_w = int((rec_e or rec_c).get("degree_w", 0) or 0)
-            if degree_w >= self.HIT_BONUS_DEGREE_GATE:
-                bonus = 1.0
-            else:
-                hit_eff = min(hit, self.HIT_BONUS_HIT_CAP) if hit >= 1 else 1
-                bonus = min(self.HIT_BONUS_CAP, 1.0 + self.HIT_BONUS_BETA * math.log(hit_eff))
-            sim_merged = base * bonus
-            rec = dict(rec_e or rec_c)
-            rec["sim_score"] = sim_merged
-            rec["src_vids"] = sorted(src_vids)
-            rec["hit_count"] = hit
-            raw_merged.append(rec)
-
-        raw_results = raw_merged
-        if not raw_results:
-            return [] if return_raw else ({}, {}, {})
-
-        # 1.5 概念簇扩展：仅高置信 seed 触发，weight_decay 弱化，在簇内为每个 seed 找少量近邻学术词
-        raw_results = self._expand_with_clusters(raw_results, regex, topk_per_seed=7, weight_decay=0.2)
-
-        # --- 2. 【学术共鸣】候选词与本次要搜索的词汇的共现（单词协作）---
-        tids = [r['tid'] for r in raw_results]
-        resonance_map = self._calculate_academic_resonance(tids)
-        for rec in raw_results:
-            rec['resonance'] = resonance_map.get(rec['tid'], 0.0)
-
-        # --- 2.5 【锚点共鸣】与“第一层学术词”的共现（工业词与学术词无论文共现，故用第一层学术词做参考）
-        # 第一层学术词 = 本轮扩展结果；取 hit_count>=2 的作为“核心第一层”（多锚点共识），若无则用全部第一层
-        first_layer_core = [r['tid'] for r in raw_results if r.get('hit_count', 0) >= 2]
-        if not first_layer_core:
-            first_layer_core = tids
-        anchor_resonance_map = self._calculate_anchor_resonance(tids, first_layer_core)
-        for rec in raw_results:
-            rec['anchor_resonance'] = anchor_resonance_map.get(rec['tid'], 0.0)
-
-        # --- 3. 【共现领域指标】为“万金油降权”与“领域专精加权”提供 cooc_span / cooc_purity ---
-        # 从 domain_regex 解析出目标领域 ID 集合（与 _query_expansion_with_topology 内一致）
-        active_domain_ids = set(re.findall(r'\d+', regex)) if regex and regex != ".*" else set()
-        cooc_metrics = self._get_cooccurrence_domain_metrics(raw_results, active_domain_ids)
-        for rec in raw_results:
-            tid_key = str(rec['tid'])
-            rec['cooc_span'] = cooc_metrics.get(tid_key, {}).get('cooc_span', 0.0)
-            rec['cooc_purity'] = cooc_metrics.get(tid_key, {}).get('cooc_purity', 0.0)
-
-        # 4. 应用数学公式计算最终动态权重（含共鸣、共现广度惩罚、共现纯度奖励）；若 return_raw 则仅返回候选列表供 stage3 统一算权
-        self.debug_info.expansion_raw_results = raw_results
-        if return_raw:
-            return raw_results
-        return self._calculate_final_weights(raw_results, query_vector)
+        return label_expansion.expand_semantic_map(
+            self,
+            core_vids=core_vids,
+            anchor_skills=anchor_skills,
+            domain_regex=domain_regex,
+            query_vector=query_vector,
+            query_text=query_text,
+            return_raw=return_raw,
+        )
 
     def _expand_with_clusters(self, raw_results, domain_regex, topk_per_seed=5, weight_decay=0.2):
         """
@@ -1067,43 +629,15 @@ class LabelRecallPath:
         return raw_results
 
     def _calculate_academic_resonance(self, tids):
-        """
-        【学术逻辑层】计算候选词集内部的连通密度（与本次要搜索的词汇的共现 = 单词协作）。
-        逻辑：如果 MPC 和 WBC 都在候选名单里，且它们在图谱中有强共现边，则两者都会获得“共鸣加成”。
-        输出：{vid: resonance_score}，供下游 convergence_bonus 加权。
-        """
-        cypher = """
-        MATCH (v1:Vocabulary)-[r:CO_OCCURRED_WITH]-(v2:Vocabulary)
-        WHERE v1.id IN $tids AND v2.id IN $tids
-        RETURN v1.id AS vid, SUM(r.weight) AS resonance_score
-        """
-        results = self.graph.run(cypher, tids=tids).data()
-        return {r['vid']: float(r['resonance_score']) for r in results}
+        return label_expansion.calculate_academic_resonance(self, tids)
 
     def _calculate_anchor_resonance(self, tids, first_layer_tids):
-        """
-        【锚点共鸣】计算每个候选学术词与“第一层学术词”（first_layer_tids）在论文中的 CO_OCCURRED_WITH 权重之和。
-        工业词与学术词在论文中无共现，故用第一层学术词（由锚点 SIMILAR_TO 得到）做共现参考；与核心第一层无共现的扩展词给 0.1 惩罚。
-        输出：{tid: anchor_resonance_score}。
-        """
-        if not first_layer_tids:
-            return {tid: 0.0 for tid in tids}
-        cypher = """
-        MATCH (v1:Vocabulary)-[r:CO_OCCURRED_WITH]-(v2:Vocabulary)
-        WHERE v1.id IN $tids AND v2.id IN $first_layer_tids
-        RETURN v1.id AS vid, SUM(r.weight) AS anchor_resonance_score
-        """
-        try:
-            results = self.graph.run(cypher, tids=tids, first_layer_tids=first_layer_tids).data()
-            return {r['vid']: float(r['anchor_resonance_score']) for r in results}
-        except Exception:
-            return {tid: 0.0 for tid in tids}
+        return label_expansion.calculate_anchor_resonance(self, tids, first_layer_tids)
 
     def _get_cooccurrence_domain_metrics(self, raw_results, active_domain_ids):
-        """
-        【共现领域指标】从 vocab_stats.db 计算每个候选词的两项指标，
-        用于后续“万金油降权”与“领域专精加权”，不改变输入/输出格式，仅向 raw_results 的调用方提供可注入的数值。
+        return label_expansion.get_cooccurrence_domain_metrics(self, raw_results, active_domain_ids)
 
+        """
         指标含义：
           - cooc_span：共现伙伴的（按共现频次加权的）平均领域跨度 domain_span。
             越大表示该词常与“跨很多领域”的词一起出现 → 万金油 → 下游做降权。
@@ -2155,12 +1689,10 @@ class LabelRecallPath:
             anchor_debug = self._get_anchor_debug_stats(job_ids[:20], self.total_job_count) if job_ids else {}
 
         # 2) 工业锚点：复用现有锚点抽取与 JD 语义补充逻辑
-        anchor_skills = self._extract_anchor_skills(
-            job_ids, query_vector=query_vector, total_j=self.total_job_count
-        )
+        anchor_skills = label_anchors.extract_anchor_skills(self, job_ids, query_vector=query_vector, total_j=self.total_job_count)
         if query_text and anchor_skills is not None:
-            self._supplement_anchors_from_jd_vector(
-                query_text, anchor_skills, total_j=self.total_job_count, top_k=self.JD_VOCAB_TOP_K
+            label_anchors.supplement_anchors_from_jd_vector(
+                self, query_text, anchor_skills, total_j=self.total_job_count, top_k=self.JD_VOCAB_TOP_K
             )
         if not anchor_skills:
             return set(), "", {}, {"job_ids": job_ids, "job_previews": job_previews, "anchor_debug": anchor_debug, "dominance": dominance}
@@ -2819,106 +2351,6 @@ class LabelRecallPath:
 
 
 if __name__ == "__main__":
-    l_path = LabelRecallPath(recall_limit=200)
-    encoder = l_path._query_encoder
+    from src.core.recall.label_means.label_debug_cli import run_label_debug_cli
 
-    try:
-        domain_choice = input("\n请选择领域编号 (0跳过): ").strip() or "0"
-
-        while True:
-            user_input = input(f"\n请输入岗位需求 (q退出): ").strip()
-            if not user_input or user_input.lower() == 'q':
-                break
-
-            query_vec, _ = encoder.encode(user_input)
-            faiss.normalize_L2(query_vec)
-
-            top_ids, search_time = l_path.recall(query_vec, domain_id=domain_choice, query_text=user_input)
-
-            # --- 核心诊断日志（收缩为闭环可验证）---
-            db = l_path.last_debug_info
-            print("\n" + "🔍 [深度诊断流水线]" + "-" * 98)
-
-            domains = db.get('active_domains', [])
-            domain_str = " | ".join(domains) if domains else "未限制"
-            print(f"【Step 1: 领域探测】目标领域: [{domain_str}] 置信度: {db.get('dominance')}")
-            job_previews = db.get('job_previews', [])
-            if job_previews:
-                print("      Top5 岗位名称:")
-                for i, jp in enumerate(job_previews[:5], 1):
-                    print(f"        #{i} {(jp.get('name') or '')[:55]}")
-
-            i_kws = db.get('industrial_kws', [])
-            melt_stats = db.get('anchor_melt_stats') or {}
-            print(f"【Step 2: 工业锚点】技能数: {len(i_kws)}  熔断前={melt_stats.get('before_melt', 0)} 熔断后={melt_stats.get('after_melt', 0)} Top30后={melt_stats.get('after_top30', 0)} 最终锚点数: {len(db.get('anchor_detail', []))}")
-
-            # 锚点主干词存活检查
-            CORE_KEYWORDS = ["动力学", "运动学", "轨迹规划", "状态估计", "最优控制"]
-            print("【锚点主干词存活检查】")
-            for kw in CORE_KEYWORDS:
-                in_cleaned = any(kw in t for t in melt_stats.get("cleaned_terms_sample", []))
-                in_before = any(kw in t for t in melt_stats.get("terms_before_melt", []))
-                in_after_melt = any(kw in t for t in melt_stats.get("terms_after_melt", []))
-                in_after_top30 = any(kw in t for t in melt_stats.get("terms_after_top30", []))
-                in_after_sim = any(kw in t for t in melt_stats.get("terms_after_sim", []))
-                in_final = any(kw in t for t in i_kws)
-                reason = "in_final" if in_final else ("sim_drop" if in_after_top30 and not in_after_sim else "topk_drop" if in_after_melt and not in_after_top30 else "melt_fail" if in_before and not in_after_melt else "clean_fail" if not in_before else "?")
-                print(f"  {kw}: cleaned={in_cleaned} before_melt={in_before} after_melt={in_after_melt} after_top30={in_after_top30} after_sim={in_after_sim} final_anchor={in_final} 原因={reason}")
-
-            # 过滤闭环
-            fcl = db.get('filter_closed_loop') or {}
-            raw_tids = fcl.get('similar_to_raw_tids', [])
-            pass_tids = fcl.get('similar_to_pass_tids', [])
-            final_tids = fcl.get('final_term_ids_for_paper', [])
-            n_final = fcl.get('final_term_count', 0)
-            print("【词过滤闭环】")
-            print(f"  similar_to_raw_tids 数量: {len(raw_tids)}  前30: {raw_tids[:30]}")
-            print(f"  similar_to_pass_tids 数量: {len(pass_tids)}  前30: {pass_tids[:30]}")
-            print(f"  final_term_ids_for_paper 数量: {n_final}  前30: {final_tids[:30]}")
-            for label, in_final in (fcl.get('contains_check') or {}).items():
-                print(f"  contains {label}: {in_final}")
-
-            # Top term 最终贡献表（Top20）
-            top_contrib = db.get('top_terms_final_contrib') or []
-            if top_contrib:
-                print("【Top term 最终贡献表】term | tid | final_weight | main_role | role_penalty | paper_count_hit | top_paper_contrib | task_advantage")
-                for r in top_contrib[:20]:
-                    ta = r.get('task_advantage')
-                    ta_s = f"{ta:.3f}" if ta is not None else "-"
-                    print(f"  {(r.get('term') or '')[:28]:28s} | {r.get('tid')} | {r.get('final_weight', 0):.4f} | {(r.get('main_role') or '')[:12]:12s} | {r.get('role_penalty') or 0:.3f} | {r.get('paper_count_hit', 0)} | {r.get('top_paper_contrib', 0):.6f} | {ta_s}")
-
-            vocab_count = db.get('recall_vocab_count', 0)
-            w_count = db.get('work_count', 0)
-            a_count = db.get('author_count', 0)
-            print(f"【Step 4: 召回规模】参与检索学术词数: {vocab_count}  检索论文: {w_count}  锁定作者: {a_count}")
-
-            # Top20 作者来源表
-            print("【Top20 作者来源】author_id | final_score | top_terms_by_contribution(前3) | best_paper | best_paper_terms")
-            for i, item in enumerate(db.get('top_samples', [])[:20], 1):
-                aid = item.get('aid', '')
-                score = item.get('score', 0)
-                top_terms = item.get('top_terms_by_contribution', [])[:3]
-                terms_s = ", ".join(f"{t}({c})" for t, c in top_terms) if top_terms else "-"
-                tp = item.get('top_paper', {}) or {}
-                best_title = (tp.get('title') or '')[:40]
-                best_hits = ", ".join((tp.get('hits') or [])[:3])
-                print(f"  #{i:2d} {aid} | {score:.4f} | {terms_s} | 《{best_title}》 | {best_hits}")
-
-            print("-" * 98)
-            print(f"{'排名':<6} | {'作者 ID':<14} | {'得分':<10} | {'代表作 (命中标签)'}")
-            print("-" * 98)
-            for i, item in enumerate(db.get('top_samples', [])[:30], 1):
-                aid = item.get('aid', '')
-                score = item.get('score', 0)
-                tp = item.get('top_paper', {}) or {}
-                title = (tp.get('title') or '')[:45]
-                hit_tags = ", ".join((tp.get('hits') or [])[:4])
-                top_terms = item.get('top_terms_by_contribution', [])[:2]
-                src = ", ".join(f"{t}({c})" for t, c in top_terms) if top_terms else ""
-                print(f"#{i:<5} | {aid:<14} | {score:.4f}    | 《{title}》 命中: {hit_tags}  来源: {src}")
-            print("-" * 98)
-            print(f"[*] 诊断完成。全链路耗时: {search_time:.2f}ms")
-
-    except Exception as e:
-        print(f"运行出错: {e}")
-        traceback.print_exc()
+    run_label_debug_cli()
