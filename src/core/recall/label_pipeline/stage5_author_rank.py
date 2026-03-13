@@ -288,6 +288,30 @@ def run_stage5(
             str(tid) == str(t_id) for t_id, _ in sorted_terms[:50]
         )
 
+    # 机器人/控制方向桥接后的英文学术短语命中情况（便于诊断 bridge 是否生效）
+    bridged_kws = [
+        "kinematics",
+        "robot kinematics",
+        "dynamics",
+        "robot dynamics",
+        "state estimation",
+        "motion planning",
+        "trajectory planning",
+        "trajectory optimization",
+        "optimal control",
+        "whole-body control",
+        "robot control",
+        "real-time control",
+        "sim-to-real",
+        "collision avoidance",
+    ]
+    for kw in bridged_kws:
+        label = f"bridged_kw:{kw}"
+        filter_closed_loop.setdefault("contains_check", {})
+        filter_closed_loop["contains_check"][label] = any(
+            kw.lower() in (t[0].lower() if t[0] else "") for t, _ in sorted_terms[:50]
+        )
+
     recall.debug_info.filter_closed_loop = filter_closed_loop
     recall.debug_info.recall_vocab_count = len(score_map)
     recall.debug_info.work_count = all_works_count

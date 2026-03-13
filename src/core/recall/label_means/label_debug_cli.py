@@ -6,7 +6,8 @@ from src.core.recall.label_path import LabelRecallPath
 
 
 def run_label_debug_cli() -> None:
-    l_path = LabelRecallPath(recall_limit=200)
+    # 开启 verbose 以输出完整 Step2 / bridge 诊断日志
+    l_path = LabelRecallPath(recall_limit=200, verbose=True)
     encoder = l_path._query_encoder
 
     try:

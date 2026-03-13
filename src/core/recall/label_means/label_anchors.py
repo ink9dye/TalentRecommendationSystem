@@ -41,6 +41,15 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
     if not cleaned_terms:
         cleaned_terms = None
 
+    # 打印 1：JD 清洗后的短语（含关键机器人词是否存活在清洗阶段）
+    sample_cleaned = list(cleaned_terms)[:50] if cleaned_terms else []
+    if getattr(label, "verbose", False):
+        print(f"[Step2 Debug] JD 清洗后技能短语样本({len(sample_cleaned)}): {sample_cleaned}")
+        core_cn_keywords = ["运动学", "动力学", "轨迹规划", "状态估计", "最优控制", "运动控制", "机械臂", "实时控制"]
+        for kw in core_cn_keywords:
+            in_cleaned = any(kw in t for t in sample_cleaned)
+            print(f"[Step2 Debug] 清洗阶段关键短语是否存在: {kw} -> in_cleaned={in_cleaned}")
+
     cypher1 = """
     MATCH (j:Job) WHERE j.id IN $j_ids
     MATCH (j)-[:REQUIRE_SKILL]->(v:Vocabulary)
@@ -57,7 +66,13 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
         rows = []
 
     if not rows:
-        stats = {"before_melt": 0, "after_melt": 0, "after_top30": 0, "melted_sample": []}
+        stats = {
+            "before_melt": 0,
+            "after_melt": 0,
+            "after_top30": 0,
+            "melted_sample": [],
+            "jd_cleaned_terms_sample": list(cleaned_terms)[:50] if cleaned_terms else [],
+        }
         label.debug_info.anchor_melt_stats = stats
         label._last_anchor_melt_stats = stats
         return {}
@@ -79,14 +94,17 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
     terms_before_melt = [r.get("term") or "" for r in rows]
     rows_with_cov = []
     melted_terms = []
+    dropped_terms = []
     for r in rows:
         vid = int(r.get("vid"))
         g = global_count.get(vid, 0)
         cov_j = (g / total_j) if total_j else 0
         if cov_j >= melt_threshold:
             melted_terms.append((r.get("term") or "", round(cov_j, 4)))
+            dropped_terms.append((r.get("term") or "", "cov_j", round(cov_j, 4)))
             continue
         if int(r.get("job_freq") or 0) < int(label.ANCHOR_MIN_JOB_FREQ):
+            dropped_terms.append((r.get("term") or "", "job_freq", int(r.get("job_freq") or 0)))
             continue
         rows_with_cov.append((r, cov_j))
 
@@ -99,9 +117,22 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
         "terms_before_melt": terms_before_melt,
         "terms_after_melt": terms_after_melt,
         "cleaned_terms_sample": list(cleaned_terms)[:50] if cleaned_terms else [],
+        "dropped_terms": dropped_terms[:50],
     }
     label.debug_info.anchor_melt_stats = stats
     label._last_anchor_melt_stats = stats
+    if getattr(label, "verbose", False):
+        n_cov = sum(1 for _, reason, _ in dropped_terms if reason == "cov_j")
+        n_freq = sum(1 for _, reason, _ in dropped_terms if reason == "job_freq")
+        print(
+            f"[Step2 Debug] REQUIRE_SKILL 原始 rows={len(rows)}，"
+            f"熔断/共识过滤后保留={len(rows_with_cov)}；cov_j 砍掉 {n_cov} 个，job_freq 砍掉 {n_freq} 个"
+        )
+        # 打印 2：每个 term 在熔断/频次过滤中的去留原因样本
+        for term, reason, value in dropped_terms[:30]:
+            print(f"[Step2 Debug] REQUIRE_SKILL 丢弃: term={term} reason={reason} value={value}")
+        for term in terms_after_melt[:30]:
+            print(f"[Step2 Debug] REQUIRE_SKILL 熔断后保留样本: term={term}")
 
     rows_with_cov.sort(key=lambda x: (x[0].get("job_freq") or 0), reverse=True)
     rows = [x[0] for x in rows_with_cov[: label.ANCHOR_FREQ_TOP_K]]
@@ -113,6 +144,8 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
     label.debug_info.anchor_melt_stats["terms_after_cleaned"] = [r.get("term") or "" for r in rows]
 
     if not rows:
+        if getattr(label, "verbose", False):
+            print("[Step2 Debug] 熔断+Top30+清洗后无锚点可用。")
         return {}
 
     if query_vector is not None:
@@ -139,7 +172,49 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
         rows = rows[: label.ANCHOR_FINAL_TOP_K]
     label.debug_info.anchor_melt_stats["terms_after_sim"] = [r.get("term") or "" for r in rows]
 
-    return {str(r.get("vid")): {"term": r.get("term")} for r in rows}
+    anchors = {str(r.get("vid")): {"term": r.get("term")} for r in rows}
+
+    # 打印 1 的补充：关键机器人词在各阶段的存活情况
+    if getattr(label, "verbose", False):
+        core_cn_keywords = ["运动学", "动力学", "轨迹规划", "状态估计", "最优控制", "运动控制", "机械臂", "实时控制"]
+        stats = label.debug_info.anchor_melt_stats or {}
+        cleaned_sample = stats.get("cleaned_terms_sample", [])
+        before_melt = stats.get("terms_before_melt", [])
+        after_melt = stats.get("terms_after_melt", [])
+        after_top30 = stats.get("terms_after_top30", [])
+        after_sim = stats.get("terms_after_sim", [])
+        final_terms = [v["term"] for v in anchors.values()]
+        for kw in core_cn_keywords:
+            in_cleaned = any(kw in t for t in cleaned_sample)
+            in_before = any(kw in t for t in before_melt)
+            in_after_melt = any(kw in t for t in after_melt)
+            in_after_top30 = any(kw in t for t in after_top30)
+            in_after_sim = any(kw in t for t in after_sim)
+            in_final = any(kw in t for t in final_terms)
+            if in_final:
+                reason = "in_final"
+            elif in_after_top30 and not in_after_sim:
+                reason = "sim_drop"
+            elif in_after_melt and not in_after_top30:
+                reason = "topk_drop"
+            elif in_before and not in_after_melt:
+                reason = "melt_fail"
+            elif not in_before:
+                reason = "clean_fail"
+            else:
+                reason = "unknown"
+            print(
+                f"[Step2 Debug] 关键词链路 {kw}: "
+                f"cleaned={in_cleaned} before_melt={in_before} after_melt={in_after_melt} "
+                f"after_top30={in_after_top30} after_sim={in_after_sim} final_anchor={in_final} 原因={reason}"
+            )
+
+        print(f"[Step2 Debug] 最终 industrial anchors 数量: {len(anchors)}")
+        print(
+            "[Step2 Debug] 最终 anchors 词样本:",
+            [v["term"] for _, v in list(anchors.items())[:20]],
+        )
+    return anchors
 
 
 def supplement_anchors_from_jd_vector(label, query_text, anchor_skills, total_j=None, top_k=None, active_domain_ids=None) -> None:
@@ -158,6 +233,8 @@ def supplement_anchors_from_jd_vector(label, query_text, anchor_skills, total_j=
     label._load_vocab_meta()
     encoder = label._query_encoder
     jd_snippet = (query_text or "").strip()[:500]
+    if getattr(label, "verbose", False):
+        print(f"[Bridge Debug] supplement_anchors_from_jd_vector 收到 query_text 片段: {jd_snippet[:120]}")
     if not jd_snippet:
         label.debug_info.supplement_anchors = []
         label.debug_info.supplement_anchors_report = []

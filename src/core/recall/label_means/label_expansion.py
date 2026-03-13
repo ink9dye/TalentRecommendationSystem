@@ -433,6 +433,8 @@ def query_expansion_by_context_vector(label, anchor_skills, query_text, regex, t
     load_vocab_meta(label)
     encoder = label._query_encoder
     jd_snippet = (query_text or "").strip()[:500]
+    if getattr(label, "verbose", False):
+        print(f"[Bridge Debug] query_expansion_by_context_vector 收到 query_text 片段: {jd_snippet[:120]}")
     active_domains = set(re.findall(r"\d+", regex)) if regex and regex != ".*" else set()
 
     v_jd = encoder.model.encode(
