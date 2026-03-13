@@ -71,6 +71,10 @@ class LabelRecallPath:
     JD_VOCAB_TOP_K = 20       # 用 JD 向量直接搜 vocabulary 的 top-K 作为补充锚点
     ANCHOR_SIM_MIN = 0.4      # 锚点语义重排的最小相似度阈值（低于直接丢弃）
     ANCHOR_MIN_JOB_FREQ = 2   # 锚点共识门槛：至少出现在 Top20 命中岗位中的 2 个岗位
+    # 无硬编码过滤：term 与任意锚点的最大余弦相似度低于此则降权（防 ML 簇劫持）
+    ANCHOR_TERM_SIM_MIN = 0.45
+    # 作者过滤：最佳论文贡献低于全局最大论文贡献的此比例则不出现在排序中
+    AUTHOR_BEST_PAPER_MIN_RATIO = 0.05
 
     def __init__(self, recall_limit=200, verbose=False):
         self.recall_limit = recall_limit
@@ -167,14 +171,12 @@ class LabelRecallPath:
     def _compute_cluster_task_factors(self, query_vector):
         """
         基于当前 JD 的 query_vector 和簇中心向量，计算 cluster_task_factor。
-        使用 soft gate: factor = alpha + (1-alpha) * sim_clipped, sim_clipped ∈ [0, 1]。
+        使用强化门控: factor = sim^1.5，使低相关簇明显降权、高相关簇保持较高权重。
         """
         # 若簇中心或 query 向量不可用，则关闭簇 gating
         if getattr(self, "cluster_centroids", None) is None or query_vector is None:
             self._cluster_task_factors = {}
             return
-
-        alpha = 0.6  # 下界因子，可视为“最小簇权重”
 
         q = np.asarray(query_vector, dtype=np.float32).flatten()
         if q.size == 0:
@@ -192,7 +194,7 @@ class LabelRecallPath:
 
         factors = {}
         for cid, sim in enumerate(sims):
-            factor = alpha + (1.0 - alpha) * float(sim)
+            factor = float(sim) ** 1.5
             factors[cid] = factor
 
         self._cluster_task_factors = factors
@@ -1384,15 +1386,29 @@ class LabelRecallPath:
         ]
         return results
 
-    def _calculate_final_weights(self, raw_results, query_vector):
+    def _calculate_final_weights(self, raw_results, query_vector, anchor_vids=None):
         """
-        【统一权重】所有候选词一律走 _apply_word_quality_penalty（含领域纯度、共鸣、语义守门等），
+        【统一权重】所有候选词一律走 _apply_word_quality_penalty（含领域纯度、共鸣、语义守门、锚点距离门控等），
         无 sim_score/degree_w 分支例外，流程清晰、领域占比一致生效。
-        仅当 rec 缺少必要字段时做安全回退，避免异常。
+        anchor_vids：本次 JD 锚点 voc id 列表，用于无硬编码的锚点距离门控（与锚点均远的 term 降权）。
         """
         score_map, term_map, idf_map = {}, {}, {}
         required = ("degree_w", "cov_j", "domain_span", "target_degree_w")
         self._last_tag_purity_debug = []
+
+        # --- 预计算锚点向量，供 _apply_word_quality_penalty 中锚点距离门控使用 ---
+        self._anchor_vectors = None
+        if anchor_vids and getattr(self, "vocab_to_idx", None) is not None and getattr(self, "all_vocab_vectors", None) is not None:
+            idxs = []
+            for vid in anchor_vids:
+                i = self.vocab_to_idx.get(str(vid))
+                if i is not None:
+                    idxs.append(i)
+            if idxs:
+                vecs = np.asarray(self.all_vocab_vectors[idxs], dtype=np.float32)
+                norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+                norms = np.where(norms > 1e-9, norms, 1.0)
+                self._anchor_vectors = (vecs / norms)
 
         # --- 预计算语义相似度分布，用于 Top20/中60/底20 分段加权 ---
         # 说明：
@@ -1479,6 +1495,10 @@ class LabelRecallPath:
         raw_tag_purity = (rec['target_degree_w'] / degree_w_expanded) if degree_w_expanded else 0.0
         tag_purity = min(1.0, raw_tag_purity)
 
+        # 标准 IDF（IR 口径）：用展开后的 paper_count（degree_w_expanded）做分母，统一口径
+        # idf = log(1 + total_work / (1 + paper_count))
+        idf_term = math.log(1.0 + float(self.total_work_count) / (1.0 + float(degree_w_expanded)))
+
         # 2. 平滑 IDF：仅在“正常 topic 区间(10~50 篇)”略微加权，两端趋近 1，避免极端放大/压制
         # 小词：不额外奖励；中等词：适度 >1；大词：略微扣一点，细节交给 purity/span 处理
         if degree_w < 10:
@@ -1524,25 +1544,41 @@ class LabelRecallPath:
             term_vec = self.all_vocab_vectors[idx]
             cos_sim = float(np.dot(term_vec, query_vector.flatten()))
 
-        # 记录供诊断（包含 cos_sim，用于后续调整 SEMANTIC_MIN 等阈值）
+        # 预计算与锚点的最大余弦（供诊断与锚点门控用）
+        max_anchor_sim = None
+        anchor_vecs = getattr(self, "_anchor_vectors", None)
+        if anchor_vecs is not None and anchor_vecs.size > 0 and idx is not None:
+            try:
+                tvec = np.asarray(self.all_vocab_vectors[idx], dtype=np.float32).flatten()
+                tn = np.linalg.norm(tvec)
+                if tn > 1e-9:
+                    max_anchor_sim = float(np.max(np.dot(anchor_vecs, (tvec / tn))))
+            except Exception:
+                pass
+
+        # 记录供诊断（cos_sim、anchor_sim 便于调参与 Top20 打印）
         if getattr(self, "_last_tag_purity_debug", None) is not None:
             self._last_tag_purity_debug.append({
                 "tid": rec.get("tid"),
                 "term": (rec.get("term") or "")[:40],
+                "hit_count": int(rec.get("hit_count", 1) or 1),
                 "degree_w": degree_w,
                 "degree_w_expanded": degree_w_expanded,
                 "target_degree_w": rec.get("target_degree_w"),
                 "raw_tag_purity": round(raw_tag_purity, 6),
                 "capped_tag_purity": round(tag_purity, 6),
                 "cos_sim": round(cos_sim, 6),
+                "anchor_sim": round(max_anchor_sim, 6) if max_anchor_sim is not None else None,
+                "idf_term": round(idf_term, 6),
+                "cov_j": round(float(cov_j), 6) if cov_j is not None else None,
             })
 
         # 语义硬拦截：低相关词直接置 0，避免稀缺词（高 IDF）“以小博大”带偏召回
         if cos_sim < float(self.SEMANTIC_MIN):
             return 0.0, idf_val
 
-        # 应用 4次方非线性惩罚，实现对弱相关词的断崖式拦截
-        semantic_factor = math.pow(max(0, cos_sim), 4)
+        # 应用 6 次方非线性惩罚，进一步拉开“贴 JD”与“擦边”词的差距（无硬编码）
+        semantic_factor = math.pow(max(0, cos_sim), 6)
 
         # 基于本次查询的语义相似度分布做 Top20% / 中60% / 底20% 分段加权：
         # - Top 20%: 语义最贴近 JD 的学术词，适度放大（×1.5）；
@@ -1562,12 +1598,11 @@ class LabelRecallPath:
                 bucket_factor = 1.0
         semantic_factor *= bucket_factor
 
-        # 基础骨架：sim * log(1+hits) * purity / log(1+paper_count)
+        # 基础骨架：sim * idf * log(1+hits) * purity（标准 IDF，paper_count 用 degree_w_expanded）
         sim_term = semantic_factor
         hits_term = math.log1p(hit_count)
         purity_term = tag_purity
-        freq_term = math.log1p(degree_w)
-        term_backbone = (sim_term * hits_term * purity_term) / max(1e-6, freq_term)
+        term_backbone = sim_term * idf_term * hits_term * purity_term
 
         # 5.5 极小词削顶：仅出现在极少论文中的“小众词”不允许压过大 topic
         if degree_w < 10:
@@ -1588,6 +1623,11 @@ class LabelRecallPath:
         # 单锚点且几乎不与核心第一层共现的词，只作为 supporting 标签存在，进一步削弱其主导排序能力
         if hit_count == 1 and anchor_ratio < 0.2:
             term_backbone *= 0.1
+
+        # 5.7 锚点距离门控（平滑因子）：anchor_factor = 0.3 + 0.7 * anchor_sim，贴近锚点权重大、远离逐渐变小
+        if max_anchor_sim is not None:
+            anchor_factor = 0.3 + 0.7 * max(0.0, min(1.0, max_anchor_sim))
+            term_backbone *= anchor_factor
 
         # --- 6. 【共现领域惩罚与奖励】基于 vocab_stats 的 vocabulary_cooccurrence ---
         # 降权：与各种领域的词都共现 → 万金油 → 共现伙伴平均领域跨度大 → cooc_span 大 → 乘小于 1 的因子
@@ -1611,6 +1651,25 @@ class LabelRecallPath:
                 * purity_bonus  # 共现伙伴集中目标领域 → 加权
                 * cluster_factor  # JD–簇 语义 gating
         )
+
+        # 记录更多分解项，便于定位“谁在压权重”
+        if getattr(self, "_last_tag_purity_debug", None) is not None and self._last_tag_purity_debug:
+            try:
+                last_row = self._last_tag_purity_debug[-1]
+                if str(last_row.get("tid")) == str(rec.get("tid")):
+                    last_row.update({
+                        "bucket_factor": round(float(bucket_factor), 6),
+                        "job_penalty": round(float(job_penalty), 6),
+                        "domain_span": int(domain_span),
+                        "convergence_bonus": round(float(convergence_bonus), 6),
+                        "span_penalty": round(float(span_penalty), 6),
+                        "purity_bonus": round(float(purity_bonus), 6),
+                        "cluster_factor": round(float(cluster_factor), 6),
+                        "term_backbone": round(float(term_backbone), 6),
+                        "dynamic_weight": round(float(dynamic_weight), 6),
+                    })
+            except Exception:
+                pass
 
         return dynamic_weight, idf_val
 
@@ -1644,7 +1703,7 @@ class LabelRecallPath:
         逻辑：
         1. 领域一票否决：与目标领域完全无交集的论文直接排除。
         2. 纯度惩罚（你的期待）：涉及的领域越多，非目标领域占比越大，得分越低。
-        3. 4 次方加成：通过 math.pow(ratio, 4) 让“不专注”的论文分数呈断崖式下跌。
+        3. 6 次方加成：通过 math.pow(ratio, 6) 让多领域均匀分布的论文分数呈断崖式下跌。
         """
         paper_domains = DomainProcessor.to_set(paper_domains_raw)
 
@@ -1662,9 +1721,9 @@ class LabelRecallPath:
             purity_ratio = len(intersect) / len(paper_domains)
 
         # 3. 基础领域分与纯度惩罚
-        # 采用 4 次方惩罚：纯度 0.5 的论文（如 CS+教育），其系数仅剩 0.0625 倍
+        # 采用 6 次方惩罚：多领域均匀分布的论文被压得更狠（无硬编码领域 id）
         base_score = 1.0 + (dominance * 5.0) if intersect else 0.5
-        return base_score * math.pow(purity_ratio, 4)
+        return base_score * math.pow(purity_ratio, 6)
 
     def _compute_contribution(self, paper, context):
         """
@@ -1746,6 +1805,28 @@ class LabelRecallPath:
             * time_decay
             * survey_decay
         )
+
+        # 7.5 paper-level JD semantic gate：论文标题与 JD 的语义相似度门控，压制跨领域噪声（如教育/农业推荐被误召）
+        jd_vec = context.get("query_vector")
+        if jd_vec is not None and raw_title and getattr(self, "_query_encoder", None):
+            try:
+                paper_vec, _ = self._query_encoder.encode(raw_title)
+                if paper_vec is not None and paper_vec.size > 0:
+                    jd_flat = np.asarray(jd_vec, dtype=np.float32).flatten()
+                    pf = np.asarray(paper_vec, dtype=np.float32).flatten()
+                    jd_norm = np.linalg.norm(jd_flat)
+                    pf_norm = np.linalg.norm(pf)
+                    if jd_norm > 1e-9 and pf_norm > 1e-9:
+                        cos = float(np.dot(jd_flat / jd_norm, pf / pf_norm))
+                        cos = max(-1.0, min(1.0, cos))
+                        if cos < 0.3:
+                            score *= 0.1
+                        elif cos < 0.5:
+                            score *= 0.4
+                        # else cos >= 0.5: factor 1.0
+            except Exception:
+                pass
+
         return score, hit_terms
 
     # ---------- 五阶段流程（便于维护与修改） ----------
@@ -1821,13 +1902,24 @@ class LabelRecallPath:
 
     def _apply_cluster_rank_decay(self, score_map: dict) -> None:
         """
-        对每个 cluster 内部按 score 排序，做平滑的 head–tail 衰减：
-          - cluster_size <= 3: 不做衰减；
-          - 否则: 使用 1/log2(rank+2) 作为 rank 衰减因子（rank 从 0 开始）。
+        对每个 cluster 内部按 score 排序，做 head-tail 衰减：
+        - cluster_size <= 3: 不做衰减；
+        - 若 anchor_sim >= 0.9: factor = 1.0；
+        - 否则若 rank <= 4: factor = 1.0；
+        - 否则: factor = 0.85 ** (rank - 4)。
         直接原地修改 score_map。
         """
         if not getattr(self, "voc_to_clusters", None) or not score_map:
             return
+
+        self._last_cluster_rank_factors = {}
+
+        debug_list = getattr(self, "_last_tag_purity_debug", None) or []
+        anchor_sim_by_tid = {}
+        for d in debug_list:
+            tid = d.get("tid")
+            if tid is not None and d.get("anchor_sim") is not None:
+                anchor_sim_by_tid[str(tid)] = float(d["anchor_sim"])
 
         cluster_to_tids = {}
         for tid_str in score_map.keys():
@@ -1838,28 +1930,54 @@ class LabelRecallPath:
             clusters = self.voc_to_clusters.get(tid)
             if not clusters:
                 continue
-            # rank 衰减只需主簇
             cid, _ = max(clusters, key=lambda x: x[1])
             cluster_to_tids.setdefault(cid, []).append(tid_str)
 
         for cid, tids in cluster_to_tids.items():
             if len(tids) <= 3:
-                continue  # 小簇不做 rank 衰减
+                for tid_str in tids:
+                    self._last_cluster_rank_factors[tid_str] = 1.0
+                continue
 
             tids_sorted = sorted(tids, key=lambda x: score_map.get(x, 0.0), reverse=True)
             for rank, tid_str in enumerate(tids_sorted):
-                # 平滑衰减：1 / log2(rank+2)
-                factor = 1.0 / math.log2(rank + 2)
-                score_map[tid_str] *= factor
+                anchor_sim = anchor_sim_by_tid.get(tid_str)
+                if anchor_sim is not None and anchor_sim >= 0.9:
+                    factor = 1.0
+                elif rank <= 4:
+                    factor = 1.0
+                else:
+                    factor = 0.85 ** (rank - 4)
 
-    def _stage3_word_weights(self, raw_candidates, query_vector):
+                score_map[tid_str] *= factor
+                self._last_cluster_rank_factors[tid_str] = float(factor)
+
+    def _stage3_word_weights(self, raw_candidates, query_vector, anchor_vids=None):
         """
-        阶段 3：词权重。统一走复杂公式（领域纯度、共鸣、语义守门等），无分支例外。
-        返回: (score_map, term_map, idf_map)。
+        阶段 3：词权重。统一走复杂公式（领域纯度、共鸣、语义守门、锚点距离门控等），无分支例外。
+        返回: (score_map, term_map, idf_map)。anchor_vids 用于无硬编码的锚点距离门控。
         """
         if not raw_candidates:
             return {}, {}, {}
-        return self._calculate_final_weights(raw_candidates, query_vector)
+        score_map, term_map, idf_map = self._calculate_final_weights(
+            raw_candidates, query_vector, anchor_vids=anchor_vids
+        )
+        # 调试：打印 Top20 学术词及其 cos_sim、anchor_sim、final_weight，便于观察谁在抢权重
+        if self.verbose and score_map and getattr(self, "_last_tag_purity_debug", None):
+            debug_by_tid = {str(d["tid"]): d for d in self._last_tag_purity_debug if d.get("tid") is not None}
+            top_tids = sorted(score_map.keys(), key=lambda t: score_map.get(t, 0.0), reverse=True)[:20]
+            lines = ["【Step 3 调试】Top20 学术词 | cos_sim(JB) | anchor_sim | final_weight"]
+            for i, tid in enumerate(top_tids, 1):
+                term = term_map.get(tid, "")
+                w = score_map.get(tid, 0.0)
+                d = debug_by_tid.get(str(tid), {})
+                cs = d.get("cos_sim")
+                ans = d.get("anchor_sim")
+                cs_s = f"{cs:.4f}" if cs is not None else "-"
+                ans_s = f"{ans:.4f}" if ans is not None else "-"
+                lines.append(f"  #{i:2d}  {term[:36]:36s}  cos={cs_s:6s}  anchor={ans_s:6s}  weight={w:.6f}")
+            print("\n".join(lines))
+        return score_map, term_map, idf_map
 
     def _stage4_graph_search(self, vocab_ids, regex_str):
         """
@@ -1900,6 +2018,7 @@ class LabelRecallPath:
             "active_domain_set": active_domain_set,
             "dominance": dominance,
             "decay_rate": get_decay_rate_for_domains(active_domain_set),
+            "query_vector": debug_1.get("query_vector"),  # JD 向量，供 paper-level semantic gate
         }
 
         # ---------- 统一“论文 → 作者”聚合逻辑 ----------
@@ -1997,6 +2116,22 @@ class LabelRecallPath:
 
                 author_scores[aid] = score
 
+        # 作者过滤（数据驱动）：最佳论文贡献低于全局最大论文贡献一定比例的作者不参与排序
+        if papers_for_agg and author_scores and author_top_works:
+            paper_scores_by_wid = {p["wid"]: float(p["score"]) for p in papers_for_agg}
+            max_paper = max(paper_scores_by_wid.values()) if paper_scores_by_wid else 0.0
+            if max_paper > 0:
+                min_contrib = max_paper * float(self.AUTHOR_BEST_PAPER_MIN_RATIO)
+                to_remove = [
+                    aid for aid in author_scores
+                    if max(
+                        (paper_scores_by_wid.get(wid, 0.0) for wid, _ in author_top_works.get(aid, [])),
+                        default=0.0,
+                    ) < min_contrib
+                ]
+                for aid in to_remove:
+                    author_scores.pop(aid, None)
+
         # 对作者得分做一次归一化，使最高分为 1.0，便于诊断与对比，不改变排序结果
         if author_scores:
             max_score = max(author_scores.values())
@@ -2018,7 +2153,7 @@ class LabelRecallPath:
                     {
                         "title": meta.get("title"),
                         "year": meta.get("year"),
-                        "contribution": round(contrib, 4),
+                        "contribution": round(contrib, 6),
                         "hits": hits,
                     }
                 )
@@ -2055,6 +2190,27 @@ class LabelRecallPath:
             [(term_map.get(tid, ""), score_map.get(tid, 0)) for tid in score_map],
             key=lambda x: x[1], reverse=True
         )
+        # Top20 学术词调试：term / cos_sim(JB) / anchor_sim / final_weight，便于观察谁在抢权重
+        top20_term_debug = []
+        if score_map and getattr(self, "_last_tag_purity_debug", None):
+            debug_by_tid = {str(d["tid"]): d for d in self._last_tag_purity_debug if d.get("tid") is not None}
+            rank_factors = getattr(self, "_last_cluster_rank_factors", {}) or {}
+            for tid in sorted(score_map.keys(), key=lambda t: score_map.get(t, 0.0), reverse=True)[:20]:
+                row = debug_by_tid.get(str(tid), {}) or {}
+                top20_term_debug.append({
+                    "term": (term_map.get(tid, ""))[:50],
+                    "cos_sim": row.get("cos_sim"),
+                    "anchor_sim": row.get("anchor_sim"),
+                    "idf_term": row.get("idf_term"),
+                    "degree_w": row.get("degree_w"),
+                    "degree_w_expanded": row.get("degree_w_expanded"),
+                    "hit_count": row.get("hit_count"),
+                    "cluster_rank_factor": round(float(rank_factors.get(str(tid), 1.0)), 6),
+                    "cluster_factor": row.get("cluster_factor"),
+                    "job_penalty": row.get("job_penalty"),
+                    "domain_span": row.get("domain_span"),
+                    "weight": round(score_map.get(tid, 0.0), 6),
+                })
         academic_kws = list(set(term_map.values()))
         self.last_debug_info = {
             "active_domains": list(active_domain_set),
@@ -2074,6 +2230,7 @@ class LabelRecallPath:
             "academic_kws": academic_kws,
             "detailed_kws": getattr(self, "_last_expansion_raw_results", []),
             "top_scored_terms": sorted_terms,
+            "top20_term_debug": top20_term_debug,
             "recall_vocab_count": len(score_map),
             "work_count": all_works_count,
             "author_count": len(scored_authors),
@@ -2104,16 +2261,18 @@ class LabelRecallPath:
         if not raw_candidates:
             return [], (time.time() - start_t) * 1000
 
-        # 阶段 3：词权重（统一走复杂公式）
-        score_map, term_map, idf_map = self._stage3_word_weights(raw_candidates, query_vector)
+        # 阶段 3：词权重（统一走复杂公式，传入锚点 ID 供锚点距离门控）
+        anchor_vids = [int(k) for k in anchor_skills.keys()] if anchor_skills else None
+        score_map, term_map, idf_map = self._stage3_word_weights(raw_candidates, query_vector, anchor_vids=anchor_vids)
 
         # 阶段 4：图检索
         author_papers_list = self._stage4_graph_search(
             [int(k) for k in score_map.keys()], regex_str
         )
 
-        # 阶段 5：作者打分与排序（debug_1 中补上 regex_str 供 last_debug_info）
+        # 阶段 5：作者打分与排序（debug_1 中补上 regex_str、query_vector 供 last_debug_info 与 paper semantic gate）
         debug_1["regex_str"] = regex_str
+        debug_1["query_vector"] = query_vector
         dominance = debug_1.get("dominance", 0.0)
         author_ids, _ = self._stage5_score_and_rank_authors(
             author_papers_list, score_map, term_map, active_domain_set, dominance, debug_1
@@ -2325,6 +2484,34 @@ if __name__ == "__main__":
                 print(f"      参与召回的学术词权重 Top15:")
                 for term, score in top_scored_terms[:15]:
                     print(f"        - {term[:40]:<40}  weight={score:.6f}")
+            # 3.5b Top20 学术词调试：分解项（定位谁在压权重）
+            top20_debug = db.get('top20_term_debug', [])
+            if top20_debug:
+                print(f"      【Step 3 调试】Top20 学术词（分解项）")
+                print(f"        字段: cos_sim | anchor_sim | idf | deg/deg_exp | hits | rank_factor | cluster_factor | job_penalty | span | weight")
+                for i, row in enumerate(top20_debug[:20], 1):
+                    term = (row.get('term') or '')[:36]
+                    cs = row.get('cos_sim')
+                    ans = row.get('anchor_sim')
+                    idf = row.get('idf_term')
+                    deg = row.get('degree_w')
+                    deg_exp = row.get('degree_w_expanded')
+                    hits = row.get('hit_count')
+                    rf = row.get('cluster_rank_factor')
+                    cf = row.get('cluster_factor')
+                    jp = row.get('job_penalty')
+                    ds = row.get('domain_span')
+                    w = row.get('weight', 0)
+                    cs_s = f"{cs:.4f}" if cs is not None else "-"
+                    ans_s = f"{ans:.4f}" if ans is not None else "-"
+                    idf_s = f"{float(idf):.3f}" if idf is not None else "-"
+                    deg_s = f"{deg}/{deg_exp}" if deg is not None and deg_exp is not None else "-"
+                    hits_s = f"{hits}" if hits is not None else "-"
+                    rf_s = f"{float(rf):.4f}" if rf is not None else "-"
+                    cf_s = f"{float(cf):.3f}" if cf is not None else "-"
+                    jp_s = f"{float(jp):.2f}" if jp is not None else "-"
+                    ds_s = f"{ds}" if ds is not None else "-"
+                    print(f"        #{i:2d}  {term:<36}  cos={cs_s:>6}  anchor={ans_s:>6}  idf={idf_s:>6}  deg={deg_s:>9}  hits={hits_s:>3}  rf={rf_s:>6}  cf={cf_s:>5}  jp={jp_s:>6}  span={ds_s:>3}  w={w:.6f}")
 
             # 3.6 Tag Purity 诊断（raw>1 时可见统计口径异常）
             tag_purity_debug = getattr(l_path, "_last_tag_purity_debug", []) or []
