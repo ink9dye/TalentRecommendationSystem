@@ -1671,15 +1671,13 @@ class LabelRecallPath:
         阶段 2：学术词扩展。边路 + 语境向量路 + 簇扩展 + 共鸣/共现，返回候选列表（不计算最终词权）。
         返回: raw_candidates，每项含 tid, term, degree_w, target_degree_w, domain_span, cov_j, hit_count 等，供 stage3 统一公式。
         """
-        # 基于当前 query_vector 预先计算一次簇级 gating 因子，供词权重阶段使用
-        self._compute_cluster_task_factors(query_vector)
-        return self._expand_semantic_map(
-            [int(k) for k in anchor_skills.keys()],
-            anchor_skills,
-            domain_regex=regex_str,
+        return stage2_expansion.run_stage2(
+            self,
+            anchor_skills=anchor_skills,
+            active_domain_set=active_domain_set,
+            regex_str=regex_str,
             query_vector=query_vector,
             query_text=query_text,
-            return_raw=True,
         )
 
     def _apply_cluster_rank_decay(self, score_map: dict) -> None:
@@ -1765,336 +1763,23 @@ class LabelRecallPath:
         阶段 4：图检索。用学术词 ID 反查 Work 与 Author。
         返回: list of { 'aid': str, 'papers': [ { wid, hits, weight, title, year, domains }, ... ] }。
         """
-        params = {"v_ids": vocab_ids, "total_w": self.total_work_count}
-        domain_clause = ""
-        if regex_str:
-            domain_clause = "AND w.domain_ids =~ $regex"
-            params["regex"] = regex_str
-        final_cypher = f"""
-        MATCH (v:Vocabulary) WHERE v.id IN $v_ids
-        WITH v, COUNT {{ (v)<-[:HAS_TOPIC]-() }} AS degree_w
-        WHERE (degree_w * 1.0 / $total_w) < 0.03 
-        WITH v, log10($total_w / (degree_w + 1)) AS idf_weight
-        MATCH (v)<-[:HAS_TOPIC]-(w:Work) 
-        WHERE 1=1 {domain_clause} 
-        WITH w, collect({{vid: v.id, idf: idf_weight}}) AS hit_info LIMIT 2000
-        MATCH (w)<-[auth_r:AUTHORED]-(a:Author)
-        RETURN a.id AS aid, collect({{wid: w.id, hits: hit_info, weight: auth_r.pos_weight, 
-                                     title: w.title, year: w.year, domains: w.domain_ids}}) AS papers
-        """
-        cursor = self.graph.run(final_cypher, **params)
-        return list(cursor)
+        return stage4_paper_recall.run_stage4(self, vocab_ids, regex_str)
 
     def _stage5_score_and_rank_authors(self, author_papers_list, score_map, term_map, active_domain_set, dominance, debug_1):
         """
         阶段 5：作者打分与排序。按论文贡献度聚合、排序、截断，并组装 last_debug_info。
         返回: (author_id_list, last_debug_info)。
         """
-        industrial_kws = debug_1.get("industrial_kws", [])
-        anchor_skills = debug_1.get("anchor_skills", {})
-        context = {
-            "score_map": score_map,
-            "term_map": term_map,
-            "anchor_kws": [k.lower() for k in industrial_kws],
-            "active_domain_set": active_domain_set,
-            "dominance": dominance,
-            "decay_rate": get_decay_rate_for_domains(active_domain_set),
-            "query_vector": debug_1.get("query_vector"),  # JD 向量，供 paper-level semantic gate
-        }
-
-        # ---------- 统一“论文 → 作者”聚合逻辑 ----------
-        # 1) 先按论文维度重组成 {wid -> 论文信息 + 全体作者列表} 结构
-        paper_map = {}  # wid -> {wid, hits, title, year, domains, authors: [{aid, pos_weight}, ...]}
-        author_raw_paper_cnt = collections.Counter()  # aid -> 原始论文数量（用于 debug 中的 paper_count）
-
-        for record in author_papers_list:
-            aid = record["aid"]
-            for paper in record["papers"]:
-                wid = paper["wid"]
-                entry = paper_map.setdefault(
-                    wid,
-                    {
-                        "wid": wid,
-                        "hits": paper["hits"],
-                        "title": paper["title"],
-                        "year": paper["year"],
-                        "domains": paper["domains"],
-                        "authors": [],
-                    },
-                )
-                entry["authors"].append(
-                    {"aid": aid, "pos_weight": float(paper.get("weight") or 1.0)}
-                )
-                author_raw_paper_cnt[aid] += 1
-
-        # 2) 对每篇论文计算“论文本身”的贡献度（不含作者拆分），并为公共聚合函数准备输入
-        papers_for_agg = []
-        paper_hit_terms = {}  # wid -> 命中标签列表（用于后续 per-author 代表作与标签统计）
-        all_works_count = 0
-
-        for wid, info in paper_map.items():
-            paper_struct = {
-                "wid": wid,
-                "hits": info["hits"],
-                "title": info["title"],
-                "year": info["year"],
-                "domains": info["domains"],
-            }
-            p_score, p_hits, p_rank_score, p_term_weights = self._compute_contribution(paper_struct, context)
-            all_works_count += 1
-            if p_score <= 0:
-                continue
-            paper_hit_terms[wid] = p_hits
-            info["score"] = float(p_score)
-            info["rank_score"] = float(p_rank_score or 0)
-            info["term_weights"] = dict(p_term_weights or {})
-            papers_for_agg.append(
-                {
-                    "wid": wid,
-                    "score": float(p_score),
-                    "rank_score": float(p_rank_score or 0),
-                    "term_weights": dict(p_term_weights or {}),
-                    "authors": info["authors"],
-                }
-            )
-
-        # 2.5 论文软上限：按本次查询下论文得分分布的 95 分位构造 τ，用 tanh 做平滑压缩
-        if papers_for_agg:
-            paper_scores = [p["score"] for p in papers_for_agg]
-            try:
-                tau = float(np.percentile(paper_scores, 95))
-            except Exception:
-                tau = 0.0
-
-            if tau > 0:
-                def _compress(s: float) -> float:
-                    # τ * tanh(s/τ)：中小论文几乎不变，极强论文逐渐被压到 τ 附近
-                    return float(tau * math.tanh(s / tau))
-
-                for p in papers_for_agg:
-                    p["score"] = _compress(float(p["score"]))
-
-        # 3) 统一调用 works_to_authors 进行“论文 → 作者”分摊与聚合（仅保留每位作者贡献最高的 Top3 论文）
-        agg_result = accumulate_author_scores(papers_for_agg, top_k_per_author=3)
-        author_scores = agg_result.author_scores
-        author_top_works = agg_result.author_top_works  # aid -> [(wid, contrib_score), ...]
-        paper_scores_by_wid = {p["wid"]: float(p["score"]) for p in papers_for_agg}
-
-        # 3.5) 每 term 对论文的贡献（用于 Top term 最终贡献表）与每作者来源 term 拆解
-        term_paper_contrib = collections.defaultdict(list)  # tid -> [(wid, contrib), ...]
-        for p in papers_for_agg:
-            wid, s_final, r_score, tw = p["wid"], p["score"], p.get("rank_score") or 1.0, p.get("term_weights") or {}
-            if r_score <= 0:
-                continue
-            for vid_s, w in tw.items():
-                term_paper_contrib[vid_s].append((wid, (w / r_score) * s_final))
-
-        author_term_contrib = collections.defaultdict(lambda: collections.defaultdict(float))  # aid -> tid -> contrib
-        for aid, works in author_top_works.items():
-            for wid, contrib in works:
-                info = paper_map.get(wid, {})
-                r_score = info.get("rank_score") or 1.0
-                tw = info.get("term_weights") or {}
-                if r_score <= 0:
-                    continue
-                for vid_s, w in tw.items():
-                    author_term_contrib[aid][vid_s] += contrib * (w / r_score)
-
-        # 4) 重建 per-author 调试与展示结构（代表作、标签统计等）
-        # ---- 作者层时间特征：活跃度 + 动量（统一 time_features）----
-        if author_scores:
-            # 为每个作者收集其论文年份列表（基于 paper_map）
-            years_by_author = {}
-            for aid in author_scores.keys():
-                years = []
-                for wid, _ in author_top_works.get(aid, []):
-                    meta = paper_map.get(wid, {})
-                    years.append(meta.get("year"))
-                years_by_author[aid] = years
-
-            for aid, base_score in list(author_scores.items()):
-                years = years_by_author.get(aid, [])
-                # activity/momentum 由 time_features 统一计算
-                activity, momentum, time_weight = compute_author_time_features(years)
-                # 基于最近代表作年龄的平滑衰减也集中在 time_features 中
-                recency_by_latest = compute_author_recency_by_latest(years)
-                score = float(base_score) * float(time_weight) * float(recency_by_latest)
-
-                author_scores[aid] = score
-
-        # 作者过滤（数据驱动）：最佳论文贡献低于全局最大论文贡献一定比例的作者不参与排序
-        if papers_for_agg and author_scores and author_top_works:
-            paper_scores_by_wid = {p["wid"]: float(p["score"]) for p in papers_for_agg}
-            max_paper = max(paper_scores_by_wid.values()) if paper_scores_by_wid else 0.0
-            if max_paper > 0:
-                min_contrib = max_paper * float(self.AUTHOR_BEST_PAPER_MIN_RATIO)
-                to_remove = [
-                    aid for aid in author_scores
-                    if max(
-                        (paper_scores_by_wid.get(wid, 0.0) for wid, _ in author_top_works.get(aid, [])),
-                        default=0.0,
-                    ) < min_contrib
-                ]
-                for aid in to_remove:
-                    author_scores.pop(aid, None)
-
-        # 对作者得分做一次归一化，使最高分为 1.0，便于诊断与对比，不改变排序结果
-        if author_scores:
-            max_score = max(author_scores.values())
-            if max_score > 0:
-                for aid in author_scores:
-                    author_scores[aid] = author_scores[aid] / max_score
-
-        scored_authors = []
-        for aid, total_score in sorted(author_scores.items(), key=lambda x: x[1], reverse=True):
-            works = author_top_works.get(aid, [])
-            if not works:
-                continue
-
-            per_author_papers = []
-            for wid, contrib in works:
-                meta = paper_map.get(wid, {})
-                hits = paper_hit_terms.get(wid, [])
-                per_author_papers.append(
-                    {
-                        "title": meta.get("title"),
-                        "year": meta.get("year"),
-                        "contribution": round(contrib, 6),
-                        "hits": hits,
-                    }
-                )
-
-            # 多篇代表作：按贡献度排序，取前 3 作为代表作列表
-            per_author_papers.sort(key=lambda x: x.get("contribution", 0.0), reverse=True)
-            top_papers = per_author_papers[:3]
-            best_paper = top_papers[0] if top_papers else None
-
-            # 标签汇总：统计作者所有正贡献论文中的标签命中次数
-            tag_counter = collections.Counter()
-            for p in per_author_papers:
-                tag_counter.update(p.get("hits") or [])
-            tag_stats = [{"term": t, "count": c} for t, c in tag_counter.most_common(10)]
-
-            # 作者总论文数（未截断，仅用于 debug 展示）
-            paper_cnt_author = author_raw_paper_cnt.get(aid, len(per_author_papers))
-
-            # 最终作者得分：论文贡献 + 作者时间特征（activity/momentum）
-            final_score = author_scores.get(aid, total_score)
-            # 作者来源 term 拆解：按贡献排序取前 5
-            atc = author_term_contrib.get(aid, {})
-            top_terms_contrib = sorted(
-                [(term_map.get(tid, ""), round(float(c), 6)) for tid, c in atc.items() if c > 0],
-                key=lambda x: -x[1],
-            )[:5]
-
-            scored_authors.append({
-                "aid": aid,
-                "score": final_score,
-                "raw_score": total_score,
-                "top_paper": best_paper,
-                "paper_count": paper_cnt_author,
-                "top_papers": top_papers,
-                "tag_stats": tag_stats,
-                "top_terms_by_contribution": top_terms_contrib,
-            })
-
-        scored_authors.sort(key=lambda x: x["score"], reverse=True)
-        sorted_terms = sorted(
-            [(term_map.get(tid, ""), score_map.get(tid, 0)) for tid in score_map],
-            key=lambda x: x[1], reverse=True
+        return stage5_author_rank.run_stage5(
+            self,
+            author_papers_list,
+            score_map,
+            term_map,
+            active_domain_set,
+            dominance,
+            debug_1,
         )
-        # Top20 学术词调试：term / cos_sim(JB) / anchor_sim / final_weight，便于观察谁在抢权重
-        top20_term_debug = []
-        if score_map and getattr(self, "_last_tag_purity_debug", None):
-            debug_by_tid = {str(d["tid"]): d for d in self.debug_info.tag_purity_debug if d.get("tid") is not None}
-            rank_factors = getattr(self, "_last_cluster_rank_factors", {}) or self.debug_info.cluster_rank_factors or {}
-            for tid in sorted(score_map.keys(), key=lambda t: score_map.get(t, 0.0), reverse=True)[:20]:
-                row = debug_by_tid.get(str(tid), {}) or {}
-                top20_term_debug.append({
-                    "term": (term_map.get(tid, ""))[:50],
-                    "cos_sim": row.get("cos_sim"),
-                    "anchor_sim": row.get("anchor_sim"),
-                    "idf_term": row.get("idf_term"),
-                    "degree_w": row.get("degree_w"),
-                    "degree_w_expanded": row.get("degree_w_expanded"),
-                    "hit_count": row.get("hit_count"),
-                    "cluster_rank_factor": round(float(rank_factors.get(str(tid), 1.0)), 6),
-                    "cluster_factor": row.get("cluster_factor"),
-                    "job_penalty": row.get("job_penalty"),
-                    "domain_span": row.get("domain_span"),
-                    "weight": round(score_map.get(tid, 0.0), 6),
-                })
-        academic_kws = list(set(term_map.values()))
-        # 过滤闭环：三份集合 + 指定 tid 是否在最终集合
-        similar_to_pass = getattr(self, "_last_similar_to_pass", []) or self.debug_info.similar_to_pass
-        similar_to_pass_tids = sorted(set(r["tid"] for r in similar_to_pass if r.get("tid") is not None))
-        similar_to_raw_tids = getattr(self, "_last_raw_candidate_tids", []) or self.debug_info.raw_candidate_tids
-        # 精检：仅选取少量高质量学术词参与论文检索
-        final_term_ids_for_paper = self._select_terms_for_paper(score_map, term_map, max_terms=16)
-        debug_check_tids = [(2280, "supervised learning"), (4045, "robot learning"), (152, "control (management)")]
-        filter_closed_loop = {
-            "similar_to_raw_tids": similar_to_raw_tids[:50],
-            "similar_to_pass_tids": similar_to_pass_tids[:50],
-            "final_term_ids_for_paper": final_term_ids_for_paper[:50],
-            "final_term_count": len(final_term_ids_for_paper),
-            "contains_check": {f"{name}({tid})": tid in final_term_ids_for_paper for tid, name in debug_check_tids},
-        }
-        # Top term 最终贡献表（Top20）：term, tid, final_weight, main_role, role_penalty, paper_count_hit, top_paper_contrib, total_paper_contrib
-        debug_by_tid = {
-            str(d["tid"]): d
-            for d in (getattr(self, "_last_tag_purity_debug", None) or self.debug_info.tag_purity_debug or [])
-            if d.get("tid") is not None
-        }
-        top_tids_by_weight = sorted(score_map.keys(), key=lambda t: score_map.get(t, 0.0), reverse=True)[:20]
-        top_terms_final_contrib = []
-        for tid in top_tids_by_weight:
-            tid_s = str(tid)
-            lst = term_paper_contrib.get(tid_s, [])
-            pc = len(lst)
-            top_c = max((c for _, c in lst), default=0.0)
-            total_c = sum(c for _, c in lst)
-            row = debug_by_tid.get(tid_s, {})
-            top_terms_final_contrib.append({
-                "term": term_map.get(tid_s, ""),
-                "tid": int(tid) if tid_s.isdigit() else tid_s,
-                "final_weight": round(score_map.get(tid_s, 0.0), 6),
-                "main_role": row.get("main_role") or "none",
-                "role_penalty": row.get("role_penalty"),
-                "paper_count_hit": pc,
-                "top_paper_contrib": round(top_c, 6),
-                "total_paper_contrib": round(total_c, 6),
-                "task_anchor_sim": row.get("task_anchor_sim"),
-                "carrier_anchor_sim": row.get("carrier_anchor_sim"),
-                "task_advantage": row.get("task_advantage"),
-            })
 
-        self.last_debug_info = {
-            "active_domains": list(active_domain_set),
-            "dominance": f"{dominance * 100:.1f}%",
-            "expansion_pipeline": getattr(self, "_last_expansion_pipeline_stats", None) or self.debug_info.expansion_pipeline_stats or None,
-            "similar_to_raw": getattr(self, "_last_similar_to_raw_rows", []) or self.debug_info.similar_to_raw_rows or [],
-            "similar_to_agg": getattr(self, "_last_similar_to_agg", []) or self.debug_info.similar_to_agg or [],
-            "similar_to_pass": similar_to_pass,
-            "regex_str": debug_1.get("regex_str", ""),
-            "job_ids": debug_1.get("job_ids", []),
-            "job_previews": debug_1.get("job_previews", []),
-            "anchor_debug": debug_1.get("anchor_debug", {}),
-            "anchor_melt_stats": getattr(self, "_last_anchor_melt_stats", None) or self.debug_info.anchor_melt_stats or None,
-            "supplement_anchors": getattr(self, "_last_supplement_anchors", []) or self.debug_info.supplement_anchors or [],
-            "industrial_kws": industrial_kws,
-            "anchor_detail": [f"{k}={v['term']}" for k, v in anchor_skills.items()],
-            "academic_kws": academic_kws,
-            "detailed_kws": getattr(self, "_last_expansion_raw_results", []) or self.debug_info.expansion_raw_results or [],
-            "top_scored_terms": sorted_terms,
-            "top20_term_debug": top20_term_debug,
-            "recall_vocab_count": len(score_map),
-            "work_count": all_works_count,
-            "author_count": len(scored_authors),
-            "top_samples": scored_authors[:50],
-            "filter_closed_loop": filter_closed_loop,
-            "top_terms_final_contrib": top_terms_final_contrib,
-        }
-        return [a["aid"] for a in scored_authors], self.last_debug_info
 
     def recall(self, query_vector, domain_id=None, query_text=None):
         """
