@@ -46,7 +46,6 @@ from src.core.recall.label_means.simple_factors import (
 )
 from src.core.recall.label_means import advanced_metrics as label_means_adv, label_anchors, label_expansion
 from src.core.recall.label_means.infra import LabelMeansInfra
-from src.core.recall.label_means import term_scoring
 from src.core.recall.label_pipeline import (
     stage1_domain_anchors,
     stage2_expansion,
@@ -1152,15 +1151,124 @@ class LabelRecallPath:
 
     def _calculate_final_weights(self, raw_results, query_vector, anchor_vids=None):
         """
-        【统一权重】所有候选词一律走 term_scoring.calculate_final_weights，
-        保持原有签名与返回值不变，作为薄代理。
+        【统一权重】所有候选词一律走 _apply_word_quality_penalty（含领域纯度、共鸣、语义守门、锚点距离门控等），
+        无 sim_score/degree_w 分支例外，流程清晰、领域占比一致生效。
+        anchor_vids：本次 JD 锚点 voc id 列表，用于无硬编码的锚点距离门控（与锚点均远的 term 降权）。
         """
-        return term_scoring.calculate_final_weights(
-            self,
-            raw_results,
-            query_vector,
-            anchor_vids=anchor_vids,
-        )
+        score_map, term_map, idf_map = {}, {}, {}
+        required = ("degree_w", "cov_j", "domain_span", "target_degree_w")
+        self.debug_info.tag_purity_debug = []
+        # 保持与旧字段名的兼容，便于现有 getattr(self, "_last_tag_purity_debug", ...) 逻辑复用
+        self._last_tag_purity_debug = self.debug_info.tag_purity_debug
+
+        # --- 预计算锚点向量，供 _apply_word_quality_penalty 中锚点距离门控使用 ---
+        # 同时基于本次 JD 语义，将锚点划分为 task_anchors 与 carrier_anchors 两个子集：
+        # - task_anchors：更贴近“控制/规划/动力学”等任务意图；
+        # - carrier_anchors：更贴近“机器人/机械臂/robotics”等载体语义。
+        self._anchor_vectors = None
+        self._task_anchor_vectors = None
+        self._carrier_anchor_vectors = None
+        if anchor_vids and getattr(self, "vocab_to_idx", None) is not None and getattr(self, "all_vocab_vectors", None) is not None:
+            idxs = []
+            for vid in anchor_vids:
+                i = self.vocab_to_idx.get(str(vid))
+                if i is not None:
+                    idxs.append(i)
+            if idxs:
+                vecs = np.asarray(self.all_vocab_vectors[idxs], dtype=np.float32)
+                norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+                norms = np.where(norms > 1e-9, norms, 1.0)
+                anchor_vecs = (vecs / norms)
+                self._anchor_vectors = anchor_vecs
+
+                # 基于本次 JD 的语义方向（query_vector）在锚点集合内部做一次 task/carrier 软划分：
+                # 仅使用向量语义，不依赖人工词表，避免过度硬编码。
+                if query_vector is not None:
+                    try:
+                        q = np.asarray(query_vector, dtype=np.float32).flatten()
+                        if q.size > 0:
+                            qn = np.linalg.norm(q)
+                            if qn > 1e-9:
+                                q = q / qn
+                                sims = np.dot(anchor_vecs, q)
+                                n_anchor = anchor_vecs.shape[0]
+                                # 锚点数较少时不做拆分，统一作为 task_anchors 使用
+                                if n_anchor < 4:
+                                    self._task_anchor_vectors = anchor_vecs
+                                else:
+                                    median_sim = float(np.median(sims))
+                                    task_mask = sims >= median_sim
+                                    carrier_mask = sims < median_sim
+                                    if np.any(task_mask):
+                                        self._task_anchor_vectors = anchor_vecs[task_mask]
+                                    if np.any(carrier_mask):
+                                        self._carrier_anchor_vectors = anchor_vecs[carrier_mask]
+                    except Exception:
+                        # 语义划分失败时退化为单一锚点集合，不影响主流程
+                        self._task_anchor_vectors = None
+                        self._carrier_anchor_vectors = None
+
+        # --- 预计算语义相似度分布，用于 Top20/中60/底20 分段加权 ---
+        # 说明：
+        #  - 仍然保留 SEMANTIC_MIN 作为硬门槛，只对 >= 阈值的词做分位数统计；
+        #  - 若当次查询候选词过少或全部低于阈值，则退化为无分段（bucket_factor=1）。
+        self._semantic_p20 = None
+        self._semantic_p80 = None
+        if query_vector is not None and raw_results:
+            sims = []
+            try:
+                q = np.asarray(query_vector, dtype=np.float32).flatten()
+                if q.size > 0:
+                    for rec in raw_results:
+                        tid = rec.get("tid")
+                        if tid is None:
+                            continue
+                        idx = self.vocab_to_idx.get(str(tid))
+                        if idx is None:
+                            continue
+                        try:
+                            term_vec = self.all_vocab_vectors[idx]
+                        except Exception:
+                            continue
+                        cos_sim = float(np.dot(term_vec, q))
+                        if cos_sim >= float(self.SEMANTIC_MIN):
+                            sims.append(cos_sim)
+            except Exception:
+                sims = []
+
+            if sims:
+                sims.sort()
+                n = len(sims)
+                # 简单的分位实现：使用排序后第 k 个元素近似 20% / 80%
+                def _pick_percentile(p: float) -> float:
+                    if n == 1:
+                        return sims[0]
+                    k = int(p * (n - 1))
+                    k = max(0, min(n - 1, k))
+                    return sims[k]
+
+                # 仅当样本数足够大时才启用分段，以避免极小样本下的过度放大
+                if n >= 5:
+                    self._semantic_p20 = _pick_percentile(0.2)
+                    self._semantic_p80 = _pick_percentile(0.8)
+
+        for rec in raw_results:
+            tid = str(rec["tid"])
+            if all(rec.get(k) is not None for k in required):
+                dynamic_weight, idf_val = self._apply_word_quality_penalty(rec, query_vector)
+            else:
+                # 安全回退：仅当数据不完整时（如某条扩展路径漏写字段）
+                degree_w = rec.get("degree_w") or 1
+                sim_score = rec.get("sim_score") or 0.0
+                dynamic_weight = sim_score / math.log(1.0 + degree_w) if degree_w else 0.0
+                idf_val = math.log10(self.total_work_count / (degree_w + 1))
+            score_map[tid] = dynamic_weight
+            term_map[tid] = rec.get("term") or ""
+            idf_map[tid] = idf_val
+        # 词级权重计算完毕后，在簇内做一次 head–tail 衰减，平衡主干与尾部 term
+        self._apply_cluster_rank_decay(score_map)
+
+        return score_map, term_map, idf_map
 
     def _select_terms_for_paper(self, score_map, term_map, max_terms=16):
         """

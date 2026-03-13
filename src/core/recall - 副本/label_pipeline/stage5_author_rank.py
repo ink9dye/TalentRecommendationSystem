@@ -10,7 +10,6 @@ from src.utils.time_features import (
 )
 from src.utils.tools import get_decay_rate_for_domains as _get_decay_rate_for_domains
 from src.core.recall.works_to_authors import accumulate_author_scores
-from src.core.recall.label_means import paper_scoring
 
 
 def run_stage5(
@@ -71,9 +70,7 @@ def run_stage5(
             "year": info["year"],
             "domains": info["domains"],
         }
-        p_score, p_hits, p_rank_score, p_term_weights = paper_scoring.compute_contribution(
-            recall, paper_struct, context
-        )
+        p_score, p_hits, p_rank_score, p_term_weights = recall._compute_contribution(paper_struct, context)
         all_works_count += 1
         if p_score <= 0:
             continue
