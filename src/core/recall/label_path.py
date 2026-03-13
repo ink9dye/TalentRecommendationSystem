@@ -176,7 +176,7 @@ class LabelRecallPath:
     def _compute_cluster_task_factors(self, query_vector):
         """
         基于当前 JD 的 query_vector 和簇中心向量，计算 cluster_task_factor。
-        使用强化门控: factor = sim^1.5，使低相关簇明显降权、高相关簇保持较高权重。
+        簇只做轻微微调：raw = sim^1.5 后线性映射到 [0.9, 1.0]，不承担主区分力。
         """
         # 若簇中心或 query 向量不可用，则关闭簇 gating
         if getattr(self, "cluster_centroids", None) is None or query_vector is None:
@@ -197,9 +197,11 @@ class LabelRecallPath:
         sims = np.dot(self.cluster_centroids, q)  # shape = (K,)
         sims = np.clip(sims, 0.0, 1.0)
 
+        # 簇只做轻微微调：将 raw 映射到 [0.9, 1.0]，不承担主区分力
         factors = {}
         for cid, sim in enumerate(sims):
-            factor = float(sim) ** 1.5
+            raw = float(sim) ** 1.5
+            factor = 0.9 + 0.1 * min(max(raw, 0.0), 1.0)
             factors[cid] = factor
 
         self._cluster_task_factors = factors
@@ -517,13 +519,14 @@ class LabelRecallPath:
 
         return {str(r.get("vid")): {"term": r.get("term")} for r in rows}
 
-    def _supplement_anchors_from_jd_vector(self, query_text, anchor_skills, total_j=None, top_k=15):
+    def _supplement_anchors_from_jd_vector(self, query_text, anchor_skills, total_j=None, top_k=None, active_domain_ids=None):
         """
         用 JD 向量直接搜 vocabulary，取与当前 JD 语义最接近的 top_k 个词作为补充锚点（不硬编码强词）。
         补充词也做熔断：仅当 cov_j < ANCHOR_MELT_COV_J 时才并入。返回本次新增的 [(vid, term), ...] 供调试。
         """
         if not query_text or not getattr(self, "vocab_index", None):
             self._last_supplement_anchors = []
+            self._last_supplement_anchors_report = []
             return
         total_j = float(total_j or 0) or self.total_job_count
         self._load_vocab_meta()
@@ -531,6 +534,7 @@ class LabelRecallPath:
         jd_snippet = (query_text or "").strip()[:500]
         if not jd_snippet:
             self._last_supplement_anchors = []
+            self._last_supplement_anchors_report = []
             return
 
         v_jd = encoder.model.encode(
@@ -540,9 +544,12 @@ class LabelRecallPath:
             show_progress_bar=False,
         )
         v_jd = np.asarray(v_jd, dtype=np.float32).reshape(1, -1)
-        k = min(int(top_k), 30)
+        # 入口 top-K：统一由 SUPPLEMENT_TOP_K 控制，避免一次补过多锚点
+        k = min(int(top_k or self.SUPPLEMENT_TOP_K), 30)
         scores, labels = self.vocab_index.search(v_jd, k)
         added = []
+        # 记录详细候选及过滤原因，便于调试
+        self._last_supplement_anchors_report = []
         melt_threshold = float(self.ANCHOR_MELT_COV_J)
         v_ids_to_check = []
         candidates = []
@@ -552,17 +559,30 @@ class LabelRecallPath:
                 continue
             if str(tid) in anchor_skills:
                 continue
-            term, _ = self._vocab_meta.get(tid, ("", ""))
+            term, etype = self._vocab_meta.get(tid, ("", ""))
+            etype = (etype or "").lower()
             if not term or len(term) < 2:
                 continue
-            candidates.append((tid, term, float(score)))
+            # 仅允许 concept / keyword 进入补充锚点候选
+            if etype and etype not in self.SUPPLEMENT_ALLOW_ENTITY_TYPES:
+                self._last_supplement_anchors_report.append({
+                    "tid": tid,
+                    "term": term,
+                    "etype": etype,
+                    "score": float(score),
+                    "reason": "etype_not_allowed",
+                })
+                continue
+            candidates.append((tid, term, etype, float(score)))
             v_ids_to_check.append(tid)
 
         if not v_ids_to_check:
             self._last_supplement_anchors = []
+            self._last_supplement_anchors_report = []
             return
 
         global_count = {}
+        stats_map = {}
         try:
             cypher = """
             UNWIND $v_ids AS vid
@@ -573,22 +593,76 @@ class LabelRecallPath:
                 global_count[int(r["vid"])] = int(r.get("cnt") or 0)
         except Exception:
             global_count = {vid: 0 for vid in v_ids_to_check}
+        try:
+            ph = ",".join("?" * len(v_ids_to_check))
+            rows = self.stats_conn.execute(
+                f"SELECT voc_id, work_count, domain_dist FROM vocabulary_domain_stats WHERE voc_id IN ({ph})",
+                v_ids_to_check,
+            ).fetchall()
+            for r in rows:
+                stats_map[int(r[0])] = (int(r[1] or 0), r[2])
+        except Exception:
+            stats_map = {}
 
-        for tid, term, score in candidates:
+        active_domains = set(str(d) for d in (active_domain_ids or []))
+        ranked = []
+        for tid, term, etype, score in candidates:
             g = global_count.get(tid, 0)
-            cov_j = (g / total_j) if total_j else 0
+            cov_j = (g / total_j) if total_j else 0.0
+            reason = None
             if cov_j >= melt_threshold:
-                continue
+                reason = "cov_j_melt"
+            row = stats_map.get(tid)
+            degree_w = 0
+            domain_ratio = 0.0
+            if row:
+                degree_w, dist_json = row
+                try:
+                    dist = json.loads(dist_json) if isinstance(dist_json, str) else (dist_json or {})
+                except (TypeError, ValueError):
+                    dist = {}
+                expanded = self._expand_domain_dist(dist)
+                degree_w_expanded = sum(expanded.values())
+                if active_domains:
+                    target_degree_w = sum(expanded.get(str(d), 0) for d in active_domains)
+                else:
+                    target_degree_w = degree_w_expanded
+                domain_ratio = (target_degree_w / degree_w_expanded) if degree_w_expanded else 0.0
+                if active_domains and domain_ratio < float(self.SUPPLEMENT_DOMAIN_RATIO_MIN):
+                    reason = "low_domain_ratio"
+            else:
+                reason = reason or "no_stats"
+
+            report_row = {
+                "tid": tid,
+                "term": term,
+                "etype": etype,
+                "score": float(score),
+                "cov_j": float(cov_j),
+                "domain_ratio": float(domain_ratio),
+                "reason": reason or "candidate",
+            }
+            self._last_supplement_anchors_report.append(report_row)
+
+            if reason is None:
+                ranked.append(report_row)
+
+        # 仅从通过全部门槛的候选中选取少量最高分补充锚点
+        ranked.sort(key=lambda x: (x["domain_ratio"], x["score"]), reverse=True)
+        for item in ranked[: self.SUPPLEMENT_MAX_ADD]:
+            tid = item["tid"]
+            term = item["term"]
+            cov_j = item["cov_j"]
             anchor_skills[str(tid)] = {"term": term}
-            added.append((tid, term, round(score, 4), round(cov_j, 4)))
+            added.append((tid, term, round(item["score"], 4), round(cov_j, 4), round(item["domain_ratio"], 4)))
 
         self._last_supplement_anchors = added
         self._cached_v_jd = v_jd
 
     # --- 第三阶段：语义扩展 ---
-    # 融合权重：相似边 0.2，语境向量 0.8；多次命中奖励：泛词(work_count大)不奖励，其余按 ln(min(hit,5)) 计算并封顶
-    CTX_EDGE_WEIGHT = 0.8
-    EDGE_WEIGHT = 0.2
+    # 融合权重：相似边 0.4，语境向量 0.6；多次命中奖励：泛词(work_count大)不奖励，其余按 ln(min(hit,5)) 计算并封顶
+    CTX_EDGE_WEIGHT = 0.6
+    EDGE_WEIGHT = 0.4
     HIT_BONUS_BETA = 0.25
     HIT_BONUS_CAP = 1.5
     HIT_BONUS_HIT_CAP = 5
@@ -599,6 +673,11 @@ class LabelRecallPath:
     CTX_MIX_LAMBDA = 0.7
     # 语义硬门槛：候选词与 query 的余弦相似度低于阈值时直接置 0（防止稀缺词以高 IDF 带偏）
     SEMANTIC_MIN = 0.4
+    # 补充锚点入口控制：top-K、补充数量上限、允许的实体类型与领域纯度下限
+    SUPPLEMENT_TOP_K = 10
+    SUPPLEMENT_MAX_ADD = 6
+    SUPPLEMENT_DOMAIN_RATIO_MIN = 0.6
+    SUPPLEMENT_ALLOW_ENTITY_TYPES = {"concept", "keyword"}
 
     def _expand_semantic_map(self, core_vids, anchor_skills, domain_regex=None, query_vector=None, query_text=None, return_raw=False):
         """
@@ -613,7 +692,7 @@ class LabelRecallPath:
         # 1. 边路：SIMILAR_TO 图检索
         raw_edge = self._query_expansion_with_topology(core_vids, regex)
         # 2. 语境向量路：JD 片段 + 锚点 编码后在 vocabulary 索引中检索（仅学术词）
-        raw_ctx = self._query_expansion_by_context_vector(anchor_skills, query_text, regex, topk_per_anchor=5) if query_text else []
+        raw_ctx = self._query_expansion_by_context_vector(anchor_skills, query_text, regex, topk_per_anchor=3) if query_text else []
 
         # 3. 按 tid 合并：sim_merged = (0.2*sim_edge + 0.8*sim_ctx) * hit_bonus，src_vids 取并集
         edge_map = {rec["tid"]: rec for rec in raw_edge}
@@ -650,8 +729,8 @@ class LabelRecallPath:
         if not raw_results:
             return [] if return_raw else ({}, {}, {})
 
-        # 1.5 概念簇扩展：在簇内为每个 seed 找少量近邻学术词（top5，且簇内相似度≥0.6），作为次级扩展
-        raw_results = self._expand_with_clusters(raw_results, regex, topk_per_seed=7)
+        # 1.5 概念簇扩展：仅高置信 seed 触发，weight_decay 弱化，在簇内为每个 seed 找少量近邻学术词
+        raw_results = self._expand_with_clusters(raw_results, regex, topk_per_seed=7, weight_decay=0.2)
 
         # --- 2. 【学术共鸣】候选词与本次要搜索的词汇的共现（单词协作）---
         tids = [r['tid'] for r in raw_results]
@@ -683,11 +762,11 @@ class LabelRecallPath:
             return raw_results
         return self._calculate_final_weights(raw_results, query_vector)
 
-    def _expand_with_clusters(self, raw_results, domain_regex, topk_per_seed=5, weight_decay=0.4):
+    def _expand_with_clusters(self, raw_results, domain_regex, topk_per_seed=5, weight_decay=0.2):
         """
         使用概念簇对第一层学术词做局部扩展：
-          1. 对每个 seed 词，找到其所属簇（取 score 最高的一个）。
-          2. 在该簇内只保留 sim_in_cluster >= 0.6 的成员，再按相似度取 topk_per_seed 个作为扩展词。
+          1. 仅高置信 seed（按 sim_score 排序的前 N 个）才触发簇扩展。
+          2. 对每个 seed 词，找到其所属簇（取 score 最高的一个）；簇内只保留 sim_in_cluster >= 0.6 的成员，再取 topk_per_seed 个。
           3. 扩展词的初始 sim_score 约为 seed_sim_score * sim_in_cluster * weight_decay。
         返回扩展后的 raw_results 列表，结构与原始列表一致（附加若干新 tid）。
         """
@@ -723,6 +802,14 @@ class LabelRecallPath:
                 continue
             seed_sim_map[vid] = float(rec.get("sim_score", 1.0))
 
+        # 仅高置信 seed 才触发簇扩展：按 sim_score 降序取前 N 个
+        CLUSTER_EXPAND_TOP_SEEDS = 15
+        sorted_by_sim = sorted(raw_results, key=lambda r: float(r.get("sim_score", 0.0)), reverse=True)
+        allowed_seed_vids = {int(r["tid"]) for r in sorted_by_sim[:CLUSTER_EXPAND_TOP_SEEDS]}
+
+        # 簇扩展来源表（用于日志 2）
+        expansion_log = []
+
         # 聚合簇扩展出来的候选学术词
         # vid -> {"sim_score": float, "support": int, "seed_vids": set[int]}
         cluster_expanded = {}
@@ -733,6 +820,8 @@ class LabelRecallPath:
             except Exception:
                 continue
             if vid not in seed_to_cluster:
+                continue
+            if vid not in allowed_seed_vids:
                 continue
 
             cid, _ = seed_to_cluster[vid]
@@ -769,6 +858,7 @@ class LabelRecallPath:
             top = sims[:topk_per_seed]
             seed_sim = seed_sim_map.get(vid, 1.0)
 
+            seed_term = rec.get("term") or (self._vocab_meta.get(vid, ("", ""))[0] if getattr(self, "_vocab_meta", None) else "")
             for m, sim_in_cluster in top:
                 contrib = weight_decay * seed_sim * sim_in_cluster
                 if contrib <= 0:
@@ -779,6 +869,14 @@ class LabelRecallPath:
                 entry["sim_score"] = max(entry["sim_score"], contrib)
                 entry["support"] += 1
                 entry["seed_vids"].add(int(vid))
+                expansion_log.append({
+                    "term_tid": int(m),
+                    "seed_vid": vid,
+                    "seed_term": seed_term or str(vid),
+                    "sim_in_cluster": round(sim_in_cluster, 4),
+                    "seed_sim": round(seed_sim, 4),
+                    "contrib": round(contrib, 6),
+                })
 
         if not cluster_expanded:
             return raw_results
@@ -861,6 +959,16 @@ class LabelRecallPath:
                 "origin": "cluster",
             }
             raw_results.append(new_rec)
+
+        # 日志 2：簇扩展来源表（便于判断坏词由谁带进）
+        self._last_cluster_expansion_log = expansion_log
+        if self.verbose and expansion_log:
+            print("\n【簇扩展来源表】term(tid) | seed_term(seed_vid) | sim_in_cluster | seed_sim | contrib")
+            for entry in expansion_log[:50]:  # 最多 50 条
+                exp_term = term_map.get(entry["term_tid"], str(entry["term_tid"]))
+                print(f"  {exp_term}({entry['term_tid']})  <-  {entry['seed_term']}({entry['seed_vid']})  {entry['sim_in_cluster']:.4f}  {entry['seed_sim']:.4f}  {entry['contrib']:.6f}")
+            if len(expansion_log) > 50:
+                print(f"  ... 共 {len(expansion_log)} 条，仅显示前 50 条")
 
         return raw_results
 
@@ -1173,7 +1281,20 @@ class LabelRecallPath:
             target_degree_w = sum(expanded.get(str(d), 0) for d in active_domains)
             domain_ratio = target_degree_w / degree_w_expanded if degree_w_expanded else 0.0
 
-            # 大词与领域纯度软惩罚（不再直接过滤）
+            # 首层 ctx 路硬过滤：语义相似度与领域纯度均需达标
+            rec = by_tid[tid]
+            ctx_sim = float(rec.get("ctx_sim", 0.0) or 0.0)
+            if ctx_sim < float(self.SEMANTIC_MIN):
+                continue
+
+            if degree_w <= 40:
+                purity_min = 0.4
+            else:
+                purity_min = float(self.DOMAIN_PURITY_MIN)
+            if active_domains and domain_ratio < purity_min:
+                continue
+
+            # 大词 size_penalty：防止高频大词统治排序
             T = float(VOCAB_P95_PAPER_COUNT)
             if degree_w > T:
                 x = min(float(degree_w) / T, 4.0)
@@ -1181,15 +1302,11 @@ class LabelRecallPath:
             else:
                 size_penalty = 1.0
 
-            eps = 0.05
-            r = max(domain_ratio, eps)
-            domain_penalty = r ** 2
-            rec = by_tid[tid]
             src_vids = sorted(rec["src_vids"])
             results.append({
                 "tid": tid,
                 "term": rec["term"] or self._vocab_meta.get(tid, ("", None))[0],
-                "sim_score": rec["ctx_sim"] * size_penalty * domain_penalty,
+                "sim_score": ctx_sim * size_penalty,
                 "src_vids": src_vids,
                 "hit_count": len(src_vids),
                 "degree_w": degree_w,
@@ -1329,7 +1446,7 @@ class LabelRecallPath:
             expanded = self._expand_domain_dist(dist)
             degree_w_expanded = sum(expanded.values())
             target_degree_w = sum(expanded.get(str(d), 0) for d in active_domains)
-            # 领域纯度过滤（分档）：由硬过滤改为软惩罚（次方形式）
+            # 领域纯度过滤（分档）：首层 SIMILAR_TO 采用硬过滤
             domain_ratio = target_degree_w / degree_w_expanded if degree_w_expanded else 0.0
             if degree_w <= 40:
                 purity_min = 0.4
@@ -1357,18 +1474,16 @@ class LabelRecallPath:
                         "fail_reason": fail_reason,
                     })
                     pipeline["fail_domain_ratio_details"] = details
+                # 领域纯度不过关：直接丢弃，不进入首层候选
+                continue
 
-            # 大词 size_penalty 与领域纯度 domain_penalty（软上限，次方惩罚）
+            # 大词 size_penalty：防止高频大词统治排序
             T = float(VOCAB_P95_PAPER_COUNT)
             if degree_w > T:
                 x = min(float(degree_w) / T, 4.0)
                 size_penalty = (1.0 / x) ** 2
             else:
                 size_penalty = 1.0
-
-            eps = 0.05
-            r = max(domain_ratio, eps)
-            domain_penalty = r ** 2
 
             pipeline["n_final"] += 1
             rec = by_tid[tid]
@@ -1377,8 +1492,8 @@ class LabelRecallPath:
             rec["target_degree_w"] = target_degree_w
             rec["domain_span"] = domain_span
             rec["cov_j"] = 0.0
-            # 将惩罚作用在 sim_score 上，避免大词/低纯度词完全统治排序
-            rec["sim_score"] = float(rec.get("sim_score", 0.0) or 0.0) * size_penalty * domain_penalty
+            # 仅保留大词 size_penalty，不再额外按领域纯度降权（低纯度已在上方丢弃）
+            rec["sim_score"] = float(rec.get("sim_score", 0.0) or 0.0) * size_penalty
             results.append(rec)
         self._last_expansion_pipeline_stats = pipeline
 
@@ -1517,6 +1632,59 @@ class LabelRecallPath:
         self._apply_cluster_rank_decay(score_map)
 
         return score_map, term_map, idf_map
+
+    def _select_terms_for_paper(self, score_map, term_map, max_terms=16):
+        """
+        从全部打分学术词中选出一小撮高质量词用于论文检索。
+        仅依赖通用指标（weight / 领域纯度 / 语义相似度），避免硬编码具体词表。
+        """
+        if not score_map:
+            return []
+
+        debug_rows = {}
+        for row in (getattr(self, "_last_tag_purity_debug", None) or []):
+            tid = row.get("tid")
+            if tid is not None:
+                debug_rows[str(tid)] = row
+
+        ranked_tids = sorted(
+            score_map.keys(),
+            key=lambda t: float(score_map.get(t, 0.0) or 0.0),
+            reverse=True,
+        )
+
+        selected = []
+        for tid in ranked_tids:
+            tid_s = str(tid)
+            row = debug_rows.get(tid_s, {})
+            weight = float(score_map.get(tid, 0.0) or 0.0)
+            if weight <= 0.0:
+                continue
+
+            # 领域纯度：优先使用 capped_tag_purity，退化到 raw_tag_purity
+            tag_purity = float(row.get("capped_tag_purity") or row.get("raw_tag_purity") or 0.0)
+            if tag_purity and tag_purity < 0.45:
+                continue
+
+            # 语义相似度：cos_sim / task_anchor_sim / anchor_sim 取最大值
+            cos_sim = float(row.get("cos_sim") or 0.0)
+            anchor_sim = float(row.get("task_anchor_sim") or row.get("anchor_sim") or 0.0)
+            sim_val = max(cos_sim, anchor_sim)
+            if sim_val and sim_val < float(self.SEMANTIC_MIN):
+                continue
+
+            selected.append(int(tid))
+            if len(selected) >= int(max_terms):
+                break
+
+        if not selected:
+            # 安全回退：若所有过滤条件都过于严格，则退化为分最高的前若干个
+            fallback = []
+            for tid in ranked_tids[: min(8, len(ranked_tids))]:
+                fallback.append(int(tid))
+            return fallback
+
+        return selected
 
     def _apply_word_quality_penalty(self, rec, query_vector):
         """
@@ -1938,7 +2106,7 @@ class LabelRecallPath:
 
         # 1. 撤稿拦截
         if self._is_retracted(raw_title):
-            return 0, []
+            return 0, [], 0.0, {}
 
         # 2. 领域纯度降权：调用辅助函数计算基于“专注度”的领域系数
         # 解决了你担心的“涉及领域越多分越低”的问题
@@ -1948,7 +2116,7 @@ class LabelRecallPath:
             context['dominance']
         )
         if domain_coeff <= 0:
-            return 0, [], 0.0, {}, 0.0, {}
+            return 0, [], 0.0, {}
 
         # 3. 标签匹配与动态权重累加
         # 这里的 score_map 已经包含了之前修改的“词级领域跨度惩罚”
@@ -2109,12 +2277,14 @@ class LabelRecallPath:
 
     def _apply_cluster_rank_decay(self, score_map: dict) -> None:
         """
-        对每个 cluster 内部按 score 排序，做 head-tail 衰减：
+        对每个 cluster 内部按 score 排序，做 head-tail 衰减（仅同簇尾部微调）：
         - cluster_size <= 3: 不做衰减；
         - 若 anchor_sim >= 0.9: factor = 1.0；
         - 否则若 rank <= 4: factor = 1.0；
         - 否则: factor = 0.85 ** (rank - 4)。
         直接原地修改 score_map。
+        注意：簇内 rank decay 只做「同簇尾部微调」，不负责纠正簇头；簇头是否该排前面由
+        task_anchor_sim / task_advantage / main_role 决定。
         """
         if not getattr(self, "voc_to_clusters", None) or not score_map:
             return
@@ -2256,6 +2426,52 @@ class LabelRecallPath:
                 final_score = score_map.get(tid, 0.0)
                 clu_rank = cluster_factors.get(str(tid), 1.0)
                 print(f"  {i:2d}  {term:32s}  {_f(d.get('anchor_factor'),5):>5} {_f(d.get('job_penalty'),6):>6} {_f(d.get('domain_span'),5,0):>5} {_f(d.get('domain_span_penalty'),9):>9} {_f(d.get('cooc_span'),6):>6} {_f(d.get('cooc_purity'),6):>6} {_f(d.get('span_penalty'),7):>7} {_f(d.get('purity_bonus'),7):>7} {_f(d.get('cluster_factor'),7):>7} {_f(d.get('term_backbone'),7):>7} {_f(d.get('idf_val'),7):>7} {_f(d.get('dynamic_weight'),7):>7}  {_f(clu_rank,7):>7}  {final_score:.6f}")
+
+            # 日志 1：每个 top term 的簇信息（便于看 factor 是否与 task_anchor_sim 脱节）
+            print("\n【日志 1】Top term 簇信息：term | cluster_id | cluster_score | cluster_factor | task_anchor_sim | task_advantage")
+            for i, tid in enumerate(head30[:20], 1):
+                term = (term_map.get(tid, "") or "")[:28]
+                d = debug_by_tid.get(str(tid), {})
+                cluster_id = None
+                cluster_score = None
+                if getattr(self, "voc_to_clusters", None):
+                    clusters = self.voc_to_clusters.get(int(tid))
+                    if clusters:
+                        cid, csc = max(clusters, key=lambda x: x[1])
+                        cluster_id = cid
+                        cluster_score = round(csc, 4)
+                clu_fac = d.get("cluster_factor")
+                if clu_fac is None and hasattr(self, "_get_cluster_factor_for_term"):
+                    clu_fac = self._get_cluster_factor_for_term(int(tid))
+                print(f"  {i:2d}  {term:28s}  cid={cluster_id}  c_score={cluster_score}  clu_fac={_f(clu_fac,5):>5}  ta_sim={_f(d.get('task_anchor_sim'),5):>5}  ta_adv={_f(d.get('task_advantage'),5):>5}")
+
+            # 日志 3：每个命中簇的前 10 个成员（便于判断控制簇/平台簇/混合簇）
+            if getattr(self, "voc_to_clusters", None) and getattr(self, "cluster_members", None):
+                hit_cids = set()
+                for tid in head30:
+                    clusters = self.voc_to_clusters.get(int(tid))
+                    if clusters:
+                        cid, _ = max(clusters, key=lambda x: x[1])
+                        hit_cids.add(cid)
+                print("\n【日志 3】命中簇前 10 成员：cluster_id | 前 10 个 member term (及 task_anchor_sim)")
+                for cid in sorted(hit_cids):
+                    members = self.cluster_members.get(int(cid)) or []
+                    if not members:
+                        continue
+                    tid_to_score = {str(t): score_map.get(str(t), score_map.get(t, 0.0)) for t in members}
+                    sorted_members = sorted(
+                        members,
+                        key=lambda t: (tid_to_score.get(str(t), 0.0), (debug_by_tid.get(str(t), {}).get("task_anchor_sim") or 0.0)),
+                        reverse=True,
+                    )
+                    top10 = sorted_members[:10]
+                    terms_with_sim = []
+                    for t in top10:
+                        term = (term_map.get(str(t), term_map.get(t, "")) or "")[:24]
+                        ta_sim = debug_by_tid.get(str(t), {}).get("task_anchor_sim")
+                        ta_s = f"{ta_sim:.4f}" if ta_sim is not None else "N/A"
+                        terms_with_sim.append(f"{term}(ta={ta_s})")
+                    print(f"  cluster_id={cid}:  " + "  |  ".join(terms_with_sim))
 
             # F. 一行汇总：角色 + 关键差异量 + 最终分（便于快速扫一眼）
             print("\n【观测面板 汇总】Top30: term | base_score | task_core | abstract | carrier | noise_pen | main_role | role_margin | role_penalty | ta-ca | task_adv | final_score")
@@ -2536,7 +2752,8 @@ class LabelRecallPath:
         similar_to_pass = getattr(self, "_last_similar_to_pass", [])
         similar_to_pass_tids = sorted(set(r["tid"] for r in similar_to_pass if r.get("tid") is not None))
         similar_to_raw_tids = getattr(self, "_last_raw_candidate_tids", [])
-        final_term_ids_for_paper = sorted([int(k) for k in score_map.keys()])
+        # 精检：仅选取少量高质量学术词参与论文检索
+        final_term_ids_for_paper = self._select_terms_for_paper(score_map, term_map, max_terms=16)
         debug_check_tids = [(2280, "supervised learning"), (4045, "robot learning"), (152, "control (management)")]
         filter_closed_loop = {
             "similar_to_raw_tids": similar_to_raw_tids[:50],
