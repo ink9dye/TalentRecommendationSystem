@@ -30,6 +30,7 @@ from config import (
     CONFIG_DICT, JOB_INDEX_PATH, JOB_MAP_PATH,
     VOCAB_INDEX_PATH, VOCAB_MAP_PATH, DB_PATH, VOCAB_STATS_DB_PATH,
     VOCAB_P95_PAPER_COUNT, SIMILAR_TO_TOP_K, SIMILAR_TO_MIN_SCORE,
+    INDEX_DIR,
 )
 from src.utils.domain_config import (
     DOMAIN_DECAY_RATES,
@@ -142,10 +143,102 @@ class LabelRecallPath:
                 self.cluster_members = collections.defaultdict(list)
                 self.voc_to_clusters = collections.defaultdict(list)
 
+            # F. 概念簇中心向量：供 JD 语义 gating 使用
+            try:
+                centroids_path = os.path.join(INDEX_DIR, "cluster_centroids.npy")
+                if os.path.exists(centroids_path):
+                    centroids = np.load(centroids_path).astype(np.float32)
+                    if centroids.ndim == 2 and centroids.size > 0:
+                        norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+                        norms[norms == 0] = 1.0
+                        self.cluster_centroids = centroids / norms
+                    else:
+                        self.cluster_centroids = None
+                else:
+                    self.cluster_centroids = None
+            except Exception:
+                self.cluster_centroids = None
+
             print("[OK] 标签路资源初始化完成")
         except Exception as e:
             print(f"[Error] 资源加载失败: {e}")
             self.graph = None
+
+    def _compute_cluster_task_factors(self, query_vector):
+        """
+        基于当前 JD 的 query_vector 和簇中心向量，计算 cluster_task_factor。
+        使用 soft gate: factor = alpha + (1-alpha) * sim_clipped, sim_clipped ∈ [0, 1]。
+        """
+        # 若簇中心或 query 向量不可用，则关闭簇 gating
+        if getattr(self, "cluster_centroids", None) is None or query_vector is None:
+            self._cluster_task_factors = {}
+            return
+
+        alpha = 0.6  # 下界因子，可视为“最小簇权重”
+
+        q = np.asarray(query_vector, dtype=np.float32).flatten()
+        if q.size == 0:
+            self._cluster_task_factors = {}
+            return
+
+        q_norm = np.linalg.norm(q)
+        if q_norm == 0:
+            self._cluster_task_factors = {}
+            return
+        q = q / q_norm
+
+        sims = np.dot(self.cluster_centroids, q)  # shape = (K,)
+        sims = np.clip(sims, 0.0, 1.0)
+
+        factors = {}
+        for cid, sim in enumerate(sims):
+            factor = alpha + (1.0 - alpha) * float(sim)
+            factors[cid] = factor
+
+        self._cluster_task_factors = factors
+
+    def _get_cluster_factor_for_term(self, tid: int) -> float:
+        """
+        给定 term 的 voc_id，返回基于其所属簇的 cluster_task_factor：
+          - 概念/keyword：取 score>=cutoff 的主簇；
+          - industry 等其它：取 score>=cutoff 的 top2 按 score 加权平均；
+          - 无簇/无 gating 信息：返回 1.0。
+        """
+        factors = getattr(self, "_cluster_task_factors", None)
+        if not factors:
+            return 1.0
+
+        clusters = self.voc_to_clusters.get(int(tid))
+        if not clusters:
+            return 1.0
+
+        cutoff = 0.1
+        clusters = [(cid, sc) for cid, sc in clusters if sc >= cutoff]
+        if not clusters:
+            return 1.0
+
+        et = None
+        if hasattr(self, "_vocab_meta"):
+            meta = self._vocab_meta.get(int(tid))
+            if meta:
+                et = (meta[1] or "").lower()
+
+        # 学术概念/keyword：仅使用主簇
+        if et in ("concept", "keyword"):
+            cid, _ = max(clusters, key=lambda x: x[1])
+            return float(factors.get(cid, 1.0))
+
+        # 其它类型（如 industry）：对 top2 簇做 score 加权平均
+        sorted_cs = sorted(clusters, key=lambda x: x[1], reverse=True)
+        top = sorted_cs[:2]
+        num = den = 0.0
+        for cid, sc in top:
+            f = float(factors.get(cid, 1.0))
+            num += f * float(sc)
+            den += float(sc)
+        if den <= 0:
+            return 1.0
+        return num / den
 
     def _get_node_count(self, label):
         """统计图谱节点总数，作为计算 IDF 的分母"""
@@ -1358,6 +1451,8 @@ class LabelRecallPath:
             score_map[tid] = dynamic_weight
             term_map[tid] = rec.get("term") or ""
             idf_map[tid] = idf_val
+        # 词级权重计算完毕后，在簇内做一次 head–tail 衰减，平衡主干与尾部 term
+        self._apply_cluster_rank_decay(score_map)
 
         return score_map, term_map, idf_map
 
@@ -1505,6 +1600,7 @@ class LabelRecallPath:
         # 7. 【最终公式：立体的评价体系】
         # 骨架：sim * log(1+hits) * purity / log(1+paper_count)
         # 细节：轻化 IDF + 岗位惩罚 + 领域跨度 + 共鸣/共现修正
+        cluster_factor = self._get_cluster_factor_for_term(rec['tid'])
         dynamic_weight = (
                 term_backbone
                 * idf_val  # 轻化后的 IDF，只做微调
@@ -1513,6 +1609,7 @@ class LabelRecallPath:
                 * convergence_bonus  # 学术共鸣（与本次搜索词共现）加成
                 * span_penalty  # 共现伙伴跨多领域 → 降权
                 * purity_bonus  # 共现伙伴集中目标领域 → 加权
+                * cluster_factor  # JD–簇 语义 gating
         )
 
         return dynamic_weight, idf_val
@@ -1711,6 +1808,8 @@ class LabelRecallPath:
         阶段 2：学术词扩展。边路 + 语境向量路 + 簇扩展 + 共鸣/共现，返回候选列表（不计算最终词权）。
         返回: raw_candidates，每项含 tid, term, degree_w, target_degree_w, domain_span, cov_j, hit_count 等，供 stage3 统一公式。
         """
+        # 基于当前 query_vector 预先计算一次簇级 gating 因子，供词权重阶段使用
+        self._compute_cluster_task_factors(query_vector)
         return self._expand_semantic_map(
             [int(k) for k in anchor_skills.keys()],
             anchor_skills,
@@ -1719,6 +1818,39 @@ class LabelRecallPath:
             query_text=query_text,
             return_raw=True,
         )
+
+    def _apply_cluster_rank_decay(self, score_map: dict) -> None:
+        """
+        对每个 cluster 内部按 score 排序，做平滑的 head–tail 衰减：
+          - cluster_size <= 3: 不做衰减；
+          - 否则: 使用 1/log2(rank+2) 作为 rank 衰减因子（rank 从 0 开始）。
+        直接原地修改 score_map。
+        """
+        if not getattr(self, "voc_to_clusters", None) or not score_map:
+            return
+
+        cluster_to_tids = {}
+        for tid_str in score_map.keys():
+            try:
+                tid = int(tid_str)
+            except (TypeError, ValueError):
+                continue
+            clusters = self.voc_to_clusters.get(tid)
+            if not clusters:
+                continue
+            # rank 衰减只需主簇
+            cid, _ = max(clusters, key=lambda x: x[1])
+            cluster_to_tids.setdefault(cid, []).append(tid_str)
+
+        for cid, tids in cluster_to_tids.items():
+            if len(tids) <= 3:
+                continue  # 小簇不做 rank 衰减
+
+            tids_sorted = sorted(tids, key=lambda x: score_map.get(x, 0.0), reverse=True)
+            for rank, tid_str in enumerate(tids_sorted):
+                # 平滑衰减：1 / log2(rank+2)
+                factor = 1.0 / math.log2(rank + 2)
+                score_map[tid_str] *= factor
 
     def _stage3_word_weights(self, raw_candidates, query_vector):
         """
