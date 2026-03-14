@@ -1,12 +1,22 @@
 import json
+import math
 import sqlite3
-from typing import Dict, Any, Set
+from typing import Dict, Any, Set, List, Tuple
 
 import faiss
 import numpy as np
 
 from config import DB_PATH, VOCAB_P95_PAPER_COUNT
 from src.utils.tools import extract_skills
+
+# backbone_score 权重：in_jd_context / is_task_like 权重大于 job_freq，避免图热词再次主导
+BACKBONE_W_JOB_FREQ = 0.15
+BACKBONE_W_COV_J = 0.2
+BACKBONE_W_SPAN = 0.1
+BACKBONE_W_IN_JD = 0.35
+BACKBONE_W_TASK_LIKE = 0.35
+BACKBONE_W_SIM = 0.2  # query 向量相似度（可选）
+BACKBONE_FLOOR_FOR_BAODI = 0.5  # 层0 保底词的最低得分，确保参与排序后有机会进 TopN
 
 
 def clean_job_skills(skills_text: str) -> Set[str]:
@@ -17,6 +27,61 @@ def clean_job_skills(skills_text: str) -> Set[str]:
     if not skills_text or not isinstance(skills_text, str):
         return set()
     return set(extract_skills(str(skills_text)))
+
+
+def _in_jd_context(term_text: str, cleaned_terms: Set[str] | None) -> bool:
+    """
+    判断图谱中的短 term 是否与当前 JD 清洗得到的技能短语存在“语境重合”：
+      - 先看精确命中；
+      - 再看 term 是否作为子串出现在任一 cleaned term 中（例如 '路径规划' 命中
+        '轨迹规划与全身控制算法开发'）。
+    仅使用简单的子串规则，避免过早引入复杂相似度。
+    """
+    if not term_text or not cleaned_terms:
+        return False
+    t = term_text.lower().strip()
+    if not t:
+        return False
+    if t in cleaned_terms:
+        return True
+    # 过短的 term（单字）不做子串匹配，避免噪声放大
+    if len(t) <= 1:
+        return False
+    for jt in cleaned_terms:
+        if not jt:
+            continue
+        if t in jt:
+            return True
+    return False
+
+
+def _is_task_like(term_text: str) -> bool:
+    """
+    轻量判断 term 是否更像“任务骨干”而非泛 soft-skill：
+      - 命中运动学/动力学/轨迹/规划/仿真/识别/估计/控制/优化/参数等关键词之一。
+    """
+    if not term_text:
+        return False
+    t = term_text.lower()
+    task_kws = [
+        "运动学",
+        "动力学",
+        "trajectory",
+        "轨迹",
+        "planning",
+        "规划",
+        "仿真",
+        "simulation",
+        "识别",
+        "estimation",
+        "估计",
+        "control",
+        "控制",
+        "优化",
+        "optimization",
+        "参数",
+    ]
+    return any(k in t for k in task_kws)
 
 
 def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None) -> Dict[str, Any]:
@@ -109,104 +174,97 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
 
     melt_threshold = float(label.ANCHOR_MELT_COV_J)
     terms_before_melt = [r.get("term") or "" for r in rows]
-    rows_with_cov = []
-    melted_terms = []
-    dropped_terms = []
-    # 结合 JD 语境做轻量保活：在清洗后的 JD 短语中出现、且领域跨度较小的“长尾技术词”不应轻易被熔断。
-    # 这里通过 cleaned_terms + 领域跨度(domain_span) 共同决定是否放宽 job_freq 门槛，而不依赖具体词面。
+    melted_terms: List[Tuple[str, float]] = []
+    dropped_terms: List[Tuple[str, str, Any]] = []
 
+    # ---------- 层1：噪声硬过滤 ----------
+    # 只丢弃：过短、极端全行业泛词(cov_j >= melt_threshold)
+    n_original_rows = len(rows)
+    candidates_for_score: List[Tuple[Dict, float, int | None, bool, bool]] = []
     for r in rows:
         vid = int(r.get("vid"))
         g = global_count.get(vid, 0)
         cov_j = (g / total_j) if total_j else 0
-        if cov_j >= melt_threshold:
-            melted_terms.append((r.get("term") or "", round(cov_j, 4)))
-            dropped_terms.append((r.get("term") or "", "cov_j", round(cov_j, 4)))
-            continue
-
-        job_freq = int(r.get("job_freq") or 0)
-        # 对“长尾但领域跨度较小、且在当前 JD 语境中出现的技术词”做统计型保活：
-        # 仅当 term 确实出现在 JD cleaned_terms 中，且 domain_span 不大时，才放宽 job_freq 门槛。
-        span = stats_span.get(vid)
         term_text = (r.get("term") or "").strip()
-        lowered = term_text.lower()
-        in_jd_context = cleaned_terms is not None and lowered in cleaned_terms
-
-        # 对“长尾但与当前 JD 语境高度相关、且领域跨度有限”的技术词做保活：
-        # - 常规规则：job_freq >= ANCHOR_MIN_JOB_FREQ；
-        # - 例外：若 job_freq 较低，但在本次 JD 清洗结果中出现且 domain_span 不大，则视作稀疏任务锚点保留。
-        if job_freq < int(label.ANCHOR_MIN_JOB_FREQ):
-            if span is not None and span <= 3 and in_jd_context:
-                rows_with_cov.append((r, cov_j))
-            else:
-                dropped_terms.append((term_text, "job_freq", job_freq))
+        if len(term_text) <= 1:
+            dropped_terms.append((term_text, "length", len(term_text)))
             continue
+        if cov_j >= melt_threshold:
+            melted_terms.append((term_text, round(cov_j, 4)))
+            dropped_terms.append((term_text, "cov_j", round(cov_j, 4)))
+            continue
+        job_freq = int(r.get("job_freq") or 0)
+        span = stats_span.get(vid)
+        in_jd = cleaned_terms is not None and _in_jd_context(term_text, cleaned_terms)
+        task_like = _is_task_like(term_text)
+        candidates_for_score.append((r, cov_j, span, in_jd, task_like))
 
-        rows_with_cov.append((r, cov_j))
+    # ---------- 层0：保底标记 ----------
+    # 满足 in_jd + is_task_like + 非超级泛词(已过层1) 的 term 记为保底，后续 backbone_score 给下限
+    def _is_baodi(in_jd: bool, task_like: bool) -> bool:
+        return bool(in_jd and task_like)
 
-    terms_after_melt = [x[0].get("term") or "" for x in rows_with_cov]
+    # ---------- 层2：统一 backbone_score，一次排序 + 一次 TopN ----------
+    q = np.asarray(query_vector, dtype=np.float32).flatten() if query_vector is not None else None
+    scored: List[Tuple[float, Dict]] = []
+    for r, cov_j, span, in_jd, task_like in candidates_for_score:
+        job_freq = int(r.get("job_freq") or 0)
+        span_val = span if span is not None else 10
+        sim = 0.0
+        if q is not None and q.size > 0:
+            vid_str = str(r.get("vid"))
+            idx = label.vocab_to_idx.get(vid_str)
+            if idx is not None:
+                try:
+                    sim = float(np.dot(label.all_vocab_vectors[idx], q))
+                except Exception:
+                    pass
+        score = (
+            BACKBONE_W_JOB_FREQ * math.log(1 + job_freq)
+            + BACKBONE_W_COV_J * (1.0 - min(1.0, cov_j))
+            + BACKBONE_W_SPAN * (1.0 / (1 + span_val))
+            + (BACKBONE_W_IN_JD if in_jd else 0.0)
+            + (BACKBONE_W_TASK_LIKE if task_like else 0.0)
+            + BACKBONE_W_SIM * max(0.0, sim)
+        )
+        if _is_baodi(in_jd, task_like):
+            score = max(score, BACKBONE_FLOOR_FOR_BAODI)
+        scored.append((score, r))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top_n = int(getattr(label, "ANCHOR_FINAL_TOP_K", 20))
+    rows = [r for _, r in scored[:top_n]]
+
+    terms_after_melt = [r.get("term") or "" for r, *_ in candidates_for_score]
     stats = {
-        "before_melt": len(rows),
-        "after_melt": len(rows_with_cov),
+        "before_melt": n_original_rows,
+        "after_layer1": len(candidates_for_score),
         "melted_sample": melted_terms[:25],
         "melt_threshold": melt_threshold,
         "terms_before_melt": terms_before_melt,
         "terms_after_melt": terms_after_melt,
         "cleaned_terms_sample": list(cleaned_terms)[:50] if cleaned_terms else [],
         "dropped_terms": dropped_terms[:50],
+        "after_topN": len(rows),
+        "terms_after_topN": [r.get("term") or "" for r in rows],
     }
     label.debug_info.anchor_melt_stats = stats
     label._last_anchor_melt_stats = stats
     if getattr(label, "verbose", False):
         n_cov = sum(1 for _, reason, _ in dropped_terms if reason == "cov_j")
-        n_freq = sum(1 for _, reason, _ in dropped_terms if reason == "job_freq")
+        n_len = sum(1 for _, reason, _ in dropped_terms if reason == "length")
         print(
-            f"[Step2 Debug] REQUIRE_SKILL 原始 rows={len(rows)}，"
-            f"熔断/共识过滤后保留={len(rows_with_cov)}；cov_j 砍掉 {n_cov} 个，job_freq 砍掉 {n_freq} 个"
+            f"[Step2 Debug] REQUIRE_SKILL 原始 rows={n_original_rows}，"
+            f"层1 噪声过滤后候选={len(candidates_for_score)}；cov_j 砍掉 {n_cov} 个，length 砍掉 {n_len} 个"
         )
-        # 打印 2：每个 term 在熔断/频次过滤中的去留原因样本
         for term, reason, value in dropped_terms[:30]:
             print(f"[Step2 Debug] REQUIRE_SKILL 丢弃: term={term} reason={reason} value={value}")
-        for term in terms_after_melt[:30]:
-            print(f"[Step2 Debug] REQUIRE_SKILL 熔断后保留样本: term={term}")
-
-    rows_with_cov.sort(key=lambda x: (x[0].get("job_freq") or 0), reverse=True)
-    rows = [x[0] for x in rows_with_cov[: label.ANCHOR_FREQ_TOP_K]]
-    label.debug_info.anchor_melt_stats["after_top30"] = len(rows)
-    label.debug_info.anchor_melt_stats["terms_after_top30"] = [r.get("term") or "" for r in rows]
-
-    if cleaned_terms is not None:
-        rows = [r for r in rows if (r.get("term") or "").lower() in cleaned_terms]
-    label.debug_info.anchor_melt_stats["terms_after_cleaned"] = [r.get("term") or "" for r in rows]
+        print(f"[Step2 Debug] backbone_score 排序后 TopN={top_n} 样本: {[r.get('term') or '' for r in rows[:20]]}")
 
     if not rows:
         if getattr(label, "verbose", False):
-            print("[Step2 Debug] 熔断+Top30+清洗后无锚点可用。")
+            print("[Step2 Debug] 层2 排序+TopN 后无锚点可用。")
         return {}
-
-    if query_vector is not None:
-        q = np.asarray(query_vector, dtype=np.float32).flatten()
-        scored = []
-        for r in rows:
-            vid = str(r.get("vid"))
-            idx = label.vocab_to_idx.get(vid)
-            sim = -1.0
-            if idx is not None and q.size > 0:
-                try:
-                    sim = float(np.dot(label.all_vocab_vectors[idx], q))
-                except Exception:
-                    sim = -1.0
-            scored.append((sim, int(r.get("job_freq") or 0), r))
-        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        sim_min = float(label.ANCHOR_SIM_MIN)
-        scored_keep = [x for x in scored if (x[0] is not None and float(x[0]) >= sim_min)]
-        label.debug_info.anchor_melt_stats["sim_min"] = sim_min
-        label.debug_info.anchor_melt_stats["sim_kept"] = len(scored_keep)
-        label.debug_info.anchor_melt_stats["sim_dropped"] = max(0, len(scored) - len(scored_keep))
-        rows = [x[2] for x in scored_keep[: label.ANCHOR_FINAL_TOP_K]]
-    else:
-        rows = rows[: label.ANCHOR_FINAL_TOP_K]
-    label.debug_info.anchor_melt_stats["terms_after_sim"] = [r.get("term") or "" for r in rows]
 
     anchors = {str(r.get("vid")): {"term": r.get("term")} for r in rows}
 
