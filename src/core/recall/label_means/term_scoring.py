@@ -6,105 +6,59 @@ import numpy as np
 from src.core.recall.label_means import advanced_metrics as label_means_adv
 
 
-def _task_core_text_factor(term: str) -> float:
+def _vector_based_alignment_factors(
+    label,
+    tid_str: str,
+    query_vector,
+) -> Tuple[float, float]:
     """
-    仅基于 term 文本形态，对“任务骨干”类词做轻量增强，避免完全依赖复杂指标。
-    目标是优先扶起运动学/动力学/规划/控制/估计/仿真等核心技术词。
+    仅用向量相似度得到任务对齐因子与语境因子，无关键词。
+    task_alignment: 0.7~1.0 由 cos_sim(term, query) 决定；
+    context_factor: 0.85~1.0 由 anchor_sim(term, anchors) 决定。
     """
-    if not term:
+    task_f, ctx_f = 1.0, 1.0
+    idx = label.vocab_to_idx.get(tid_str) if getattr(label, "vocab_to_idx", None) else None
+    if idx is None:
+        return task_f, ctx_f
+    try:
+        term_vec = np.asarray(label.all_vocab_vectors[idx], dtype=np.float32).flatten()
+    except Exception:
+        return task_f, ctx_f
+    if query_vector is not None and term_vec.size > 0:
+        q = np.asarray(query_vector, dtype=np.float32).flatten()
+        if q.size == term_vec.size:
+            cos_sim = float(np.dot(term_vec, q))
+            cos_sim = max(-1.0, min(1.0, cos_sim))
+            task_f = 0.7 + 0.3 * max(0.0, cos_sim)
+    anchor_vecs = getattr(label, "_anchor_vectors", None)
+    if anchor_vecs is not None and anchor_vecs.size > 0 and term_vec.size > 0:
+        try:
+            anchor_vecs = np.asarray(anchor_vecs, dtype=np.float32)
+            if anchor_vecs.ndim == 1:
+                anchor_vecs = anchor_vecs.reshape(1, -1)
+            sims = np.dot(anchor_vecs, term_vec)
+            anchor_sim = float(np.mean(sims))
+            anchor_sim = max(-1.0, min(1.0, anchor_sim))
+            ctx_f = 0.85 + 0.15 * max(0.0, anchor_sim)
+        except Exception:
+            pass
+    return task_f, ctx_f
+
+
+def _source_credibility(rec: Dict[str, Any]) -> float:
+    """
+    按 Stage2 来源做可信度加权，无硬编码词表。
+    edge_and_ctx=1.0, edge_only=0.95, ctx_only=0.72, cluster 继承种子或 0.95。
+    """
+    s = (rec.get("source") or rec.get("origin") or "").strip().lower()
+    if s == "edge_and_ctx":
         return 1.0
-    t = term.lower()
-
-    core_hints = [
-        # 英文任务骨干
-        "kinematic",
-        "dynamic",
-        "motion",
-        "trajectory",
-        "planning",
-        "optimization",
-        "optimal control",
-        "mpc",
-        "lqr",
-        "ilqr",
-        "ddp",
-        "state estimation",
-        "estimation",
-        "observer",
-        "whole-body",
-        "whole body",
-        "sim-to-real",
-        "simulation",
-        # 中文任务骨干
-        "运动学",
-        "动力学",
-        "轨迹",
-        "规划",
-        "最优控制",
-        "状态估计",
-        "全身控制",
-        "仿真",
-        "仿真到实机",
-    ]
-    if any(h in t for h in core_hints):
-        return 1.2
-
-    # 次一级：robot + control/kinematics/trajectory 组合
-    if "robot" in t and any(x in t for x in ["control", "kinematic", "trajectory"]):
-        return 1.1
-
-    return 1.0
-
-
-def _robot_entity_text_penalty(term: str) -> float:
-    """
-    对“泛机器人实体词”（robot hand / modular robot / UGV / Robot vision 等）
-    做一档纯形态降权，避免其在缺乏任务骨干修饰时占据 Top。
-    """
-    if not term:
-        return 1.0
-    t = term.lower()
-
-    robot_like = any(x in t for x in ["robot", "robotic", "robotics", "vehicle", "arm", "hand", "ugv", "uav"])
-    task_like = any(
-        x in t
-        for x in [
-            "kinematic",
-            "dynamic",
-            "motion",
-            "trajectory",
-            "planning",
-            "optimization",
-            "control",
-            "estimation",
-            "whole-body",
-            "whole body",
-            "sim-to-real",
-            "仿真",
-            "运动学",
-            "动力学",
-            "轨迹",
-            "规划",
-            "最优控制",
-            "状态估计",
-        ]
-    )
-
-    # 机器人/载具实体，但缺少任务骨干修饰 → 视作泛实体
-    if robot_like and not task_like:
-        return 0.4
-
-    # 明显噪声控制词
-    noisy_control = [
-        "industrial control system",
-        "emotional control",
-        "psychological control",
-        "chemical control",
-    ]
-    if any(x in t for x in noisy_control):
-        return 0.3
-
-    return 1.0
+    if s == "edge_only":
+        return 0.95
+    if s == "ctx_only":
+        return 0.72
+    # cluster 或其它：继承自种子时已在 expand_with_clusters 中设为 edge_and_ctx/edge_only/ctx_only
+    return 0.95
 
 
 def calculate_final_weights(
@@ -233,11 +187,12 @@ def calculate_final_weights(
             dynamic_weight = sim_score / math.log(1.0 + degree_w) if degree_w else 0.0
             idf_val = math.log10(label.total_work_count / (degree_w + 1))
 
-        # 纯文本形态上的轻量调整：优先扶起任务骨干词，压制泛机器人实体词，
-        # 避免完全依赖复杂统计/向量指标。
+        # 仅用向量相似度调节：任务对齐(cos_sim)、语境(anchor_sim)，无关键词规则
         if dynamic_weight > 0.0:
-            dynamic_weight *= _task_core_text_factor(term_text)
-            dynamic_weight *= _robot_entity_text_penalty(term_text)
+            task_f, ctx_f = _vector_based_alignment_factors(label, tid_str, query_vector)
+            dynamic_weight *= task_f * ctx_f
+        # Stage2 来源可信度：edge_and_ctx > edge_only > ctx_only
+        dynamic_weight *= _source_credibility(rec)
 
         score_map[tid_str] = dynamic_weight
         term_map[tid_str] = term_text
@@ -324,6 +279,9 @@ def _apply_word_quality_penalty(label, rec: Dict[str, Any], query_vector):
     purity_term = tag_purity
 
     idf_term = _idf_backbone(label.total_work_count, degree_w_expanded)
+    # ctx_only 仅来自 JD/锚点向量扩展，对 IDF 做轻量折损，避免大泛词靠 idf 拉高
+    if (rec.get("source") or "").strip().lower() == "ctx_only":
+        idf_term *= 0.85
     idf_val = _smoothed_idf(degree_w, idf_term)
 
     cos_sim = 0.5
@@ -409,6 +367,7 @@ def _apply_word_quality_penalty(label, rec: Dict[str, Any], query_vector):
                     "term_backbone": round(term_backbone, 6),
                     "generic_penalty": round(generic_penalty, 6),
                     "dynamic_weight": round(dynamic_weight, 6),
+                    "source": (rec.get("source") or rec.get("origin") or "").strip(),
                 }
             )
         except Exception:

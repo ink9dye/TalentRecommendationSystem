@@ -63,7 +63,50 @@ def expand_semantic_map(
         rec["sim_score"] = sim_merged
         rec["src_vids"] = sorted(src_vids)
         rec["hit_count"] = hit
+        # 来源标记：供 Stage3 做来源可信度加权（无硬编码词表）
+        if rec_e and rec_c:
+            rec["source"] = "edge_and_ctx"
+        elif rec_e:
+            rec["source"] = "edge_only"
+        else:
+            rec["source"] = "ctx_only"
         raw_merged.append(rec)
+
+    # Stage2 三路调试：raw_edge / raw_ctx / raw_merged 各 top20，统一含 tid, term, sim_score, source/origin, degree_w, domain_span
+    _top = lambda lst, key="sim_score": sorted(lst, key=lambda r: float(r.get(key, 0.0) or 0.0), reverse=True)[:20]
+    label.debug_info.stage2_raw_edge_top20 = [
+        {
+            "tid": r.get("tid"),
+            "term": (r.get("term") or "")[:40],
+            "sim_score": round(float(r.get("sim_score", 0) or 0), 4),
+            "origin": "edge",
+            "degree_w": int(r.get("degree_w", 0) or 0),
+            "domain_span": int(r.get("domain_span", 0) or 0),
+        }
+        for r in _top(raw_edge)
+    ]
+    label.debug_info.stage2_raw_ctx_top20 = [
+        {
+            "tid": r.get("tid"),
+            "term": (r.get("term") or "")[:40],
+            "sim_score": round(float(r.get("sim_score", 0) or 0), 4),
+            "origin": "ctx",
+            "degree_w": int(r.get("degree_w", 0) or 0),
+            "domain_span": int(r.get("domain_span", 0) or 0),
+        }
+        for r in _top(raw_ctx)
+    ]
+    label.debug_info.stage2_raw_merged_top20 = [
+        {
+            "tid": r.get("tid"),
+            "term": (r.get("term") or "")[:40],
+            "sim_score": round(float(r.get("sim_score", 0) or 0), 4),
+            "source": r.get("source", ""),
+            "degree_w": int(r.get("degree_w", 0) or 0),
+            "domain_span": int(r.get("domain_span", 0) or 0),
+        }
+        for r in _top(raw_merged)
+    ]
 
     raw_results = raw_merged
     if not raw_results:
@@ -197,6 +240,16 @@ def expand_with_clusters(label, raw_results, domain_regex, topk_per_seed=5, weig
     if not cluster_expanded:
         return raw_results
 
+    # 种子 vid -> source，用于传播到 cluster 扩展出的新词
+    source_rank = {"edge_and_ctx": 2, "edge_only": 1, "ctx_only": 0}
+    seed_to_source = {}
+    for rec in raw_results:
+        try:
+            vid = int(rec["tid"])
+            seed_to_source[vid] = rec.get("source") or "edge_only"
+        except Exception:
+            continue
+
     new_vids = [vid for vid in cluster_expanded.keys() if vid not in seed_vids_set]
     if not new_vids:
         return raw_results
@@ -251,19 +304,27 @@ def expand_with_clusters(label, raw_results, domain_regex, topk_per_seed=5, weig
         r = max(domain_ratio, eps)
         domain_penalty = r ** 2
 
+        # 继承种子中最好的 source，供 Stage3 来源可信度加权
+        seed_vids_list = list(agg.get("seed_vids") or [])
+        best_source = "cluster"
+        for sid in seed_vids_list:
+            s = seed_to_source.get(int(sid))
+            if s and source_rank.get(s, -1) > source_rank.get(best_source, -1):
+                best_source = s
         raw_results.append(
             {
                 "tid": vid,
                 "term": term_map[vid],
                 "sim_score": agg["sim_score"] * size_penalty * domain_penalty,
                 "hit_count": agg["support"],
-                "seed_vids": sorted(list(agg.get("seed_vids") or [])),
+                "seed_vids": sorted(seed_vids_list),
                 "degree_w": degree_w,
                 "degree_w_expanded": degree_w_expanded,
                 "target_degree_w": target_degree_w,
                 "domain_span": domain_span,
                 "cov_j": 0.0,
                 "origin": "cluster",
+                "source": best_source,
             }
         )
 

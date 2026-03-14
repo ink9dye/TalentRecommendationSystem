@@ -1162,10 +1162,16 @@ class LabelRecallPath:
             anchor_vids=anchor_vids,
         )
 
-    def _select_terms_for_paper(self, score_map, term_map, max_terms=16):
+    SELECT_TAG_PURITY_MIN = 0.40
+    SELECT_SEMANTIC_MIN = 0.38
+    SELECT_CTX_ONLY_CAP = 5
+    SELECT_MIN_PAPER_COUNT = 3
+    SELECT_FALLBACK_TOP = 12
+
+    def _select_terms_for_paper(self, score_map, term_map, max_terms=20):
         """
         从全部打分学术词中选出一小撮高质量词用于论文检索。
-        仅依赖通用指标（weight / 领域纯度 / 语义相似度），避免硬编码具体词表。
+        依赖：weight、领域纯度、语义相似度、来源(ctx_only 上限)、图论文数下限、轻量覆盖(edge_and_ctx 至少 1)。
         """
         if not score_map:
             return []
@@ -1183,6 +1189,9 @@ class LabelRecallPath:
         )
 
         selected = []
+        ctx_only_count = 0
+        edge_and_ctx_passed = []
+
         for tid in ranked_tids:
             tid_s = str(tid)
             row = debug_rows.get(tid_s, {})
@@ -1190,26 +1199,45 @@ class LabelRecallPath:
             if weight <= 0.0:
                 continue
 
-            # 领域纯度：优先使用 capped_tag_purity，退化到 raw_tag_purity
             tag_purity = float(row.get("capped_tag_purity") or row.get("raw_tag_purity") or 0.0)
-            if tag_purity and tag_purity < 0.45:
+            if tag_purity and tag_purity < getattr(self, "SELECT_TAG_PURITY_MIN", 0.40):
                 continue
 
-            # 语义相似度：cos_sim / task_anchor_sim / anchor_sim 取最大值
             cos_sim = float(row.get("cos_sim") or 0.0)
             anchor_sim = float(row.get("task_anchor_sim") or row.get("anchor_sim") or 0.0)
             sim_val = max(cos_sim, anchor_sim)
-            if sim_val and sim_val < float(self.SEMANTIC_MIN):
+            if sim_val and sim_val < getattr(self, "SELECT_SEMANTIC_MIN", 0.38):
                 continue
+
+            degree_w = int(row.get("degree_w") or 0)
+            if degree_w < getattr(self, "SELECT_MIN_PAPER_COUNT", 3):
+                continue
+
+            source = (row.get("source") or row.get("origin") or "").strip().lower()
+            if source == "ctx_only":
+                if ctx_only_count >= getattr(self, "SELECT_CTX_ONLY_CAP", 5):
+                    continue
+                ctx_only_count += 1
+
+            if source == "edge_and_ctx":
+                edge_and_ctx_passed.append((tid, weight))
 
             selected.append(int(tid))
             if len(selected) >= int(max_terms):
                 break
 
+        if selected and edge_and_ctx_passed:
+            has_edge_and_ctx = any(
+                (debug_rows.get(str(t)) or {}).get("source", "").strip().lower() == "edge_and_ctx"
+                for t in selected
+            )
+            if not has_edge_and_ctx:
+                best_tid = edge_and_ctx_passed[0][0]
+                selected = selected[:-1] + [int(best_tid)]
+
         if not selected:
-            # 安全回退：若所有过滤条件都过于严格，则退化为分最高的前若干个
             fallback = []
-            for tid in ranked_tids[: min(8, len(ranked_tids))]:
+            for tid in ranked_tids[: min(getattr(self, "SELECT_FALLBACK_TOP", 12), len(ranked_tids))]:
                 fallback.append(int(tid))
             return fallback
 
@@ -1400,7 +1428,7 @@ class LabelRecallPath:
         score_map, term_map, idf_map = self._stage3_word_weights(raw_candidates, query_vector, anchor_vids=anchor_vids)
 
         # 精检：仅选取少量高质量学术词参与论文检索（其余用于打分与 debug），避免大泛词统治图检索规模
-        final_term_ids_for_paper = self._select_terms_for_paper(score_map, term_map, max_terms=16)
+        final_term_ids_for_paper = self._select_terms_for_paper(score_map, term_map, max_terms=20)
         # 将闭环信息提前挂到 debug_1，供 stage5_author_rank 复用/补全
         filter_closed_loop = debug_1.get("filter_closed_loop") or {}
         filter_closed_loop["final_term_ids_for_paper"] = final_term_ids_for_paper

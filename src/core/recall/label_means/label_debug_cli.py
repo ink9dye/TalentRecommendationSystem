@@ -96,6 +96,24 @@ def run_label_debug_cli() -> None:
             pass_tids = fcl.get("similar_to_pass_tids", [])
             final_tids = fcl.get("final_term_ids_for_paper", [])
             n_final = fcl.get("final_term_count", 0)
+            # Stage2 三路候选 Top20（edge / ctx / merged），统一表头：tid | term | sim_score | source/origin | degree_w | domain_span
+            di = getattr(l_path, "debug_info", None)
+            if di:
+                for name, attr in [
+                    ("raw_edge Top20", "stage2_raw_edge_top20"),
+                    ("raw_ctx Top20", "stage2_raw_ctx_top20"),
+                    ("raw_merged Top20", "stage2_raw_merged_top20"),
+                ]:
+                    rows = getattr(di, attr, None) or []
+                    print(f"【Stage2 {name}】tid | term | sim_score | source/origin | degree_w | domain_span")
+                    for r in rows[:20]:
+                        term = (r.get("term") or "")[:28]
+                        sim = r.get("sim_score", 0)
+                        src = r.get("source") or r.get("origin") or "-"
+                        deg_w = r.get("degree_w", 0)
+                        d_span = r.get("domain_span", 0)
+                        print(f"  {r.get('tid')} | {term:28s} | {sim:.4f} | {src:14s} | {deg_w:>7} | {d_span:>10}")
+
             print("【词过滤闭环】")
             print(f"  similar_to_raw_tids 数量: {len(raw_tids)}  前30: {raw_tids[:30]}")
             print(f"  similar_to_pass_tids 数量: {len(pass_tids)}  前30: {pass_tids[:30]}")
@@ -118,20 +136,61 @@ def run_label_debug_cli() -> None:
                     )
 
                 # 学术 Top term 命运表：查看这些学术词在 Stage2/Stage3 各环节的流转情况
+                # 统一用 int 做 membership，避免 tid 为 str 而列表为 int（或反之）导致误判
                 fcl = db.get("filter_closed_loop") or {}
-                raw_tids = set(fcl.get("similar_to_raw_tids", []) or [])
-                pass_tids = set(fcl.get("similar_to_pass_tids", []) or [])
-                final_tids = set(fcl.get("final_term_ids_for_paper", []) or [])
+                def _to_int_set(lst):
+                    s = set()
+                    for x in (lst or []):
+                        try:
+                            s.add(int(x))
+                        except (TypeError, ValueError):
+                            pass
+                    return s
+                raw_tids = _to_int_set(fcl.get("similar_to_raw_tids"))
+                pass_tids = _to_int_set(fcl.get("similar_to_pass_tids"))
+                final_tids = _to_int_set(fcl.get("final_term_ids_for_paper"))
                 print("【学术词命运表】tid | term | in_similar_raw | in_similar_pass | in_final_paper")
                 for r in top_contrib[:20]:
                     tid = r.get("tid")
                     term = (r.get("term") or "")[:28]
-                    in_raw = tid in raw_tids
-                    in_pass = tid in pass_tids
-                    in_final = tid in final_tids
+                    tid_int = int(tid) if tid is not None else None
+                    in_raw = tid_int in raw_tids if tid_int is not None else False
+                    in_pass = tid_int in pass_tids if tid_int is not None else False
+                    in_final = tid_int in final_tids if tid_int is not None else False
                     print(
                         f"  {tid:<6} | {term:28s} | {str(in_raw):>13} | {str(in_pass):>15} | {str(in_final):>13}"
                     )
+
+                # Stage3 来源回溯表：Top 学术词的 source + tag_purity / cos_sim / anchor_sim，便于判断坏词来自 edge 还是 ctx
+                di2 = getattr(l_path, "debug_info", None)
+                if di2:
+                    exp_raw = getattr(di2, "expansion_raw_results", None) or []
+                    tag_debug = getattr(di2, "tag_purity_debug", None) or []
+                    source_by_tid = {}
+                    for rec in exp_raw:
+                        t = rec.get("tid")
+                        if t is not None:
+                            source_by_tid[str(t)] = rec.get("source") or rec.get("origin") or "-"
+                    debug_by_tid = {}
+                    for row in tag_debug:
+                        t = row.get("tid")
+                        if t is not None:
+                            debug_by_tid[str(t)] = row
+                    print("【Stage3 来源回溯表】term | tid | source | tag_purity | cos_sim | anchor_sim | final_weight")
+                    for r in top_contrib[:20]:
+                        tid_s = str(r.get("tid"))
+                        term = (r.get("term") or "")[:24]
+                        src = source_by_tid.get(tid_s, "-")
+                        row2 = debug_by_tid.get(tid_s, {})
+                        tp = row2.get("capped_tag_purity") or row2.get("raw_tag_purity")
+                        tp_s = f"{float(tp):.3f}" if tp is not None else "-"
+                        cos = row2.get("cos_sim")
+                        cos_s = f"{float(cos):.3f}" if cos is not None else "-"
+                        anc = row2.get("anchor_sim") or row2.get("task_anchor_sim")
+                        anc_s = f"{float(anc):.3f}" if anc is not None else "-"
+                        fw = r.get("final_weight", 0)
+                        fw_s = f"{float(fw):.4f}" if fw is not None else "-"
+                        print(f"  {term:24s} | {tid_s:>6} | {src:14s} | {tp_s:>9} | {cos_s:>6} | {anc_s:>8} | {fw_s}")
 
             vocab_count = db.get("recall_vocab_count", 0)
             w_count = db.get("work_count", 0)
