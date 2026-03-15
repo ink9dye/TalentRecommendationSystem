@@ -10,6 +10,7 @@
 - **[目录树](#目录树)**
 - **[整体架构与数据流](#整体架构与数据流)**
 - **[知识图谱构建详解](#知识图谱构建详解)**
+  - [6. 数据表与图模型速查](#6-数据表与图模型速查)
 - **[三路召回与文本转向量详解](#三路召回与文本转向量详解)**
 - **[索引构建详解](#索引构建详解)**
 - **[KGAT-AX 模型详解](#kgat-ax-模型详解)**
@@ -332,6 +333,53 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 3. **语义桥接的 type**：SIMILAR_TO 只连 `entity_type` 不同的词对，所以 vocabulary 的 `entity_type`（如 concept / keyword / industry）必须正确填写，否则可能几乎没有桥接边。  
 4. **增量与顺序**：每次运行 pipeline 会重置 `semantic_bridge_sync` 的 marker，但其他任务（如 topology、job_skill）用各自 marker 增量；若中途改过 builder 逻辑或 config，需要视情况清空 Neo4j 或重置对应 marker 再跑。
 
+### 6. 数据表与图模型速查
+
+以下为查库、写查询与扩展 ETL 时的快速参考；完整建表与索引见 `src/infrastructure/crawler/use_openalex/database.py`、`merge_database.py`、`build_vocab_stats_index.py`。
+
+**SQLite 主库（config 中 `DB_PATH`）**
+
+| 表名 | 主要字段 | 用途 |
+|------|----------|------|
+| **works** | work_id, title, year, citation_count, concepts_text, keywords_text, domain_ids | 论文主表；领域过滤、共现、HAS_TOPIC 数据源 |
+| **abstracts** | work_id, full_text_en | 摘要文本；向量路摘要索引 |
+| **vocabulary** | voc_id, term, entity_type | 统一词表（概念/关键词/岗位技能）；REQUIRE_SKILL / HAS_TOPIC / SIMILAR_TO |
+| **authors** | author_id, name, h_index, works_count, cited_by_count | 作者画像；精排 AX、展示 |
+| **authorships** | ship_id, work_id, author_id, inst_id, source_id, pos_index, is_corresponding, is_alphabetical | 署名关系；拓扑、AUTHORED 权重、协作索引 |
+| **institutions** | inst_id, name, works_count, cited_by_count | 机构；PRODUCED_BY、特征索引 |
+| **sources** | source_id, display_name, type, works_count, cited_by_count | 发表渠道；PUBLISHED_IN |
+| **jobs** | securityId, job_name, skills, description, crawl_time, domain_ids | 岗位；标签路锚点、Job 向量索引；domain_ids 可由后续脚本回填 |
+
+**SQLite 词汇统计库（`VOCAB_STATS_DB_PATH`，如 vocab_stats.db）**
+
+| 表名 | 主要字段 | 用途 |
+|------|----------|------|
+| **vocabulary_domain_stats** | voc_id, work_count, domain_span, domain_dist, updated_at | 词关联论文数、领域跨度、各领域分布；标签路领域纯度/熔断 |
+| **vocabulary_cooccurrence** | term_a, term_b, freq | 词对共现频次；与 KG CO_OCCURRED_WITH 一致；标签路 cooc_span/cooc_purity |
+
+**Neo4j 节点与边速查**
+
+| 节点标签 | 主键 | 主要属性 |
+|----------|------|----------|
+| Author | id | name, h_index, works_count, citations |
+| Work | id | title, name, year, citations, domain_ids |
+| Vocabulary | id | term, type |
+| Institution | id | name, works_count, citations |
+| Source | id | name, type, works_count, citations |
+| Job | id | name, skills, description, domain_ids |
+
+| 边类型 | 方向 | 边主要属性 |
+|--------|------|------------|
+| AUTHORED | Author→Work | pos_index, pub_year, is_corresponding, **pos_weight** |
+| PRODUCED_BY | Work→Institution | 无 |
+| PUBLISHED_IN | Work→Source | 无 |
+| HAS_TOPIC | Work→Vocabulary | 无 |
+| REQUIRE_SKILL | Job→Vocabulary | 无 |
+| CO_OCCURRED_WITH | Vocabulary–Vocabulary | **weight** |
+| SIMILAR_TO | Vocabulary→Vocabulary | **score** |
+
+（边权重含义见上文「3. 边类型、边属性与边权重」。）
+
 ---
 
 ## 三路召回与文本转向量详解
@@ -401,6 +449,28 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 
 5. **Stage5 作者排序**（`label_pipeline/stage5_author_rank`，辅以 `works_to_authors`）  
    将论文级得分聚合为作者级得分（如按论文得分之和或最佳论文贡献比例过滤）；按作者总分排序，取前 recall_limit 个 author_id 及耗时。调试信息通过 `RecallDebugInfo` / `last_debug_info` 输出（领域探测、锚点、学术词质量、论文/作者规模等）。
+
+**标签路可调类常量（LabelRecallPath）**
+
+以下为 `label_path.py` 中 `LabelRecallPath` 的类常量，调参与复现时可参考。完整定义见 `src/core/recall/label_path.py`。
+
+| 常量 | 典型值 | 含义 |
+|------|--------|------|
+| **DETECT_JOBS_TOP_K** | 20 | 领域探测时在 Job 索引检索的岗位数 |
+| **CANDIDATE_DOMAINS_TOP_K** | 5 | 候选领域数量（按 Job 统计） |
+| **ACTIVE_DOMAINS_TOP_K** | 3 | 最终参与召回的领域数 |
+| **ANCHOR_JOBS_TOP_K** | 20 | 参与锚点提取的 Top 岗位数 |
+| **ANCHOR_FREQ_TOP_K** | 30 | 熔断后按频次取的词数 |
+| **ANCHOR_FINAL_TOP_K** | 20 | 语义重排后保留的锚点数 |
+| **ANCHOR_MELT_COV_J** | 0.03 | 锚点熔断：cov_j ≥ 3% 的技能不参与 |
+| **JD_VOCAB_TOP_K** | 20 | JD 向量在 vocabulary 索引上补充锚点的 Top-K |
+| **ANCHOR_SIM_MIN** | 0.4 | 锚点语义重排的最小相似度，低于则丢弃 |
+| **ANCHOR_MIN_JOB_FREQ** | 2 | 技能至少出现在几个命中岗位中才保留 |
+| **ANCHOR_TERM_SIM_MIN** | 0.45 | 学术词与任意锚点最大余弦相似度下限，低于则降权 |
+| **AUTHOR_BEST_PAPER_MIN_RATIO** | 0.05 | 作者最佳论文贡献低于全局最大此比例则不出现在排序 |
+| **SEMANTIC_POWER** | 3 | 词权重中语义因子 cos_sim 的次方 |
+| **ANCHOR_BASE** / **ANCHOR_GAIN** | 0.35, 0.65 | 词权重中锚点相关系数 |
+| **SPAN_PENALTY_EXPONENT** | 0.35 | 领域跨度惩罚 (1+domain_span)^exp 的指数 |
 
 ---
 
