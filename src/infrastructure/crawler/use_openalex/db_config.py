@@ -14,26 +14,8 @@ DB_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "academic_dataset_v5.db")
 DATA_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "academic_dataset_v5_exports"))
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# 3. 领域 ID 配置
-FIELDS = {
-    "1": ("Computer_science", "C41008148"),
-    "2": ("Medicine", "C71924100"),
-    "3": ("Political_science", "C17744445"),
-    "4": ("Engineering", "C127413603"),
-    "5": ("Physics", "C121332964"),
-    "6": ("Materials_science", "C192562407"),
-    "7": ("Biology", "C86803240"),
-    "8": ("Geography", "C205649164"),
-    "9": ("Chemistry", "C185592680"),
-    "10": ("Business", "C144133560"),
-    "11": ("Sociology", "C144024400"),
-    "12": ("Philosophy", "C138885662"),
-    "13": ("Environmental_science", "C39432304"),
-    "14": ("Mathematics", "C33923547"),
-    "15": ("Psychology", "C15744967"),
-    "16": ("Geology", "C127313418"),
-    "17": ("Economics", "C162324750")
-}
+# 3. 领域配置（统一由 src.utils.domain_config 维护，此处仅兼容 re-export）
+from src.utils.domain_config import OPENALEX_FIELDS as FIELDS
 
 # 4. API 性能配置
 BASE_DELAY = 0.1

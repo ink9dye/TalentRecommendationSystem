@@ -1,15 +1,14 @@
 import sqlite3
 import logging
-from src.infrastructure.crawler.use_openalex.db_config import DB_PATH, FIELDS
+from src.infrastructure.crawler.use_openalex.db_config import DB_PATH
+from src.utils.domain_config import NAME_EN_TO_DOMAIN_ID
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("DomainBackfiller")
 
 
 def run_local_backfill():
-    # 构建映射表：{"Computer science": "1", "Medicine": "2", ...}
-    # 注意：FIELDS 里的名称带有下划线，需处理为空格以对齐 OpenAlex display_name
-    name_to_id = {v[0].replace("_", " ").lower(): k for k, v in FIELDS.items()}
+    name_to_id = NAME_EN_TO_DOMAIN_ID
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()

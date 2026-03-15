@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 from alex_utils import generate_work_id, clean_id, safe_get
 from database import DatabaseManager
-from src.infrastructure.crawler.use_openalex.db_config import FIELDS # 导入 17 领域配置
+from src.utils.domain_config import NAME_EN_TO_DOMAIN_ID
 
 logger = logging.getLogger(__name__)
 
@@ -13,13 +13,8 @@ class DataProcessor:
         self.db = db
         self.today = datetime.now().date()
 
-        # --- 关键新增：预构建领域名称到 ID 的映射表，提升匹配效率 ---
-        # 映射示例: {"computer science": "1", "medicine": "2", ...}
-        # 将 FIELDS 中的下划线替换为空格并转为小写，以匹配 OpenAlex 的 display_name
-        self.domain_name_to_id = {
-            v[0].replace("_", " ").lower(): k
-            for k, v in FIELDS.items()
-        }
+        # 归一化英文名 -> 领域 ID，与 OpenAlex display_name 匹配（统一由 domain_config 维护）
+        self.domain_name_to_id = NAME_EN_TO_DOMAIN_ID
 
     def _extract_domain_ids(self, concepts: list) -> str:
         """

@@ -27,6 +27,7 @@
   - [辅助数据脚本与配置](#辅助数据脚本与配置)
 - **[技术栈综述](#技术栈综述)**
 - **[环境准备与安装](#环境准备与安装)**
+  - [0. 配置项速查（config.py）](#0-配置项速查configpy)
 - **[运行指南](#运行指南)**
   - [1. 快速体验（已有数据与索引）](#1-快速体验已有数据与索引)
   - [2. 从零构建完整数据与模型管线](#2-从零构建完整数据与模型管线)
@@ -58,8 +59,27 @@ TalentRecommendationSystem-master/
     │   │   ├── input_to_vector.py  # OpenVINO 加速的 SBERT 文本编码器
     │   │   ├── total_recall.py     # 多路召回总控（向量 / 标签 / 协同）
     │   │   ├── vector_path.py      # 向量路：Faiss + 向量索引召回作者
-    │   │   ├── label_path.py       # 标签路：基于 Job-Skill 与 Vocabulary 的图谱召回
-    │   │   └── collaboration_path.py # 协同路：基于本地协作索引的协同召回
+    │   │   ├── label_path.py       # 标签路入口：编排五阶段流水线（label_pipeline + label_means）
+    │   │   ├── label_path_pre.py   # 标签路旧版/备用实现（内部或历史参考）
+    │   │   ├── works_to_authors.py # 论文级得分聚合为作者级，供标签路 Stage5 使用
+    │   │   ├── diagnose_embedding_neighbors.py # 嵌入邻居诊断工具（开发与调试用）
+    │   │   ├── collaboration_path.py # 协同路：基于本地协作索引的协同召回
+    │   │   ├── label_means/        # 标签路子模块：基础设施、锚点、扩展、词/论文打分与调试
+    │   │   │   ├── infra.py        # 资源管理：Neo4j / Faiss / vocab_stats.db / 簇中心等
+    │   │   │   ├── base.py
+    │   │   │   ├── label_anchors.py
+    │   │   │   ├── label_expansion.py
+    │   │   │   ├── term_scoring.py
+    │   │   │   ├── paper_scoring.py
+    │   │   │   ├── simple_factors.py
+    │   │   │   ├── advanced_metrics.py
+    │   │   │   └── label_debug_cli.py
+    │   │   └── label_pipeline/      # 标签路五阶段流水线实现
+    │   │       ├── stage1_domain_anchors.py   # 领域探测与工业侧锚点提取
+    │   │       ├── stage2_expansion.py       # 语义扩展（SIMILAR_TO、共现/领域指标）
+    │   │       ├── stage3_term_filtering.py  # 词过滤与权重（IDF、纯度、语义守门等）
+    │   │       ├── stage4_paper_recall.py    # 论文召回与贡献度
+    │   │       └── stage5_author_rank.py     # 作者排序与截断
     │   └── ranking/
     │       ├── ranking_engine.py   # 精排引擎：融合召回与 KGAT 打分
     │       ├── rank_scorer.py      # KGAT 子空间打分逻辑
@@ -67,7 +87,11 @@ TalentRecommendationSystem-master/
     ├── interface/
     │   └── app.py                  # 主 Streamlit 前端（JD 输入 / 结果展示）
     ├── utils/
-    │   └── domain_utils.py         # 领域 ID 解析 / 正则构造 / 交集判定工具
+    │   ├── domain_config.py       # 领域常量唯一数据源（17 领域、DOMAIN_MAP、decay_rate 等）
+    │   ├── domain_detector.py     # 领域探测器：Query → Job 索引 + Neo4j 推断领域集合
+    │   ├── domain_utils.py        # 领域 ID 解析 / 正则构造 / 交集判定（DomainProcessor）
+    │   ├── time_features.py       # 论文与作者时序权重（recency、time_decay 等）
+    │   └── tools.py               # 技能清洗、JD 句式/停用词、get_decay_rate_for_domains 等
     ├── infrastructure/
     │   ├── mock_data.py            # Streamlit Demo 用到的模拟人才与图谱数据
     │   ├── database/
@@ -359,27 +383,24 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 ### 3. 标签路召回（label_path.py — LabelRecallPath）
 
 **核心目的**  
-走「**岗位技能 → 学术词 → 论文 → 作者**」的图谱路径，用知识图谱 + 多维度打分，找出与 JD 技能要求在语义和共现上都对齐的学术词，再只保留领域垂直、论文质量高的论文与作者；强调硬技能/概念对齐，并抑制泛词、万金油论文和弱相关论文。
+走「**岗位技能 → 学术词 → 论文 → 作者**」的图谱路径，用知识图谱 + 多维度打分，找出与 JD 技能要求在语义和共现上都对齐的学术词，再只保留领域垂直、论文质量高的论文与作者；强调硬技能/概念对齐，并抑制泛词、万金油论文和弱相关论文。实现上采用**五阶段流水线**（`label_pipeline`）与**标签子模块**（`label_means`），基础设施与索引（Neo4j、Faiss、vocab_stats.db、簇中心等）由 `label_means.infra` 统一加载与管理。
 
 **使用的方法（按阶段）**
 
-1. **领域探测 `_detect_domain_context(query_vector)`**  
-   用 Job 的 Faiss 索引对 query_vector 做 Top-10 检索，得到最相似的 10 个岗位 ID；在 Neo4j 里查这些 Job 的 domain_ids，统计各领域出现次数；取 Top-3 领域作为 inferred_domains，并算主导领域占比 dominance，供后续领域纯度和权重用。
+1. **Stage1 领域与锚点**（`label_pipeline/stage1_domain_anchors`，辅以 `label_means.label_anchors`）  
+   领域探测：用 Job 的 Faiss 索引对 query_vector 做 Top-K 检索，在 Neo4j 查这些 Job 的 domain_ids，统计各领域出现次数，取 Top-3 作为 active_domains，并算 dominance。锚点提取：从 Top 岗位做 (Job)-[:REQUIRE_SKILL]->(Vocabulary)，统计词被多少 Job 引用（cov_j）；**3% 熔断**：只保留 cov_j < 0.03 的技能词；按频次与语义重排取前若干作为工业侧锚点；可选地用 JD 向量在 vocabulary 索引上做 Top-K 补充锚点。
 
-2. **锚点技能提取 `_extract_anchor_skills(target_job_ids)`**  
-   在 Neo4j 中对上述 Top 岗位（如前 5 个）做 (Job)-[:REQUIRE_SKILL]->(Vocabulary)，统计每个词被多少 Job 引用，算 cov_j = count/total_job；**1% 熔断**：只保留 cov_j < 0.01 的技能词，过滤“沟通、办公”等泛词；按 cov_j 升序取前 50 个词作为工业侧锚点（高含金量、偏稀缺技能）。
+2. **Stage2 语义扩展**（`label_pipeline/stage2_expansion`，辅以 `label_means.label_expansion`、`advanced_metrics`）  
+   从锚点词出发沿 (Vocabulary)-[:SIMILAR_TO]-(Vocabulary) 找邻居学术词；对每个邻居统计 hit_count、cov_j；在 vocabulary_domain_stats 中查 work_count、domain_span、domain_dist，只保留在目标领域有产出的词。**学术共鸣**：对候选词集合查 CO_OCCURRED_WITH，resonance_score 为共现边 weight 之和。**共现领域指标**（vocab_stats.db）：为每个候选词算 **cooc_span**（共现伙伴平均领域跨度）与 **cooc_purity**（共现伙伴在目标领域的论文占比），万金油词用 cooc_span 降权，领域专精词用 cooc_purity 加权。
 
-3. **语义扩展 `_expand_semantic_map()`**  
-   - **图扩展** `_query_expansion_with_topology`：从锚点词出发沿 (Vocabulary)-[:SIMILAR_TO]-(Vocabulary) 找邻居学术词；对每个邻居统计「被多少个不同锚点命中」hit_count、在 Job 侧的覆盖率 cov_j；在 SQLite 的 vocabulary_domain_stats 里查 work_count、domain_span、domain_dist，只保留在目标领域里有产出的词。  
-   - **学术共鸣** `_calculate_academic_resonance`：对当前候选词集合在 Neo4j 里查 CO_OCCURRED_WITH，对每个词汇总共现边的 weight 之和作为 resonance_score（与其它候选词在论文里经常一起出现的词加分，即「单词协作」）。  
-   - **共现领域指标** `_get_cooccurrence_domain_metrics`：从 vocab_stats.db 的 vocabulary_cooccurrence 与 vocabulary_domain_stats（及主库 vocabulary）为每个候选词算 **cooc_span**（共现伙伴的平均领域跨度）与 **cooc_purity**（共现伙伴在目标领域的论文占比）。与各种领域的词都共现 → 万金油 → 用 cooc_span 降权；只跟特定领域的词共现 → 专精 → 用 cooc_purity 加权。  
-   - **词权重** `_apply_word_quality_penalty`：IDF、岗位惩罚（cov_j 过高压分）、领域纯度与跨度、共鸣熔断/加成、收敛奖励（多锚点命中 + 共现强）；**SBERT 语义守门员**：semantic_factor = max(0, cos_sim)^6；**共现领域**：span_penalty = 1/(1+log1p(cooc_span))（万金油降权）、purity_bonus = 1+log1p(cooc_purity)（领域专精加权）；最终公式：Weight = (IDF/job_penalty) × purity² × (convergence_bonus/span) × semantic_factor × span_penalty × purity_bonus。
+3. **Stage3 词过滤与权重**（`label_pipeline/stage3_term_filtering`，辅以 `label_means.term_scoring`、`simple_factors`）  
+   词级打分：IDF、岗位惩罚（cov_j 过高则压分）、领域纯度与跨度、共鸣与收敛奖励；**SBERT 语义守门**：semantic_factor = max(0, cos_sim)^n；**共现领域**：span_penalty（万金油降权）、purity_bonus（领域专精加权）；无硬编码过滤：与任意锚点的最大余弦相似度低于阈值则降权，防止 ML 簇劫持。最终词权重公式综合上述因子。
 
-4. **图谱反查论文与作者**  
-   Cypher 从带权重的 Vocabulary 集合出发沿 (Vocabulary)<-[:HAS_TOPIC]-(Work) 找论文（可选 w.domain_ids =~ $regex）；再 (Work)<-[auth_r:AUTHORED]-(Author)；对论文做 1% 熔断（degree_w/total_w < 0.01）；为每篇论文收集命中的 (vid, idf_weight)、auth_r.pos_weight、title、year、domains 等，用于下一步作者级打分。
+4. **Stage4 论文召回**（`label_pipeline/stage4_paper_recall`，辅以 `label_means.paper_scoring`）  
+   Cypher 从带权 Vocabulary 集合沿 (Vocabulary)<-[:HAS_TOPIC]-(Work) 找论文（可选 w.domain_ids 正则过滤）；再 (Work)<-[auth_r:AUTHORED]-(Author)。对论文做 **3% 熔断**（degree_w/total_w < 0.03 则剔除）；为每篇论文收集命中的 (vid, idf_weight)、auth_r.pos_weight、title、year、domains 等。**论文贡献度**：撤稿拦截、领域纯度、标签得分累加、综述降权、紧密度（命中词向量相似度）、时序与署名（time_decay × pos_weight），单篇得分 = 各项相乘。
 
-5. **论文贡献度 `_compute_contribution(paper, context)`**  
-   撤稿拦截；**领域纯度**（论文领域与目标无交集则 0，有交集则 (目标领域数/论文涉及领域数)^4）；标签得分累加（score_map[vid] × hit.idf）；综述降权（survey/overview/review × 0.1，多标签 1/n²）；**紧密度**：命中词在向量空间两两余弦相似度均值，(1+proximity)^n 加成；时序与署名：time_decay = decay_rate^year_diff，再乘 auth_r.pos_weight；单篇论文得分 = 上述各项相乘；作者得分 = 其所有论文得分之和，按作者总分排序取前 recall_limit 个 author_id。
+5. **Stage5 作者排序**（`label_pipeline/stage5_author_rank`，辅以 `works_to_authors`）  
+   将论文级得分聚合为作者级得分（如按论文得分之和或最佳论文贡献比例过滤）；按作者总分排序，取前 recall_limit 个 author_id 及耗时。调试信息通过 `RecallDebugInfo` / `last_debug_info` 输出（领域探测、锚点、学术词质量、论文/作者规模等）。
 
 ---
 
@@ -431,7 +452,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 |------|----------|----------|
 | **文本转向量** | JD → 与索引一致的语义向量，并强化核心技能词 | 动态词库、自共振增强、OpenVINO SBERT、mean pooling、L2 归一化 |
 | **向量路** | 按「与 JD 最像的论文」找作者 | 摘要 Faiss 检索、领域硬过滤、论文序→作者序映射 |
-| **标签路** | 按「岗位技能→学术词→论文→作者」+ 多维度打分 | 领域探测、锚点 1% 熔断、SIMILAR_TO 扩展、共现共鸣、词权重公式、论文贡献度（纯度/紧密度/时序/署名）、作者聚合 |
+| **标签路** | 按「岗位技能→学术词→论文→作者」+ 多维度打分 | Stage1 领域与锚点（3% 熔断、JD 补充）→ Stage2 语义扩展（SIMILAR_TO、共现/领域指标）→ Stage3 词过滤与权重（IDF、纯度、语义守门）→ Stage4 论文召回（贡献度、时序）→ Stage5 作者排序；依赖 `label_means` 与 `label_pipeline` 子模块；基础设施由 `label_means.infra` 管理 |
 | **协同路** | 由种子作者扩展合作者 | 种子=V+L Top100、协作表双向查询、score 聚合、按总分排序 |
 | **总控** | 单次编码、三路并行、统一排序 | Query 领域扩展、RRF 融合、路径权重 1.2/1.0/0.6 |
 
@@ -518,7 +539,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 ### 4. 词汇统计索引（build_vocab_stats_index.py，领域分布 + 共现）
 
 **目的**  
-为**标签路召回**提供「每个学术词」的领域统计：**work_count (degree_w)**：该词关联多少篇论文；**domain_span**：涉及多少个不同领域；**domain_dist**：各领域论文数分布（如 `{"1":100,"4":50}`）。用于：领域纯度、领域跨度惩罚（跨领域多的词降权）、以及和 Neo4j 的 HAS_TOPIC 一起做 1% 熔断、IDF/稀缺度等计算。
+为**标签路召回**提供「每个学术词」的领域统计：**work_count (degree_w)**：该词关联多少篇论文；**domain_span**：涉及多少个不同领域；**domain_dist**：各领域论文数分布（如 `{"1":100,"4":50}`）。用于：领域纯度、领域跨度惩罚（跨领域多的词降权）、以及和 Neo4j 的 HAS_TOPIC 一起做 **3% 熔断**（论文权重占比低于 3% 则剔除）、IDF/稀缺度等计算。
 
 **依赖配置**  
 - `CONFIG_DICT`（Neo4j 连接）  
@@ -872,14 +893,18 @@ KGAT-AX 是「**知识图谱注意力网络 + 学术指标增强（AX）**」的
   - 文件末尾提供独立测试脚本，可交互式体验向量路召回。
 
 - **`src/core/recall/label_path.py`**  
-  - `LabelRecallPath` 类，是 **最复杂的标签路召回引擎**，关键步骤：
-    1. 通过 Job 向量索引检测 Query 所属领域；
-    2. 从 Job 节点中提取高含金量技能锚点；
-    3. 在 Neo4j 中沿 `SIMILAR_TO`、`HAS_TOPIC` 等关系扩展学术词集合；
-    4. 结合 SQLite 的 `vocabulary_domain_stats` 与 SBERT 向量对候选学术词多维打分；并利用 `vocabulary_cooccurrence` 通过 `_get_cooccurrence_domain_metrics` 计算 **cooc_span**（共现伙伴领域跨度）与 **cooc_purity**（共现伙伴目标领域纯度），实现万金油降权与领域专精加权；同时保留学术共鸣（与本次搜索词共现）加成；
-    5. 在 Neo4j 中反查 `(Vocabulary)<-[:HAS_TOPIC]-(Work)<-[:AUTHORED]-(Author)`，基于论文贡献度与时序衰减聚合成作者得分。
-  - 输入输出格式不变：`recall(query_vector, domain_ids)` 仍返回 `(author_id_list, elapsed_ms)`；语义扩展仍返回 `(score_map, term_map, idf_map)`。
-  - `last_debug_info` 字段用于输出完整诊断链路（领域探测、锚点、学术词质量、论文/作者规模等），便于调参与可解释性分析。
+  - `LabelRecallPath` 类，是 **标签路召回入口与编排**：统一调用 **label_pipeline 五阶段**（stage1_domain_anchors → stage2_expansion → stage3_term_filtering → stage4_paper_recall → stage5_author_rank）与 **label_means** 中的锚点、扩展、词/论文打分逻辑。定义 `Stage1Result`、`RecallContext`、`RecallDebugInfo` 等结构体用于阶段间状态与调试。输入输出格式不变：`recall(query_vector, domain_ids)` 仍返回 `(author_id_list, elapsed_ms)`；完整诊断链路通过 `debug_info` / `last_debug_info` 输出，便于调参与可解释性分析。
+  - **`label_means/`** 子模块：`infra` 统一管理 Neo4j、Faiss、vocab_stats.db、簇中心等资源；`label_anchors`、`label_expansion` 负责锚点提取与语义扩展；`term_scoring`、`paper_scoring`、`simple_factors`、`advanced_metrics` 负责词级与论文级打分与指标；`base`、`label_debug_cli` 提供基类与调试 CLI。
+  - **`label_pipeline/`** 子模块：五阶段实现分别对应 `stage1_domain_anchors.py`（领域探测与工业侧锚点）、`stage2_expansion.py`（SIMILAR_TO 扩展与共现/领域指标）、`stage3_term_filtering.py`（词过滤与权重）、`stage4_paper_recall.py`（论文召回与贡献度）、`stage5_author_rank.py`（作者排序与截断）。
+
+- **`src/core/recall/works_to_authors.py`**  
+  - 将论文级得分聚合为作者级得分，供标签路 Stage5 及总召回使用；被 `label_path` 与流水线阶段调用。
+
+- **`src/core/recall/diagnose_embedding_neighbors.py`**  
+  - 嵌入邻居诊断工具，用于分析向量/标签路检索结果，便于开发与调试（如检查 Faiss 或词汇向量的近邻分布）。
+
+- **`src/core/recall/label_path_pre.py`**  
+  - 标签路旧版或备用实现，当前主入口为 `label_path.py`；保留供内部或历史参考。
 
 - **`src/core/recall/collaboration_path.py`**  
   - `CollaborativeRecallPath` 类，实现协同路召回：
@@ -936,12 +961,24 @@ KGAT-AX 是「**知识图谱注意力网络 + 学术指标增强（AX）**」的
 
 ### 通用工具 `src/utils`
 
-- **`src/utils/domain_utils.py`**  
+- **`src/utils/domain_config.py`**  
+  - 领域常量的**唯一数据源**：定义 17 个业务领域的 `DOMAIN_TABLE`（含 name、name_en、openalex_concept_id、decay_rate）；导出 `DOMAIN_MAP`、`NAME_TO_DOMAIN_ID`、`DOMAIN_DECAY_RATES`、`OPENALEX_FIELDS`、`NAME_EN_TO_DOMAIN_ID` 等，供 config、召回、爬虫、标签路时序衰减等使用，避免在多处重复定义。
+
+- **`src/utils/domain_detector.py`**  
+  - `DomainDetector`：对外提供「给定 Query 向量 → 推断领域 ID 集合」的接口。默认基于 Job Faiss 索引 + Neo4j 统计岗位 domain_ids 完成探测；若无图/索引则可选回退到 Label 路的 `_stage1_domain_and_anchors`。标签路 Stage1 领域探测使用本组件（或等价逻辑）。
+
+- **`src/utils/domain_utils.py`**
   - `DomainProcessor`：对领域 ID 相关操作进行统一封装：
     - `to_set()`：将 `1|4|14`、`"1,4"`、列表等各种输入统一解析为集合；
     - `build_neo4j_regex()`：构造用于 Neo4j 的正则过滤表达式；
     - `build_python_regex()`：构造用于 Python `re` 过滤的正则对象；
     - `has_intersect()`：判断论文 `domain_ids` 与目标领域集合是否有交集，是召回与精排阶段过滤的核心工具。
+
+- **`src/utils/time_features.py`**  
+  - 论文与作者层**时序权重**：`compute_paper_recency(year)` 按论文年龄分段给出 recency（如 0–3 年 1.0，10+ 年 0.01）；`compute_author_time_features`、`compute_author_recency_by_latest` 等提供作者侧时间特征，供标签路论文贡献度、向量路等使用。
+
+- **`src/utils/tools.py`**  
+  - 技能与 JD 文本清洗：技能分隔符、JD 句式前缀/尾缀、垃圾词与停用词（`FORBIDDEN`、`JD_NOISE_PATTERN` 等）；`get_decay_rate_for_domains` 按领域 ID 返回衰减率（依赖 `domain_config.DOMAIN_DECAY_RATES`），供标签路时序衰减等使用。
 
 ---
 
@@ -1180,6 +1217,28 @@ KGAT-AX 是「**知识图谱注意力网络 + 学术指标增强（AX）**」的
 ---
 
 ## 环境准备与安装
+
+### 0. 配置项速查（config.py）
+
+以下为与运行、索引及标签路强相关的主要配置，完整定义见项目根目录 `config.py`。
+
+| 类别 | 配置项 | 含义 / 典型值 |
+|------|--------|----------------|
+| **数据库与图** | `DB_PATH` | 主库 SQLite 路径，如 `data/academic_dataset_v5.db` |
+| | `NEO4J_URI` / `NEO4J_USER` / `NEO4J_PASSWORD` / `NEO4J_DATABASE` | Neo4j 连接与库名（如 `talent-graph`） |
+| | `VOCAB_STATS_DB_PATH` | 词汇领域统计库，如 `data/build_index/vocab_stats.db` |
+| | `COLLAB_DB_PATH` | 协作索引库，如 `data/build_index/scholar_collaboration.db` |
+| **向量与索引** | `INDEX_DIR` | 索引根目录，如 `data/build_index` |
+| | `VOCAB_INDEX_PATH` / `VOCAB_MAP_PATH` | 词汇 Faiss 索引及 id 映射 |
+| | `ABSTRACT_INDEX_PATH` / `ABSTRACT_MAP_PATH` | 摘要 Faiss 索引及 id 映射 |
+| | `JOB_INDEX_PATH` / `JOB_MAP_PATH` | 岗位 Faiss 索引及 id 映射 |
+| | `FEATURE_INDEX_PATH` | 作者/机构特征 JSON，如 `feature_index.json` |
+| **SBERT** | `SBERT_DIR` / `SBERT_MODEL_NAME` | 模型本地目录与 HuggingFace 模型名（如 `Alibaba-NLP/gte-multilingual-base`） |
+| **标签路** | `VOCAB_P95_PAPER_COUNT` | 学术词 paper_count 上限，过滤泛词（如 800） |
+| | `SIMILAR_TO_TOP_K` | 每锚点沿 SIMILAR_TO 最多扩展词数（如 3） |
+| | `SIMILAR_TO_MIN_SCORE` | SIMILAR_TO 边权重下限（如 0.65） |
+
+修改上述配置后需确保：`DB_PATH` 与爬虫/合并脚本一致；Neo4j 与 KG 构建、召回使用的连接一致；索引路径与构建脚本输出一致。
 
 ### 1. Python 环境
 
