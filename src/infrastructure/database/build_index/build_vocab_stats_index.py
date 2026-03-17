@@ -2,16 +2,17 @@
 """
 词汇统计索引构建模块（领域分布 + 共现矩阵 + 概念簇）
 
-本模块负责构建并写入 vocab_stats.db，包含五类与 Vocabulary 相关的统计型索引：
+本模块负责构建并写入 vocab_stats.db，包含六类与 Vocabulary 相关的统计型索引：
   1. 领域分布索引 (vocabulary_domain_stats)：每个词汇关联论文的领域分布与跨度，供标签路召回降噪/排序。
   2. 领域占比索引 (vocabulary_domain_ratio)：按 (voc_id, domain_id) 存 ratio=该领域论文数/work_count，供查询时快速筛「单词领域占比≥阈值」。
   3. 共现索引 (vocabulary_cooccurrence)：词对在同一篇 Work 下的共现频次，与知识图谱 CO_OCCURRED_WITH 一致。
   4. 共现领域占比索引 (vocabulary_cooc_domain_ratio)：按 (voc_id, domain_id) 存「共现伙伴的领域占比」的 freq 加权均值，供标签路直接查 cooc_purity。
-  5. 概念簇索引 (vocabulary_cluster, cluster_members)：词→簇、簇→学术词成员，供标签路按簇扩展；并产出 cluster_centroids.npy。
+  5. 三级领域索引 (vocabulary_topic_stats)：先用 vocabulary_topic_index.json 直接填 field/subfield/topic（有则填），再用共现对无标签或缺层级词补全 field_dist/subfield_dist/topic_dist（百分比）。
+  6. 概念簇索引 (vocabulary_cluster, cluster_members)：词→簇、簇→学术词成员，供标签路按簇扩展；并产出 cluster_centroids.npy。
 
 数据来源：
-  - 领域分布：从 Neo4j 图谱 (Vocabulary)<-[:HAS_TOPIC]-(Work) 聚合得到。
-  - 共现统计：从主库 academic_dataset_v5.db 的 works 表 (concepts_text/keywords_text) 计算得到，与 build_kg 逻辑一致。
+  - 领域分布：从主库 works 的 concepts_text/keywords_text 解析 term，与 vocabulary 映射后按 work 的 domain_ids 聚合，与共现逻辑同源，不依赖 Neo4j。
+  - 共现统计：从主库 works 表 (concepts_text/keywords_text) 计算得到，与 build_kg 逻辑一致。
   - 概念簇：依赖 build_vector_index 产出的 vocabulary 向量与主库 vocabulary.entity_type。
 
 运行方式：在项目根目录执行
@@ -28,14 +29,13 @@ import collections
 import numpy as np
 from tqdm import tqdm
 from datetime import datetime
-from py2neo import Graph
 from sklearn.cluster import KMeans
 
-# 词汇统计库路径、Neo4j 配置、主库路径、索引路径及共现用 SQL 均从 config 统一读取
+# 词汇统计库路径、主库路径、索引路径等从 config 统一读取（不依赖 Neo4j）
 from config import (
-    CONFIG_DICT,
     VOCAB_STATS_DB_PATH,
     DB_PATH,
+    DATA_DIR,
     SQL_QUERIES,
     VOCAB_INDEX_PATH,
     VOCAB_MAP_PATH,
@@ -50,30 +50,20 @@ INDUSTRY_CLUSTER_MIN_SCORE = 0.3
 
 class VocabStatsIndexer:
     """
-    学术词汇统计索引构建器（领域分布 + 共现）。
+    学术词汇统计索引构建器（领域分布 + 共现），仅依赖主库 SQLite，不依赖 Neo4j。
 
     职责：
-      - 领域分布：扫描 Neo4j 中 (v:Vocabulary)<-[:HAS_TOPIC]-(w:Work)，统计每个词汇的
-        work_count、domain_span、domain_dist（JSON），写入 vocabulary_domain_stats。
+      - 领域分布：从主库 works 的 concepts_text/keywords_text 解析 term，与 vocabulary 映射后按 domain_ids 聚合，
+        得到 work_count、domain_span、domain_dist，写入 vocabulary_domain_stats。
       - 领域占比：从 vocabulary_domain_stats 的 domain_dist 展开为 (voc_id, domain_id, ratio)，写入 vocabulary_domain_ratio。
-      - 共现统计：在主库中构建 work_terms_temp，执行 GET_VOCAB_CO_OCCURRENCE 得到 (term_a, term_b, freq)，
-        写入 vocabulary_cooccurrence，与 build_kg 的 CO_OCCURRED_WITH 数据源一致。
+      - 共现统计：从主库 works 的 concepts_text/keywords_text 计算词对共现频次，写入 vocabulary_cooccurrence。
       - 共现领域占比：从 vocabulary_cooccurrence + vocabulary_domain_ratio + 主库 vocabulary 计算每个词在各领域的「共现伙伴占比」freq 加权均值，写入 vocabulary_cooc_domain_ratio。
     """
 
     def __init__(self):
         # 词汇统计库路径，与 config.VOCAB_STATS_DB_PATH 一致（通常为 data/build_index/vocab_stats.db）
         self.db_path = VOCAB_STATS_DB_PATH
-        self._init_graph()
         self._prepare_db()
-
-    def _init_graph(self):
-        """初始化 Neo4j 连接，用于拉取 Vocabulary–Work 拓扑以计算领域分布。"""
-        self.graph = Graph(
-            CONFIG_DICT["NEO4J_URI"],
-            auth=(CONFIG_DICT["NEO4J_USER"], CONFIG_DICT["NEO4J_PASSWORD"]),
-            name=CONFIG_DICT["NEO4J_DATABASE"],
-        )
 
     def _prepare_db(self):
         """
@@ -171,6 +161,22 @@ class VocabStatsIndexer:
             PRIMARY KEY (cluster_id, voc_id)
         );
         CREATE INDEX IF NOT EXISTS idx_cm_cluster ON cluster_members(cluster_id);
+
+        -- 三级领域表：先用 JSON 直接填（有则填），再用共现补全
+        CREATE TABLE IF NOT EXISTS vocabulary_topic_stats (
+            voc_id INTEGER PRIMARY KEY,
+            field_id TEXT,
+            field_name TEXT,
+            subfield_id TEXT,
+            subfield_name TEXT,
+            topic_id TEXT,
+            topic_display_name TEXT,
+            field_dist TEXT,
+            subfield_dist TEXT,
+            topic_dist TEXT,
+            source TEXT,
+            updated_at TIMESTAMP
+        );
         """)
         conn.close()
 
@@ -213,75 +219,96 @@ class VocabStatsIndexer:
     def _build_domain_stats(self):
         """
         构建词汇领域分布索引并写入 vocabulary_domain_stats。
+        仅从主库 works 的 concepts_text/keywords_text 解析 term，与 vocabulary 映射后按 work 的 domain_ids 聚合，
+        解析规则与共现逻辑一致（不包含标题扫描），不依赖 Neo4j。
 
         流程：
-          1. 从 Neo4j 拉取所有 Vocabulary 的 id。
-          2. 按批（500 个）执行 Cypher：对每批词汇，聚合其 HAS_TOPIC 指向的 Work 的 domain_ids。
-          3. 在 Python 中统计每个词汇的 work_count、domain_span、domain_dist（Counter 转 JSON）。
-          4. 批量 INSERT 进 vocabulary_domain_stats（每满 1000 条提交一次）。
+          1. 从主库 vocabulary 加载 (voc_id, term)，构建 term_lower -> voc_id 映射。
+          2. 流式扫描主库 works(work_id, domain_ids, concepts_text, keywords_text)，按 |;, 拆 term，累加 voc_id -> [domain_ids]。
+          3. 按 voc_id 顺序将 domain_ids 列表聚合成 domain_dist（Counter），写入 vocabulary_domain_stats。
         """
-        print("-> 正在构建词汇领域分布索引 (vocabulary_domain_stats)...")
-        voc_query = "MATCH (v:Vocabulary) RETURN v.id AS vid"
-        voc_ids = [r["vid"] for r in self.graph.run(voc_query)]
-
-        if not voc_ids:
-            print("  -> Neo4j 中无 Vocabulary 节点，跳过。")
+        print("-> 正在构建词汇领域分布索引 (vocabulary_domain_stats)，数据源：主库 concepts_text + keywords_text...")
+        if not os.path.exists(DB_PATH):
+            print(f"  [Skip] 主库不存在: {DB_PATH}")
             return
 
-        total = len(voc_ids)
-        batch_size = 500
+        # 1. 从主库加载 vocabulary：term_lower -> voc_id（同一 term 取一个 voc_id）
+        with sqlite3.connect(DB_PATH) as main_conn:
+            main_conn.row_factory = sqlite3.Row
+            rows = main_conn.execute(
+                "SELECT voc_id, term FROM vocabulary WHERE term IS NOT NULL AND term != ''"
+            ).fetchall()
+        term_to_voc = {}
+        all_voc_ids_ordered = []
+        for r in rows:
+            vid = int(r["voc_id"])
+            term_lower = (r["term"] or "").strip().lower()
+            if term_lower:
+                term_to_voc[term_lower] = vid
+            all_voc_ids_ordered.append(vid)
+        # 去重并保持 voc_id 升序，用于写入时的顺序与断点
+        all_voc_ids_ordered = sorted(set(all_voc_ids_ordered))
+        if not term_to_voc:
+            print("  -> 主库 vocabulary 无有效 term，跳过。")
+            return
 
-        # 断点续传：checkpoint 存的是已处理到的下标 i
-        start_idx, done = self._get_progress("domain_stats")
+        # 断点：上次写到的最大 voc_id；若 done 则跳过
+        last_written_voc_id, done = self._get_progress("domain_stats")
         if done:
             print("  -> 已完成，跳过。")
             return
 
-        start_idx = max(0, min(start_idx, total))
-
-        conn = sqlite3.connect(self.db_path, timeout=60)
-        pbar = tqdm(
-            total=total - start_idx,
-            desc="Indexing Vocab Domain Distribution",
-        )
-
-        batch_results = []
-        for i in range(start_idx, total, batch_size):
-            v_batch = voc_ids[i : i + batch_size]
-            cypher = """
-            MATCH (v:Vocabulary)<-[:HAS_TOPIC]-(w:Work)
-            WHERE v.id IN $vids
-            RETURN v.id AS vid, collect(w.domain_ids) AS domains_list
-            """
-            cursor = self.graph.run(cypher, vids=v_batch)
-
-            for record in cursor:
-                vid = record["vid"]
-                # domain_ids 在图中可能为 "1,4"、"1"、"4,14" 等逗号分隔字符串
-                all_domains = record["domains_list"]
-
-                dist = collections.Counter()
-                for d_str in all_domains:
-                    if d_str:
-                        for d_id in d_str.split(","):
-                            dist[d_id.strip()] += 1
-
-                if not dist:
-                    continue
-
-                work_count = sum(dist.values())
-                domain_span = len(dist)
-
-                batch_results.append(
-                    (
-                        vid,
-                        work_count,
-                        domain_span,
-                        json.dumps(dist),
-                        datetime.now().isoformat(),
-                    )
+        # 2. 扫描 works，累加 voc_id -> list of domain_ids 字符串（每篇 work 贡献一次）
+        voc_domain_lists = collections.defaultdict(list)
+        with sqlite3.connect(DB_PATH) as main_conn:
+            main_conn.row_factory = sqlite3.Row
+            total_works = main_conn.execute(
+                """
+                SELECT COUNT(*) FROM works
+                WHERE (concepts_text IS NOT NULL OR keywords_text IS NOT NULL)
+                """
+            ).fetchone()[0]
+            cursor = main_conn.execute(
+                """
+                SELECT work_id, domain_ids, concepts_text, keywords_text
+                FROM works
+                WHERE (concepts_text IS NOT NULL OR keywords_text IS NOT NULL)
+                """
+            )
+            for row in tqdm(cursor, total=total_works, desc="Scan works (domain_stats)"):
+                raw_meta = f"{row['concepts_text'] or ''}|{row['keywords_text'] or ''}"
+                terms = set(
+                    t.strip().lower()
+                    for t in re.split(r"[|;,]", raw_meta)
+                    if t.strip()
                 )
+                domain_ids_str = (row["domain_ids"] or "").strip()
+                for term in terms:
+                    if term in term_to_voc:
+                        voc_domain_lists[term_to_voc[term]].append(domain_ids_str)
 
+        # 3. 按 voc_id 顺序写出，只处理 > last_written_voc_id，每 1000 条提交
+        conn = sqlite3.connect(self.db_path, timeout=60)
+        batch_results = []
+        write_count = 0
+        now_iso = datetime.now().isoformat()
+        for vid in tqdm(all_voc_ids_ordered, desc="Write vocabulary_domain_stats"):
+            if vid <= last_written_voc_id:
+                continue
+            domain_ids_list = voc_domain_lists.get(vid, [])
+            dist = collections.Counter()
+            for d_str in domain_ids_list:
+                if d_str:
+                    for d_id in d_str.split(","):
+                        d_id = d_id.strip()
+                        if d_id:
+                            dist[d_id] += 1
+            if not dist:
+                continue
+            work_count = sum(dist.values())
+            domain_span = len(dist)
+            batch_results.append((vid, work_count, domain_span, json.dumps(dist), now_iso))
+            write_count += 1
             if len(batch_results) >= 1000:
                 conn.executemany(
                     """
@@ -292,11 +319,9 @@ class VocabStatsIndexer:
                     batch_results,
                 )
                 conn.commit()
+                last_in_batch = max(r[0] for r in batch_results)
+                self._set_progress("domain_stats", last_in_batch, done=False)
                 batch_results = []
-                # 已成功写入，以 i+batch_size 作为新的断点
-                self._set_progress("domain_stats", i + batch_size, done=False)
-
-            pbar.update(len(v_batch))
 
         if batch_results:
             conn.executemany(
@@ -308,12 +333,9 @@ class VocabStatsIndexer:
                 batch_results,
             )
             conn.commit()
-
-        pbar.close()
         conn.close()
-        # 全部完成
-        self._set_progress("domain_stats", total, done=True)
-        print("  -> 词汇领域分布索引构建完成。")
+        self._set_progress("domain_stats", max(all_voc_ids_ordered) if all_voc_ids_ordered else 0, done=True)
+        print(f"  -> 词汇领域分布索引构建完成，写入 {write_count} 条。")
 
     def _build_domain_ratio(self):
         """
@@ -673,6 +695,156 @@ class VocabStatsIndexer:
         finally:
             conn.close()
 
+    def _build_topic_stats(self):
+        """
+        三级领域索引：先用 vocabulary_topic_index.json 直接填（有则填，含一级/二级/三级），
+        再用共现对无标签或缺层级的词补全 field_dist / subfield_dist / topic_dist（百分比）。
+        """
+        print("-> 正在构建三级领域索引 (vocabulary_topic_stats)...")
+        json_path = os.path.join(DATA_DIR, "vocabulary_topic_index.json")
+        if not os.path.exists(json_path):
+            print(f"  [Skip] 未找到 {json_path}，请先运行 export_vocabulary_topic_index 导出方案 B JSON。")
+            return
+        if not os.path.exists(DB_PATH):
+            print(f"  [Skip] 主库不存在: {DB_PATH}")
+            return
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            topic_index = json.load(f)
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        stats_conn = sqlite3.connect(self.db_path, timeout=60)
+        stats_conn.execute("DELETE FROM vocabulary_topic_stats")
+        stats_conn.commit()
+
+        # 1) 直接填：JSON 中至少有一级（field_id 或 field_name）则写入
+        direct_fill = {}
+        batch = []
+        for vid_str, ent in topic_index.items():
+            vid = int(vid_str)
+            field_id = ent.get("field_id") or None
+            field_name = ent.get("field_name") or None
+            subfield_id = ent.get("subfield_id") or None
+            subfield_name = ent.get("subfield_name") or None
+            topic_id = ent.get("topic_id") or None
+            topic_display_name = ent.get("topic_display_name") or None
+            if not field_id and not field_name:
+                continue
+            batch.append((
+                vid, field_id, field_name, subfield_id, subfield_name,
+                topic_id, topic_display_name, None, None, None, "direct", now
+            ))
+            direct_fill[vid] = (field_id, field_name, subfield_id, subfield_name, topic_id, topic_display_name)
+        if batch:
+            stats_conn.executemany(
+                """
+                INSERT INTO vocabulary_topic_stats
+                (voc_id, field_id, field_name, subfield_id, subfield_name, topic_id, topic_display_name,
+                 field_dist, subfield_dist, topic_dist, source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                batch,
+            )
+            stats_conn.commit()
+        print(f"  -> 直接填: {len(direct_fill)} 条")
+
+        # 2) 主库 voc_id <-> term，共现表按 term 建索引
+        with sqlite3.connect(DB_PATH) as main_conn:
+            main_conn.row_factory = sqlite3.Row
+            rows = main_conn.execute("SELECT voc_id, term FROM vocabulary WHERE term IS NOT NULL AND term != ''").fetchall()
+        voc_to_term = {}
+        term_to_voc = {}
+        for r in rows:
+            vid = int(r["voc_id"])
+            term = (r["term"] or "").strip().lower()
+            voc_to_term[vid] = term
+            if term:
+                term_to_voc[term] = vid
+        all_voc_ids = set(voc_to_term.keys())
+
+        # 共现：term -> [(partner_term, freq), ...]
+        cooc_by_term = collections.defaultdict(list)
+        for row in stats_conn.execute("SELECT term_a, term_b, freq FROM vocabulary_cooccurrence").fetchall():
+            ta, tb, freq = (row[0] or "").strip().lower(), (row[1] or "").strip().lower(), int(row[2] or 0)
+            if not ta or not tb or freq <= 0:
+                continue
+            cooc_by_term[ta].append((tb, freq))
+            cooc_by_term[tb].append((ta, freq))
+
+        # 3) 无标签词：用共现伙伴中有标签的聚合为 field_dist / subfield_dist / topic_dist
+        unlabeled = all_voc_ids - set(direct_fill.keys())
+        batch_cooc = []
+        for vid in tqdm(unlabeled, desc="Cooc fill (unlabeled)"):
+            term = voc_to_term.get(vid)
+            if not term:
+                continue
+            partners = cooc_by_term.get(term, [])
+            fc, sc, tc = collections.Counter(), collections.Counter(), collections.Counter()
+            for partner_term, freq in partners:
+                p_vid = term_to_voc.get(partner_term)
+                if p_vid is None or p_vid not in direct_fill:
+                    continue
+                fid, fname, sid, sname, tid, tname = direct_fill[p_vid]
+                if fid:
+                    fc[fid] += freq
+                if sid:
+                    sc[sid] += freq
+                if tid:
+                    tc[tid] += freq
+            if not fc and not sc and not tc:
+                continue
+            total_f = sum(fc.values()) or 1
+            total_s = sum(sc.values()) or 1
+            total_t = sum(tc.values()) or 1
+            field_dist = json.dumps({k: round(v / total_f, 6) for k, v in fc.items()}) if fc else None
+            subfield_dist = json.dumps({k: round(v / total_s, 6) for k, v in sc.items()}) if sc else None
+            topic_dist = json.dumps({k: round(v / total_t, 6) for k, v in tc.items()}) if tc else None
+            batch_cooc.append((vid, None, None, None, None, None, None, field_dist, subfield_dist, topic_dist, "cooc", now))
+        if batch_cooc:
+            stats_conn.executemany(
+                """
+                INSERT INTO vocabulary_topic_stats
+                (voc_id, field_id, field_name, subfield_id, subfield_name, topic_id, topic_display_name,
+                 field_dist, subfield_dist, topic_dist, source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                batch_cooc,
+            )
+            stats_conn.commit()
+        print(f"  -> 共现补全(无标签): {len(batch_cooc)} 条")
+
+        # 4) 有标签但缺层级：用共现补全 *_dist 并可选填主值
+        rows_partial = stats_conn.execute(
+            """SELECT voc_id FROM vocabulary_topic_stats WHERE source = 'direct'
+               AND (subfield_id IS NULL OR topic_id IS NULL)"""
+        ).fetchall()
+        for (vid,) in tqdm(rows_partial, desc="Cooc fill (partial)"):
+            vid = int(vid)
+            term = voc_to_term.get(vid)
+            if not term:
+                continue
+            partners = cooc_by_term.get(term, [])
+            sc, tc = collections.Counter(), collections.Counter()
+            for partner_term, freq in partners:
+                p_vid = term_to_voc.get(partner_term)
+                if p_vid is None or p_vid not in direct_fill:
+                    continue
+                _, _, sid, sname, tid, tname = direct_fill[p_vid]
+                if sid:
+                    sc[sid] += freq
+                if tid:
+                    tc[tid] += freq
+            subfield_dist = json.dumps({k: round(v / sum(sc.values()), 6) for k, v in sc.items()}) if sc else None
+            topic_dist = json.dumps({k: round(v / sum(tc.values()), 6) for k, v in tc.items()}) if tc else None
+            stats_conn.execute(
+                """UPDATE vocabulary_topic_stats SET subfield_dist = ?, topic_dist = ?, source = 'direct+cooc', updated_at = ?
+                   WHERE voc_id = ?""",
+                (subfield_dist, topic_dist, now, vid),
+            )
+        stats_conn.commit()
+        stats_conn.close()
+        print("  -> 三级领域索引构建完成。")
+
     def _build_concept_clusters(self):
         """
         构建概念簇索引：对学术词做 K-means 聚类，工业词按与簇中心相似度归属到 top-K 簇。
@@ -834,11 +1006,12 @@ class VocabStatsIndexer:
         全量构建词汇统计索引：先领域分布，再共现，再概念簇。
 
         执行顺序：
-          1. _build_domain_stats()：依赖 Neo4j，写入 vocabulary_domain_stats。
+          1. _build_domain_stats()：从主库 works(concepts_text/keywords_text) 聚合，写入 vocabulary_domain_stats，不依赖 Neo4j。
           2. _build_domain_ratio()：从 vocabulary_domain_stats 展开，写入 vocabulary_domain_ratio。
-          3. _build_cooccurrence_index()：依赖主库 works，写入 vocabulary_cooccurrence。
-          4. _build_cooc_domain_ratio()：依赖 vocabulary_cooccurrence + vocabulary_domain_ratio + 主库 vocabulary，写入 vocabulary_cooc_domain_ratio。
-          5. _build_concept_clusters()：依赖 vocabulary 向量与 entity_type，写入 vocabulary_cluster、cluster_members，并保存 cluster_centroids.npy。
+          3. _build_cooccurrence_index()：从主库 works，写入 vocabulary_cooccurrence。
+          4. _build_cooc_domain_ratio()：从 vocabulary_cooccurrence + vocabulary_domain_ratio + 主库 vocabulary，写入 vocabulary_cooc_domain_ratio。
+          5. _build_topic_stats()：从 vocabulary_topic_index.json + 共现补全，写入 vocabulary_topic_stats。
+          6. _build_concept_clusters()：依赖 vocabulary 向量与 entity_type，写入 vocabulary_cluster、cluster_members，并保存 cluster_centroids.npy。
         """
         print(f"--- 开始构建词汇统计索引 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ---")
 
@@ -847,6 +1020,7 @@ class VocabStatsIndexer:
         self._build_domain_ratio()
         self._build_cooccurrence_index()
         self._build_cooc_domain_ratio()
+        self._build_topic_stats()
         self._build_concept_clusters()
 
         print("--- 词汇统计索引构建完成 ---")
