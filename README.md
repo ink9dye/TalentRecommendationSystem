@@ -186,9 +186,9 @@ TalentRecommendationSystem-master/
    - `src/infrastructure/database/build_kg/generate_kg.py` 调用 `run_pipeline(CONFIG_DICT)`：
      - 通过 `builder.KGBuilder` & `kg_utils.GraphEngine` 将 SQLite 数据增量同步至 Neo4j，建立节点与关系：
        - 节点：`Author / Work / Vocabulary / Institution / Source / Job`
-       - 关系：`AUTHORED / PRODUCED_BY / PUBLISHED_IN / HAS_TOPIC / REQUIRE_SKILL / SIMILAR_TO / CO_OCCURRED_WITH`
+       - 关系：`AUTHORED / PRODUCED_BY / PUBLISHED_IN / HAS_TOPIC / REQUIRE_SKILL / SIMILAR_TO`（共现不写入 Neo4j，见下）
      - 使用 `build_work_semantic_links()` + Aho‑Corasick 自动机扫描论文标题与关键词，补齐 `(Work)-[:HAS_TOPIC]->(Vocabulary)`。
-     - `build_cooccurrence_links()` 利用 SQLite 计算词汇在论文中的共现频次，写入 `CO_OCCURRED_WITH`。
+     - 共现数据由 `build_index/build_vocab_stats_index.py` 流式写入 `vocab_stats.db` 的 `vocabulary_cooccurrence`，标签路召回（学术共鸣、锚点共鸣、cooc_span/cooc_purity）均从该库读取，KG 流水线不再构建 `CO_OCCURRED_WITH`，避免大表自连接导致磁盘占满。
      - `build_semantic_bridge()` 利用 SBERT 计算跨类型词汇相似度（如岗位技能 ↔ 学术词汇），写入 `SIMILAR_TO`。
    - `build_index/` 下的一系列脚本继续构建：
      - 词汇 / 论文 / 岗位的 Faiss 向量索引；
@@ -242,7 +242,7 @@ TalentRecommendationSystem-master/
 | **Step 1** | 六类节点同步：Vocabulary → Author → Work → Institution → Source → Job |
 | **Step 2** | 作者–论文–机构–渠道拓扑（含 **AUTHORED 边权重**） |
 | **Step 3** | 语义打标 → `(Work)-[:HAS_TOPIC]->(Vocabulary)`、`(Job)-[:REQUIRE_SKILL]->(Vocabulary)` |
-| **Step 4** | 词汇共现 → `(Vocabulary)-[:CO_OCCURRED_WITH]-(Vocabulary)`，边属性 **weight** |
+| **Step 4** | 共现已迁移至 `build_vocab_stats_index`（`vocab_stats.db` 的 `vocabulary_cooccurrence`），KG 流水线不再构建 Neo4j 共现边 |
 | **Step 5** | 语义桥接 → `(Vocabulary)-[:SIMILAR_TO]->(Vocabulary)`，边属性 **score** |
 
 数据从 SQLite（`config['DB_PATH']`）读出，经 `SyncStateManager` 做增量（marker），由 `GraphEngine.send_batch` 批量写入 Neo4j。
@@ -265,7 +265,7 @@ TalentRecommendationSystem-master/
 - **Vocabulary**：统一词表（概念、关键词、岗位技能等），`type` 区分 concept / keyword / industry 等，语义桥接时只做**跨类型**连接。  
 - **Job**：岗位，与 Vocabulary 通过 REQUIRE_SKILL 相连，供标签路召回。
 
-Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary.term`、`Author.h_index`，以及 `CO_OCCURRED_WITH.weight`。
+Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary.term`、`Author.h_index`。共现数据由 `vocab_stats.db` 的 `vocabulary_cooccurrence` 提供，不在 Neo4j 中建 `CO_OCCURRED_WITH`。
 
 ### 3. 边类型、边属性与边权重
 
@@ -302,18 +302,11 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 - **边属性**：无。  
 - 数据来自 `jobs.skills`，按 `,，;；/` 拆成多个 skill，转小写后与 `Vocabulary.term` 匹配建边；增量以 `crawl_time` 为 marker。
 
-#### 3.5 CO_OCCURRED_WITH（Vocabulary – Vocabulary，无向）
+#### 3.5 共现数据（Vocabulary – Vocabulary，不写入 Neo4j）
 
-- **含义**：两词在多篇论文中一起出现，共现次数越多关系越强。  
-- **边属性**：**`weight`**（整数），表示**共现频次**（多少篇 Work 同时包含这两个 term）。
-
-**计算方式**（`build_cooccurrence_links`）：  
-- 在 SQLite 建临时表 `work_terms_temp(work_id, term)`。  
-- 当前实现用 `json_each(concepts_text)` 将 works 的 concepts 展开为 (work_id, term) 再插入（依赖 `concepts_text` 为合法 JSON 数组；若为 `|` 分隔需先 ETL 或改 SQL）。  
-- 执行 `GET_VOCAB_CO_OCCURRENCE`：`a.work_id = b.work_id AND a.term < b.term` 自连接，按 (term_a, term_b) 聚合 `COUNT(*)` 为 `freq`，且 `HAVING freq > 1`。  
-- 在 Neo4j 中 `MERGE (v1)-[r:CO_OCCURRED_WITH]-(v2) SET r.weight = row.freq`。
-
-即：**边权重 = 同时包含这两词的论文数**，且至少为 2 才建边。
+- **含义**：两词在多篇论文中一起出现，共现次数越多关系越强；用于标签路的学术共鸣、锚点共鸣及 cooc_span/cooc_purity 等指标。  
+- **数据来源**：由 `build_index/build_vocab_stats_index.py` 从主库 `works` 的 `concepts_text`/`keywords_text` 流式计算词对共现频次，写入 **vocab_stats.db** 的 **vocabulary_cooccurrence**（term_a, term_b, freq），与 KG 原逻辑一致（strip+lower 清洗、同一 Work 内词对、freq 至少为 2）。  
+- **使用方式**：标签路召回中的 `calculate_academic_resonance`、`calculate_anchor_resonance` 及 `get_cooccurrence_domain_metrics` 均从 `vocabulary_cooccurrence` 读取，**不再依赖 Neo4j**。KG 流水线不再执行 `build_cooccurrence_links()`，避免在主库上做大表自连接导致「database or disk is full」。
 
 #### 3.6 SIMILAR_TO（Vocabulary → Vocabulary，有向）
 
@@ -335,7 +328,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 | PUBLISHED_IN | Work→Source | 无 | 发表渠道 |
 | HAS_TOPIC | Work→Vocabulary | 无 | 论文–主题/关键词 |
 | REQUIRE_SKILL | Job→Vocabulary | 无 | 岗位–技能 |
-| CO_OCCURRED_WITH | Vocabulary–Vocabulary | **weight** (int) | **共现论文数** |
+| （共现） | 由 vocab_stats.db 的 vocabulary_cooccurrence 提供，不写入 Neo4j | term_a, term_b, **freq** | **共现论文数**；标签路共鸣与 cooc_span/cooc_purity 由此表读取 |
 | SIMILAR_TO | Vocabulary→Vocabulary | **score** (float) | **SBERT 语义相似度（仅跨类型）** |
 
 ### 4. 构建逻辑要点
@@ -343,13 +336,13 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 - **Step 0**：Neo4j 执行 `INIT_SCHEMA`（各节点 `id` 唯一约束 + 上述索引）；SQLite 执行 `SQL_INIT_SCRIPTS`，保证按 `last_updated`/`year`/`crawl_time`/`ship_id` 等增量查表高效。  
 - **Step 1 节点同步**：对每类实体调用 `sync_engine(task_name, sql, cypher, time_field)`，从 SQLite 按 `time_field` 增量拉取（如 `last_updated > marker`），按 `BATCH_SIZE` 批处理，每批用对应 `MERGE_*` 写入 Neo4j，并在 `sync_metadata` 表更新 marker，实现断点续跑。  
 - **Step 2 拓扑**：从 `authorships` 联表 `works` 取每条署名的 author_id、work_id、inst_id、source_id、pos_index、is_corresponding、is_alphabetical、year；对每行先用 `WeightStrategy.calculate` 算 `pos_w`，再调用 `LINK_AUTHORED_COMPLEX` 一次创建 AUTHORED（含 pos_weight）及可选的 PRODUCED_BY、PUBLISHED_IN。  
-- **Step 3 语义打标**：先 `build_work_semantic_links()`（AC 自动机 + concepts/keywords），再 `build_job_skill_links()`；这样 **HAS_TOPIC 先于 CO_OCCURRED_WITH**，共现统计依赖的「论文–词」关系已存在（若共现改用 work_terms_temp，需与 HAS_TOPIC 的数据源一致，见下）。  
-- **Step 4 共现**：依赖 Step 3 的 HAS_TOPIC（或与 HAS_TOPIC 同源的 work–term 表）；当前代码用 `json_each(concepts_text)` 填 `work_terms_temp`，若你的 `concepts_text` 是 `"a|b|c"` 这种格式，需在别处先转成 JSON 再灌，或改 SQL 为按 `|` 拆分的逻辑，否则共现会为空或报错。  
+- **Step 3 语义打标**：先 `build_work_semantic_links()`（AC 自动机 + concepts/keywords），再 `build_job_skill_links()`。  
+- **Step 4 共现**：共现数据由 **build_vocab_stats_index** 流式写入 `vocab_stats.db` 的 `vocabulary_cooccurrence`，KG 流水线不再构建；标签路共鸣与共现指标均从该表读取。  
 - **Step 5 语义桥接**：只加「跨类型」的 SIMILAR_TO，避免同类型词之间重复连接；增量由 `semantic_bridge_sync` 的 marker（voc_id）控制，只处理 `voc_id > marker` 的词。
 
 ### 5. 实现细节与注意点
 
-1. **共现数据源**：`build_cooccurrence_links` 里用 `json_each(concepts_text)` 填充 `work_terms_temp`，要求 `works.concepts_text` 为 JSON 数组。若实际是 `"a|b|c"` 这种格式，需要先在一处统一成 (work_id, term) 再写入临时表（或改 SQL），否则 Step 4 会没有数据或报错。  
+1. **共现数据源**：共现由 **build_vocab_stats_index** 从主库 `works.concepts_text`/`keywords_text` 流式计算并写入 `vocab_stats.db` 的 `vocabulary_cooccurrence`，与 HAS_TOPIC 同源（strip+lower 清洗）；KG 流水线不再执行 `build_cooccurrence_links`。  
 2. **HAS_TOPIC 与 Vocabulary 同步**：HAS_TOPIC 和 REQUIRE_SKILL 都通过 `Vocabulary.term` 匹配，因此必须先有 Step 1 的 vocab_sync；且 vocabulary 表里要有从 works（concepts/keywords）和 jobs（skills）来的 term。  
 3. **语义桥接的 type**：SIMILAR_TO 只连 `entity_type` 不同的词对，所以 vocabulary 的 `entity_type`（如 concept / keyword / industry）必须正确填写，否则可能几乎没有桥接边。  
 4. **增量与顺序**：每次运行 pipeline 会重置 `semantic_bridge_sync` 的 marker，但其他任务（如 topology、job_skill）用各自 marker 增量；若中途改过 builder 逻辑或 config，需要视情况清空 Neo4j 或重置对应 marker 再跑。
@@ -380,7 +373,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 | PUBLISHED_IN | Work→Source | 无 | 发表渠道 |
 | HAS_TOPIC | Work→Vocabulary | 无 | 论文–主题/关键词 |
 | REQUIRE_SKILL | Job→Vocabulary | 无 | 岗位–技能 |
-| CO_OCCURRED_WITH | Vocabulary–Vocabulary | **weight** (int) | 共现论文数 |
+| （共现） | 不写入 Neo4j | 由 vocab_stats.db 的 vocabulary_cooccurrence 提供 | 共现论文数；标签路共鸣等由此表读取 |
 | SIMILAR_TO | Vocabulary→Vocabulary | **score** (float) | SBERT 语义相似度（仅跨类型） |
 
 （边权重与建边逻辑见上文「3. 边类型、边属性与边权重」。）
@@ -548,7 +541,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 | task_name | TEXT | 是 |
 | last_marker | TEXT |  |
 
-**work_terms_temp**（构建共现等时的临时表，work_id + term）
+**work_terms_temp**（已废弃：KG 共现步骤已迁移至 build_vocab_stats_index，共现由 vocab_stats.db 的 vocabulary_cooccurrence 提供；主库中不再建此临时表。）
 
 | 字段名 | 类型 | 主键 |
 |--------|------|------|
@@ -577,7 +570,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 | 表名 | 主要字段 | 用途 |
 |------|----------|------|
 | **vocabulary_domain_stats** | voc_id, work_count, domain_span, domain_dist, updated_at | 词关联论文数、领域跨度、各领域分布；标签路领域纯度/熔断 |
-| **vocabulary_cooccurrence** | term_a, term_b, freq | 词对共现频次；与 KG CO_OCCURRED_WITH 一致；标签路 cooc_span/cooc_purity |
+| **vocabulary_cooccurrence** | term_a, term_b, freq | 词对共现频次；由 build_vocab_stats_index 写入；标签路学术共鸣、锚点共鸣及 cooc_span/cooc_purity 均由此表读取（KG 不再构建 Neo4j CO_OCCURRED_WITH） |
 | **vocabulary_topic_stats** | voc_id, field_id, field_name, subfield_id, subfield_name, topic_id, topic_display_name, field_dist, subfield_dist, topic_dist, source, updated_at | 三级领域：有标签词由 JSON 直接填，无标签词由共现算 field/subfield/topic 占比补全；source 为 direct / cooc / direct+cooc |
 
 **vocabulary_domain_stats 完整字段**
@@ -608,7 +601,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 | PUBLISHED_IN | Work→Source | 无 |
 | HAS_TOPIC | Work→Vocabulary | 无 |
 | REQUIRE_SKILL | Job→Vocabulary | 无 |
-| CO_OCCURRED_WITH | Vocabulary–Vocabulary | **weight** |
+| （共现） | 由 vocab_stats 提供，不建边 | vocabulary_cooccurrence(term_a, term_b, freq) |
 | SIMILAR_TO | Vocabulary→Vocabulary | **score** |
 
 （边权重含义见上文「3. 边类型、边属性与边权重」。）
@@ -784,7 +777,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 | **输入参数（名字与含义）** | 同 Stage2 总入口：**prepared_anchors**、**active_domain_set**、**query_vector**、**query_text**、**jd_field_ids** / **jd_subfield_ids** / **jd_topic_ids**；内部使用 **primary_landings**（及高可信子集 diffusion_primaries）。 |
 | **输出参数（名字与含义）** | **raw_candidates**：List[Dict]，每项含 **tid**、**term**、**term_role**（primary / dense_expansion / cluster_expansion / cooc_expansion）、**identity_score**、**source**、**degree_w**、**domain_span**、**target_degree_w**、**degree_w_expanded**、**topic_align**、**topic_level**、**topic_confidence**、**domain_fit**、**parent_anchor**、**parent_primary** 等，供 Stage3 消费。 |
 | **主要公式** | **领域门控**：扩展词仅当 `domain_fit ≥ DOMAIN_FIT_MIN_EXPANSION` 且 `domain_span ≤ DOMAIN_SPAN_MAX_EXPANSION` 才进入词池。topic_align 来自 `_attach_topic_align`（vocabulary_topic_stats 层级命中 × topic_confidence）。 |
-| **调用的表/知识图谱** | **Neo4j**：**Vocabulary**、**CO_OCCURRED_WITH**（共现）；**Faiss**：Vocabulary 向量索引（dense 近邻）；**SQLite**：`vocabulary_domain_stats`（work_count、domain_span、domain_dist）、`vocabulary_cooccurrence`（term_a、term_b、freq）、`vocabulary_topic_stats`（field_id、subfield_id、topic_id、*_dist、source）；**簇数据**：cluster_members、voc_to_clusters、cluster_centroids（label_means.infra）。 |
+| **调用的表/知识图谱** | **Neo4j**：**Vocabulary**；**Faiss**：Vocabulary 向量索引（dense 近邻）；**SQLite**：`vocabulary_domain_stats`（work_count、domain_span、domain_dist）、`vocabulary_cooccurrence`（term_a、term_b、freq，学术共鸣与锚点共鸣及 cooc_span/cooc_purity 均由此表读取）、`vocabulary_topic_stats`（field_id、subfield_id、topic_id、*_dist、source）；**簇数据**：cluster_members、voc_to_clusters、cluster_centroids（label_means.infra）。 |
 
 ---
 
@@ -1086,7 +1079,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 
 - **领域分布**：从主库 `works` 的 `concepts_text`、`keywords_text` 解析 term（与共现逻辑同源），与 `vocabulary` 映射后按 work 的 `domain_ids` 聚合，用 `Counter` 得到 `domain_dist`；`work_count`、`domain_span` 写入 `vocabulary_domain_stats`。不依赖知识图谱。
 
-- **共现表**：从主库 works 的 concepts_text/keywords_text 构建共现，写入 `vocabulary_cooccurrence`（term_a, term_b, freq），与 build_kg 的 CO_OCCURRED_WITH 一致。
+- **共现表**：从主库 works 的 concepts_text/keywords_text 流式构建共现，写入 `vocabulary_cooccurrence`（term_a, term_b, freq）；标签路学术共鸣、锚点共鸣及 cooc_span/cooc_purity 均由此表提供，KG 流水线不再在 Neo4j 中构建 CO_OCCURRED_WITH。
 
 - **三级领域（vocabulary_topic_stats）**：先读 `DATA_DIR/vocabulary_topic_index.json`（由方案 B 脚本 `export_vocabulary_topic_index.py` 从主库 `vocabulary_topic` 表导出）；对 JSON 中至少有一级（field_id 或 field_name）的 voc_id 直接写入 field/subfield/topic 标量，`source='direct'`。再对**未在 JSON 中出现**的 voc_id，用 `vocabulary_cooccurrence` 中有标签的共现伙伴按 freq 加权聚合，得到 field_dist、subfield_dist、topic_dist（JSON 占比），`source='cooc'`。对有标签但缺层级的词，用共现补全 *_dist 并设 `source='direct+cooc'`。
 
@@ -1614,7 +1607,7 @@ KGAT-AX 是「**知识图谱注意力网络 + 学术指标增强（AX）**」的
     - `build_semantic_bridge()`：基于 SBERT + Faiss 计算词汇间相似度，并写入 `SIMILAR_TO`；
     - `build_work_semantic_links()`：基于 Aho‑Corasick 自动机扫描论文标题和元数据，补齐 `HAS_TOPIC`；
     - `build_job_skill_links()`：基于 `jobs.skills` 将岗位与技能词汇建立 `REQUIRE_SKILL` 关系；
-    - `build_cooccurrence_links()`：统计词汇在同一论文中的共现频率，构建 `CO_OCCURRED_WITH` 共现网络。
+    - 共现数据由 `build_index/build_vocab_stats_index.py` 写入 `vocab_stats.db`，KG 不再调用 `build_cooccurrence_links()`。
 
 - **`src/infrastructure/database/build_kg/kg_utils.py`**  
   - 定义：
@@ -1626,7 +1619,7 @@ KGAT-AX 是「**知识图谱注意力网络 + 学术指标增强（AX）**」的
   - `run_pipeline(CONFIG_DICT)`：一键执行完整 KG 构建流程：
     1. 确保 Neo4j 约束与索引存在、SQLite 建立必要索引；
     2. 执行节点同步与拓扑构建；
-    3. 执行语义打标 / 共现网络构建 / 语义桥接；
+    3. 执行语义打标与语义桥接（共现由 build_vocab_stats_index 提供，不在此流水线构建）；
     4. 在脚本末尾提供 `__main__` 入口，便于命令行直接启动流水线。
 
 #### `build_index` 子模块
@@ -1645,7 +1638,7 @@ KGAT-AX 是「**知识图谱注意力网络 + 学术指标增强（AX）**」的
     - 阶段 3：引入间接协作（共同合作者）与 H‑index 正则化，生成最终 `scholar_collaboration` 表，并裁剪为 Top‑100 伙伴。
 
 - **`build_vocab_stats_index.py`**
-  - `VocabStatsIndexer` 构建 vocab_stats.db 中多张表，**仅依赖主库 SQLite，不依赖 Neo4j**：（1）`vocabulary_domain_stats`：从主库 `works` 的 `concepts_text`、`keywords_text` 解析 term 并聚合 `domain_ids`，为每个词计算 work_count、领域跨度、domain_dist；（2）`vocabulary_cooccurrence`：从主库 works 计算词对共现频次 (term_a, term_b, freq)，与 KG CO_OCCURRED_WITH 一致；（3）`vocabulary_topic_stats`：**三级领域**，先用 `data/vocabulary_topic_index.json`（方案 B 导出）直接填有标签词的 field/subfield/topic，再用共现对无标签或缺层级词补全 field_dist、subfield_dist、topic_dist（百分比）。构建前需先运行 `backfill_vocabulary_topic` 与 `export_vocabulary_topic_index`（仅三级领域步骤依赖该 JSON）。
+  - `VocabStatsIndexer` 构建 vocab_stats.db 中多张表，**仅依赖主库 SQLite，不依赖 Neo4j**：（1）`vocabulary_domain_stats`：从主库 `works` 的 `concepts_text`、`keywords_text` 解析 term 并聚合 `domain_ids`，为每个词计算 work_count、领域跨度、domain_dist；（2）`vocabulary_cooccurrence`：从主库 works 流式计算词对共现频次 (term_a, term_b, freq)，标签路共鸣与共现指标均由此表提供（KG 不再构建 Neo4j CO_OCCURRED_WITH）；（3）`vocabulary_topic_stats`：**三级领域**，先用 `data/vocabulary_topic_index.json`（方案 B 导出）直接填有标签词的 field/subfield/topic，再用共现对无标签或缺层级词补全 field_dist、subfield_dist、topic_dist（百分比）。构建前需先运行 `backfill_vocabulary_topic` 与 `export_vocabulary_topic_index`（仅三级领域步骤依赖该 JSON）。
 
 - **`build_feature_index.py`**  
   - `FeatureIndexBuilder` 从 `authors / institutions` 表抽取学术指标（H‑index、论文数、引用数），做 log1p + Min‑Max 归一化，生成：
@@ -1993,7 +1986,7 @@ python generate_kg.py
   - 在 Neo4j 中创建索引与约束；
   - 将 SQLite 中的作者 / 论文 / 机构 / 渠道 / 词汇 / 岗位同步到图数据库；
   - 建立 Authorship 与 Job‑Skill 等关系；
-  - 通过标题扫描与统计构建 HAS_TOPIC / CO_OCCURRED_WITH / SIMILAR_TO 等语义边。
+  - 通过标题扫描构建 HAS_TOPIC、通过 SBERT 构建 SIMILAR_TO 等语义边；共现数据由 `build_vocab_stats_index` 写入 `vocab_stats.db`，不在此脚本中构建。
 
 #### 2.5 构建向量索引与特征索引
 
@@ -2483,6 +2476,302 @@ def stage3_filter_and_score_terms(term_candidates, active_domains):
     **4. Stage 2 主落点熔断逻辑（硬护栏）**  
     在实现 `select_primary_academic_landings` 时，必须在代码中加入以下**逻辑契约**：  
     若某锚点经跨类型 SIMILAR_TO（及可选 JD 向量）检索后，其最高分的 `identity_score` 仍低于 `PRIMARY_MIN_IDENTITY (0.62)`，则该锚点**必须**被标记为 `unresolved`。**禁止**为其生成任何 `dense_expansion`、`cluster_expansion` 或 `cooc_expansion`。此条为防止「语义漂移」的最有效关卡。
+
+---
+
+### 两阶段架构升级与落地计划（成稿）
+
+以下为可直接落地的修改计划成稿：总召回、训练数据、KGAT-AX 结构、精排与证据链的升级方向与实施顺序，可整体作为后续规划正文引用或拆入对应章节。
+
+#### 整体架构与数据流
+
+##### 2.1 两阶段推荐范式：从“多路名单融合”升级为“统一候选池 + 深度精排”
+
+当前系统已经具备：
+
+- 多路召回（Vector / Label / Collaboration）
+- 图模型精排（KGAT-AX）
+- Neo4j 证据解释
+
+但从工程职责上看，后续系统将进一步明确为更标准的两阶段推荐架构：
+
+> **多通道召回 → 统一候选池 → 轻量预排序 → KGAT-AX 深度精排 → 证据链解释**
+
+这意味着后续不再把总召回理解为“三条路径分别给名单，再做一次融合”，而是把它升级为一个真正的**候选池构建器（Candidate Pool Builder）**。
+候选池的目标不是直接给最终答案，而是为下游精排提供一个：
+
+- 高覆盖
+- 低噪声
+- 来源清晰
+- 特征完整
+- 与训练分布一致
+
+的统一候选集合。
+
+因此，整条链路的职责将被重新定义为：
+
+1. **召回层**
+- 负责尽量不漏掉相关专家；
+- 强调“覆盖率”和“多样性”，不追求最终精确排序。
+
+2. **候选池层**
+- 对三路召回结果进行配额控制、去重合并、来源特征保留、基础过滤与分桶；
+- 这是线上推理和线下训练共用的中间层。
+
+3. **预排序层**
+- 在进入 KGAT-AX 之前，对候选池做一次轻量级压缩；
+- 目的是降低精排成本，而不是代替精排。
+
+4. **精排层**
+- 使用 KGAT-AX 对统一候选池内部作者做重排序；
+- 核心目标是从“都看起来相关”的作者中找出“最适合当前岗位的活跃研究者”。
+
+5. **解释层**
+- 将召回来源、图路径证据、论文证据、作者指标与模型排序依据统一输出为可追溯证据链。
+
+##### 2.2 升级后的完整线上流程
+
+后续线上推荐流程建议固定为如下顺序：
+
+1. **输入 JD / 查询文本**
+- 用户输入岗位职责、技术栈、研究方向、业务领域等。
+- 若用户手动指定领域，则优先以用户领域为硬约束；
+- 否则由领域探测器自动判定 active domains。
+
+2. **统一编码与领域探测**
+- 对原始 JD 做基础编码；
+- 使用 `DomainDetector` 输出 `active_domains`；
+- 同时为向量路构造带有领域 bias 的查询向量。
+
+3. **三路独立召回**
+- Vector 路输出高覆盖候选；
+- Label 路输出高精度候选；
+- Collaboration 路基于前两路种子做结构补充。
+
+4. **候选池构建**
+- 三路结果做配额控制；
+- 按 `author_id` 去重合并；
+- 保留各路来源与分数；
+- 执行硬过滤；
+- 执行分桶；
+- 产出统一候选池。
+
+5. **候选池预排序**
+- 使用轻量规则分数或基础特征分数对候选池做一次压缩；
+- 将候选池规模控制到适合 KGAT-AX 处理的范围。
+
+6. **KGAT-AX 深度精排**
+- 结合图谱结构、高阶关系、作者显式指标、召回来源和 query-author 交叉特征，得到最终模型分数。
+
+7. **稳定融合**
+- 将候选池基础分、KGAT-AX 模型分、规则稳定项做最终融合；
+- 输出 TopN 专家。
+
+8. **证据链解释**
+- 输出“召回来源 → 技能词/学术词 → 论文 → 作者 → 合作者/机构/期刊”的完整解释链。
+
+#### 总召回模块的重新定位与升级（total_recall）
+
+##### 3.1 总召回模块的重新定位
+
+`src/core/recall/total_recall.py` 当前已经完成了三项关键能力：
+
+- 统一 Query 编码；
+- 并行调起向量路与标签路；
+- 使用前两路种子驱动协同路；
+- 使用 RRF 做多路融合；
+- 对多路命中作者追加柔性 bonus。
+
+后续不推翻这一设计，而是在其基础上进一步升级为**统一候选池构建器**。
+
+也就是说，`TotalRecallSystem` 不再只返回：
+
+- `final_top_200`
+- `rank_map`
+
+而是应逐步升级为返回一个结构化候选池对象，包含：
+
+- 候选作者主表；
+- 候选来源特征；
+- 候选证据明细；
+- 候选分桶信息；
+- 可直接供训练脚本与线上精排复用的中间表示。
+
+##### 3.2 总召回的目标与原则
+
+- **3.2.1 高覆盖但不放任脏候选**  
+  总召回不是最终排序器，因此必须允许一定程度的“相关但未必最优”的候选进入池中；但它也不能过脏，否则精排模型会浪费容量去清理明显错误的人。
+
+- **3.2.2 各路径职责必须清晰**  
+  三条路径不再是完全平级的“投票器”，而是职责明确的召回源：**Vector 路**：高覆盖，负责语义泛化；**Label 路**：高精度，负责岗位技能到学术词再到论文/作者的精确链路；**Collaboration 路**：结构补充，负责把核心作者周围的高价值合作者补进来。
+
+- **3.2.3 候选池必须能复用到训练**  
+  总召回输出不能只服务线上展示。后续训练数据生成也应尽量复用这套候选池逻辑，保证线上看到什么样的候选分布，训练就学会在什么样的候选分布上做排序。
+
+- **3.2.4 来源信息本身就是排序特征**  
+  作者是从哪条路被召回进来的，本身就是极强的排序信号。因此，总召回必须保留路径来源，而不是只输出一个融合后的 author_id 列表。
+
+##### 3.3 总召回的升级后流程（七阶段）
+
+- **阶段一：统一编码与领域处理**  
+  输入：`query_text`、`domain_id`、`is_training`。输出：`raw_vec`、`query_vec`、`active_domains`、`applied_domain_str`、`domain_debug`、`vector_domains`。此阶段继续沿用当前逻辑。
+
+- **阶段二：三路独立召回**  
+  **Vector 路输出**：`author_id`、`vector_score_raw`、`vector_rank`、`vector_evidence`。**Label 路输出**：`author_id`、`label_score_raw`、`label_rank`、`label_evidence`。**Collaboration 路输出**：`author_id`、`collab_score_raw`、`collab_rank`、`collab_evidence`。即使当前代码里三路很多地方还只返回作者列表，README 里也应先把目标输出接口定义清楚。
+
+- **阶段三：配额控制**  
+  明确独立可调的三路配额：`K_vector`、`K_label`、`K_collab`。推荐原则：`K_vector` 较大负责广覆盖；`K_label` 较大或略高负责高精度；`K_collab` 显著低于前两路，仅作补充。协同路不再与向量路、标签路争夺主导地位，而是作为一种“结构补全路径”存在，抑制“熟人圈放大”问题。
+
+- **阶段四：去重合并**  
+  为每个作者构建统一候选记录，推荐字段：`author_id`、`recall_from_vector`、`recall_from_label`、`recall_from_collab`、`recall_path_count`、`vector_rank`、`label_rank`、`collab_rank`、`vector_score_raw`、`label_score_raw`、`collab_score_raw`、`rrf_score`、`multi_path_bonus`、`candidate_pool_score`、`is_multi_path_hit`。
+
+- **阶段五：硬过滤**  
+  领域硬过滤、活跃度硬过滤、论文质量硬过滤、协同弱命中过滤、极弱单路命中过滤。目标不是把池子缩得非常小，而是清掉明显不值得进入精排的候选。
+
+- **阶段六：分桶**  
+  推荐分桶：**A 桶**：主题强相关 + 近期活跃；**B 桶**：主题强相关 + 指标一般；**C 桶**：指标较强 + 主题中等相关；**D 桶**：协同补充型候选。防止候选池被同一种风格的作者占满，给 KGAT-AX 提供更有层次的比较对象。
+
+- **阶段七：统一导出**  
+  (1) 候选作者主表：面向精排与训练，每个作者一行，包含所有统一特征。(2) 候选证据明细表：面向解释，记录作者被召回的路径、命中的 skill / term / paper / collaborator / source 等证据。
+
+##### 3.4 总召回建议新增的中间结构
+
+- **CandidateRecord**  
+  用于统一表示某位作者在候选池中的信息。建议包含：基础标识（`author_id`、`author_name`）；路径来源（`from_vector`、`from_label`、`from_collab`、`path_count`）；各路表现（`vector_rank`、`label_rank`、`collab_rank`、`vector_score_raw`、`label_score_raw`、`collab_score_raw`）；融合分（`rrf_score`、`multi_path_bonus`、`candidate_pool_score`）；候选质量特征（`bucket_type`、`is_multi_path_hit`、`passed_hard_filter`）；证据（`vector_evidence`、`label_evidence`、`collab_evidence`）。
+
+- **CandidatePool**  
+  用于统一表示一轮查询的候选池结果。建议包含：`query_text`、`applied_domains`、`candidate_records`、`candidate_evidence_rows`、`stats_summary`、`path_costs`、`domain_debug`。后续训练脚本、精排引擎、解释模块都从这个对象读取。
+
+##### 3.5 总召回的预期收益
+
+提升线上候选池质量；降低 KGAT-AX 的清噪负担；保留路径来源，便于精排学习；统一线上与训练的数据分布；为解释模块提供更完整的中间证据。
+
+#### KGAT-AX 在系统中的重新定位与结构升级
+
+##### 5.1 KGAT-AX 的重新定位
+
+KGAT-AX 不再被描述为“全量作者检索模型”，而应被定义为**第二阶段深度精排器（Re-ranker）**。它的职责不是在全库里高速找人，而是在总召回产出的统一候选池中，对候选作者进行更细粒度、更高质量的排序。核心输入由四类信息共同构成：图结构信息、作者显式指标、召回来源信息、query-author 交叉特征。
+
+##### 5.2 当前优势与需要补强的地方
+
+当前 KGAT-AX 已有离线训练脚本、图索引构建工具、训练数据导出链路、`kg_final.txt -> kg_triplets` 索引底座、线上调用与排序融合能力。收益最大的做法不是“重写精排器”，而是：把总召回做成高质量候选池；把训练数据对齐线上候选池；把 KGAT-AX 输入从“图 + 少量辅助特征”升级为“图 + 指标 + 来源 + 交叉特征”的四分支融合结构。
+
+##### 5.3 KGAT-AX 的升级后结构（四分支）
+
+- **图结构分支（Graph Tower）**  
+  保留 KGAT 主体，建模 Job、Vocabulary、Work、Author、Institution、Source、Author-Author；主链为 **Job → Vocabulary → Work → Author**。职责：学习多关系图上的高阶连接，为作者提供结构语义表示，为解释模块提供注意力依据。
+
+- **作者显式指标分支（Author Tower）**  
+  输入建议包括：`h_index`、`works_count`、`cited_by_count`、`recent_works_count`、`recent_citations`、`institution_level`、`source_quality_stats`、`top_work_quality`、`time_decay_features`。显式告诉模型谁学术影响力更强、谁近期更活跃、谁更符合“值得排前”的作者画像。
+
+- **召回来源分支（Recall Tower）**  
+  输入建议包括：`from_vector`、`from_label`、`from_collab`、`path_count`、`vector_rank`、`label_rank`、`collab_rank`、各路 `*_score_raw`、`bucket_type`、`is_multi_path_hit`。让模型学会多路命中通常更可信、只来自协同路且无主题支撑的候选要保守等。
+
+- **query-author 交叉分支（Interaction Tower）**  
+  输入建议包括：`topic_similarity`、`skill_coverage_ratio`、`academic_term_hit_strength`、`domain_consistency`、`paper_hit_strength`、`recent_activity_match`、`top_paper_match_quality`、`career_stage_match`、`institution_task_fit` 等。回答“这个作者与这个岗位，到底有多匹配？”。
+
+##### 5.4 最终融合打分
+
+\[
+s(job, author)=
+w_g \cdot s_{graph}
++ w_a \cdot s_{author}
++ w_r \cdot s_{recall}
++ w_i \cdot s_{interaction}
+\]
+
+其中：`s_graph` 图结构分支得分；`s_author` 作者显式指标分支得分；`s_recall` 召回来源分支得分；`s_interaction` query-author 交叉分支得分。图分支负责结构语义，指标分支负责学术实力与活跃度，来源分支负责候选可信度，交叉分支负责岗位-作者直接匹配程度。
+
+##### 5.5 为什么当前阶段仍然保留 KGAT-AX
+
+已有完整的离线训练链路、图索引与训练数据导出能力、线上推理与排序融合能力。当前更大的收益来自候选池和训练样本升级，而不是换新模型。后续工作重点：补齐总召回、补齐训练样本、补齐特征输入，让现有 KGAT-AX 真正发挥价值。
+
+#### 精排与解释的重新定义与证据链升级
+
+##### 6.1 精排阶段的重新定义
+
+精排阶段明确分成三步：**候选池预排序** → **KGAT-AX 深度精排** → **最终稳定融合**。
+
+##### 6.2 候选池预排序
+
+目标：压缩候选池规模、清理弱候选、给 KGAT-AX 提供更高质量的输入。输入：总召回的候选池基础特征（如 `candidate_pool_score`、`path_count`、`from_label`、`from_vector`、`from_collab`、`bucket_type`、`domain_consistency`、`recent_activity_match`、`top_paper_hit_count`）。输出：规模更可控的精排候选池（例如 300→150 或 500→200）。预排序只做“粗筛”，不代替深度排序。
+
+##### 6.3 KGAT-AX 深度精排
+
+在一批都看起来相关的作者里，判断谁更贴题、谁更活跃、谁更有实力、谁更值得排到前面。更重视 Top10/Top20 的前排质量、不同类型候选之间的稳定比较、排序结果与证据链的一致性。
+
+##### 6.4 最终稳定融合
+
+推荐最终分数结构：
+
+\[
+final\_score =
+\lambda_1 \cdot candidate\_pool\_score +
+\lambda_2 \cdot kgatax\_score +
+\lambda_3 \cdot rule\_stability
+\]
+
+`rule_stability` 可包含：主题一致性底线、活跃度底线、多路命中 bonus、仅协同命中 penalty、缺乏强论文证据 penalty。避免模型偶发性把低可信候选排得过高，增加线上结果的可控性。
+
+##### 6.5 精排阶段的目标定义
+
+- **第一层目标**：压下明显不该排前的人（仅协同命中但主题不够相关、活跃度明显不足、没有强论文证据、学术指标偏弱且无图结构支撑）。
+- **第二层目标**：在相关作者中找出更优人选（主题更贴、近年更活跃、学术实力更强、代表作更匹配、多路共识更高）。
+- **第三层目标**：为解释提供可信排序依据（最终排名能回答：该作者为什么被召回、为什么在这些候选人中排得更前、他的核心证据链是什么）。
+
+##### 6.6 证据链解释的升级方向（三层统一证据框架）
+
+- **第一层：召回来源证据**  
+  输出：`from_vector`、`from_label`、`from_collab`、`path_count`、`dominant_recall_path`。回答：这个作者是从哪条路进候选池的？是否命中了多条路？哪条路贡献最大？
+
+- **第二层：图路径证据**  
+  继续沿用当前 `rank_explainer.py` 的多跳路径挖掘逻辑，把候选池证据明细并入解释输入。回答：岗位哪项技能与作者哪篇论文发生了连接？命中的核心学术词、关键论文、期刊/会议、合作者或机构支撑。
+
+- **第三层：排序支撑证据**  
+  统一输出：主题匹配度高、技能覆盖度高、多路召回共识强、近期活跃、学术指标较强、代表作质量好、模型注意力对关键论文赋权高。
+
+##### 6.7 证据链的最终输出格式（四段式）
+
+- **召回摘要**：例如“该作者同时命中标签路与向量路，并由协同路进一步补强；属于多路共识候选，候选可信度较高。”
+- **主题匹配摘要**：岗位强调的方向与作者强命中论文、关键证据论文。
+- **学术实力摘要**：近三年活跃度、H-index/总引用/代表作质量、机构与发表渠道影响力。
+- **模型置信摘要**：KGAT-AX 在主链上给予的注意力、排序结果与召回来源和论文证据的一致性。
+
+#### 后续规划落地顺序与目标
+
+##### 10.1 总召回升级计划
+
+优先对 `src/core/recall/total_recall.py` 做结构升级：三路独立配额控制、去重合并、路径来源特征化、硬过滤、分桶、候选池统一导出给线上与训练。同时改善线上候选池质量、训练样本质量、精排输入质量、证据链完整度。
+
+##### 10.2 KGAT-AX 训练数据升级计划
+
+`kgat_ax/generate_training_data.py` 尽量复用线上总召回逻辑，先构造统一候选池，再在候选池内部生成排序样本。
+
+- **训练目标**：模拟真实线上排序问题——区分“一批都相关的人中，谁更值得排前”，而非“相关 vs 完全无关”。
+- **正样本构造**：多信号共识（标签路命中强、向量路支持、领域一致、近年活跃、学术指标不差、关键论文命中强、位于高质量桶）。
+- **负样本构造**：分层负样本——**EasyNeg**（明显不相关）、**FieldNeg**（同领域但主题偏移）、**HardNeg**（主题相近、指标也不差但不是最佳人选）、**CollabNeg**（合作很近但主题不够匹配）。关键为 HardNeg 与 CollabNeg。
+- **样本字段扩充**：召回来源特征（`from_vector`、`from_label`、`from_collab`、`path_count`、`path_ranks`、`path_scores`）；交叉特征（`topic_similarity`、`skill_coverage_ratio`、`paper_hit_strength`、`domain_consistency`、`recent_activity_match`）；候选池特征（`bucket_type`、`is_multi_path_hit`、`passed_hard_filter`、`candidate_pool_score`）。
+- **训练与评估目标**：训练可保留 pairwise 主体，评估明显偏向 top-heavy 指标（Top10 命中质量、Top20 排序稳定性、多路命中候选的前排保持率、证据链一致性）。
+
+##### 10.3 KGAT-AX 结构升级计划
+
+保留 Graph Tower；增加 Author Tower、Recall Tower、Interaction Tower；将最终得分改为多分支融合。让模型不仅知道“谁和岗位有图谱连接”，也知道“谁近期更活跃、谁学术实力更强、谁被多路一致支持、谁与岗位更匹配”。
+
+##### 10.4 精排与解释升级计划
+
+精排阶段固定为：候选池预排序 → KGAT-AX 深度精排 → 最终稳定融合 → 四段式证据链输出。证据链统一覆盖：召回来源、主题匹配、学术实力、模型置信。
+
+##### 10.5 推荐的工程落地顺序
+
+- **第一阶段**：先改总召回（三路配额制、去重合并、来源特征化、硬过滤、分桶、候选池统一导出）。
+- **第二阶段**：再改训练数据与 KGAT-AX 输入（训练数据与候选池对齐、分层负样本、增加召回来源特征与 query-author 交叉特征、增加作者显式指标输入）。
+- **第三阶段**：最后补强精排与解释（候选池预排序、最终稳定融合、四段式证据链输出、排名结果与解释依据统一）。
+
+##### 10.6 升级后的总体目标
+
+完成上述改造后，系统将从“多路召回 + 模型融合”的原型架构，升级为一个更接近工业推荐系统的完整两阶段专家推荐框架：总召回负责高质量候选池；KGAT-AX 负责候选池内部深度排序；训练样本与线上候选池分布一致；证据链能够完整说明召回原因、排序原因与关键论文依据。这也是当前工期下最稳、最现实、收益最高的演进方向。
+
+---
 
 以下为整合后的 KGAT-AX v2 修改方案（已合并原 README 中多处重复与差异表述，保留全部细节）：
 ## KGAT-AX v2 修改方案

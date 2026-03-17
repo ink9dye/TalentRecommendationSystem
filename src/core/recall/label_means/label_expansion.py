@@ -415,29 +415,91 @@ def expand_with_clusters(label, raw_results, domain_regex, topk_per_seed=5, weig
     return raw_results
 
 
+def _voc_id_to_term_lower(conn, voc_ids: List[int]) -> Dict[int, str]:
+    """从主库 vocabulary 取 voc_id -> term_lower，与 build_vocab_stats 的清洗一致（strip+lower）。"""
+    if not voc_ids:
+        return {}
+    ph = ",".join("?" * len(voc_ids))
+    rows = conn.execute(
+        f"SELECT voc_id, term FROM vocabulary WHERE voc_id IN ({ph})",
+        voc_ids,
+    ).fetchall()
+    out = {}
+    for (vid, term) in rows:
+        t = (term or "").strip().lower()
+        if t:
+            out[int(vid)] = t
+    return out
+
+
 def calculate_academic_resonance(label, tids: List[int]) -> Dict[int, float]:
-    cypher = """
-    MATCH (v1:Vocabulary)-[r:CO_OCCURRED_WITH]-(v2:Vocabulary)
-    WHERE v1.id IN $tids AND v2.id IN $tids
-    RETURN v1.id AS vid, SUM(r.weight) AS resonance_score
     """
-    results = label.graph.run(cypher, tids=tids).data()
-    return {r["vid"]: float(r["resonance_score"]) for r in results}
+    从 vocab_stats.db 的 vocabulary_cooccurrence 计算候选词集内部共现权重和（学术共鸣）。
+    与 build_vocab_stats_index 的共现数据一致，不再依赖 Neo4j CO_OCCURRED_WITH。
+    """
+    out = {tid: 0.0 for tid in tids}
+    if len(tids) < 2 or not getattr(label, "stats_conn", None):
+        return out
+    try:
+        with sqlite3.connect(DB_PATH) as main_conn:
+            tid_to_term = _voc_id_to_term_lower(main_conn, tids)
+        if len(tid_to_term) < 2:
+            return out
+        term_to_tid = {t: vid for vid, t in tid_to_term.items()}
+        terms = list(term_to_tid.keys())
+        ph = ",".join("?" * len(terms))
+        sql = (
+            f"SELECT term_a, term_b, freq FROM vocabulary_cooccurrence "
+            f"WHERE term_a IN ({ph}) AND term_b IN ({ph})"
+        )
+        rows = label.stats_conn.execute(sql, terms + terms).fetchall()
+        for (ta, tb, freq) in rows:
+            f = int(freq or 0)
+            if ta in term_to_tid and tb in term_to_tid:
+                vid_a, vid_b = term_to_tid[ta], term_to_tid[tb]
+                if vid_a in out:
+                    out[vid_a] += f
+                if vid_b in out:
+                    out[vid_b] += f
+    except Exception:
+        pass
+    return out
 
 
 def calculate_anchor_resonance(label, tids: List[int], first_layer_tids: List[int]) -> Dict[int, float]:
-    if not first_layer_tids:
-        return {tid: 0.0 for tid in tids}
-    cypher = """
-    MATCH (v1:Vocabulary)-[r:CO_OCCURRED_WITH]-(v2:Vocabulary)
-    WHERE v1.id IN $tids AND v2.id IN $first_layer_tids
-    RETURN v1.id AS vid, SUM(r.weight) AS anchor_resonance_score
     """
+    从 vocab_stats.db 的 vocabulary_cooccurrence 计算候选词与第一层学术词的共现权重和（锚点共鸣）。
+    与 build_vocab_stats_index 的共现数据一致，不再依赖 Neo4j CO_OCCURRED_WITH。
+    """
+    out = {tid: 0.0 for tid in tids}
+    if not first_layer_tids or not getattr(label, "stats_conn", None):
+        return out
     try:
-        results = label.graph.run(cypher, tids=tids, first_layer_tids=first_layer_tids).data()
-        return {r["vid"]: float(r["anchor_resonance_score"]) for r in results}
+        with sqlite3.connect(DB_PATH) as main_conn:
+            tid_to_term_cand = _voc_id_to_term_lower(main_conn, tids)
+            tid_to_term_first = _voc_id_to_term_lower(main_conn, first_layer_tids)
+        if not tid_to_term_cand or not tid_to_term_first:
+            return out
+        terms_cand = set(tid_to_term_cand.values())
+        terms_first = set(tid_to_term_first.values())
+        term_to_tid_cand = {t: vid for vid, t in tid_to_term_cand.items()}
+        ph_c = ",".join("?" * len(terms_cand))
+        ph_f = ",".join("?" * len(terms_first))
+        sql = (
+            f"SELECT term_a, term_b, freq FROM vocabulary_cooccurrence "
+            f"WHERE (term_a IN ({ph_c}) AND term_b IN ({ph_f})) OR (term_a IN ({ph_f}) AND term_b IN ({ph_c}))"
+        )
+        params = list(terms_cand) + list(terms_first) + list(terms_first) + list(terms_cand)
+        rows = label.stats_conn.execute(sql, params).fetchall()
+        for (ta, tb, freq) in rows:
+            f = int(freq or 0)
+            if ta in terms_cand and tb in terms_first and ta in term_to_tid_cand:
+                out[term_to_tid_cand[ta]] = out.get(term_to_tid_cand[ta], 0) + f
+            elif ta in terms_first and tb in terms_cand and tb in term_to_tid_cand:
+                out[term_to_tid_cand[tb]] = out.get(term_to_tid_cand[tb], 0) + f
     except Exception:
-        return {tid: 0.0 for tid in tids}
+        pass
+    return out
 
 
 def get_cooccurrence_domain_metrics(label, raw_results, active_domain_ids):

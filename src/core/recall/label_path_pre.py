@@ -44,6 +44,7 @@ from src.utils.time_features import (
     compute_author_time_features,
     compute_author_recency_by_latest
 )
+from src.core.recall.label_means import label_expansion
 
 
 class LabelRecallPath:
@@ -990,35 +991,16 @@ class LabelRecallPath:
     def _calculate_academic_resonance(self, tids):
         """
         【学术逻辑层】计算候选词集内部的连通密度（与本次要搜索的词汇的共现 = 单词协作）。
-        逻辑：如果 MPC 和 WBC 都在候选名单里，且它们在图谱中有强共现边，则两者都会获得“共鸣加成”。
-        输出：{vid: resonance_score}，供下游 convergence_bonus 加权。
+        数据来源：vocab_stats.db 的 vocabulary_cooccurrence，与 build_vocab_stats_index 一致。
         """
-        cypher = """
-        MATCH (v1:Vocabulary)-[r:CO_OCCURRED_WITH]-(v2:Vocabulary)
-        WHERE v1.id IN $tids AND v2.id IN $tids
-        RETURN v1.id AS vid, SUM(r.weight) AS resonance_score
-        """
-        results = self.graph.run(cypher, tids=tids).data()
-        return {r['vid']: float(r['resonance_score']) for r in results}
+        return label_expansion.calculate_academic_resonance(self, tids)
 
     def _calculate_anchor_resonance(self, tids, first_layer_tids):
         """
-        【锚点共鸣】计算每个候选学术词与“第一层学术词”（first_layer_tids）在论文中的 CO_OCCURRED_WITH 权重之和。
-        工业词与学术词在论文中无共现，故用第一层学术词（由锚点 SIMILAR_TO 得到）做共现参考；与核心第一层无共现的扩展词给 0.1 惩罚。
-        输出：{tid: anchor_resonance_score}。
+        【锚点共鸣】计算每个候选学术词与“第一层学术词”的共现权重之和。
+        数据来源：vocab_stats.db 的 vocabulary_cooccurrence，与 build_vocab_stats_index 一致。
         """
-        if not first_layer_tids:
-            return {tid: 0.0 for tid in tids}
-        cypher = """
-        MATCH (v1:Vocabulary)-[r:CO_OCCURRED_WITH]-(v2:Vocabulary)
-        WHERE v1.id IN $tids AND v2.id IN $first_layer_tids
-        RETURN v1.id AS vid, SUM(r.weight) AS anchor_resonance_score
-        """
-        try:
-            results = self.graph.run(cypher, tids=tids, first_layer_tids=first_layer_tids).data()
-            return {r['vid']: float(r['anchor_resonance_score']) for r in results}
-        except Exception:
-            return {tid: 0.0 for tid in tids}
+        return label_expansion.calculate_anchor_resonance(self, tids, first_layer_tids)
 
     def _get_cooccurrence_domain_metrics(self, raw_results, active_domain_ids):
         """

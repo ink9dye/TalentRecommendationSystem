@@ -11,7 +11,7 @@ def run_pipeline(config):
     1. 实体同步：建立 Author, Work, Vocabulary 等孤立节点。
     2. 外部拓扑：建立 Authorship 专家署名权重边。
     3. 语义打标：执行 Aho-Corasick 标题回溯扫描，补全 HAS_TOPIC 关系。
-    4. 共现拓扑：利用 HAS_TOPIC 边，计算并构建 CO_OCCURRED_WITH 权重网。
+    4. 共现：已迁移至 build_vocab_stats_index（vocab_stats.db），召回从该库读取，此处不再构建。
     5. 向量桥接：计算词汇间 SBERT 语义相似度边。
     """
     monitor = Monitor()
@@ -72,10 +72,9 @@ def run_pipeline(config):
             builder.build_work_semantic_links()
             builder.build_job_skill_links()
 
-        # --- 4. 【核心新增】共现权重拓扑构建 ---
-        # 统计词汇对在 55 万篇论文中的实际共现频率，用于过滤虚假相似度
-        with monitor.track("Building Co-occurrence Knowledge Network"):
-            builder.build_cooccurrence_links()
+        # --- 4. 共现权重（已迁移至 build_vocab_stats_index）---
+        # 共现数据由 build_vocab_stats_index 流式写入 vocab_stats.db (vocabulary_cooccurrence)，
+        # 召回侧从 vocab_stats 读取，不再在 KG 中做自连接构建 Neo4j CO_OCCURRED_WITH，避免磁盘打满。
 
         # --- 5. 向量空间桥接 (Vocab-Vocab) ---
         # 利用 SBERT 构建词汇间的跨领域语义跳转边
