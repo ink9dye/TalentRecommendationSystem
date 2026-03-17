@@ -98,10 +98,12 @@ def run_stage5(
     industrial_kws = debug_1.get("industrial_kws", [])
     anchor_skills = debug_1.get("anchor_skills", {})
     term_role_map = debug_1.get("term_role_map") or {}
+    term_confidence_map = debug_1.get("term_confidence_map") or {}
     context = {
         "score_map": score_map,
         "term_map": term_map,
         "term_role_map": term_role_map,
+        "term_confidence_map": term_confidence_map,
         "anchor_kws": [k.lower() for k in industrial_kws],
         "active_domain_set": active_domain_set,
         "dominance": dominance,

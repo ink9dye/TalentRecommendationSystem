@@ -52,6 +52,31 @@ TOPIC_WEIGHT_CLUSTER = 0.35  # cluster_expansion 的 topic 权重
 TOPIC_WEIGHT_COOC = 0.25     # cooc_expansion 的 topic 权重
 TOPIC_MIN_ALIGN = 0.20       # expansion 低对齐软门限（仅 expansion 生效）
 TOPIC_LOW_ALIGN_PENALTY = 0.50  # 低对齐 expansion 额外惩罚系数
+# Stage3 按 source_type 降权：cluster/cooc 视为噪声，最终分乘以下系数
+CLUSTER_EXPANSION_PENALTY = 0.75   # cluster_expansion 最终分乘数
+COOC_EXPANSION_PENALTY = 0.65      # cooc_expansion 最终分乘数
+
+# 6.3 领域拟合（domain_fit）与 Stage2 门控
+DOMAIN_FIT_WEIGHTS = (0.4, 0.3, 0.2, 0.1)  # domain, field, subfield, topic
+DOMAIN_FIT_MIN_PRIMARY = 0.25      # Stage2A：domain_fit 低于此禁止做 primary
+DOMAIN_FIT_MIN_PRIMARY_BROAD = 0.40  # Stage2A：broad_concept 锚点（如 generic_task_term）做 primary 时 domain_fit 下限，强降权
+DOMAIN_FIT_MIN_EXPANSION = 0.20   # Stage2B：扩展词 domain_fit 低于此不进词池
+DOMAIN_SPAN_MAX_EXPANSION = 12    # Stage2B：扩展词 domain_span 超过此不进词池（跨域过大）
+
+# 高歧义锚点（acronym / generic_task_term）做 primary 时 identity 下限，高于普通 PRIMARY_MIN_IDENTITY
+PRIMARY_MIN_IDENTITY_HIGH_AMBIGUITY = 0.72
+
+# Stage2B 高可信 primary：参与 dense/cluster/cooc 扩散须同时满足 identity、domain_fit、source、domain_span 等结构约束（不依赖词面黑名单）
+DOMAIN_FIT_HIGH_CONFIDENCE = 0.35   # 高可信 primary 的 domain_fit 下限
+TRUSTED_SOURCE_TYPES_FOR_DIFFUSION = ("similar_to", "jd_vector")  # 仅此来源的 primary 可参与扩散；当前仅 similar_to，jd_vector 预留
+
+# Stage3 final_score 公式：source_weight / domain_gate / role_penalty
+SOURCE_WEIGHT_SIMILAR_TO = 1.0    # primary 来自 similar_to
+SOURCE_WEIGHT_JD_VECTOR = 0.95   # primary 来自 jd_vector
+SOURCE_WEIGHT_DENSE = 0.85       # dense_expansion
+SOURCE_WEIGHT_CLUSTER = 0.75    # cluster_expansion
+SOURCE_WEIGHT_COOC = 0.70       # cooc_expansion
+DOMAIN_GATE_MIN = 0.5           # domain_gate = DOMAIN_GATE_MIN + (1-DOMAIN_GATE_MIN)*domain_fit
 
 # --- 7. SBERT 模型本地存放路径 ---
 SBERT_MODEL_NAME = 'Alibaba-NLP/gte-multilingual-base'

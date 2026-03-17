@@ -8,15 +8,32 @@ def _run_stage3_dual_gate(
     raw_candidates: List[Dict[str, Any]],
     query_vector,
     anchor_vids=None,
-) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, float]]:
-    """Stage3 双闸门路径：identity 闸门 -> topic 闸门 -> quality 分 -> 最终分 -> 质量闸门。"""
+) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, float], Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str]]:
+    """Stage3 双闸门路径：identity 闸门 -> topic 闸门 -> quality 分 -> 最终分 -> 质量闸门。以结构化门控为主，不依赖词面黑/白名单。返回 score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map。"""
     score_map: Dict[str, float] = {}
     term_map: Dict[str, str] = {}
     idf_map: Dict[str, float] = {}
+    term_role_map: Dict[str, str] = {}
+    term_source_map: Dict[str, str] = {}
+    parent_anchor_map: Dict[str, str] = {}
+    parent_primary_map: Dict[str, str] = {}
     recall.debug_info.tag_purity_debug = []
     recall._last_tag_purity_debug = recall.debug_info.tag_purity_debug
     stage3_debug = getattr(term_scoring, "STAGE3_DEBUG", False)
     n_identity_ok, n_final_ok = 0, 0
+
+    if stage3_debug and raw_candidates:
+        print("[stage3_input] tid | term | source_type | parent_anchor | parent_primary | score")
+        for i, rec in enumerate(raw_candidates[:25]):
+            tid = rec.get("tid")
+            term = (rec.get("term") or "")[:24]
+            st = (rec.get("source") or rec.get("origin") or "")
+            pa = rec.get("parent_anchor") or ""
+            pp = rec.get("parent_primary") or ""
+            sc = rec.get("identity_score") or rec.get("sim_score") or 0
+            print(f"  {i+1} {tid} | {term!r} | {st} | {pa!r} | {pp!r} | {sc:.3f}")
+        if len(raw_candidates) > 25:
+            print(f"  ... 共 {len(raw_candidates)} 条")
 
     for rec in raw_candidates:
         if not term_scoring.passes_identity_gate(rec):
@@ -34,6 +51,10 @@ def _run_stage3_dual_gate(
             continue
         score_map[tid_str] = float(rec["final_score"])
         term_map[tid_str] = rec.get("term") or ""
+        term_role_map[tid_str] = rec.get("term_role") or "primary"
+        term_source_map[tid_str] = rec.get("source") or rec.get("origin") or ""
+        parent_anchor_map[tid_str] = rec.get("parent_anchor") or ""
+        parent_primary_map[tid_str] = rec.get("parent_primary") or ""
         degree_w = int(rec.get("degree_w") or 0)
         total = float(getattr(recall, "total_work_count", 1e6) or 1e6)
         idf_map[tid_str] = term_scoring._smoothed_idf(
@@ -50,6 +71,9 @@ def _run_stage3_dual_gate(
             "degree_w": rec.get("degree_w"),
             "degree_w_expanded": rec.get("degree_w_expanded"),
             "source": rec.get("source") or rec.get("origin"),
+            "domain_fit": rec.get("domain_fit"),
+            "parent_anchor": rec.get("parent_anchor"),
+            "parent_primary": rec.get("parent_primary"),
         }
         # 合并调试指标（task_anchor_sim、task_advantage、cluster_factor、base_score 等）供日志打印
         debug_metrics = term_scoring.get_term_debug_metrics(recall, rec, query_vector)
@@ -76,7 +100,12 @@ def _run_stage3_dual_gate(
 
     if stage3_debug:
         print(f"[Stage3] 双闸门汇总 输入={len(raw_candidates)} 通过identity={n_identity_ok} 通过final_score={n_final_ok} 输出词数={len(score_map)}")
-    return score_map, term_map, idf_map
+        print("[stage3_output] tid | term | source_type | parent_anchor | parent_primary | score")
+        for i, (tid_str, sc) in enumerate(sorted(score_map.items(), key=lambda x: -x[1])[:25]):
+            print(f"  {i+1} {tid_str} | {term_map.get(tid_str, '')!r} | {term_source_map.get(tid_str, '')} | {parent_anchor_map.get(tid_str, '')!r} | {parent_primary_map.get(tid_str, '')!r} | {sc:.3f}")
+        if len(score_map) > 25:
+            print(f"  ... 共 {len(score_map)} 条")
+    return score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map
 
 
 def run_stage3(
@@ -84,26 +113,31 @@ def run_stage3(
     raw_candidates: List[Dict[str, Any]],
     query_vector,
     anchor_vids=None,
-) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, float]]:
+) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, float], Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str]]:
     """
     阶段 3：词权重。
     若候选含 term_role/identity_score（Stage2 新格式），走双闸门路径；否则走原有 _calculate_final_weights。
+    返回 score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map。
     """
     if not raw_candidates:
-        return {}, {}, {}
+        return {}, {}, {}, {}, {}, {}, {}
 
     use_dual_gate = (
         raw_candidates
         and ("term_role" in raw_candidates[0] or "identity_score" in raw_candidates[0])
     )
     if use_dual_gate:
-        score_map, term_map, idf_map = _run_stage3_dual_gate(
+        score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map = _run_stage3_dual_gate(
             recall, raw_candidates, query_vector, anchor_vids=anchor_vids
         )
     else:
         score_map, term_map, idf_map = recall._calculate_final_weights(
             raw_candidates, query_vector, anchor_vids=anchor_vids
         )
+        term_role_map = {}
+        term_source_map = {}
+        parent_anchor_map = {}
+        parent_primary_map = {}
 
     # 保留原有的 verbose 调试逻辑（从 _stage3_word_weights 搬运）
     if recall.verbose and score_map and getattr(recall, "_last_tag_purity_debug", None):
@@ -249,5 +283,5 @@ def run_stage3(
                 f"ta-ca={_f(ta_ca,6):>6}  adv={_f(d.get('task_advantage'),5):>5}  final={score_map.get(tid, 0.0):.6f}"
             )
 
-    return score_map, term_map, idf_map
+    return score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map
 

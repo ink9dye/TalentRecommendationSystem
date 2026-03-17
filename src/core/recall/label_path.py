@@ -111,6 +111,42 @@ class RecallDebugInfo:
         self.cluster_expansion_log: List[Dict[str, Any]] = []
 
 
+def _emit_label_pipeline_checkpoints(checkpoints, debug_1=None):
+    """
+    标签路必查日志：每阶段关键计数，用于定位「从哪一步开始跑偏」。
+    必打一行汇总；若某步 ok=False 或计数为 0，该步即为首次跑偏点。
+    """
+    if not checkpoints:
+        return
+    parts = []
+    first_bad = None
+    for c in checkpoints:
+        stage = c.get("stage", "?")
+        ok = c.get("ok", True)
+        if stage == "S1":
+            parts.append(f"S1 anchors={c.get('anchors', 0)} domains={c.get('active_domains', 0)}")
+        elif stage == "S2":
+            parts.append(f"S2 raw_candidates={c.get('raw_candidates', 0)}")
+        elif stage == "S3":
+            parts.append(f"S3 score_map_terms={c.get('score_map_terms', 0)}")
+        elif stage == "S3_select":
+            parts.append(f"S3_select final_term_ids={c.get('final_term_ids', 0)}")
+        elif stage == "S4":
+            parts.append(f"S4 authors={c.get('authors', 0)} papers={c.get('papers', 0)}")
+        elif stage == "S5":
+            parts.append(f"S5 ranked={c.get('ranked_authors', 0)}")
+        else:
+            parts.append(f"{stage}={c}")
+        if first_bad is None and not ok:
+            first_bad = stage
+    line = " | ".join(parts)
+    print(f"[Label必查] {line}")
+    if first_bad is not None:
+        print(f"[Label必查] 首次异常阶段: {first_bad}（此处开始跑偏，请优先排查）")
+    if debug_1 is not None and isinstance(debug_1, dict):
+        debug_1["pipeline_checkpoints"] = checkpoints
+
+
 class LabelRecallPath:
     """
     【核心架构】解耦版标签路召回 - 结构化流水线
@@ -1363,10 +1399,32 @@ class LabelRecallPath:
                 score_map[tid_str] *= factor
                 self.debug_info.cluster_rank_factors[tid_str] = float(factor)
 
+    def _build_term_confidence_map(self, term_role_map, term_source_map):
+        """
+        按来源给每个 term 可信度：exact/bridge primary 高(0.95)、similar_to primary 中(0.9)、dense 中(0.75)、cluster/cooc 低(0.6)。
+        供 paper_term_contrib = term_weight * term_confidence * paper_match_strength 使用。
+        """
+        out = {}
+        for tid_str, role in (term_role_map or {}).items():
+            role = (role or "").strip().lower()
+            source = (term_source_map or {}).get(tid_str, "").strip().lower()
+            if role == "primary":
+                if source in ("similar_to", "jd_vector", ""):
+                    out[tid_str] = 0.95
+                else:
+                    out[tid_str] = 0.90
+            elif role == "dense_expansion":
+                out[tid_str] = 0.75
+            elif role in ("cluster_expansion", "cooc_expansion"):
+                out[tid_str] = 0.60
+            else:
+                out[tid_str] = 0.80
+        return out
+
     def _stage3_word_weights(self, raw_candidates, query_vector, anchor_vids=None):
         """
         阶段 3：词权重。统一走复杂公式（领域纯度、共鸣、语义守门、锚点距离门控等），无分支例外。
-        返回: (score_map, term_map, idf_map)。anchor_vids 用于无硬编码的锚点距离门控。
+        返回: (score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map)。
         """
         return stage3_term_filtering.run_stage3(self, raw_candidates, query_vector, anchor_vids=anchor_vids)
 
@@ -1409,7 +1467,10 @@ class LabelRecallPath:
             semantic_query_text=semantic_query_text,
             domain_id=domain_id,
         )
+        checkpoints = []
+        checkpoints.append({"stage": "S1", "anchors": len(anchor_skills or {}), "active_domains": len(active_domain_set or set()), "ok": bool(anchor_skills)})
         if not anchor_skills:
+            _emit_label_pipeline_checkpoints(checkpoints, None)
             return [], (time.time() - start_t) * 1000
 
         # 阶段 2：学术词扩展（仅产出候选，不算权）
@@ -1420,7 +1481,9 @@ class LabelRecallPath:
             query_vector,
             query_text=semantic_query_text or query_text,
         )
+        checkpoints.append({"stage": "S2", "raw_candidates": len(raw_candidates or []), "ok": bool(raw_candidates)})
         if not raw_candidates:
+            _emit_label_pipeline_checkpoints(checkpoints, debug_1)
             return [], (time.time() - start_t) * 1000
         self.debug_info.raw_candidate_tids = sorted(
             set(r.get("tid") for r in raw_candidates if r.get("tid") is not None)
@@ -1429,38 +1492,60 @@ class LabelRecallPath:
 
         # 阶段 3：词权重（统一走复杂公式，传入锚点 ID 供锚点距离门控）
         anchor_vids = [int(k) for k in anchor_skills.keys()] if anchor_skills else None
-        score_map, term_map, idf_map = self._stage3_word_weights(raw_candidates, query_vector, anchor_vids=anchor_vids)
+        score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map = self._stage3_word_weights(
+            raw_candidates, query_vector, anchor_vids=anchor_vids
+        )
+        checkpoints.append({"stage": "S3", "score_map_terms": len(score_map or {}), "ok": bool(score_map)})
 
         # 精检：仅选取少量高质量学术词参与论文检索（其余用于打分与 debug），避免大泛词统治图检索规模
         final_term_ids_for_paper = self._select_terms_for_paper(score_map, term_map, max_terms=20)
+        checkpoints.append({"stage": "S3_select", "final_term_ids": len(final_term_ids_for_paper or []), "ok": bool(final_term_ids_for_paper)})
+        if getattr(term_scoring, "STAGE3_DEBUG", False):
+            print("[final_term_ids_for_paper] tid | term | source_type | parent_anchor | parent_primary | score")
+            for i, tid in enumerate(final_term_ids_for_paper[:30], 1):
+                tid_str = str(tid)
+                term = term_map.get(tid_str, "")
+                st = term_source_map.get(tid_str, "")
+                pa = parent_anchor_map.get(tid_str, "")
+                pp = parent_primary_map.get(tid_str, "")
+                sc = score_map.get(tid_str, 0.0)
+                print(f"  {i} {tid} | {term!r} | {st} | {pa!r} | {pp!r} | {sc:.3f}")
+            if len(final_term_ids_for_paper) > 30:
+                print(f"  ... 共 {len(final_term_ids_for_paper)} 条")
         # 将闭环信息提前挂到 debug_1，供 stage5_author_rank 复用/补全
         filter_closed_loop = debug_1.get("filter_closed_loop") or {}
         filter_closed_loop["final_term_ids_for_paper"] = final_term_ids_for_paper
         filter_closed_loop["final_term_count"] = len(final_term_ids_for_paper)
         debug_1["filter_closed_loop"] = filter_closed_loop
 
+        # term_confidence：exact/bridge primary 高、similar_to primary 中、cluster/cooc 低，供 paper_term_contrib
+        term_confidence_map = self._build_term_confidence_map(term_role_map, term_source_map)
+        debug_1["term_role_map"] = term_role_map
+        debug_1["term_source_map"] = term_source_map
+        debug_1["term_confidence_map"] = term_confidence_map
+        debug_1["parent_anchor_map"] = parent_anchor_map
+        debug_1["parent_primary_map"] = parent_primary_map
+
         # 阶段 4：图检索
         author_papers_list = self._stage4_graph_search(
             final_term_ids_for_paper,
             regex_str,
         )
-
-        # 从 Stage3 双闸门 tag_purity_debug 构建 term_role_map（tid -> term_role），供 Stage4 权重与护栏 5 使用
-        tag_purity_debug = getattr(self, "_last_tag_purity_debug", None) or self.debug_info.tag_purity_debug or []
-        term_role_map = {
-            str(r["tid"]): (r.get("term_role") or "primary")
-            for r in tag_purity_debug
-            if r.get("tid") is not None
-        }
-        debug_1["term_role_map"] = term_role_map
+        n_papers = sum(len(p.get("papers") or []) for p in (author_papers_list or []))
+        checkpoints.append({"stage": "S4", "authors": len(author_papers_list or []), "papers": n_papers, "ok": bool(author_papers_list)})
 
         # 阶段 5：作者打分与排序（debug_1 中补上 regex_str、query_vector 供 last_debug_info 与 paper semantic gate）
         debug_1["regex_str"] = regex_str
         debug_1["query_vector"] = query_vector
         dominance = debug_1.get("dominance", 0.0)
-        author_ids, _ = self._stage5_score_and_rank_authors(
+        author_ids, last_debug_info = self._stage5_score_and_rank_authors(
             author_papers_list, score_map, term_map, active_domain_set, dominance, debug_1
         )
+        checkpoints.append({"stage": "S5", "ranked_authors": len(author_ids or []), "ok": True})
+        debug_1["pipeline_checkpoints"] = checkpoints
+        if last_debug_info is not None:
+            last_debug_info["pipeline_checkpoints"] = checkpoints
+        _emit_label_pipeline_checkpoints(checkpoints, debug_1)
 
         elapsed_ms = (time.time() - start_t) * 1000
         return author_ids[: self.recall_limit], elapsed_ms

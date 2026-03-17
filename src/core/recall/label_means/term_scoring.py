@@ -10,6 +10,14 @@ from config import (
     TOPIC_WEIGHT_COOC,
     TOPIC_MIN_ALIGN,
     TOPIC_LOW_ALIGN_PENALTY,
+    CLUSTER_EXPANSION_PENALTY,
+    COOC_EXPANSION_PENALTY,
+    SOURCE_WEIGHT_SIMILAR_TO,
+    SOURCE_WEIGHT_JD_VECTOR,
+    SOURCE_WEIGHT_DENSE,
+    SOURCE_WEIGHT_CLUSTER,
+    SOURCE_WEIGHT_COOC,
+    DOMAIN_GATE_MIN,
 )
 from src.core.recall.label_means import advanced_metrics as label_means_adv
 
@@ -641,8 +649,62 @@ def get_topic_weight_by_role(term_role: str) -> float:
     return 0.0
 
 
+def _get_source_weight(rec: Dict[str, Any]) -> float:
+    """按来源 source 返回 source_weight。"""
+    s = (rec.get("source") or rec.get("origin") or "").strip().lower()
+    if s == "similar_to":
+        return SOURCE_WEIGHT_SIMILAR_TO
+    if s == "jd_vector":
+        return SOURCE_WEIGHT_JD_VECTOR
+    if s == "dense":
+        return SOURCE_WEIGHT_DENSE
+    if s == "cluster":
+        return SOURCE_WEIGHT_CLUSTER
+    if s == "cooc":
+        return SOURCE_WEIGHT_COOC
+    return 1.0
+
+
+def _get_domain_gate(rec: Dict[str, Any]) -> float:
+    """domain_gate：三层领域匹配，乘回 final_score。缺 domain_fit 时退化为 DOMAIN_GATE_MIN，避免漏传反而无惩罚。"""
+    default_fit = DOMAIN_GATE_MIN  # 缺失或 None 时保守默认，不用 1.0
+    raw = rec.get("domain_fit", default_fit)
+    if raw is None:
+        raw = default_fit
+    domain_fit = float(raw)
+    return DOMAIN_GATE_MIN + (1.0 - DOMAIN_GATE_MIN) * max(0.0, min(1.0, domain_fit))
+
+
+def _get_role_penalty(rec: Dict[str, Any]) -> float:
+    """role_penalty：任务核心/抽象/载体/噪声。暂无细分时按 term_role 给权。"""
+    role = (rec.get("term_role") or "").strip().lower()
+    if role == "primary":
+        return 1.0
+    if role == "dense_expansion":
+        return 0.95
+    if role == "cluster_expansion":
+        return 0.90
+    if role == "cooc_expansion":
+        return 0.85
+    return 1.0
+
+
+def _get_expansion_penalty(rec: Dict[str, Any]) -> float:
+    """expansion_penalty：对 cluster/cooc 额外惩罚。"""
+    role = (rec.get("term_role") or "").strip().lower()
+    if role == "cluster_expansion":
+        return CLUSTER_EXPANSION_PENALTY
+    if role == "cooc_expansion":
+        return COOC_EXPANSION_PENALTY
+    return 1.0
+
+
 def compose_term_final_score(rec: Dict[str, Any]) -> float:
-    """最终分：base_score（identity+quality 按 term_role）再乘 topic_factor；expansion 低对齐时额外惩罚。"""
+    """
+    final_score = base_score * source_weight * domain_gate * task_consistency * role_penalty * expansion_penalty
+    其中：source_weight 看来源；domain_gate 看三层领域匹配；task_consistency 看 JD 语义+强锚点共振；
+    role_penalty 看是否任务核心/抽象/载体/噪声；expansion_penalty 对 cluster/cooc 额外惩罚。
+    """
     identity = float(rec.get("identity_score") or 0.0)
     quality = float(rec.get("quality_score") or 0.0)
     role = (rec.get("term_role") or "").strip().lower()
@@ -655,20 +717,24 @@ def compose_term_final_score(rec: Dict[str, Any]) -> float:
     else:
         base_score = 0.5 * identity + 0.5 * quality
 
+    source_weight = _get_source_weight(rec)
+    domain_gate = _get_domain_gate(rec)
     topic_align = float(rec["topic_align"]) if "topic_align" in rec else 1.0
     topic_weight = get_topic_weight_by_role(role)
-    topic_factor = 1.0 - topic_weight + topic_weight * topic_align
-    final_score = base_score * topic_factor
-
+    task_consistency = 1.0 - topic_weight + topic_weight * topic_align
     if role in EXPANSION_ROLES and topic_align < TOPIC_MIN_ALIGN:
-        final_score *= TOPIC_LOW_ALIGN_PENALTY
+        task_consistency *= TOPIC_LOW_ALIGN_PENALTY
+    role_penalty = _get_role_penalty(rec)
+    expansion_penalty = _get_expansion_penalty(rec)
+
+    final_score = base_score * source_weight * domain_gate * task_consistency * role_penalty * expansion_penalty
 
     if STAGE3_DEBUG and final_score < FINAL_MIN_TERM_SCORE:
         tid = rec.get("tid") or rec.get("vid") or ""
         term = (rec.get("term") or "")[:24]
         print(
             f"[Stage3] final_score 低于阈值 tid={tid} term={term!r} role={role} score={final_score:.3f} < {FINAL_MIN_TERM_SCORE} "
-            f"(base={base_score:.3f} topic_align={topic_align:.3f} topic_factor={topic_factor:.3f})"
+            f"(base={base_score:.3f} domain_gate={domain_gate:.3f} task_cons={task_consistency:.3f})"
         )
     return final_score
 

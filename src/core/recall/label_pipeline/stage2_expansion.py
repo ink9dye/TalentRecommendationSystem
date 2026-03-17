@@ -2,6 +2,7 @@
 """
 Stage2：学术词扩展。
 先 Stage2A 主落点（保守），再 Stage2B 仅围绕 primary 扩展；无缩写扩写表。
+当前 Stage2A 候选来源仅跨类型 SIMILAR_TO。
 """
 from typing import Any, Dict, List, Optional, Set
 
@@ -33,6 +34,9 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
             "cov_j": c.cov_j,
             "hit_count": c.hit_count,
             "src_vids": getattr(c, "src_vids", []) or [],
+            "domain_fit": getattr(c, "domain_fit", 1.0),
+            "parent_anchor": c.anchor_term,
+            "parent_primary": getattr(c, "parent_primary", c.term) or c.term,
         }
         rec["topic_align"] = getattr(c, "topic_align", 1.0)
         rec["topic_level"] = getattr(c, "topic_level", "missing")
@@ -56,6 +60,7 @@ def run_stage2(
     阶段 2：学术词扩展。
     先转 anchor_skills 为 PreparedAnchor，再走 Stage2A 主落点 + Stage2B 仅围绕 primary 扩展；
     返回 raw_candidates（含 term_role、identity_score、topic_align）供 Stage3 双闸门使用。
+    当前 Stage2A 仅 SIMILAR_TO 主落点，无其他候选源并轨。
     可选 jd_field_ids/jd_subfield_ids/jd_topic_ids 供三层领域 topic_align；也可从 recall 上读取。
     """
     prepared_anchors = _anchor_skills_to_prepared_anchors(recall, anchor_skills)

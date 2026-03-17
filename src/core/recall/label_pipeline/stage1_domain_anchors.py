@@ -24,6 +24,7 @@ def run_stage1(
       3) 决定 active_domain_set 与 regex_str；
       4) 写入 recall._last_stage1_result 供后续调试；
       5) 返回 (active_domain_set, regex_str, anchor_skills, debug_1)。
+    anchor_skills 中每项含 anchor_type，供 Stage2/3 做门槛与扩散权限控制（不切换候选源）。
     """
     job_ids: list[int] = []
     inferred_domains: list[int] = []

@@ -23,6 +23,7 @@ from config import (
     ABSTRACT_INDEX_PATH, ABSTRACT_MAP_PATH,
     JOB_INDEX_PATH, JOB_MAP_PATH
 )
+from src.utils.tools import normalize_skill
 
 # --- 针对 i5-1240P 的终极稳定配置 ---
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -118,20 +119,30 @@ class StableVectorGenerator:
         cursor = self.conn.cursor()
         try:
             rows = cursor.execute(
-                "SELECT voc_id, term FROM vocabulary WHERE term IS NOT NULL AND term != ''").fetchall()
-            # Alias Embedding：有缩写时用 "term | abbr"，否则仍用 term（README：向量索引支持缩写与全称双匹配）
+                "SELECT voc_id, term, COALESCE(entity_type, '') AS entity_type FROM vocabulary WHERE term IS NOT NULL AND term != ''"
+            ).fetchall()
+            # 工业词：先 tools 清洗 → 空则跳过；再缩写扩写。非工业词：仅缩写扩写。索引只保留 id。
             term_to_abbrs = self._load_term_to_abbreviation_map()
             texts = []
+            ids = []
             for row in rows:
                 term = row['term']
-                key = term.strip().lower().replace("-", " ")
-                abbrs = term_to_abbrs.get(key, [])
-                if abbrs:
-                    texts.append(f"{term} | {' | '.join(abbrs)}")
+                is_industry = (row['entity_type'] or '').strip().lower() == 'industry'
+                if is_industry:
+                    cleaned = normalize_skill(term)
+                    if not cleaned:
+                        continue
+                    key = cleaned.strip().lower().replace("-", " ")
+                    abbrs = term_to_abbrs.get(key, [])
+                    text = f"{cleaned} | {' | '.join(abbrs)}" if abbrs else cleaned
                 else:
-                    texts.append(term)
-            ids = [int(row['voc_id']) for row in rows]
+                    key = term.strip().lower().replace("-", " ")
+                    abbrs = term_to_abbrs.get(key, [])
+                    text = f"{term} | {' | '.join(abbrs)}" if abbrs else term
+                texts.append(text)
+                ids.append(int(row['voc_id']))
             if not texts:
+                print("[!] 无有效词汇，跳过词汇表索引。")
                 return
 
             with torch.no_grad():

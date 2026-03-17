@@ -85,6 +85,7 @@ def compute_contribution(
     score_map: Dict[str, float] = context["score_map"]
     term_map: Dict[str, str] = context["term_map"]
     term_role_map: Dict[str, str] = context.get("term_role_map") or {}
+    term_confidence_map: Dict[str, float] = context.get("term_confidence_map") or {}
 
     rank_score = 0.0
     term_weights: Dict[str, float] = {}
@@ -95,10 +96,13 @@ def compute_contribution(
         vid_s = str(hit["vid"])
         if vid_s not in score_map:
             continue
-        w = float(score_map[vid_s]) * float(hit.get("idf", 0.0))
-        if term_role_map:
+        term_weight = float(score_map[vid_s])
+        paper_match_strength = float(hit.get("idf", 0.0))
+        term_confidence = float(term_confidence_map.get(vid_s, 0.85))
+        if not term_confidence_map:
             role = (term_role_map.get(vid_s) or "primary").strip().lower()
-            w *= TERM_ROLE_WEIGHT.get(role, 1.0)
+            term_confidence = TERM_ROLE_WEIGHT.get(role, 1.0)
+        w = term_weight * term_confidence * paper_match_strength
         rank_score += w
         term_weights[vid_s] = w
         valid_hids.append(hit["vid"])
