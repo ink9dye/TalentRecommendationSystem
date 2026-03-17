@@ -18,7 +18,7 @@ if sys.platform.startswith('win'):
 
 # 2. 导入统一配置
 from config import (
-    DB_PATH, INDEX_DIR, SBERT_DIR, SBERT_MODEL_NAME,
+    DB_PATH, DATA_DIR, INDEX_DIR, SBERT_DIR, SBERT_MODEL_NAME,
     VOCAB_INDEX_PATH, VOCAB_MAP_PATH,
     ABSTRACT_INDEX_PATH, ABSTRACT_MAP_PATH,
     JOB_INDEX_PATH, JOB_MAP_PATH
@@ -94,16 +94,45 @@ class StableVectorGenerator:
         faiss.write_index(index, index_path)
         print(f"[成功] {name} 索引已保存。")
 
+    def _load_term_to_abbreviation_map(self):
+        """从 data/industrial_abbr_expansion.json 构建 归一化全称 -> [缩写] 的反向映射，供 Alias Embedding 使用。"""
+        path = os.path.join(DATA_DIR, "industrial_abbr_expansion.json")
+        if not os.path.isfile(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            abbr_to_expansions = json.load(f)
+        term_to_abbrs = {}
+        for abbr, expansions in abbr_to_expansions.items():
+            if not isinstance(expansions, list):
+                expansions = [expansions]
+            for exp in expansions:
+                key = exp.strip().lower().replace("-", " ")
+                if key not in term_to_abbrs:
+                    term_to_abbrs[key] = []
+                if abbr not in term_to_abbrs[key]:
+                    term_to_abbrs[key].append(abbr)
+        return term_to_abbrs
+
     def build_vocabulary_index(self):
         print("\n>>> 任务 1: 构建词汇表向量索引 (Vocabulary)")
         cursor = self.conn.cursor()
         try:
             rows = cursor.execute(
                 "SELECT voc_id, term FROM vocabulary WHERE term IS NOT NULL AND term != ''").fetchall()
-            texts = [row['term'] for row in rows]
-            # 关键：用 IndexIDMap 写入 voc_id(int64)，确保 Faiss search 返回的 label 就是 voc_id
+            # Alias Embedding：有缩写时用 "term | abbr"，否则仍用 term（README：向量索引支持缩写与全称双匹配）
+            term_to_abbrs = self._load_term_to_abbreviation_map()
+            texts = []
+            for row in rows:
+                term = row['term']
+                key = term.strip().lower().replace("-", " ")
+                abbrs = term_to_abbrs.get(key, [])
+                if abbrs:
+                    texts.append(f"{term} | {' | '.join(abbrs)}")
+                else:
+                    texts.append(term)
             ids = [int(row['voc_id']) for row in rows]
-            if not texts: return
+            if not texts:
+                return
 
             with torch.no_grad():
                 embeddings = self.model.encode(texts, batch_size=BATCH_SIZE, show_progress_bar=True)

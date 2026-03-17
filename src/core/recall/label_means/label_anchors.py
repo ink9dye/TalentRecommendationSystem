@@ -1,12 +1,13 @@
 import json
 import math
+import os
 import sqlite3
 from typing import Dict, Any, Set, List, Tuple
 
 import faiss
 import numpy as np
 
-from config import DB_PATH, VOCAB_P95_PAPER_COUNT
+from config import DB_PATH, DATA_DIR, VOCAB_P95_PAPER_COUNT
 from src.utils.tools import extract_skills
 
 # backbone_score 权重：in_jd_context / is_task_like 权重大于 job_freq，避免图热词再次主导
@@ -17,6 +18,50 @@ BACKBONE_W_IN_JD = 0.35
 BACKBONE_W_TASK_LIKE = 0.35
 BACKBONE_W_SIM = 0.2  # query 向量相似度（可选）
 BACKBONE_FLOOR_FOR_BAODI = 0.5  # 层0 保底词的最低得分，确保参与排序后有机会进 TopN
+
+# 缩写词典 key 集合缓存，供 classify_anchor_type 判断 acronym
+_ABBR_KEYS_CACHE: Set[str] | None = None
+
+
+def _load_abbr_keys() -> Set[str]:
+    """加载 data/industrial_abbr_expansion.json 的缩写 key 集合（小写），用于锚点类型 acronym 判断。"""
+    global _ABBR_KEYS_CACHE
+    if _ABBR_KEYS_CACHE is not None:
+        return _ABBR_KEYS_CACHE
+    path = os.path.join(DATA_DIR, "industrial_abbr_expansion.json")
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            _ABBR_KEYS_CACHE = {str(k).strip().lower() for k in (data or {}).keys()}
+        else:
+            _ABBR_KEYS_CACHE = set()
+    except Exception:
+        _ABBR_KEYS_CACHE = set()
+    return _ABBR_KEYS_CACHE
+
+
+def classify_anchor_type(term: str) -> str:
+    """
+    对锚点（技能/概念词）打类型标签，供 Stage2/Stage3 按类型分策略使用。
+    返回: acronym | canonical_academic_like | application_term | generic_task_term | unknown
+    """
+    if not term or len((term or "").strip()) < 2:
+        return "unknown"
+    t = (term or "").strip().lower()
+    if t in _load_abbr_keys():
+        return "acronym"
+    generic_task_words = {
+        "算法", "模型", "方法", "系统", "开发", "技术", "学习", "研究",
+        "research", "algorithm", "model", "method", "system", "framework",
+        "learning", "optimization",
+    }
+    if t in generic_task_words:
+        return "generic_task_term"
+    application_kws = ("应用", "开发", "工程", "implementation", "application", "engineering")
+    if any(k in t for k in application_kws):
+        return "application_term"
+    return "canonical_academic_like"
 
 
 def clean_job_skills(skills_text: str) -> Set[str]:

@@ -85,6 +85,18 @@ def run_stage1(
             "dominance": dominance,
         }
 
+    # 方式1：扩展现有 anchor_skills，为每个锚点打上 anchor_type，供 Stage2/Stage3 按类型分策略
+    for info in anchor_skills.values():
+        info["anchor_type"] = label_anchors.classify_anchor_type(info.get("term") or "")
+
+    # 调试：打印锚点及类型，便于排查
+    if getattr(recall, "verbose", False):
+        print("\n【Stage1 锚点类型】tid | term | anchor_type")
+        for tid, info in anchor_skills.items():
+            term = (info.get("term") or "")[:40]
+            atype = info.get("anchor_type", "")
+            print(f"  {tid} | {term} | {atype}")
+
     industrial_kws = [v["term"] for v in anchor_skills.values()]
 
     # 3) 领域集合：如果用户指定 domain_id，则优先；否则使用推断领域 + 向量语义排序

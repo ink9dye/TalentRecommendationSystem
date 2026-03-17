@@ -1950,9 +1950,10 @@ python main.py
     词汇统计阶段构建 Field → Subfield → Topic 层级（如 Engineering → Robotics → Motion Planning）。词汇在不同领域中可有不同概率分布（例：`rapidly exploring random tree` 在 robotics.motion_planning / control.theory / optimization 下的分布），存储在 `vocabulary_topic_stats`。
   - **3 为什么领域信息不进入向量索引**
     领域信息**不**加入 embedding（不做「词 (field.subfield.topic)」形式的向量编码）。原因：embedding 模型会把括号内内容当作语义，导致 robotics、motion planning、robot control 等向量过度聚集，产生**语义空间塌缩（Semantic Collapse）**。因此策略为：**领域信息只用于图谱与标签路排序/扩展，不进入向量索引。**
-  - **4 三级领域在标签路中的作用**
-    - **领域加权排序**：候选词评分 `score = semantic_score × domain_ratio × idf`，其中 `domain_ratio` 来自 `vocabulary_topic_stats`。
-    - **扩展词过滤**：SIMILAR_TO 扩展阶段要求 `candidate_topic_overlap > threshold` 才允许扩展（如 motion planning → trajectory planning / robot path planning，过滤 business planning / financial planning）。
+  - **4 三级领域在标签路中的作用**  
+    三级领域**不是**独立图节点系统，而是 **vocabulary_topic_stats 里的词级附属统计**：有直接标签时存 `field_id`/`subfield_id`/`topic_id`，无标签或缺层级时存 `field_dist`/`subfield_dist`/`topic_dist`（占比 JSON，来自共现伙伴按 freq 加权补全）。因此 README 中的正确定位是：**Stage2 把三级领域当作单词级过滤与扩展护栏**，**Stage3 把三级领域当作单词级一致性分与加权项**；并需明确使用**百分比阈值**（如 topic_overlap > 0.20、subfield_overlap > 0.30、field_overlap > 0.40），因为表里存的就是 `topic_dist`/`subfield_dist`/`field_dist` 这类占比。具体接入方式见后文「三级领域在 Stage2 / Stage3 中的接入方式（基于单词级统计索引）」。
+    - **领域加权排序**：候选词评分中 `domain_ratio` / topic_fit 来自 `vocabulary_topic_stats` 的占比分布，作为加权项而非主语义来源。
+    - **扩展词过滤**：SIMILAR_TO 扩展阶段要求候选在主领域上的占比超过阈值（如 `topic_overlap > 0.20`）才允许扩展。
     - **Cluster 扩展控制**：`cluster_weight = cluster_factor × topic_similarity`。
   - **5 完整召回流程**
     JD → Skill Clean → Abbreviation Expansion → Embedding → **Vocabulary Projection**（top20 vocab）→ **Domain Detection + Domain Anchored Expansion**（topic 聚合 + topic_overlap 过滤，取 top5 作 new query）→ 再 Embedding → Vector Recall (final) → **Anchor Rerank**（semantic × idf）→ **Cluster Diversification**（按簇去重，anchor ≈20）→ LabelPath Expansion → Academic Term → Paper → Author → KGAT-AX Ranking。（参见「Vector 与 LabelPath 衔接的两个隐藏问题」与「数据驱动的 Query 语义标准化」）
@@ -1994,6 +1995,107 @@ python main.py
   - **小结**  
     语义标准化采用 **embedding-driven query grounding**，不维护规则；用 **domain anchored expansion** 防止 semantic drift，充分利用现有 **semantic embedding + vocabulary_topic_stats + knowledge graph** 的 Hybrid Retrieval 架构。
 
+- **三级领域在 Stage2 / Stage3 中的接入方式（基于单词级统计索引）**  
+  本系统中的三级领域信息**不是**独立的图节点推理结果，而是挂载在 **单词级词汇统计索引 vocabulary_topic_stats** 上的辅助结构信息。  
+  - **数据来源**  
+    - **direct**：词在 `vocabulary_topic_index.json` 中有直接三级领域标注，则直接写入 `field_id` / `subfield_id` / `topic_id`。  
+    - **cooc / direct+cooc**：若词本身无标签或仅有部分层级，则根据其共现伙伴的三级领域按 `freq` 加权聚合，生成 `field_dist` / `subfield_dist` / `topic_dist`。  
+    - `field_dist` / `subfield_dist` / `topic_dist` 均为 **JSON 形式的占比分布**，分布值本质上是百分比/概率质量，可直接用于阈值过滤、主领域判定和排序加权。  
+    - 因此三级领域在标签路中承担的是**结构化约束**，而不是替代 embedding 的主语义来源。  
+
+  - **一、为什么三级领域要放在 Stage2 / Stage3，而不是写进向量**  
+    当前三级领域索引是**词级统计索引**，不是单独训练出来的 semantic representation。它更适合解决的是：**这个词更可能属于哪个学术语境**、**扩展词是否仍处于正确的 topic/subfield/field 邻域**、**是否已发生跨领域漂移**。因此正确接法是：**Stage2** 控制哪些词允许进入扩展，**Stage3** 控制这些词最后保留多少权重；而不是把 field/subfield/topic 文本拼进 term 后重新编码。  
+
+  - **二、Stage2 中的接入方式：先做主领域判定，再做扩展过滤**  
+    Stage2 的职责是回答：候选学术词里，哪些仍处在 query / anchor 对应的主领域邻域中？由于 `vocabulary_topic_stats` 是单词级索引，只需基于候选词已有的 `topic_dist` / `subfield_dist` / `field_dist` 做聚合即可。  
+    - **2.1 先从候选词聚合出主领域**  
+      在 Stage2 初始候选（如 vector recall top20 vocab 或 anchor 对应的 academic 候选）中，读取每个词的 `topic_dist`、`subfield_dist`、`field_dist`，按候选词自身的语义分数加权聚合，得到当前 query / anchor 的主领域分布，例如：  
+      `topic_score(z) = Σ semantic_score(t) · P(topic=z|t)`，同理 `subfield_score(s)`、`field_score(f)`。  
+      分别取 `main_topic = argmax(topic_score)`、`main_subfield = argmax(subfield_score)`、`main_field = argmax(field_score)`。  
+      **注意**：`topic_dist` 可能为空则回退到 `subfield_dist`，再空则回退到 `field_dist`，与索引“有标签直接填、无标签按共现补全”的数据结构一致。  
+    - **2.2 用占比阈值做 Stage2 过滤**  
+      主领域确定后，根据该词在主领域上的**占比**过滤。推荐规则：  
+      - 若词存在 `topic_dist`，优先检查 `topic_dist[main_topic] >= τ_topic`；  
+      - 若无 `topic_dist` 但有 `subfield_dist`，检查 `subfield_dist[main_subfield] >= τ_subfield`；  
+      - 若两者都没有，则检查 `field_dist[main_field] >= τ_field`。  
+      即 `topic_overlap(t) = P(main_topic|t)`，`subfield_overlap(t) = P(main_subfield|t)`，`field_overlap(t) = P(main_field|t)`。  
+      **推荐阈值**：`topic_overlap > 0.20`、`subfield_overlap > 0.30`、`field_overlap > 0.40`。  
+      `*_dist` 本身就是百分比/占比分布，Stage2 用“某主领域占比是否超过阈值”判断是否保留，而不是“看名字像不像”。  
+    - **2.3 Stage2 中三级领域的具体作用**  
+      （1）**限制 query expansion 方向**：只有在主领域上占比足够高的词才允许进入 query expansion（如主领域为 robotics.motion_planning 时保留 motion planning、path planning、trajectory planning 等，过滤 business planning、trajectory dataset 等占比不足的）。  
+      （2）**限制 anchor 扩展方向**：SIMILAR_TO / 共现扩展时要求 `candidate_topic_overlap > threshold`，避免余弦相近但 topic 错误。  
+      （3）**生成领域锚定后的 new query**：过滤后保留的 top 词重组成 `grounded_query = " ".join(filtered_terms[:k])`，再编码或召回，先把 query 语义“钉”在对的 academic neighborhood 里。  
+
+  - **三、Stage3 中的接入方式：把三级领域变成一致性分和加权项**  
+    Stage2 解决“能不能进来”，Stage3 解决“进来后保留多大权重”；三级领域进入 term 级打分公式。  
+    - **3.1 Stage3 先做 topic consistency gate**  
+      建议先加一道 topic consistency gate：若词在主领域上占比太低则不应保留。  
+      `pass(t) = 1[topic_overlap(t)≥τ_t ∨ subfield_overlap(t)≥τ_s ∨ field_overlap(t)≥τ_f]`。  
+      优先按 `topic_dist` 判，没有再按 `subfield_dist`，再不行才按 `field_dist`，避免“语义近但 topic 错”的词靠其他项混进最终 term 集合。  
+    - **3.2 Stage3 中把三级领域接入 quality score**  
+      三级领域转化为 `topic_fit` 或 `domain_fit` 因子接入词质量分，而不是单独巨大 bonus。  
+      推荐：`topic_fit(t) = λ1·topic_overlap(t) + λ2·subfield_overlap(t) + λ3·field_overlap(t)`，其中 λ1 > λ2 > λ3（如 0.6 / 0.3 / 0.1）。  
+      接进词级质量分：`quality_score(t) = idf(t)^α · purity(t)^β · resonance(t)^γ · (1 + η·topic_fit(t))`。  
+      **注意**：topic_fit 是辅助放大器、非主导项；主体仍应是 semantic / idf / purity / resonance，因为三级领域本质是词级统计结果，不应凌驾于词本身语义与可用性之上。  
+    - **3.3 Stage3 中 role-aware 地使用三级领域**  
+      - **primary term**：可更宽松，topic_fit 作为加权项，阈值可稍低。  
+      - **similar expansion**：应更严格，topic_fit 同时参与过滤与加权（易 semantic drift）。  
+      - **cooc expansion**：应最严格，topic_fit 先过闸门再允许进入最终排序（共现只代表“经常一起出现”，不一定同 topic）。  
+
+  - **四、推荐伪代码骨架（单词级统计索引口径）**  
+
+```python
+def aggregate_main_domain(candidates):
+    topic_scores = Counter()
+    subfield_scores = Counter()
+    field_scores = Counter()
+    for c in candidates:
+        w = c.semantic_score
+        for tid, p in c.topic_dist.items():
+            topic_scores[tid] += w * p
+        for sid, p in c.subfield_dist.items():
+            subfield_scores[sid] += w * p
+        for fid, p in c.field_dist.items():
+            field_scores[fid] += w * p
+    main_topic = argmax(topic_scores) if topic_scores else None
+    main_subfield = argmax(subfield_scores) if subfield_scores else None
+    main_field = argmax(field_scores) if field_scores else None
+    return main_topic, main_subfield, main_field
+
+def compute_domain_overlap(term_stats, main_topic, main_subfield, main_field):
+    topic_overlap = term_stats.topic_dist.get(main_topic, 0.0) if main_topic else 0.0
+    subfield_overlap = term_stats.subfield_dist.get(main_subfield, 0.0) if main_subfield else 0.0
+    field_overlap = term_stats.field_dist.get(main_field, 0.0) if main_field else 0.0
+    return topic_overlap, subfield_overlap, field_overlap
+
+def stage2_filter_candidates(candidates):
+    main_topic, main_subfield, main_field = aggregate_main_domain(candidates)
+    filtered = []
+    for c in candidates:
+        topic_overlap, subfield_overlap, field_overlap = compute_domain_overlap(
+            c.topic_stats, main_topic, main_subfield, main_field
+        )
+        if topic_overlap >= 0.20 or subfield_overlap >= 0.30 or field_overlap >= 0.40:
+            filtered.append(c)
+    return filtered, (main_topic, main_subfield, main_field)
+
+def stage3_score_terms(term_candidates, main_domain):
+    final_terms = []
+    for t in term_candidates:
+        topic_overlap, subfield_overlap, field_overlap = compute_domain_overlap(
+            t.topic_stats, *main_domain
+        )
+        if not (topic_overlap >= 0.20 or subfield_overlap >= 0.30 or field_overlap >= 0.40):
+            continue
+        topic_fit = 0.6 * topic_overlap + 0.3 * subfield_overlap + 0.1 * field_overlap
+        t.final_score = t.semantic_score * t.idf * t.purity * (1 + 0.5 * topic_fit)
+        final_terms.append(t)
+    return final_terms
+```
+
+  - **五、一句话总结**  
+    三级领域在本系统中的正确表述是：**挂在 vocabulary_topic_stats 上的单词级占比分布索引**；**Stage2** 用它做主领域聚合与扩展过滤，**Stage3** 用它做 topic consistency gate 与 term 质量加权。它不是“新的语义表示”，而是 **semantic recall 之后的结构化纠偏器**。
+
 - **流行度偏置（Popularity Bias / Citation Bias）与论文/作者评分**
   在「词 → 论文 → 作者」链路上存在 **Popularity Bias / Citation Bias**：若不处理，召回看起来合理，但作者几乎全是「老牌高引大牛」而非 **当前岗位最适合的活跃研究者**。问题出在 **vocabulary → paper** 这一层：OpenAlex/Semantic Scholar 呈 **citation power-law**，极少数论文拥有极大引用量，paper 聚合容易变成 **citation ranking** 而非 **relevance ranking**，导致 1990s 开创性论文（如 RRT/PRM 原论文）及其作者长期霸榜，而近 5 年在该方向持续产出的工程研究者被压低。系统目标已是「最适合岗位的活跃研究者」，因此必须在论文评分与作者聚合阶段显式抑制流行度偏置。  
   - **论文评分公式（时间衰减 + 引用归一）**  
@@ -2022,13 +2124,13 @@ python main.py
 
 - **标签路 Stage1～Stage3 改造（学术词落点 + 双闸门）**
   当前主问题集中在「学术词不对」。目标是把链路从「锚点 → 直接扩学术词 → 再过滤」改成「**锚点分类 → 学术落点 → 受限扩展 → 身份闸门 → 质量闸门**」。不新增大模型重写器，而是补齐三层函数能力：**学术落点层**（先把工业锚点对到可信学术词）、**受限扩展层**（围绕落点少量扩展，不围绕原始锚点大扩）、**双闸门层**（先判「是不是那个词」再判「值不值得保留」）。  
-  - **Stage1**（`stage1_domain_anchors.py`、`label_anchors.py`、`tools.py`、`domain_detector.py`）：新增锚点类型标注 `classify_anchor_type`（acronym / canonical_academic_like / application_term / generic_task_term / unknown）、缩写扩写 `expand_anchor_acronyms`、规范化 `normalize_anchor_term`、预处理总控 `prepare_anchor_candidates`（输出含 normalized、anchor_type、acronym_expansions、alias_seeds），让 Stage2 不再直接吃裸 anchor。  
-  - **Stage2 拆为 2A + 2B**（`stage2_expansion.py`、`label_expansion.py`、`infra.py`）：**Stage2A 学术落点**：exact/alias 落点 `retrieve_academic_term_by_exact_alias`、BM25 落点 `retrieve_academic_term_by_bm25`（受限 academic 池）、dense 落点 `retrieve_academic_term_by_dense`、topic 先验 `infer_topic_prior_for_anchor`、落点汇总 `collect_landing_candidates`、身份分 `score_academic_identity`、主落点选择 `select_primary_academic_landings`（每 anchor 1～3 个主落点，min_identity_score 约 0.62）。**Stage2B 邻域扩展**：仅围绕 primary landing 做 `expand_neighbors_from_primary_landings`（SIMILAR_TO 1-hop、提高阈值、topic/domain 一致）、`expand_by_cooccurrence_support`（共现仅作辅助）、`merge_primary_and_expanded_terms`（标注 term_role：primary / similar_expansion / cooc_expansion）。  
+  - **Stage1**（`stage1_domain_anchors.py`、`label_anchors.py`、`tools.py`、`domain_detector.py`）：新增锚点类型标注 `classify_anchor_type`（acronym / canonical_academic_like / application_term / generic_task_term / unknown）、缩写扩写 `expand_anchor_acronyms`、规范化 `normalize_anchor_term`、预处理总控 `prepare_anchor_candidates`（输出含 anchor_type），让 Stage2 不再直接吃裸 anchor。  
+  - **Stage2 拆为 2A + 2B**（`stage2_expansion.py`、`label_expansion.py`、`infra.py`）：**Stage2A 学术落点**：exact/alias 落点 `retrieve_academic_term_by_exact_alias`、dense 落点 `retrieve_academic_term_by_dense`、topic 先验 `infer_topic_prior_for_anchor`、落点汇总 `collect_landing_candidates`、身份分 `score_academic_identity`、主落点选择 `select_primary_academic_landings`（每 anchor 1～3 个主落点，min_identity_score 约 0.62）。**Stage2B 邻域扩展**：仅围绕 primary landing 做 `expand_neighbors_from_primary_landings`（SIMILAR_TO 1-hop、提高阈值、topic/domain 一致）、`expand_by_cooccurrence_support`（共现仅作辅助）、`merge_primary_and_expanded_terms`（标注 term_role：primary / similar_expansion / cooc_expansion）。  
   - **Stage3**（`stage3_term_filtering.py`、`term_scoring.py`、`advanced_metrics.py`、`simple_factors.py`）：从「一个总词分」改为「两分 + 双闸门」。新增身份闸门 `passes_identity_gate`（primary/similar/cooc 不同阈值）、质量分 `score_term_expansion_quality`（idf、domain_purity、cooc_purity、resonance、span_penalty 等，仅衡量「作为召回 term 好不好用」）、最终分 `compose_term_final_score`（identity + quality 融合，按 term_role 加权）、泛任务惩罚 `apply_generic_task_penalty`、topic 一致性 `passes_topic_consistency`、调试 `diagnose_term_error_type`（acronym_error / alias_mapping_error / generic_drift / domain_mismatch / weak_identity 等）、`build_term_debug_record`。改造 `compute_anchor_landing_alignment`：区分原始 anchor、扩写词、别名词的对齐。  
   - **Stage4/5 轻量改造**：Stage4 的 term→paper 贡献区分 term_role（primary 权重大、expansion 适中/更低）；新增 `compute_primary_term_coverage`（论文被多少 primary term 支撑）。Stage5 的 `aggregate_author_evidence_by_term_role` 区分 primary-supported 与 expansion-supported evidence，便于可解释性。  
-  - **统一 term 结构**：建议采用 `TermCandidate` 等结构，字段含 anchor、anchor_type、term_id、term、term_role、source、identity_score、quality_score、final_score、bm25_score、dense_sim、alias_hit、acronym_hit、domain_fit、topic_fit、cooc_purity、is_primary_landing、debug_error_type 等，避免「一个 record 只存一个总分」难以扩展。  
-  - **改造顺序建议**：**第一批**（先降「学术词不对」）：classify_anchor_type、expand_anchor_acronyms、retrieve_academic_term_by_exact_alias、retrieve_academic_term_by_bm25、score_academic_identity、select_primary_academic_landings。**第二批**（Stage2/3 成型）：infer_topic_prior_for_anchor、passes_identity_gate、score_term_expansion_quality、compose_term_final_score、expand_neighbors_from_primary_landings。**第三批**（可解释与调试）：expand_by_cooccurrence_support、diagnose_term_error_type、build_term_debug_record、compute_primary_term_coverage、aggregate_author_evidence_by_term_role。  
-  - **Stage2/Stage3 主流程骨架**：Stage2 总入口 `stage2_generate_academic_terms(prepared_anchors, active_domains)` → 对每个 anchor 调用 `infer_topic_prior_for_anchor` → `collect_landing_candidates`（exact/alias + 扩写检索 + BM25 + dense）→ 对候选算 `score_academic_identity` → `select_primary_academic_landings` → Stage2B 仅对 primary 做 `expand_neighbors_from_primary_landings`、`expand_by_cooccurrence_support` → `merge_primary_and_expanded_terms`。Stage3 总入口 `stage3_filter_and_score_terms(term_candidates, active_domains)` → 对每个 term 先 `passes_identity_gate`、再 `passes_topic_consistency` → 算 `score_term_expansion_quality` → `compose_term_final_score` → `apply_generic_task_penalty_if_needed` → 质量闸门 → `diagnose_term_error_type`、`build_term_debug_record`。
+  - **统一 term 结构**：建议采用 `TermCandidate` 等结构，字段含 anchor、anchor_type、term_id、term、term_role、source、identity_score、quality_score、final_score、dense_sim、alias_hit、acronym_hit、domain_fit、topic_fit、cooc_purity、is_primary_landing、debug_error_type 等，避免「一个 record 只存一个总分」难以扩展。
+  - **改造顺序建议**：**第一批**（先降「学术词不对」）：classify_anchor_type、expand_anchor_acronyms、retrieve_academic_term_by_exact_alias、score_academic_identity、select_primary_academic_landings。**第二批**（Stage2/3 成型）：infer_topic_prior_for_anchor、passes_identity_gate、score_term_expansion_quality、compose_term_final_score、expand_neighbors_from_primary_landings。**第三批**（可解释与调试）：expand_by_cooccurrence_support、diagnose_term_error_type、build_term_debug_record、compute_primary_term_coverage、aggregate_author_evidence_by_term_role。
+  - **Stage2/Stage3 主流程骨架**：Stage2 总入口 `stage2_generate_academic_terms(prepared_anchors, active_domains)` → 对每个 anchor 调用 `infer_topic_prior_for_anchor` → `collect_landing_candidates`（exact/alias + 扩写检索 + dense）→ 对候选算 `score_academic_identity` → `select_primary_academic_landings` → Stage2B 仅对 primary 做 `expand_neighbors_from_primary_landings`、`expand_by_cooccurrence_support` → `merge_primary_and_expanded_terms`。Stage3 总入口 `stage3_filter_and_score_terms(term_candidates, active_domains)` → 对每个 term 先 `passes_identity_gate`、再 `passes_topic_consistency` → 算 `score_term_expansion_quality` → `compose_term_final_score` → `apply_generic_task_penalty_if_needed` → 质量闸门 → `diagnose_term_error_type`、`build_term_debug_record`。
   - **标签路改造目标伪代码骨架**（计划落地后的形态）：
 
 ```python
@@ -2044,7 +2146,6 @@ class TermCandidate:
     identity_score: float
     quality_score: float
     final_score: float
-    bm25_score: float
     dense_sim: float
     alias_hit: bool
     acronym_hit: bool
@@ -2059,7 +2160,7 @@ def stage2_generate_academic_terms(prepared_anchors, active_domains):
     term_candidates = []
     for anchor in prepared_anchors:
         topic_prior = infer_topic_prior_for_anchor(anchor, active_domains)
-        landing_candidates = collect_landing_candidates(anchor, topic_prior)  # exact/alias + BM25 + dense
+        landing_candidates = collect_landing_candidates(anchor, topic_prior)  # exact/alias + dense
         for c in landing_candidates:
             c["identity_score"] = score_academic_identity(c, anchor)
         primary_landings = select_primary_academic_landings(landing_candidates, min_identity_score=0.62)
@@ -2089,22 +2190,133 @@ def stage3_filter_and_score_terms(term_candidates, active_domains):
   - **标签路目标（一句话）**：标签路的目标**不是扩大召回面**，而是提高「学术词命中正确率」和「高价值论文证据纯度」；本质上是**高精度学术语义对齐模块**（应用词→学术词落点、缩写消歧、对口论文证据提纯），而不只是普通召回路。
 
   - **工程护栏与落地约束（六条）**：为稳定落地，必须在计划中显式加入以下约束与规则。  
-    - **护栏 1：无主落点禁止扩展**。只要某个 anchor 没有通过 `select_primary_academic_landings` 选出 primary landing，就**禁止进入 Stage2B 扩展**：不许 similar 扩展、不许 cooc 扩展；该 anchor 直接记为 `unresolved_anchor`。避免“exact/BM25/dense 都不太行但仍拿模糊近邻继续扩”，把泛任务词带回来。  
+    - **护栏 1：无主落点禁止扩展**。只要某个 anchor 没有通过 `select_primary_academic_landings` 选出 primary landing，就**禁止进入 Stage2B 扩展**：不许 similar 扩展、不许 cooc 扩展；该 anchor 直接记为 `unresolved_anchor`。避免“exact/dense 都不太行但仍拿模糊近邻继续扩”，把泛任务词带回来。  
     - **护栏 2：primary 需唯一性优势**。除 `min_identity_score≈0.62` 外，增加**唯一性判断**：仅当 `top1_identity - top2_identity >= identity_margin`（建议 `identity_margin >= 0.08`）时才判定为稳定主落点；否则标为 `ambiguous_primary`，只保留 primary、不做邻域扩展，或降级为极保守模式。避免多义词/缩写映到多个学术主题时“两个都像”导致乱扩。  
-    - **护栏 3：Stage2A 召回源可信度优先级**。落点来源按可信度顺序使用，**topic prior 仅作辅助，不单独决定 primary**。建议顺序：① exact / curated alias；② 缩写扩写后的 exact；③ BM25 in academic pool；④ dense retrieval；⑤ cooc/topic prior 仅作 rerank/support。防止“领域看起来对、但词其实不对”的 term 被扶成 primary。  
+    - **护栏 3：Stage2A 召回源可信度优先级**。落点来源按可信度顺序使用，**topic prior 仅作辅助，不单独决定 primary**。建议顺序：① exact / curated alias；② 缩写扩写后的 exact；③ dense retrieval；④ cooc/topic prior 仅作 rerank/support。防止“领域看起来对、但词其实不对”的 term 被扶成 primary。  
     - **护栏 4：Stage3 按 term_role 设数量与权重配额**。除双闸门外，增加**角色配额**：每 anchor 最多保留 primary 3～5 个、similar_expansion 5～8 个、cooc_expansion 2～3 个；最终候选中 **primary 贡献至少占总 term 权重的 50% 以上**。避免 expansion 数量过多在 Stage4 淹没主落点。  
     - **护栏 5：Stage4 primary coverage 硬门槛**。论文进入高优先级候选，至少满足其一：命中 ≥1 个高权重 primary term，或命中 ≥2 个 primary/supporting terms；**纯 expansion 支撑的论文不允许排到 very top**。即高分论文必须有「主学术词证据」，不能只靠扩展词堆出来。`compute_primary_term_coverage` 需与该规则一致。  
     - **护栏 6：调试输出做阶段级失败类型统计**。除单条 `diagnose_term_error_type` / `build_term_debug_record` 外，**每次 query 输出阶段级统计**，例如：`unresolved_anchor_count`、`ambiguous_primary_count`、`acronym_error_count`、`alias_mapping_error_count`、`generic_drift_count`、`domain_mismatch_count`、`weak_identity_count`。便于定位是落点、扩展还是质量闸门出问题，提升调参效率。
 
   - **Topic/Domain 约束原则**：domain/topic 只做**约束与校验**，不主导 primary 选择。落点以 academic identity 为核心；topic/domain 用于排除明显错域；不因 topic 看起来像就把 identity 不够强的 term 拉成 primary。
 
-下面是一份可以直接粘贴进 README 的 完整 KGAT-AX 修改方案 Markdown 成稿。
-你可以把它作为一个独立大节放进 README，例如：
+- **Stage2 / Stage3 实现契约与默认参数表**  
+  本节补齐「可直接照着施工」所需的：**数据结构定义**、**默认阈值表**、**文件级改动顺序与函数挂载点**。补完后可按此逐函数实现，无需临场决定字段与阈值。
+
+  - **一、数据结构表（中间对象与字段契约）**  
+    以下 dataclass / 类型约定为 Stage2/Stage3 全链路统一使用，避免 dict 字段越传越乱。必填字段以 **粗体** 标出。
+
+    | 类型名 | 用途 | 必填字段 | 可选/衍生字段 |
+    |--------|------|----------|----------------|
+    | **PreparedAnchor** | Stage1 输出，Stage2 输入锚点（见「四、实现细节契约」状态传递） | **anchor: str**, **anchor_type: str** (acronym \| canonical \| application \| task \| unknown), **expanded_forms: List[str]**, **weight: float**, **domain_hints: Set[str]** | normalized_term |
+    | **LandingCandidate** | Stage2A 落点检索单条候选 | **vid: int**, **term: str**, **source: str** (exact \| alias \| dense), **semantic_score: float** (cos_sim) | dense_sim, alias_hit: bool, acronym_hit: bool, topic_prior_score |
+    | **PrimaryLanding** | Stage2A 选出的主落点 | **vid: int**, **term: str**, **identity_score: float**, **source: str**, **anchor: str** | 同 LandingCandidate 可选字段 |
+    | **ExpandedTermCandidate** | Stage2B 扩展后的单条 term（含 primary） | **vid: int**, **term: str**, **term_role: str** (primary \| similar_expansion \| cooc_expansion), **identity_score: float**, **source: str**, **anchor: str** | quality_score, topic_fit, cooc_purity, resonance, span_penalty, from_primary_vid |
+    | **TermCandidate** | Stage3 输入/输出统一 term 结构（与上文伪代码一致） | **anchor, anchor_type, term_id/vid, term, term_role, source, identity_score, quality_score, final_score** | dense_sim, alias_hit, acronym_hit, domain_fit, topic_fit, cooc_purity, is_primary_landing, debug_error_type |
+    | **TermDebugRecord** | 调试与阶段统计用 | **term_id, term, term_role, error_type** (acronym_error \| alias_mapping_error \| generic_drift \| domain_mismatch \| weak_identity \| pass), **stage** (stage2a \| stage2b \| stage3) | identity_score, quality_score, gate_fail_reason |
+
+    **函数级入参/出参契约（关键接口）**：
+
+    | 函数 | 入参 | 出参 | 说明 |
+    |------|------|------|------|
+    | `collect_landing_candidates(anchor: PreparedAnchor, topic_prior)` | PreparedAnchor, 可选 topic 先验 | **List[LandingCandidate]** | 内部调 exact/alias、dense，合并去重，统一为 LandingCandidate |
+    | `score_academic_identity(c: LandingCandidate, anchor: PreparedAnchor)` | 单条候选 + 锚点 | **float** [0,1] | 按 source 可信度与 semantic_score 等算身份分 |
+    | `select_primary_academic_landings(candidates: List[LandingCandidate], min_identity_score, identity_margin)` | 候选列表 + 阈值 | **List[PrimaryLanding]** | 过滤 ≥ min_identity_score，且满足 top1−top2 ≥ identity_margin，每 anchor 最多 PRIMARY_MAX_PER_ANCHOR 个 |
+    | `expand_neighbors_from_primary_landings(primary_landings: List[PrimaryLanding])` | 主落点列表 | **List[ExpandedTermCandidate]**（term_role=similar_expansion） | 仅 SIMILAR_TO 1-hop，相似度 ≥ SIMILAR_EXPANSION_MIN_SIM，每 primary 最多 SIMILAR_MAX_PER_PRIMARY 个 |
+    | `expand_by_cooccurrence_support(primary_landings)` | 主落点列表 | **List[ExpandedTermCandidate]**（term_role=cooc_expansion） | 共现频 ≥ COOC_SUPPORT_MIN_FREQ，每 primary 最多 COOC_MAX_PER_PRIMARY 个 |
+    | `merge_primary_and_expanded_terms(primary_landings, similar_list, cooc_list)` | 主落点 + 两类扩展列表 | **List[ExpandedTermCandidate]** | 合并并标注 term_role，primary 带 is_primary_landing=True |
+    | `passes_identity_gate(tc: TermCandidate)` | 单条 TermCandidate | **bool** | 按 term_role 查表：primary ≥ PRIMARY_MIN_IDENTITY，similar ≥ SIMILAR_MIN_IDENTITY，cooc ≥ COOC_MIN_IDENTITY |
+    | `passes_topic_consistency(tc, active_domains)` | term + 当前领域 | **bool** | 三级领域占比：topic_overlap ≥ TOPIC_OVERLAP_MIN 或 subfield ≥ SUBFIELD_OVERLAP_MIN 或 field ≥ FIELD_OVERLAP_MIN |
+    | `score_term_expansion_quality(tc)` | TermCandidate | **float** | 仅衡量「作为召回 term 好不好用」：idf、domain_purity、cooc_purity、resonance、span_penalty 等 |
+    | `compose_term_final_score(tc)` | TermCandidate（含 identity_score、quality_score） | **float** | identity 与 quality 按 term_role 加权融合，primary 权重占主导 |
+    | `build_term_debug_record(tc)` | TermCandidate | **TermDebugRecord** | 填 error_type、stage、gate_fail_reason 等 |
+
+  - **二、默认阈值表（实现时可直接照抄的常量）**  
+    以下为推荐默认值，可在 config 或 label_means 常量中集中定义，便于调参。
+
+    | 常量名 | 默认值 | 说明 |
+    |--------|--------|------|
+    | **Stage2A 主落点** | | |
+    | PRIMARY_MIN_IDENTITY | 0.62 | 主落点身份分下限 |
+    | IDENTITY_MARGIN | 0.08 | top1 与 top2 身份分差下限，否则标 ambiguous_primary |
+    | PRIMARY_MAX_PER_ANCHOR | 3 | 每锚点最多主落点个数（可配置 3～5） |
+    | **Stage2B 扩展** | | |
+    | SIMILAR_EXPANSION_MIN_SIM | 0.72 | SIMILAR_TO 扩展边权重下限（高于当前 SIMILAR_TO_MIN_SCORE） |
+    | SIMILAR_MAX_PER_PRIMARY | 6 | 每个主落点最多 similar 扩展数（5～8 可调） |
+    | COOC_SUPPORT_MIN_FREQ | 2 | 共现最少出现频次 |
+    | COOC_MAX_PER_PRIMARY | 2 | 每个主落点最多 cooc 扩展数（2～3 可调） |
+    | **Stage3 三级领域（占比阈值）** | | |
+    | TOPIC_OVERLAP_MIN | 0.20 | topic 一致性闸门：候选词在主 topic 占比下限 |
+    | SUBFIELD_OVERLAP_MIN | 0.30 | subfield 占比下限 |
+    | FIELD_OVERLAP_MIN | 0.40 | field 占比下限 |
+    | **Stage3 身份闸门（按 term_role）** | | |
+    | PRIMARY_MIN_IDENTITY_GATE | 0.62 | primary 通过身份闸门下限（可与 Stage2A 同值） |
+    | SIMILAR_MIN_IDENTITY_GATE | 0.45 | similar_expansion 身份分下限 |
+    | COOC_MIN_IDENTITY_GATE | 0.35 | cooc_expansion 身份分下限 |
+    | **Stage3 质量与最终** | | |
+    | FINAL_MIN_TERM_SCORE | 0.15 | 最终 term 得分下限，低于则丢弃 |
+    | PRIMARY_WEIGHT_MIN_RATIO | 0.50 | 最终候选中 primary 贡献占总 term 权重的比例下限 |
+    | **已有/沿用** | | |
+    | SIMILAR_TO_TOP_K | 3 | 每锚点 SIMILAR_TO 方向扩展数（若仍用于 2B） |
+    | SIMILAR_TO_MIN_SCORE | 0.65 | 现有 SIMILAR_TO 边下限（2B 可用更高 SIMILAR_EXPANSION_MIN_SIM） |
+
+  - **三、文件级改动顺序表（替换/保留/谁调用谁）**  
+    按「先改谁、再改谁」列出每个文件的改动类型与挂载点，实现时按表施工即可。
+
+    | 文件 | 改动类型 | 具体说明 |
+    |------|----------|----------|
+    | **stage2_expansion.py** | 新增 + 改写 | **新增** `stage2_generate_academic_terms(prepared_anchors, active_domains)` 为 Stage2 总入口；**原** `_expand_semantic_map` 改为只服务 Stage2B（仅对 primary landing 做 SIMILAR_TO/共现扩展），不再承担「从裸 anchor 直接出 primary」；入口由 label_path 改为先调 Stage2A 再调 Stage2B。 |
+    | **label_expansion.py** | 新增 | **新增** `retrieve_academic_term_by_exact_alias(anchor)`、`retrieve_academic_term_by_dense(anchor, top_k)`；**新增** `collect_landing_candidates`、`expand_neighbors_from_primary_landings`、`expand_by_cooccurrence_support`、`merge_primary_and_expanded_terms`。现有 SIMILAR_TO 封装保留，供 expand_neighbors 调用。 |
+    | **label_anchors.py / stage1_domain_anchors.py** | 新增 | **新增** `classify_anchor_type`、`expand_anchor_acronyms`、`normalize_anchor_term`、`prepare_anchor_candidates`；Stage1 输出由「裸 anchor_skills」改为 **List[PreparedAnchor]**，供 stage2_generate_academic_terms 消费。 |
+    | **stage3_term_filtering.py** | 替换 + 新增 | **原** 单一总分入口改为：先 `passes_identity_gate` → 再 `passes_topic_consistency` → `score_term_expansion_quality` → `compose_term_final_score` → `apply_generic_task_penalty_if_needed` → 质量闸门；**新增** `diagnose_term_error_type`、`build_term_debug_record`；输入为 List[ExpandedTermCandidate]/TermCandidate，输出为 List[TermCandidate]（含 debug 字段）。 |
+    | **term_scoring.py** | 拆分 + 新增 | **原** `calculate_final_weights` 拆成两块：**identity 相关**（供 Stage2A `score_academic_identity` 及 Stage3 身份闸门）、**quality 相关**（供 `score_term_expansion_quality`）；**新增** `score_term_expansion_quality`、`compose_term_final_score`；identity 权重占主导由 compose 中按 term_role 加权体现。 |
+    | **advanced_metrics.py** | 职责明确 | 负责 **topic_fit**、**cooc_purity**、**resonance**、**span_penalty** 等，供 `score_term_expansion_quality` 调用；不再主导「身份判断」，仅提供质量子项。 |
+    | **simple_factors.py** | 保留 + 限定 | 只保留轻量 **penalty / bonus**（如泛任务惩罚、覆盖归一等），不再主导身份判断；`apply_generic_task_penalty` 由 Stage3 在 compose 之后调用。 |
+
+    **调用关系小结**：  
+    `stage2_generate_academic_terms` → `collect_landing_candidates`（内部调 exact/alias、dense）→ `score_academic_identity` → `select_primary_academic_landings` → `expand_neighbors_from_primary_landings` + `expand_by_cooccurrence_support` → `merge_primary_and_expanded_terms` → 输出 List[ExpandedTermCandidate]。  
+    `stage3_filter_and_score_terms` → 对每条 term 依次：`passes_identity_gate` → `passes_topic_consistency` → `score_term_expansion_quality`（调 advanced_metrics）→ `compose_term_final_score`（调 term_scoring 的 identity/quality 融合）→ `apply_generic_task_penalty_if_needed`（调 simple_factors）→ 质量闸门 → `diagnose_term_error_type`、`build_term_debug_record`。
+
+  - **四、实现细节契约（Stage 1→2 状态传递、三级领域公式、物理查询定位、主落点熔断）**  
+    以下四条契约确保 Stage 2/3 与底层数据库及上层总控逻辑的物理对齐，编码阶段须严格遵循以实现「零误差」衔接。
+
+    **1. 状态传递契约（Stage 1 → Stage 2）**  
+    Stage 1 输出须从简单字符串列表升级为对象列表。`stage1_domain_anchors.py` 返回的 `Stage1Result` 必须包含如下精确结构的 `PreparedAnchor`（定义于 `src/core/recall/label_path.py` 或专用 types 文件）：
+
+    ```python
+    @dataclass
+    class PreparedAnchor:
+        anchor: str                 # 原始清洗后的词，如 "rrt"
+        anchor_type: str            # acronym | canonical | application | task | unknown
+        expanded_forms: List[str]   # 扩写结果，如 ["rapidly exploring random tree"]
+        weight: float               # Stage 1 计算的原始权重
+        domain_hints: Set[str]      # 该锚点命中的领域 ID 集合
+    ```
+
+    **2. 三级领域分布的数学对齐**  
+    在 Stage 2 判定主领域（`aggregate_main_domain`）和 Stage 3 计算 `topic_fit` 时，`vocabulary_topic_stats` 表中的分布以 JSON 字符串存储的百分比形式存在，计算须遵循：
+
+    $$TopicScore(z) = \sum_{t \in Candidates} (IdentityScore(t) \times P(Topic=z|t))$$
+
+    其中 $P(Topic=z|t)$ 从数据库字段 `topic_dist` 中解析出对应 Topic ID 的数值。  
+    **实现提示**：若某词在 `topic_dist` 中不存在，代码必须显式按优先级回退到 `subfield_dist` 或 `field_dist` 进行补全计算。
+
+    **3. 物理数据库查询定位**  
+    为避免在 `label_expansion.py` 中写错路径，检索方式的物理落点约定如下：
+
+    | 检索方式 | 依赖索引 / 表 | 检索范围约束 |
+    | :--- | :--- | :--- |
+    | **Exact/Alias** | `vocabulary` 表 (term/old_voc_id) | `entity_type` 为 'concept' 或 'keyword' |
+    | **Dense** | `VOCAB_INDEX_PATH` (Faiss) | 取前 $K$ 个，过滤掉 `entity_type = 'industry'` 的词 |
+
+    **4. Stage 2 主落点熔断逻辑（硬护栏）**  
+    在实现 `select_primary_academic_landings` 时，必须在代码中加入以下**逻辑契约**：  
+    若某锚点经 Exact、Dense 检索后，其最高分的 `identity_score` 仍低于 `PRIMARY_MIN_IDENTITY (0.62)`，则该锚点**必须**被标记为 `unresolved`。**禁止**为其生成任何 `similar_expansion` 或 `cooc_expansion`。此条为防止「语义漂移」的最有效关卡。
+
+以下为整合后的 KGAT-AX v2 修改方案（已合并原 README 中多处重复与差异表述，保留全部细节）：
 ## KGAT-AX v2 修改方案
 
 
-KGAT-AX v2 修改方案
-1. 改造背景
+### 1. 改造背景
 当前系统整体采用“两阶段推荐”架构：
 多路召回阶段
 包括：
@@ -2118,7 +2330,7 @@ KGAT-AX v2 修改方案
 融合部分作者学术指标特征；
 对候选作者进行二次排序。
 但在当前阶段，仍存在以下问题：
-1.1 缺乏真实监督数据
+#### 1.1 缺乏真实监督数据
 目前缺少大规模、标准化的真实标签数据，例如：
 岗位 -> 最终录用专家
 岗位 -> 面试通过专家
@@ -2140,9 +2352,9 @@ H-index
 KGAT-AX v2 的核心目标是：
 在保留 KGAT 图传播主干的前提下，将“图结构关系”“作者学术指标”“岗位-作者匹配特征”“弱监督 teacher 信号”统一纳入精排模型，使其能够在无真实标签条件下稳定训练，并具备更强的指标感与解释性。
 具体目标如下：
-2.1 保留 KGAT 主干
+#### 2.1 保留 KGAT 主干
 不推翻现有 KGAT / GNN 主体，而是在其基础上增强输入与排序头。
-2.2 引入显式作者指标分支
+#### 2.2 引入显式作者指标分支
 将以下作者特征显式接入模型：
 H-index
 总被引数
@@ -2152,19 +2364,20 @@ H-index
 代表作被引数
 机构权威性
 渠道权威性
-2.3 引入岗位-作者匹配特征分支
+#### 2.3 引入岗位-作者匹配特征分支
 显式建模 (Query, Author) 对应关系，包括：
 召回来源信息
 召回分数
 岗位与作者的语义相似度
 领域重合度
 Topic 重合度
-2.4 在无真实标签条件下进行弱监督训练
+#### 2.4 在无真实标签条件下进行弱监督训练
 通过规则教师（teacher score）与分层伪标签构造训练信号，使模型能够在没有真实招聘标签时仍然稳定学习。
-2.5 保持工程可部署性
+#### 2.5 保持工程可部署性
 训练时与推理时使用同构的在线可复算特征，避免线上线下特征偏移问题。
 
-3. 总体设计思路
+### 3. 总体设计思路
+
 KGAT-AX v2 不再是简单的“图嵌入内积排序模型”，而是升级为：
 图表示分支 + 作者指标分支 + Query-Author 匹配分支 + 弱监督训练目标
 总体流程如下：
@@ -2191,11 +2404,13 @@ KGAT 图传播得到 Query / Author 图嵌入
 输出最终精排分数
 
 
-4. Query-aware 图输入改造
+### 4. Query-aware 图输入改造
+
 为了让 KGAT-AX 更适合岗位推荐任务，v2 版本中将岗位 JD 显式作为 Query 节点接入图谱。
-4.1 新增 Query 节点
+
+#### 4.1 新增 Query 节点
 每个岗位 JD 视为一个独立 Query 节点。
-4.2 Query 节点的关系设计
+#### 4.2 Query 节点的关系设计
 建议至少新增以下关系：
 QUERY_HAS_TOPIC -> Topic
 QUERY_REQUIRES_SKILL -> Skill
@@ -2212,19 +2427,17 @@ QUERY_RECALLS_AUTHOR_VECTOR
 QUERY_RECALLS_AUTHOR_LABEL
 QUERY_RECALLS_AUTHOR_COLLAB
 也可以保留单一关系并在 pair 特征中记录来源。
-4.3 Query-aware 子图的意义
+#### 4.3 Query-aware 子图的意义
 这样设计的作用是：
 让模型显式理解“岗位需求”；
 让排序过程具备上下文条件；
 让作者排序不再是“全局静态强者排序”，而是“针对当前岗位的条件排序”。
 
-5. 输入特征改造
-KGAT-AX v2 的输入特征分为三类：
-Query 侧特征
-Author 侧特征
-Query-Author Pair 特征
+### 5. 输入特征改造
 
-5.1 Query 侧特征
+KGAT-AX v2 的输入特征分为三类：Query 侧特征、Author 侧特征、Query-Author Pair 特征。
+
+#### 5.1 Query 侧特征
 每个 Query 至少包含：
 query_id
 query_text
@@ -2237,7 +2450,7 @@ query_embedding
 计算 Query-Author 匹配特征；
 训练与推理时统一使用。
 
-5.2 Author 侧特征（author_aux）
+#### 5.2 Author 侧特征（author_aux）
 这部分是 KGAT-AX v2 的重要增强分支。
 建议固定列顺序如下：
 AUTHOR_AUX_COLUMNS = [
@@ -2273,7 +2486,7 @@ avg_source_authority：作者渠道整体平均权威性
 权威性特征尽量归一化到 [0,1]
 author_aux 属于静态/半静态特征，可离线预生成
 
-5.3 Query-Author Pair 特征
+#### 5.3 Query-Author Pair 特征
 Pair 特征必须分成两类：
 A. Online Pair Features（线上可复算）
 这些特征允许进入模型推理阶段。
@@ -2309,9 +2522,11 @@ TEACHER_ONLY_FEATURES = [
 Teacher Collapse
 如果 teacher 使用的全部特征都原样喂给模型，模型极易退化成“teacher 公式拟合器”。
 
-6. 弱监督训练数据设计
+### 6. 弱监督训练数据设计
+
 由于缺乏真实标签，KGAT-AX v2 使用规则教师构造弱监督训练目标。
-6.1 Teacher Score
+
+#### 6.1 Teacher Score
 对每个 (Query, Author)，计算一个规则教师分数 teacher_score。
 建议总体形式为：
 [
@@ -2322,7 +2537,7 @@ teacher_score
 0.12 \cdot recency
 ]
 
-6.2 relevance（匹配度）
+#### 6.2 relevance（匹配度）
 反映岗位与作者的语义与主题匹配情况。
 可由以下信号构成：
 vector_score
@@ -2346,7 +2561,7 @@ relevance_score = (
 )
 
 
-6.3 impact（学术影响力）
+#### 6.3 impact（学术影响力）
 反映作者学术产出与影响力。
 建议由以下信号构成：
 author_h_index_log
@@ -2355,20 +2570,21 @@ best_paper_citations_log
 top3_paper_citations_mean_log
 author_recent_5y_citations_log
 
-6.4 authority（权威性）
+#### 6.4 authority（权威性）
 反映作者所属机构与发表渠道的可信度与顶尖程度。
 建议由以下信号构成：
 best_institution_authority
 best_source_authority
 
-6.5 recency（时新性）
+#### 6.5 recency（时新性）
 反映作者近年是否仍持续产出高质量成果。
 建议由以下信号构成：
 paper_recency_score
 author_recent_5y_works_log
 
-7. 伪标签设计
-7.1 分层标签 label_level
+### 7. 伪标签设计
+
+#### 7.1 分层标签 label_level
 根据 teacher_score 将样本划分为 4 层：
 3：strong positive
 2：positive
@@ -2385,7 +2601,7 @@ else:
 label_level = 0
 
 
-7.2 负样本类型 negative_type
+#### 7.2 负样本类型 negative_type
 为了提升排序能力，将负样本进一步细分为：
 easy
 semi_hard
@@ -2400,7 +2616,7 @@ hard
 confusing
 机构或渠道权威性较高，但语义匹配较弱，容易干扰排序。
 
-7.3 样本权重 sample_weight
+#### 7.3 样本权重 sample_weight
 权重设计要保守，避免过早对 hard negative 施加强压制。
 建议初始方案：
 strong positive：1.4
@@ -3133,7 +3349,7 @@ KGAT-AX v2 的评估目标不是单纯让训练 loss 更漂亮，也不是只提
 #### 10. Baseline 设计建议
 
 - **Recall-level Baselines**：仅 Vector Path、仅 Label Path、三路召回简单融合。  
-- **Ranker-level Baselines**：BM25/启发式打分、MLP on handcrafted features、原版 KGAT、原版 KGAT-AX。  
+- **Ranker-level Baselines**：启发式打分、MLP on handcrafted features、原版 KGAT、原版 KGAT-AX。  
 - **可选强基线**：LightGBM/XGBoost on pair+author features。
 
 #### 11. 最小可运行版实验方案
@@ -3235,335 +3451,9 @@ def run_ablation_suite(configs, train_data, val_data, test_data):
 
 ---
 
-8. KGAT-AX v2 模型结构
-KGAT-AX v2 保留 KGAT 主干，但增加 4 个关键组件：
-author_aux_proj
-pair_aux_proj
-graph_only_head
-rank_backbone + rank_head
 
-8.1 KGAT 主干
-保留原有：
-entity_embed
-relation_embed
-gnn_layers / kgat_layers
-职责不变：
-对图中的 Query / Author / Topic / Skill / Work / Institution / Source 等节点进行高阶传播；
-输出图嵌入表示。
+**本节说明**：上文各 ### 小节（排序原则、teacher_score、Loss、训练样本、阶段化训练、推理、评估、工程改造清单）已完整覆盖模型结构、Loss、防退化、数据文件、文件改动、修改顺序、训练策略、MVP、预期收益及改造原则；无需再以「8.～17.」重复罗列，按上文实施即可。
 
-8.2 author_aux 分支
-对 author_aux 进行低维投影。
-设计原则：
-容量不要过大；
-防止辅助特征分支完全压倒图分支。
-建议：
-两层 MLP
-输出维度控制在 16 ~ 32
+整体改造遵循：**先改数据，再改 loader，再改模型，再改 trainer，最后补推理**，以降低工程风险并保证每一步都有明确产出与可验证结果。
 
-8.3 pair_aux 分支
-对 pair_aux_online 进行低维投影。
-设计原则与 author_aux 分支相同：
-低维投影
-配合强 dropout 与随机 mask 使用
-
-8.4 graph_only_head
-这是 v2 中非常关键的保险机制。
-它只使用图嵌入计算 Query-Author 分数，不看任何 aux 特征。
-作用是：
-强制图分支保留排序能力；
-避免模型退化成“逻辑回归 / 特征回归”。
-
-8.5 融合排序头
-最终打分不再使用简单内积：
-[
-score = \text{MLP}([q, a, q*a, |q-a|, author_aux_proj, pair_aux_proj])
-]
-即拼接以下特征：
-query_emb
-author_emb
-query_emb * author_emb
-|query_emb - author_emb|
-author_aux_proj(author_aux)
-pair_aux_proj(pair_aux_online)
-
-9. Loss 设计
-KGAT-AX v2 的训练目标由以下几部分组成。
-9.1 排序损失 loss_cf_rank
-主排序损失，建议采用加权 BPR / Pairwise Ranking Loss：
-正样本分数应高于负样本分数
-sample_weight 控制样本重要性
-
-9.2 图分支排序损失 loss_graph_rank
-对 graph_only_head 单独施加排序损失，保证图表示本身具有排序能力。
-
-9.3 蒸馏损失 loss_cf_distill
-让模型输出逼近 teacher_score。
-但需要注意：
-前期权重不能过大
-需采用 warmup 方式逐步提高
-否则模型容易直接“抄 teacher”。
-
-9.4 分类辅助损失 loss_cf_cls
-对 label_level 进行 4 分类辅助学习，帮助模型理解样本层级结构。
-
-9.5 KG 结构损失 loss_kg
-继续保留原有 KG 三元组损失，用于维持图结构学习能力。
-
-9.6 总损失形式
-建议如下：
-loss =
-1.0 * loss_cf_rank
-+ 0.35 * loss_graph_rank
-+ distill_w * loss_cf_distill
-+ 0.15 * loss_cf_cls
-+ lambda_kg * loss_kg
-+ lambda_reg * loss_l2
-
-
-10. 防退化机制
-KGAT-AX v2 在训练中必须重点防止以下四类问题。
-
-10.1 Teacher Collapse
-问题
-teacher_score 由显式特征计算，而显式特征又直接喂给排序头，模型极易退化成“teacher 公式拟合器”。
-解决方式
-pair 特征拆成 online 与 teacher-only
-aux 分支使用较强 dropout
-训练时对 aux 特征做随机 mask
-增加 graph_only_head
-distill loss 采用 warmup
-
-10.2 GNN / MLP 学习速率失衡
-问题
-MLP 收敛快，GNN 更新慢，最终模型只学到浅层特征。
-解决方式
-使用分层学习率
-GNN 学习率更大
-MLP 学习率更小
-MLP 使用更大 weight decay
-
-10.3 Training-Serving Skew
-问题
-训练阶段使用的 pair 特征，线上推理时算不出来或算得不一致。
-解决方式
-模型只吃 online_pair_features
-teacher-only 特征仅用于构造 teacher
-训练和推理共用同一个 build_pair_features_online() 逻辑
-
-10.4 Hard Negative 误伤
-问题
-若对 hard negative 施加过大权重，可能把高质量作者整体 embedding 拉低。
-解决方式
-先提高 hard negative 的采样概率
-不急于提高其 loss 权重
-监控同一作者在不同 query 下的正负表现差异
-
-11. 数据文件组织
-为支持 KGAT-AX v2，训练数据目录建议如下：
-data/kgatax_train_data_v2/
-├── train_pairs.jsonl
-├── valid_pairs.jsonl
-├── query_features.jsonl
-├── author_aux_features.npy
-├── author_id_map.json
-├── pair_aux_train_online.npy
-├── pair_aux_valid_online.npy
-├── kg_final.txt
-├── relation_map.json
-└── stats.json
-
-各文件说明
-train_pairs.jsonl / valid_pairs.jsonl
-保存 (Query, Author) 样本主记录，包括：
-teacher_score
-label_level
-negative_type
-sample_weight
-pair 特征
-author 特征（可选冗余保留，方便分析）
-query_features.jsonl
-保存 Query 侧静态特征。
-author_aux_features.npy
-保存 author 侧辅助特征矩阵。
-pair_aux_train_online.npy / pair_aux_valid_online.npy
-保存线上可复算 pair 特征矩阵。
-kg_final.txt
-保存增强后的 Query-aware 图谱边。
-relation_map.json
-保存关系类型映射。
-stats.json
-保存样本数、标签分布、负样本类型分布等统计信息。
-
-12. 文件级改动清单
-12.1 generate_training_data.py
-该文件是第一优先级改造对象。
-需要新增以下能力：
-构造 Query 节点特征
-调用三路召回
-合并候选作者
-生成 author_aux
-生成 online pair features
-生成 teacher-only features
-计算 teacher_score
-划分 label_level
-判断 negative_type
-设置 sample_weight
-构造 Query 子图边
-落盘训练数据文件
-建议新增函数：
-build_query_feature_row()
-run_multi_path_recall()
-merge_candidate_authors()
-build_author_aux_features()
-build_pair_features()
-compute_teacher_score()
-assign_label_level()
-infer_negative_type()
-infer_sample_weight()
-build_query_author_kg_edges()
-
-12.2 data_loader.py
-需要升级 batch 输出格式，使其能同时支持：
-Query-Author 排序训练
-KG 三元组训练
-建议新增或修改：
-_load_train_pairs()
-_load_valid_pairs()
-_load_author_aux()
-_load_pair_aux()
-_build_pair_indices()
-sample_cf_batch()
-sample_kg_batch()
-sample_cf_batch() 应输出：
-query_ids
-pos_author_ids
-neg_author_ids
-pos_author_aux
-neg_author_aux
-pos_pair_aux
-neg_pair_aux
-pos_teacher_score
-neg_teacher_score
-pair_weight
-label_level
-conflict_flag
-
-12.3 model.py
-在保留 KGAT 主干的基础上，新增以下模块：
-author_aux_proj
-pair_aux_proj
-node_aux_proj
-rank_backbone
-rank_head
-graph_only_head
-class_head
-random_feature_mask()
-score_query_author()
-score_graph_only()
-forward_cf()
-calc_kg_loss()
-其中：
-author_aux_proj / pair_aux_proj：用于处理显式特征
-graph_only_head：用于保证图分支保活
-random_feature_mask()：用于防 teacher collapse
-
-12.4 trainer.py
-需要将训练流程升级为多目标训练。
-建议新增：
-build_optimizer()
-get_distill_weight()
-calc_cf_rank_loss()
-calc_graph_rank_loss()
-calc_cf_distill_loss()
-calc_cf_cls_loss()
-train_one_epoch()
-validate()
-evaluate_one_query()
-其中最重要的改动包括：
-分层学习率
-distill warmup
-graph-only loss
-新的验证指标监控
-
-12.5 ranking_engine.py / 推理模块
-若未来将 KGAT-AX v2 接入在线推理链路，则推理模块也需要同步升级：
-批量构造 online_pair_features
-加载 author_aux
-调用训练时同构的 Query-Author 打分逻辑
-仅使用线上可复算特征
-不依赖 teacher-only 特征
-
-13. 推荐修改顺序
-Step 1：先改 generate_training_data.py
-先把训练数据形态升级到位。
-这是整个 v2 改造的基础。
-Step 2：再改 data_loader.py
-确保训练 batch 正确输出。
-Step 3：再改 model.py
-增加特征分支与 graph-only 分支，完成结构升级。
-Step 4：最后改 trainer.py
-接通新的 loss、分层学习率与验证逻辑。
-Step 5：补推理侧
-将训练时的在线特征逻辑同步到推理端。
-
-14. 推荐训练策略
-14.1 分层学习率
-建议：
-GNN / entity / relation：较大学习率
-rank head / aux MLP：较小学习率
-MLP 部分更大 weight decay
-14.2 Distill Warmup
-蒸馏损失前期保持较低权重，后期逐步增大。
-14.3 Hard Negative 采样
-提高 hard negative 采样比例，但初期不放大其 loss 权重。
-14.4 监控指标
-训练与验证阶段建议重点监控：
-pair_acc
-teacher_spearman
-hard_negative_suppression
-aux_ablation_gap
-author_conflict_gap
-
-15. 最小可运行版本
-如果希望先快速落地，再逐步增强，建议先实现以下最小版本：
-必做
-生成 teacher_score
-生成 author_aux
-生成 online_pair_aux
-改造 sample_cf_batch()
-增加 score_query_author()
-增加 graph_only_head
-增加 loss_cf_rank
-增加 loss_graph_rank
-增加 loss_cf_distill
-启用分层学习率
-可后续增强
-class_head
-institution/source 节点级 aux
-更复杂的 teacher-only 特征
-更强的可视化与消融分析
-
-16. 预期收益
-完成 KGAT-AX v2 改造后，系统将获得以下收益：
-排序能力更符合高端科技人才筛选逻辑
-不再只依赖语义相似，而能综合考虑学术实力、权威性与时新性。
-图结构优势得到保留
-通过 graph-only 分支与 KG loss，KGAT 主干不会被简单 MLP 替代。
-在无真实标签条件下仍可训练
-通过 teacher score 与伪标签实现可控弱监督。
-工程上更可落地
-通过 online / teacher-only 特征拆分，训练与推理链路保持一致。
-为后续真实反馈接入预留空间
-当未来拥有真实行为数据、面试数据或录用数据时，可自然替换或补充当前 teacher 信号。
-
-17. 小结
-KGAT-AX v2 的改造重点不是“推翻现有 KGAT 主干”，而是：
-增强输入
-增强显式特征融合
-增强弱监督训练
-增强防退化机制
-增强工程可部署性
-整体改造遵循以下原则：
-先改数据，再改 loader，再改模型，再改 trainer，最后补推理。
-这样可以最大程度降低工程风险，同时保证每一步都有明确产出与可验证结果。
 
