@@ -1199,15 +1199,19 @@ class LabelRecallPath:
             if weight <= 0.0:
                 continue
 
-            tag_purity = float(row.get("capped_tag_purity") or row.get("raw_tag_purity") or 0.0)
-            if tag_purity and tag_purity < getattr(self, "SELECT_TAG_PURITY_MIN", 0.40):
-                continue
-
-            cos_sim = float(row.get("cos_sim") or 0.0)
-            anchor_sim = float(row.get("task_anchor_sim") or row.get("anchor_sim") or 0.0)
-            sim_val = max(cos_sim, anchor_sim)
-            if sim_val and sim_val < getattr(self, "SELECT_SEMANTIC_MIN", 0.38):
-                continue
+            final_score = row.get("final_score")
+            has_legacy = (row.get("raw_tag_purity") is not None or row.get("capped_tag_purity") is not None)
+            if has_legacy:
+                tag_purity = float(row.get("capped_tag_purity") or row.get("raw_tag_purity") or 0.0)
+                if tag_purity and tag_purity < getattr(self, "SELECT_TAG_PURITY_MIN", 0.40):
+                    continue
+                cos_sim = float(row.get("cos_sim") or 0.0)
+                anchor_sim = float(row.get("task_anchor_sim") or row.get("anchor_sim") or 0.0)
+                sim_val = max(cos_sim, anchor_sim)
+                if sim_val and sim_val < getattr(self, "SELECT_SEMANTIC_MIN", 0.38):
+                    continue
+            else:
+                pass
 
             degree_w = int(row.get("degree_w") or 0)
             if degree_w < getattr(self, "SELECT_MIN_PAPER_COUNT", 3):
@@ -1440,6 +1444,15 @@ class LabelRecallPath:
             final_term_ids_for_paper,
             regex_str,
         )
+
+        # 从 Stage3 双闸门 tag_purity_debug 构建 term_role_map（tid -> term_role），供 Stage4 权重与护栏 5 使用
+        tag_purity_debug = getattr(self, "_last_tag_purity_debug", None) or self.debug_info.tag_purity_debug or []
+        term_role_map = {
+            str(r["tid"]): (r.get("term_role") or "primary")
+            for r in tag_purity_debug
+            if r.get("tid") is not None
+        }
+        debug_1["term_role_map"] = term_role_map
 
         # 阶段 5：作者打分与排序（debug_1 中补上 regex_str、query_vector 供 last_debug_info 与 paper semantic gate）
         debug_1["regex_str"] = regex_str

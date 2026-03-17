@@ -3,13 +3,85 @@ import json
 import math
 import re
 import sqlite3
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import faiss
 import numpy as np
 
-from config import DB_PATH, VOCAB_P95_PAPER_COUNT, SIMILAR_TO_TOP_K, SIMILAR_TO_MIN_SCORE
+from config import (
+    DB_PATH,
+    VOCAB_P95_PAPER_COUNT,
+    SIMILAR_TO_TOP_K,
+    SIMILAR_TO_MIN_SCORE,
+    TOPIC_ALIGN_SUBFIELD,
+    TOPIC_ALIGN_FIELD,
+)
 from src.utils.domain_utils import DomainProcessor
+
+# ---------- Stage2/3 保守常量：先跑通再精调 ----------
+LABEL_EXPANSION_DEBUG = True  # 调试时打印 Stage2A/2B 流程
+PRIMARY_MIN_IDENTITY = 0.62
+IDENTITY_MARGIN = 0.08
+PRIMARY_MAX_PER_ANCHOR = 2  # 保守：每锚点最多 2 个 primary
+DENSE_MAX_PER_PRIMARY = 4   # Stage2B 每个 primary 最多 dense 近邻数
+CLUSTER_MAX_PER_PRIMARY = 3 # Stage2B 每个 primary 最多簇内支持词数
+COOC_SUPPORT_MIN_FREQ = 2
+COOC_MAX_PER_PRIMARY = 2
+
+
+@dataclass
+class PreparedAnchor:
+    """Stage1 输出，Stage2 输入。无缩写扩写表时 expanded_forms 仅 [anchor]。"""
+    anchor: str
+    vid: int
+    anchor_type: str = "unknown"
+    expanded_forms: List[str] = field(default_factory=list)
+
+
+@dataclass
+class LandingCandidate:
+    """Stage2A 落点候选。"""
+    vid: int
+    term: str
+    source: str  # similar_to | jd_vector
+    semantic_score: float
+    anchor_vid: int = 0
+    anchor_term: str = ""
+
+
+@dataclass
+class PrimaryLanding:
+    """Stage2A 选出的主落点。"""
+    vid: int
+    term: str
+    identity_score: float
+    source: str
+    anchor_vid: int
+    anchor_term: str
+
+
+@dataclass
+class ExpandedTermCandidate:
+    """Stage2 输出 / Stage3 输入，含 term_role 与三层领域 topic_align。"""
+    vid: int
+    term: str
+    term_role: str  # primary | dense_expansion | cluster_expansion | cooc_expansion
+    identity_score: float
+    source: str
+    anchor_vid: int
+    anchor_term: str
+    semantic_score: float = 0.0
+    degree_w: int = 0
+    domain_span: int = 0
+    target_degree_w: int = 0
+    degree_w_expanded: int = 0
+    cov_j: float = 0.0
+    src_vids: List[int] = field(default_factory=list)
+    hit_count: int = 0
+    topic_align: float = 1.0
+    topic_level: str = "missing"
+    topic_confidence: float = 1.0
 
 
 def expand_semantic_map(
@@ -781,4 +853,594 @@ def query_expansion_with_topology(label, v_ids, regex):
         for r in results
     ]
     return results
+
+
+# ---------- Stage2A：学术落点（跨类型 SIMILAR_TO 为主，可选 JD 向量） ----------
+
+
+def _anchor_skills_to_prepared_anchors(label, anchor_skills: Dict[str, Any]) -> List[PreparedAnchor]:
+    """将现有 anchor_skills (vid -> {term}) 转为 List[PreparedAnchor]。"""
+    load_vocab_meta(label)
+    out = []
+    for vid_str, info in (anchor_skills or {}).items():
+        try:
+            vid = int(vid_str)
+        except (TypeError, ValueError):
+            continue
+        term = (info.get("term") or "").strip() or (label._vocab_meta.get(vid, ("", ""))[0])
+        if not term:
+            continue
+        out.append(PreparedAnchor(anchor=term, vid=vid, expanded_forms=[term]))
+    return out
+
+
+def retrieve_academic_term_by_similar_to(label, anchor: PreparedAnchor) -> List[LandingCandidate]:
+    """Stage2A 落点：从锚点（industry）查跨类型 SIMILAR_TO → 学术词。图内为带扩写向量相似度。"""
+    load_vocab_meta(label)
+    if not getattr(label, "graph", None):
+        if LABEL_EXPANSION_DEBUG:
+            print(f"[Stage2A] SIMILAR_TO 跳过 anchor={anchor.anchor!r} vid={anchor.vid}（无 graph）")
+        return []
+    params = {
+        "anchor_vid": anchor.vid,
+        "min_score": SIMILAR_TO_MIN_SCORE,
+        "top_k": SIMILAR_TO_TOP_K,
+    }
+    cypher = """
+    MATCH (v:Vocabulary {id: $anchor_vid})-[r:SIMILAR_TO]->(v_rel:Vocabulary)
+    WHERE r.score >= $min_score
+      AND coalesce(v_rel.type, 'concept') IN ['concept', 'keyword']
+    RETURN v_rel.id AS tid, v_rel.term AS term, r.score AS sim_score
+    ORDER BY sim_score DESC
+    LIMIT $top_k
+    """
+    try:
+        rows = label.graph.run(cypher, **params).data()
+    except Exception as e:
+        if LABEL_EXPANSION_DEBUG:
+            print(f"[Stage2A] SIMILAR_TO 查询异常 anchor_vid={anchor.vid} anchor={anchor.anchor!r}: {e}")
+        return []
+    if LABEL_EXPANSION_DEBUG:
+        print(f"[Stage2A] SIMILAR_TO anchor_vid={anchor.vid} anchor={anchor.anchor!r} min_score={SIMILAR_TO_MIN_SCORE} top_k={SIMILAR_TO_TOP_K} -> 命中 {len(rows)} 条")
+    out = []
+    for r in rows:
+        tid = r.get("tid")
+        if tid is None:
+            continue
+        try:
+            tid = int(tid)
+        except (TypeError, ValueError):
+            continue
+        term = (r.get("term") or "").strip() or (label._vocab_meta.get(tid, ("", ""))[0])
+        sim = max(0.0, min(1.0, float(r.get("sim_score", 0.0) or 0.0)))
+        out.append(
+            LandingCandidate(
+                vid=tid,
+                term=term or str(tid),
+                source="similar_to",
+                semantic_score=sim,
+                anchor_vid=anchor.vid,
+                anchor_term=anchor.anchor,
+            )
+        )
+    if LABEL_EXPANSION_DEBUG and out:
+        for i, c in enumerate(out[:5]):
+            print(f"[Stage2A]   落点[{i}] vid={c.vid} term={c.term!r} sim={c.semantic_score:.3f}")
+        if len(out) > 5:
+            print(f"[Stage2A]   ... 共 {len(out)} 个落点候选")
+    return out
+
+
+def collect_landing_candidates(label, anchor: PreparedAnchor) -> List[LandingCandidate]:
+    """Stage2A：仅跨类型 SIMILAR_TO（+ 可选 JD 向量）。不做 exact/alias、不做 anchor→dense。"""
+    similar_list = retrieve_academic_term_by_similar_to(label, anchor)
+    by_vid = {c.vid: c for c in similar_list}
+    cands = list(by_vid.values())
+    if LABEL_EXPANSION_DEBUG:
+        print(f"[Stage2A] collect_landing_candidates anchor={anchor.anchor!r} -> {len(cands)} 个候选")
+    return cands
+
+
+def score_academic_identity(c: LandingCandidate) -> float:
+    """身份分：similar_to 用边权；jd_vector 用 0.5+0.5*semantic_score。"""
+    if c.source == "similar_to":
+        return max(0.0, min(1.0, c.semantic_score))
+    if c.source == "jd_vector":
+        return 0.5 + 0.5 * max(0.0, min(1.0, c.semantic_score))
+    return 0.5 + 0.5 * max(0.0, min(1.0, c.semantic_score))
+
+
+def select_primary_academic_landings(
+    candidates: List[LandingCandidate],
+    anchor_vid: int,
+    min_identity: float = PRIMARY_MIN_IDENTITY,
+    identity_margin: float = IDENTITY_MARGIN,
+    max_per_anchor: int = PRIMARY_MAX_PER_ANCHOR,
+) -> List[PrimaryLanding]:
+    """保守：只留 identity 高且领先足够的；每锚点最多 max_per_anchor 个。"""
+    if not candidates:
+        return []
+    for c in candidates:
+        setattr(c, "identity_score", score_academic_identity(c))
+    sorted_c = sorted(candidates, key=lambda x: getattr(x, "identity_score", 0.0), reverse=True)
+    out = []
+    for i, c in enumerate(sorted_c):
+        sc = getattr(c, "identity_score", 0.0)
+        if sc < min_identity:
+            continue
+        if i >= 1:
+            prev_score = getattr(sorted_c[i - 1], "identity_score", 0.0)
+            if prev_score - sc < identity_margin:
+                continue
+        if len(out) >= max_per_anchor:
+            break
+        out.append(
+            PrimaryLanding(
+                vid=c.vid,
+                term=c.term,
+                identity_score=sc,
+                source=c.source,
+                anchor_vid=c.anchor_vid,
+                anchor_term=c.anchor_term,
+            )
+        )
+    if LABEL_EXPANSION_DEBUG:
+        print(f"[Stage2A] select_primary 候选数={len(candidates)} min_identity={min_identity} -> primary 数={len(out)}")
+        for p in out:
+            print(f"[Stage2A]   primary vid={p.vid} term={p.term!r} identity={p.identity_score:.3f} source={p.source}")
+    return out
+
+
+# ---------- Stage2B：学术侧补充（dense / 簇 / 共现，不再用 SIMILAR_TO 学术→学术） ----------
+
+
+def expand_from_vocab_dense_neighbors(
+    label,
+    primary_landings: List[PrimaryLanding],
+    top_k_per_primary: int = None,
+) -> List[ExpandedTermCandidate]:
+    """从词汇向量索引取 primary 的学术近邻。term_role=dense_expansion。"""
+    top_k_per_primary = top_k_per_primary or DENSE_MAX_PER_PRIMARY
+    if not primary_landings or not getattr(label, "vocab_index", None) or not getattr(label, "vocab_to_idx", None):
+        return []
+    if getattr(label, "all_vocab_vectors", None) is None:
+        return []
+    load_vocab_meta(label)
+    seen = set(p.vid for p in primary_landings)
+    out = []
+    for p in primary_landings:
+        idx = label.vocab_to_idx.get(str(p.vid))
+        if idx is None:
+            continue
+        vec = np.asarray(label.all_vocab_vectors[idx], dtype=np.float32).reshape(1, -1)
+        k = min(top_k_per_primary + 5, 30)
+        scores, ids = label.vocab_index.search(vec, k)
+        count = 0
+        for score, tid in zip(scores[0], ids[0]):
+            if count >= top_k_per_primary:
+                break
+            tid = int(tid)
+            if tid <= 0 or tid in seen:
+                continue
+            meta = label._vocab_meta.get(tid, ("", ""))
+            if meta[1] not in ("concept", "keyword", "") and meta[1]:
+                continue
+            sim = max(0.0, min(1.0, float(score)))
+            if sim < 0.3:
+                continue
+            seen.add(tid)
+            out.append(
+                ExpandedTermCandidate(
+                    vid=tid,
+                    term=meta[0] or str(tid),
+                    term_role="dense_expansion",
+                    identity_score=sim,
+                    source="dense",
+                    anchor_vid=p.anchor_vid,
+                    anchor_term=p.anchor_term,
+                    semantic_score=sim,
+                    src_vids=[p.vid],
+                    hit_count=1,
+                )
+            )
+            count += 1
+    if LABEL_EXPANSION_DEBUG:
+        print(f"[Stage2B] expand_from_vocab_dense_neighbors primary数={len(primary_landings)} -> dense_expansion {len(out)} 个")
+    return out
+
+
+def expand_from_cluster_members(
+    label,
+    primary_landings: List[PrimaryLanding],
+    max_per_primary: int = None,
+) -> List[ExpandedTermCandidate]:
+    """从簇内取同簇支持词。term_role=cluster_expansion。"""
+    max_per_primary = max_per_primary or CLUSTER_MAX_PER_PRIMARY
+    voc_to_clusters = getattr(label, "voc_to_clusters", None) or {}
+    cluster_members = getattr(label, "cluster_members", None) or {}
+    if not primary_landings or not voc_to_clusters or not cluster_members:
+        return []
+    load_vocab_meta(label)
+    seen = set(p.vid for p in primary_landings)
+    out = []
+    for p in primary_landings:
+        clusters = voc_to_clusters.get(p.vid)
+        if not clusters:
+            continue
+        cid, _ = max(clusters, key=lambda x: x[1])
+        members = cluster_members.get(cid) or []
+        count = 0
+        for vid in members:
+            if count >= max_per_primary:
+                break
+            vid = int(vid)
+            if vid in seen:
+                continue
+            meta = label._vocab_meta.get(vid, ("", ""))
+            if meta[1] not in ("concept", "keyword", "") and meta[1]:
+                continue
+            seen.add(vid)
+            out.append(
+                ExpandedTermCandidate(
+                    vid=vid,
+                    term=meta[0] or str(vid),
+                    term_role="cluster_expansion",
+                    identity_score=0.5,
+                    source="cluster",
+                    anchor_vid=p.anchor_vid,
+                    anchor_term=p.anchor_term,
+                    semantic_score=0.0,
+                    src_vids=[p.vid],
+                    hit_count=1,
+                )
+            )
+            count += 1
+    if LABEL_EXPANSION_DEBUG:
+        print(f"[Stage2B] expand_from_cluster_members primary数={len(primary_landings)} -> cluster_expansion {len(out)} 个")
+    return out
+
+
+def expand_from_cooccurrence_support(label, primary_landings: List[PrimaryLanding]) -> List[ExpandedTermCandidate]:
+    """共现高支持度学术词。term_role=cooc_expansion。term -> voc_id 通过 _vocab_meta 反查。"""
+    if not primary_landings or not getattr(label, "stats_conn", None):
+        return []
+    load_vocab_meta(label)
+    term_to_vid = {}
+    if getattr(label, "_vocab_meta", None):
+        for v, (t, _) in label._vocab_meta.items():
+            if t and t not in term_to_vid:
+                term_to_vid[t.strip()] = v
+    vid_to_term = {p.vid: (p.term, p.anchor_vid, p.anchor_term) for p in primary_landings}
+    out = []
+    seen = set(p.vid for p in primary_landings)
+    for vid, (term, anchor_vid, anchor_term) in vid_to_term.items():
+        if not term:
+            continue
+        try:
+            rows = label.stats_conn.execute(
+                "SELECT term_a, term_b, freq FROM vocabulary_cooccurrence WHERE (term_a = ? OR term_b = ?) AND freq >= ?",
+                (term, term, COOC_SUPPORT_MIN_FREQ),
+            ).fetchall()
+        except Exception:
+            continue
+        count = 0
+        for row in rows:
+            if count >= COOC_MAX_PER_PRIMARY:
+                break
+            ta, tb, freq = row[0], row[1], row[2]
+            other = (tb if ta == term else ta) or ""
+            if other == term or not other:
+                continue
+            vid_other = term_to_vid.get(other.strip())
+            if vid_other is None:
+                continue
+            if vid_other in seen:
+                continue
+            seen.add(vid_other)
+            meta = label._vocab_meta.get(vid_other, ("", ""))
+            out.append(
+                ExpandedTermCandidate(
+                    vid=vid_other,
+                    term=meta[0] or other,
+                    term_role="cooc_expansion",
+                    identity_score=0.4,  # 共现给予固定身份分以过闸门 0.35
+                    source="cooc",
+                    anchor_vid=anchor_vid,
+                    anchor_term=anchor_term,
+                    semantic_score=0.0,
+                    src_vids=[vid],
+                    hit_count=int(freq),
+                )
+            )
+            count += 1
+    if LABEL_EXPANSION_DEBUG:
+        print(f"[Stage2B] expand_from_cooccurrence_support primary数={len(primary_landings)} -> cooc_expansion {len(out)} 个")
+    return out
+
+
+# ---------- 三层领域：vocabulary_topic_stats 查表与 topic_align 计算 ----------
+
+
+def _load_vocabulary_topic_stats(label, voc_id: int) -> Optional[Dict[str, Any]]:
+    """按 voc_id 查询 vocabulary_topic_stats，无记录或表不存在返回 None。"""
+    if not getattr(label, "stats_conn", None):
+        return None
+    try:
+        row = label.stats_conn.execute(
+            "SELECT field_id, subfield_id, topic_id, field_dist, subfield_dist, topic_dist, source FROM vocabulary_topic_stats WHERE voc_id=?",
+            (voc_id,),
+        ).fetchone()
+    except Exception:
+        return None
+    if not row:
+        return None
+    return {
+        "field_id": row[0],
+        "subfield_id": row[1],
+        "topic_id": row[2],
+        "field_dist": row[3],
+        "subfield_dist": row[4],
+        "topic_dist": row[5],
+        "source": row[6] if len(row) > 6 else None,
+    }
+
+
+def _parse_dist(dist_raw: Any) -> Dict[str, float]:
+    """解析 JSON 分布，返回 {id_str: prob}。"""
+    if not dist_raw:
+        return {}
+    try:
+        d = json.loads(dist_raw) if isinstance(dist_raw, str) else dist_raw
+        return {str(k): float(v) for k, v in (d or {}).items()}
+    except Exception:
+        return {}
+
+
+def _extract_ids_from_row(topic_row: Dict[str, Any], key_id: str, key_dist: str) -> Set[str]:
+    """从主值或分布提取 ID 集合。"""
+    out = set()
+    main = topic_row.get(key_id)
+    if main is not None and str(main).strip():
+        for p in re.split(r"[|,\s]+", str(main).strip()):
+            if p:
+                out.add(p.strip())
+    if not out:
+        dist = _parse_dist(topic_row.get(key_dist))
+        for k, v in dist.items():
+            if v and float(v) > 0:
+                out.add(k)
+    return out
+
+
+def _compute_hierarchy_match_score(
+    topic_row: Dict[str, Any],
+    jd_field_ids: Set[str],
+    jd_subfield_ids: Set[str],
+    jd_topic_ids: Set[str],
+) -> Tuple[float, str]:
+    """层级命中分与档位。自上而下：topic → subfield → field → none。"""
+    if not jd_topic_ids and not jd_subfield_ids and not jd_field_ids:
+        return 1.0, "missing"
+    term_topic = _extract_ids_from_row(topic_row, "topic_id", "topic_dist")
+    term_subfield = _extract_ids_from_row(topic_row, "subfield_id", "subfield_dist")
+    term_field = _extract_ids_from_row(topic_row, "field_id", "field_dist")
+
+    def has_overlap(a: Set[str], b: Set[str]) -> bool:
+        return bool(a & b) if a and b else False
+
+    if jd_topic_ids and has_overlap(term_topic, jd_topic_ids):
+        return 1.0, "topic"
+    if jd_subfield_ids and has_overlap(term_subfield, jd_subfield_ids):
+        return TOPIC_ALIGN_SUBFIELD, "subfield"
+    if jd_field_ids and has_overlap(term_field, jd_field_ids):
+        return TOPIC_ALIGN_FIELD, "field"
+    return 0.0, "none"
+
+
+def _compute_topic_confidence(topic_row: Dict[str, Any]) -> float:
+    """按 source 映射主题可信度。"""
+    source = (topic_row.get("source") or "").strip().lower()
+    if source == "direct":
+        return 1.0
+    if source == "direct+cooc":
+        return 0.9
+    if source == "cooc":
+        return 0.7
+    return 1.0
+
+
+def _attach_topic_align(
+    label,
+    voc_id: int,
+    jd_field_ids: Set[str],
+    jd_subfield_ids: Set[str],
+    jd_topic_ids: Set[str],
+) -> Tuple[float, str, float]:
+    """为单个 voc_id 计算 topic_align, topic_level, topic_confidence。缺表/无记录时返回 (1.0, 'missing', 1.0)。"""
+    topic_row = _load_vocabulary_topic_stats(label, voc_id)
+    if not topic_row:
+        return 1.0, "missing", 1.0
+    hierarchy_score, topic_level = _compute_hierarchy_match_score(
+        topic_row, jd_field_ids, jd_subfield_ids, jd_topic_ids
+    )
+    confidence = _compute_topic_confidence(topic_row)
+    topic_align = hierarchy_score * confidence
+    return topic_align, topic_level, confidence
+
+
+def merge_primary_and_support_terms(
+    primary_landings: List[PrimaryLanding],
+    dense_list: List[ExpandedTermCandidate],
+    cluster_list: List[ExpandedTermCandidate],
+    cooc_list: List[ExpandedTermCandidate],
+    label,
+    active_domains: Optional[Set[int]] = None,
+    jd_field_ids: Optional[Set[str]] = None,
+    jd_subfield_ids: Optional[Set[str]] = None,
+    jd_topic_ids: Optional[Set[str]] = None,
+) -> List[ExpandedTermCandidate]:
+    """合并 primary + dense_expansion + cluster_expansion + cooc_expansion，补全 degree_w 与 topic_align 供 Stage3。"""
+    load_vocab_meta(label)
+    active = active_domains or set()
+    jd_f = set(str(x) for x in (jd_field_ids or []))
+    jd_s = set(str(x) for x in (jd_subfield_ids or []))
+    jd_t = set(str(x) for x in (jd_topic_ids or []))
+    out = []
+    for p in primary_landings:
+        row = None
+        if getattr(label, "stats_conn", None):
+            row = label.stats_conn.execute(
+                "SELECT work_count, domain_span, domain_dist FROM vocabulary_domain_stats WHERE voc_id=?",
+                (p.vid,),
+            ).fetchone()
+        degree_w = int(row[0]) if row else 0
+        domain_span = int(row[1]) if row and len(row) > 1 else 0
+        dist = {}
+        if row and len(row) > 2 and row[2]:
+            try:
+                dist = json.loads(row[2]) if isinstance(row[2], str) else row[2]
+            except Exception:
+                pass
+        expanded = expand_domain_dist(label, dist)
+        degree_w_expanded = sum(expanded.values())
+        target_degree_w = sum(expanded.get(str(d), 0) for d in active)
+        topic_align, topic_level, topic_conf = _attach_topic_align(label, p.vid, jd_f, jd_s, jd_t)
+        out.append(
+            ExpandedTermCandidate(
+                vid=p.vid,
+                term=p.term,
+                term_role="primary",
+                identity_score=p.identity_score,
+                source=p.source,
+                anchor_vid=p.anchor_vid,
+                anchor_term=p.anchor_term,
+                semantic_score=1.0,
+                degree_w=degree_w,
+                domain_span=domain_span,
+                degree_w_expanded=degree_w_expanded,
+                target_degree_w=target_degree_w,
+                src_vids=[],
+                hit_count=1,
+                topic_align=topic_align,
+                topic_level=topic_level,
+                topic_confidence=topic_conf,
+            )
+        )
+    for c in dense_list:
+        row = None
+        if getattr(label, "stats_conn", None):
+            row = label.stats_conn.execute(
+                "SELECT work_count, domain_span, domain_dist FROM vocabulary_domain_stats WHERE voc_id=?",
+                (c.vid,),
+            ).fetchone()
+        if row:
+            c.degree_w = int(row[0])
+            c.domain_span = int(row[1]) if len(row) > 1 else 0
+            try:
+                dist = json.loads(row[2]) if isinstance(row[2], str) else row[2] if len(row) > 2 else {}
+            except Exception:
+                dist = {}
+            expanded = expand_domain_dist(label, dist)
+            c.degree_w_expanded = sum(expanded.values())
+            c.target_degree_w = sum(expanded.get(str(d), 0) for d in active)
+        c.topic_align, c.topic_level, c.topic_confidence = _attach_topic_align(label, c.vid, jd_f, jd_s, jd_t)
+        out.append(c)
+    for c in cluster_list:
+        row = None
+        if getattr(label, "stats_conn", None):
+            row = label.stats_conn.execute(
+                "SELECT work_count, domain_span, domain_dist FROM vocabulary_domain_stats WHERE voc_id=?",
+                (c.vid,),
+            ).fetchone()
+        if row:
+            c.degree_w = int(row[0])
+            c.domain_span = int(row[1]) if len(row) > 1 else 0
+            try:
+                dist = json.loads(row[2]) if isinstance(row[2], str) else row[2] if len(row) > 2 else {}
+            except Exception:
+                dist = {}
+            expanded = expand_domain_dist(label, dist)
+            c.degree_w_expanded = sum(expanded.values())
+            c.target_degree_w = sum(expanded.get(str(d), 0) for d in active)
+        c.topic_align, c.topic_level, c.topic_confidence = _attach_topic_align(label, c.vid, jd_f, jd_s, jd_t)
+        out.append(c)
+    for c in cooc_list:
+        row = None
+        if getattr(label, "stats_conn", None):
+            row = label.stats_conn.execute(
+                "SELECT work_count, domain_span, domain_dist FROM vocabulary_domain_stats WHERE voc_id=?",
+                (c.vid,),
+            ).fetchone()
+        if row:
+            c.degree_w = int(row[0])
+            c.domain_span = int(row[1]) if len(row) > 1 else 0
+            try:
+                dist = json.loads(row[2]) if isinstance(row[2], str) else row[2] if len(row) > 2 else {}
+            except Exception:
+                dist = {}
+            expanded = expand_domain_dist(label, dist)
+            c.degree_w_expanded = sum(expanded.values())
+            c.target_degree_w = sum(expanded.get(str(d), 0) for d in active)
+        c.topic_align, c.topic_level, c.topic_confidence = _attach_topic_align(label, c.vid, jd_f, jd_s, jd_t)
+        out.append(c)
+    if LABEL_EXPANSION_DEBUG:
+        n_primary = len(primary_landings)
+        n_dense, n_cluster, n_cooc = len(dense_list), len(cluster_list), len(cooc_list)
+        print(f"[Stage2B] merge_primary_and_support_terms primary={n_primary} dense={n_dense} cluster={n_cluster} cooc={n_cooc} -> 合计 {len(out)} 项")
+    return out
+
+
+def stage2_generate_academic_terms(
+    label,
+    prepared_anchors: List[PreparedAnchor],
+    active_domain_set: Optional[Set[int]] = None,
+    domain_regex: Optional[str] = None,
+    query_vector=None,
+    query_text: Optional[str] = None,
+    jd_field_ids: Optional[Set[str]] = None,
+    jd_subfield_ids: Optional[Set[str]] = None,
+    jd_topic_ids: Optional[Set[str]] = None,
+) -> List[ExpandedTermCandidate]:
+    """
+    Stage2 总入口：先 Stage2A 主落点（保守），再 Stage2B 仅围绕 primary 扩展。
+    无主落点则不扩展。可选传入 jd_field_ids/jd_subfield_ids/jd_topic_ids 供三层领域 topic_align。
+    """
+    active_domains = set(int(x) for x in (active_domain_set or [])) if active_domain_set else set()
+    if domain_regex and not active_domains:
+        try:
+            active_domains = set(int(x) for x in re.findall(r"\d+", domain_regex))
+        except (ValueError, TypeError):
+            pass
+    all_terms = []
+    if LABEL_EXPANSION_DEBUG:
+        print(f"[Stage2] stage2_generate_academic_terms 开始 锚点数={len(prepared_anchors)} active_domains={len(active_domains)}")
+    for anchor in prepared_anchors:
+        candidates = collect_landing_candidates(label, anchor)
+        primary_landings = select_primary_academic_landings(
+            candidates, anchor.vid, PRIMARY_MIN_IDENTITY, IDENTITY_MARGIN, PRIMARY_MAX_PER_ANCHOR
+        )
+        if not primary_landings:
+            if LABEL_EXPANSION_DEBUG:
+                print(f"[Stage2] 锚点 anchor={anchor.anchor!r} vid={anchor.vid} 无 primary，跳过")
+            continue
+        dense_list = expand_from_vocab_dense_neighbors(label, primary_landings)
+        cluster_list = expand_from_cluster_members(label, primary_landings)
+        cooc_list = expand_from_cooccurrence_support(label, primary_landings)
+        merged = merge_primary_and_support_terms(
+            primary_landings,
+            dense_list,
+            cluster_list,
+            cooc_list,
+            label,
+            active_domains=active_domains,
+            jd_field_ids=jd_field_ids,
+            jd_subfield_ids=jd_subfield_ids,
+            jd_topic_ids=jd_topic_ids,
+        )
+        all_terms.extend(merged)
+        if LABEL_EXPANSION_DEBUG:
+            print(f"[Stage2] 锚点 anchor={anchor.anchor!r} 本锚合并后 +{len(merged)} 项，累计 {len(all_terms)} 项")
+    if LABEL_EXPANSION_DEBUG:
+        print(f"[Stage2] stage2_generate_academic_terms 结束 总学术词数={len(all_terms)}")
+    return all_terms
 

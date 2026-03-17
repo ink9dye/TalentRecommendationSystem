@@ -3,6 +3,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from config import (
+    TOPIC_WEIGHT_PRIMARY,
+    TOPIC_WEIGHT_DENSE,
+    TOPIC_WEIGHT_CLUSTER,
+    TOPIC_WEIGHT_COOC,
+    TOPIC_MIN_ALIGN,
+    TOPIC_LOW_ALIGN_PENALTY,
+)
 from src.core.recall.label_means import advanced_metrics as label_means_adv
 
 
@@ -263,6 +271,93 @@ def _genericity_penalty(rec: Dict[str, Any]) -> float:
     return max(0.1, float(penalty))
 
 
+def get_term_debug_metrics(
+    label, rec: Dict[str, Any], query_vector
+) -> Optional[Dict[str, Any]]:
+    """
+    仅计算并返回单条 rec 的调试指标（task_anchor_sim、carrier_anchor_sim、anchor_factor、term_backbone 等），
+    不写入 tag_purity_debug。供 Stage3 双闸门路径合并到 debug 条目用。
+    """
+    try:
+        degree_w = int(rec.get("degree_w") or 0)
+        degree_w_expanded = int(rec.get("degree_w_expanded") or 0) or max(degree_w, 1)
+        target_degree_w = int(rec.get("target_degree_w") or 0)
+        domain_span = max(1, int(rec.get("domain_span") or 1))
+        cov_j = float(rec.get("cov_j") or 0.0)
+
+        raw_tag_purity = (target_degree_w / degree_w_expanded) if degree_w_expanded else 0.0
+        tag_purity = min(1.0, raw_tag_purity)
+        purity_term = tag_purity
+
+        total = float(getattr(label, "total_work_count", 1e6) or 1e6)
+        idf_term = _idf_backbone(total, degree_w_expanded)
+        if (rec.get("source") or "").strip().lower() == "ctx_only":
+            idf_term *= 0.85
+        idf_val = _smoothed_idf(degree_w, idf_term)
+
+        cos_sim = 0.5
+        idx = getattr(label, "vocab_to_idx", None) and label.vocab_to_idx.get(str(rec.get("tid")))
+        if idx is not None and query_vector is not None:
+            av = getattr(label, "all_vocab_vectors", None)
+            if av is not None:
+                term_vec = av[idx]
+                cos_sim = float(np.dot(np.asarray(term_vec).flatten(), np.asarray(query_vector).flatten()))
+
+        if cos_sim < float(getattr(label, "SEMANTIC_MIN", 0.0)):
+            return {"idf_val": round(idf_val, 6)}
+
+        semantic_factor = math.pow(max(0.0, cos_sim), float(getattr(label, "SEMANTIC_POWER", 1.0)))
+        max_anchor_sim = None
+        task_anchor_sim = None
+        carrier_anchor_sim = None
+        anchor_vecs = getattr(label, "_anchor_vectors", None)
+        task_anchor_vecs = getattr(label, "_task_anchor_vectors", None)
+        carrier_anchor_vecs = getattr(label, "_carrier_anchor_vectors", None)
+        if idx is not None:
+            try:
+                av = getattr(label, "all_vocab_vectors", None)
+                if av is not None:
+                    tvec = np.asarray(av[idx], dtype=np.float32).flatten()
+                    tn = np.linalg.norm(tvec)
+                    if tn > 1e-9:
+                        t_unit = tvec / tn
+                        if anchor_vecs is not None and anchor_vecs.size > 0:
+                            max_anchor_sim = float(np.max(np.dot(anchor_vecs, t_unit)))
+                        if task_anchor_vecs is not None and task_anchor_vecs.size > 0:
+                            task_anchor_sim = float(np.max(np.dot(task_anchor_vecs, t_unit)))
+                        if carrier_anchor_vecs is not None and carrier_anchor_vecs.size > 0:
+                            carrier_anchor_sim = float(np.max(np.dot(carrier_anchor_vecs, t_unit)))
+            except Exception:
+                pass
+
+        ta = task_anchor_sim if task_anchor_sim is not None else max_anchor_sim
+        ca = carrier_anchor_sim if carrier_anchor_sim is not None else max_anchor_sim
+        anchor_factor = _anchor_factor(
+            ta, ca,
+            base=getattr(label, "ANCHOR_BASE", 0.35),
+            gain=getattr(label, "ANCHOR_GAIN", 0.65),
+        )
+        size_penalty = label_means_adv.size_penalty_factor(degree_w, degree_w_expanded)
+        term_backbone = semantic_factor * idf_term * purity_term * size_penalty * anchor_factor
+
+        task_advantage = None
+        if task_anchor_sim is not None and carrier_anchor_sim is not None:
+            task_advantage = round(task_anchor_sim - carrier_anchor_sim, 6)
+
+        return {
+            "anchor_sim": round(max_anchor_sim, 6) if max_anchor_sim is not None else None,
+            "task_anchor_sim": round(task_anchor_sim, 6) if task_anchor_sim is not None else None,
+            "carrier_anchor_sim": round(carrier_anchor_sim, 6) if carrier_anchor_sim is not None else None,
+            "task_advantage": task_advantage,
+            "idf_val": round(idf_val, 6),
+            "anchor_factor": round(anchor_factor, 6),
+            "term_backbone": round(term_backbone, 6),
+            "cos_sim": round(cos_sim, 6),
+        }
+    except Exception:
+        return None
+
+
 def _apply_word_quality_penalty(label, rec: Dict[str, Any], query_vector):
     """
     从 LabelRecallPath._apply_word_quality_penalty 迁移而来，内部使用 label 访问资源与超参。
@@ -475,4 +570,105 @@ def _anchor_factor(ta: float, ca: float, base: float, gain: float) -> float:
         + gain * math.pow(ta_clamped, 1.5)
         + 0.15 * math.pow(ca_clamped, 1.1)
     )
+
+
+# ---------- Stage3 双闸门与两分制（先跑通，公式从简） ----------
+STAGE3_DEBUG = True  # 调试时打印身份闸门未通过、最终分
+PRIMARY_MIN_IDENTITY_GATE = 0.62
+DENSE_CLUSTER_MIN_IDENTITY_GATE = 0.45  # dense_expansion / cluster_expansion 共用
+COOC_MIN_IDENTITY_GATE = 0.35
+FINAL_MIN_TERM_SCORE = 0.15
+EXPANSION_ROLES = frozenset({"dense_expansion", "cluster_expansion", "cooc_expansion"})
+
+
+def passes_identity_gate(rec: Dict[str, Any]) -> bool:
+    """按 term_role 判身份闸门。支持 primary | dense_expansion | cluster_expansion | cooc_expansion。"""
+    role = (rec.get("term_role") or "").strip().lower()
+    identity = float(rec.get("identity_score") or 0.0)
+    tid = rec.get("tid") or rec.get("vid") or ""
+    term = (rec.get("term") or "")[:24]
+    if not role:
+        return True
+    threshold = None
+    if role == "primary":
+        threshold = PRIMARY_MIN_IDENTITY_GATE
+        passed = identity >= threshold
+    elif role == "dense_expansion" or role == "cluster_expansion":
+        threshold = DENSE_CLUSTER_MIN_IDENTITY_GATE
+        passed = identity >= threshold
+    elif role == "cooc_expansion":
+        threshold = COOC_MIN_IDENTITY_GATE
+        passed = identity >= threshold
+    else:
+        threshold = COOC_MIN_IDENTITY_GATE
+        passed = identity >= threshold
+    if STAGE3_DEBUG and not passed:
+        print(f"[Stage3] identity_gate 未通过 tid={tid} term={term!r} role={role} identity={identity:.3f} < {threshold}")
+    return passed
+
+
+def passes_topic_consistency(rec: Dict[str, Any], active_domains: Optional[Any] = None) -> bool:
+    """Topic 一致性闸门。先跑通阶段直接通过，后续再接 vocabulary_topic_stats。"""
+    return True
+
+
+def score_term_expansion_quality(label, rec: Dict[str, Any]) -> float:
+    """质量分：仅衡量「作为召回 term 好不好用」。先简化为 idf 骨架 + 语义/纯度。"""
+    tid = rec.get("tid")
+    degree_w = int(rec.get("degree_w") or 0)
+    degree_w_expanded = int(rec.get("degree_w_expanded") or 0) or max(degree_w, 1)
+    target_degree_w = int(rec.get("target_degree_w") or 0)
+    total_work_count = float(getattr(label, "total_work_count", 1e6) or 1e6)
+    idf_backbone = _idf_backbone(total_work_count, degree_w_expanded)
+    idf_val = _smoothed_idf(degree_w, idf_backbone)
+    purity = target_degree_w / degree_w_expanded if degree_w_expanded else 0.0
+    sim = max(0.0, float(rec.get("sim_score") or 0.0))
+    quality = idf_val * (0.5 + 0.5 * purity) * (0.5 + 0.5 * min(1.0, sim))
+    return max(0.0, min(1.0, quality))
+
+
+def get_topic_weight_by_role(term_role: str) -> float:
+    """按 term_role 返回三层领域权重（乘性融合用）。"""
+    role = (term_role or "").strip().lower()
+    if role == "primary":
+        return TOPIC_WEIGHT_PRIMARY
+    if role == "dense_expansion":
+        return TOPIC_WEIGHT_DENSE
+    if role == "cluster_expansion":
+        return TOPIC_WEIGHT_CLUSTER
+    if role == "cooc_expansion":
+        return TOPIC_WEIGHT_COOC
+    return 0.0
+
+
+def compose_term_final_score(rec: Dict[str, Any]) -> float:
+    """最终分：base_score（identity+quality 按 term_role）再乘 topic_factor；expansion 低对齐时额外惩罚。"""
+    identity = float(rec.get("identity_score") or 0.0)
+    quality = float(rec.get("quality_score") or 0.0)
+    role = (rec.get("term_role") or "").strip().lower()
+    if role == "primary":
+        base_score = 0.7 * identity + 0.3 * quality
+    elif role == "dense_expansion" or role == "cluster_expansion":
+        base_score = 0.4 * identity + 0.6 * quality
+    elif role == "cooc_expansion":
+        base_score = 0.3 * identity + 0.7 * quality
+    else:
+        base_score = 0.5 * identity + 0.5 * quality
+
+    topic_align = float(rec["topic_align"]) if "topic_align" in rec else 1.0
+    topic_weight = get_topic_weight_by_role(role)
+    topic_factor = 1.0 - topic_weight + topic_weight * topic_align
+    final_score = base_score * topic_factor
+
+    if role in EXPANSION_ROLES and topic_align < TOPIC_MIN_ALIGN:
+        final_score *= TOPIC_LOW_ALIGN_PENALTY
+
+    if STAGE3_DEBUG and final_score < FINAL_MIN_TERM_SCORE:
+        tid = rec.get("tid") or rec.get("vid") or ""
+        term = (rec.get("term") or "")[:24]
+        print(
+            f"[Stage3] final_score 低于阈值 tid={tid} term={term!r} role={role} score={final_score:.3f} < {FINAL_MIN_TERM_SCORE} "
+            f"(base={base_score:.3f} topic_align={topic_align:.3f} topic_factor={topic_factor:.3f})"
+        )
+    return final_score
 

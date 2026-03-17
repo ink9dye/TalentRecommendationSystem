@@ -103,6 +103,9 @@ class SyncStateManager:
                     except Exception as e:
                         logging.error(f"Error processing row: {e}")
                         continue
+                    # 返回 None 表示跳过该行（如词汇清洗未通过）
+                    if row_data is None:
+                        continue
 
                 batch.append(row_data)
 

@@ -12,37 +12,65 @@ from src.core.recall.label_means.simple_factors import (
     paper_jd_semantic_gate_factor,
 )
 
+# Stage4 轻量改造：term_role 权重，primary 权重大、expansion 适中/更低
+TERM_ROLE_WEIGHT = {
+    "primary": 1.0,
+    "dense_expansion": 0.70,
+    "cluster_expansion": 0.60,
+    "cooc_expansion": 0.50,
+}
+
+
+def compute_primary_term_coverage(
+    paper_hits: List[Dict[str, Any]],
+    term_role_map: Dict[str, str],
+) -> Tuple[int, int]:
+    """
+    论文被多少 primary term 支撑、多少 supporting（dense/cluster/cooc）支撑。
+    护栏 5 用：纯 expansion 支撑的论文不允许排到 very top。
+    返回 (primary_count, supporting_count)。
+    """
+    primary_count = 0
+    supporting_count = 0
+    for hit in paper_hits or []:
+        vid_s = str(hit.get("vid") or "")
+        if not vid_s or vid_s not in term_role_map:
+            continue
+        role = (term_role_map[vid_s] or "").strip().lower()
+        if role == "primary":
+            primary_count += 1
+        elif role in ("dense_expansion", "cluster_expansion", "cooc_expansion"):
+            supporting_count += 1
+    return primary_count, supporting_count
+
 
 def compute_contribution(
     recall,
     paper: Dict[str, Any],
     context: Dict[str, Any],
-) -> Tuple[float, List[str], float, Dict[str, float]]:
+) -> Tuple[float, List[str], float, Dict[str, float], int, int]:
     """
     论文级贡献度计算（从 LabelRecallPath._compute_contribution 迁移），
-    作为 label_means 层的统一入口。
+    作为 label_means 层的统一入口。支持 term_role 权重与 primary coverage（护栏 5）。
 
     参数:
-      - recall: 提供 voc_to_clusters/_is_retracted/_get_domain_purity_factor/_calculate_proximity/_query_encoder 等方法与属性的宿主对象
+      - recall: 提供 voc_to_clusters 等
       - paper: 论文结构 {wid, hits, title, year, domains}
-      - context: 上下文，至少需要:
-          * score_map: term 分数
-          * term_map: tid -> term
-          * active_domain_set: 当前激活领域集合
-          * dominance: 领域主导度
-          * query_vector: JD 向量（可选，用于 paper-JD 语义 gate）
+      - context: score_map, term_map, active_domain_set, dominance; 可选 term_role_map（tid -> term_role）
 
     返回:
       - score: 论文最终得分
       - hit_terms: 命中标签的 term 列表
-      - rank_score: 仅由标签权重累加得到的基础分
-      - term_weights: {vid_s: 加权分}，用于后续作者拆分与 debug
+      - rank_score: 仅由标签权重累加得到的基础分（已按 term_role 加权）
+      - term_weights: {vid_s: 加权分}
+      - primary_count: 命中的 primary term 数（无 term_role_map 时为 -1）
+      - supporting_count: 命中的 supporting term 数（无 term_role_map 时为 -1）
     """
     raw_title = (paper.get("title") or "")
 
     # 1. 撤稿拦截
     if _is_retracted(raw_title):
-        return 0.0, [], 0.0, {}
+        return 0.0, [], 0.0, {}, -1, -1
 
     # 2. 领域纯度降权
     domain_coeff = _get_domain_purity_factor(
@@ -51,11 +79,12 @@ def compute_contribution(
         context["dominance"],
     )
     if domain_coeff <= 0:
-        return 0.0, [], 0.0, {}
+        return 0.0, [], 0.0, {}, -1, -1
 
-    # 3. 标签匹配与动态权重累加
+    # 3. 标签匹配与动态权重累加（按 term_role 加权：primary 权重大、expansion 适中/更低）
     score_map: Dict[str, float] = context["score_map"]
     term_map: Dict[str, str] = context["term_map"]
+    term_role_map: Dict[str, str] = context.get("term_role_map") or {}
 
     rank_score = 0.0
     term_weights: Dict[str, float] = {}
@@ -64,15 +93,23 @@ def compute_contribution(
 
     for hit in paper.get("hits", []):
         vid_s = str(hit["vid"])
-        if vid_s in score_map:
-            w = float(score_map[vid_s]) * float(hit.get("idf", 0.0))
-            rank_score += w
-            term_weights[vid_s] = w
-            valid_hids.append(hit["vid"])
-            hit_terms.append(term_map.get(vid_s, ""))
+        if vid_s not in score_map:
+            continue
+        w = float(score_map[vid_s]) * float(hit.get("idf", 0.0))
+        if term_role_map:
+            role = (term_role_map.get(vid_s) or "primary").strip().lower()
+            w *= TERM_ROLE_WEIGHT.get(role, 1.0)
+        rank_score += w
+        term_weights[vid_s] = w
+        valid_hids.append(hit["vid"])
+        hit_terms.append(term_map.get(vid_s, ""))
 
     if rank_score == 0:
-        return 0.0, [], 0.0, {}
+        return 0.0, [], 0.0, {}, -1, -1
+
+    primary_count, supporting_count = -1, -1
+    if term_role_map:
+        primary_count, supporting_count = compute_primary_term_coverage(paper.get("hits", []), term_role_map)
 
     # 4. 综述/文本类型衰减
     hit_count = len(valid_hids)
@@ -124,7 +161,7 @@ def compute_contribution(
     )
     score *= gate_factor
 
-    return float(score), hit_terms, float(rank_score), term_weights
+    return float(score), hit_terms, float(rank_score), term_weights, primary_count, supporting_count
 
 
 def _is_retracted(title: str) -> bool:

@@ -56,7 +56,10 @@ def run_pipeline(config):
             state.reset_marker("job_skill_sync")  # 岗位-技能关联
             state.reset_marker("semantic_bridge_sync")  # 词库间的 Faiss 相似度关联
             for task, sql, cypher, t_field in node_tasks:
-                builder.sync_nodes_task(task, sql, cypher, t_field)
+                if task == "vocab_sync":
+                    builder.sync_vocab_filtered()
+                else:
+                    builder.sync_nodes_task(task, sql, cypher, t_field)
 
         # --- 2. 核心拓扑连接 (Author-Work-Inst) ---
         with monitor.track("Building Topology (Authorship & Affiliation)"):

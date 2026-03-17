@@ -1,5 +1,83 @@
 from typing import Any, Dict, List, Tuple
 
+from src.core.recall.label_means import term_scoring
+
+
+def _run_stage3_dual_gate(
+    recall,
+    raw_candidates: List[Dict[str, Any]],
+    query_vector,
+    anchor_vids=None,
+) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, float]]:
+    """Stage3 双闸门路径：identity 闸门 -> topic 闸门 -> quality 分 -> 最终分 -> 质量闸门。"""
+    score_map: Dict[str, float] = {}
+    term_map: Dict[str, str] = {}
+    idf_map: Dict[str, float] = {}
+    recall.debug_info.tag_purity_debug = []
+    recall._last_tag_purity_debug = recall.debug_info.tag_purity_debug
+    stage3_debug = getattr(term_scoring, "STAGE3_DEBUG", False)
+    n_identity_ok, n_final_ok = 0, 0
+
+    for rec in raw_candidates:
+        if not term_scoring.passes_identity_gate(rec):
+            continue
+        n_identity_ok += 1
+        if not term_scoring.passes_topic_consistency(rec, None):
+            continue
+        rec["quality_score"] = term_scoring.score_term_expansion_quality(recall, rec)
+        rec["final_score"] = term_scoring.compose_term_final_score(rec)
+        if rec.get("final_score", 0.0) < term_scoring.FINAL_MIN_TERM_SCORE:
+            continue
+        n_final_ok += 1
+        tid_str = str(rec.get("tid", ""))
+        if not tid_str or tid_str == "None":
+            continue
+        score_map[tid_str] = float(rec["final_score"])
+        term_map[tid_str] = rec.get("term") or ""
+        degree_w = int(rec.get("degree_w") or 0)
+        total = float(getattr(recall, "total_work_count", 1e6) or 1e6)
+        idf_map[tid_str] = term_scoring._smoothed_idf(
+            degree_w,
+            term_scoring._idf_backbone(total, int(rec.get("degree_w_expanded") or 0) or max(degree_w, 1)),
+        )
+        entry = {
+            "tid": rec.get("tid"),
+            "term": rec.get("term"),
+            "term_role": rec.get("term_role"),
+            "identity_score": rec.get("identity_score"),
+            "quality_score": rec.get("quality_score"),
+            "final_score": rec.get("final_score"),
+            "degree_w": rec.get("degree_w"),
+            "degree_w_expanded": rec.get("degree_w_expanded"),
+            "source": rec.get("source") or rec.get("origin"),
+        }
+        # 合并调试指标（task_anchor_sim、task_advantage、cluster_factor、base_score 等）供日志打印
+        debug_metrics = term_scoring.get_term_debug_metrics(recall, rec, query_vector)
+        if debug_metrics:
+            entry.update(debug_metrics)
+        tid = rec.get("tid")
+        if tid is not None and hasattr(recall, "_get_cluster_factor_for_term"):
+            try:
+                entry["cluster_factor"] = recall._get_cluster_factor_for_term(int(tid))
+            except (TypeError, ValueError):
+                pass
+        identity = float(rec.get("identity_score") or 0.0)
+        quality = float(rec.get("quality_score") or 0.0)
+        role = (rec.get("term_role") or "").strip().lower()
+        if role == "primary":
+            entry["base_score"] = 0.7 * identity + 0.3 * quality
+        elif role in ("dense_expansion", "cluster_expansion"):
+            entry["base_score"] = 0.4 * identity + 0.6 * quality
+        elif role == "cooc_expansion":
+            entry["base_score"] = 0.3 * identity + 0.7 * quality
+        else:
+            entry["base_score"] = 0.5 * identity + 0.5 * quality
+        recall.debug_info.tag_purity_debug.append(entry)
+
+    if stage3_debug:
+        print(f"[Stage3] 双闸门汇总 输入={len(raw_candidates)} 通过identity={n_identity_ok} 通过final_score={n_final_ok} 输出词数={len(score_map)}")
+    return score_map, term_map, idf_map
+
 
 def run_stage3(
     recall,
@@ -9,14 +87,23 @@ def run_stage3(
 ) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, float]]:
     """
     阶段 3：词权重。
-    直接调用 recall._calculate_final_weights，并保留原有 verbose 调试输出逻辑。
+    若候选含 term_role/identity_score（Stage2 新格式），走双闸门路径；否则走原有 _calculate_final_weights。
     """
     if not raw_candidates:
         return {}, {}, {}
 
-    score_map, term_map, idf_map = recall._calculate_final_weights(
-        raw_candidates, query_vector, anchor_vids=anchor_vids
+    use_dual_gate = (
+        raw_candidates
+        and ("term_role" in raw_candidates[0] or "identity_score" in raw_candidates[0])
     )
+    if use_dual_gate:
+        score_map, term_map, idf_map = _run_stage3_dual_gate(
+            recall, raw_candidates, query_vector, anchor_vids=anchor_vids
+        )
+    else:
+        score_map, term_map, idf_map = recall._calculate_final_weights(
+            raw_candidates, query_vector, anchor_vids=anchor_vids
+        )
 
     # 保留原有的 verbose 调试逻辑（从 _stage3_word_weights 搬运）
     if recall.verbose and score_map and getattr(recall, "_last_tag_purity_debug", None):

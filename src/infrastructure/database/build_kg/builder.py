@@ -7,8 +7,8 @@ import faiss
 import sqlite3
 from tqdm import tqdm
 from datetime import datetime
-from config import SQL_QUERIES, CYPHER_TEMPLATES,SBERT_MODEL_NAME
-from src.utils.tools import extract_skills
+from config import SQL_QUERIES, CYPHER_TEMPLATES, SBERT_MODEL_NAME
+from src.utils.tools import extract_skills, normalize_skill, is_bad_skill
 
 
 class WeightStrategy:
@@ -70,6 +70,28 @@ class KGBuilder:
         将简单的实体表（如 Author, Institution）同步至 Neo4j。
         """
         self.state.sync_engine(task_name, SQL_QUERIES[sql_key], CYPHER_TEMPLATES[cypher_key], time_field)
+
+    def sync_vocab_filtered(self):
+        """
+        词汇节点同步（带清洗）：仅将通过 tools 校验的 term 同步到图。
+        表不动，仅在写入图前过滤，未通过 is_bad_skill(normalize_skill(term)) 的词汇不会入图。
+        """
+        def _vocab_row_filter(row):
+            term = row.get("term") or row.get("name") or ""
+            if not term or not str(term).strip():
+                return None
+            normalized = normalize_skill(str(term).strip())
+            if not normalized or is_bad_skill(normalized):
+                return None
+            return row
+
+        self.state.sync_engine(
+            "vocab_sync",
+            SQL_QUERIES["GET_ALL_VOCAB"],
+            CYPHER_TEMPLATES["MERGE_VOCAB"],
+            "id",
+            row_processor=_vocab_row_filter,
+        )
 
     def build_topology_incremental(self):
         """

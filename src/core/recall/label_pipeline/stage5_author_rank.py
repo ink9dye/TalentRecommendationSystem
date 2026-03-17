@@ -13,6 +13,54 @@ from src.core.recall.works_to_authors import accumulate_author_scores
 from src.core.recall.label_means import paper_scoring
 
 
+def _is_primary_supported(primary_count: int, supporting_count: int) -> bool:
+    """护栏 5 条件：≥1 个 primary 或 ≥2 个 primary/supporting 为 primary_supported。"""
+    if primary_count < 0 and supporting_count < 0:
+        return True
+    return primary_count >= 1 or (primary_count + supporting_count) >= 2
+
+
+def aggregate_author_evidence_by_term_role(
+    papers_for_agg: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    按作者区分 primary_supported 与 expansion_supported 的证据，便于可解释。
+    返回: aid -> {
+      "primary_supported_score": float,
+      "primary_supported_wids": List[int],
+      "expansion_supported_score": float,
+      "expansion_supported_wids": List[int],
+    }
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for p in papers_for_agg or []:
+        primary_count = p.get("primary_count", -1)
+        supporting_count = p.get("supporting_count", -1)
+        is_primary = _is_primary_supported(primary_count, supporting_count)
+        score = float(p.get("score") or 0.0)
+        wid = p.get("wid")
+        for author in p.get("authors") or []:
+            aid = author.get("aid") if isinstance(author, dict) else author
+            if aid is None or aid == "":
+                continue
+            if aid not in out:
+                out[aid] = {
+                    "primary_supported_score": 0.0,
+                    "primary_supported_wids": [],
+                    "expansion_supported_score": 0.0,
+                    "expansion_supported_wids": [],
+                }
+            if is_primary:
+                out[aid]["primary_supported_score"] += score
+                if wid is not None:
+                    out[aid]["primary_supported_wids"].append(wid)
+            else:
+                out[aid]["expansion_supported_score"] += score
+                if wid is not None:
+                    out[aid]["expansion_supported_wids"].append(wid)
+    return out
+
+
 def run_stage5(
     recall,
     author_papers_list: List[Dict[str, Any]],
@@ -23,14 +71,37 @@ def run_stage5(
     debug_1: Dict[str, Any],
 ) -> Tuple[List[str], Dict[str, Any]]:
     """
-    阶段 5：作者打分与排序。
-    基本搬运 LabelRecallPath._stage5_score_and_rank_authors 逻辑，保持返回 (author_ids, last_debug_info)。
+    阶段 5：作者打分与排序。按论文贡献度聚合、时间与活跃度加权、最佳论文比过滤后排序。
+    返回 (author_id_list, last_debug_info)。
     """
+    score_map = score_map or {}
+    term_map = term_map or {}
+    active_domain_set = active_domain_set or set()
+    industrial_kws = debug_1.get("industrial_kws", []) if debug_1 else []
+    if not author_papers_list:
+        recall.debug_info.work_count = 0
+        recall.debug_info.author_count = 0
+        recall.debug_info.recall_vocab_count = len(score_map)
+        recall.last_debug_info = {
+            "active_domains": [str(d) for d in sorted(active_domain_set)],
+            "dominance": float(dominance),
+            "industrial_kws": industrial_kws,
+            "anchor_skills": debug_1.get("anchor_skills", {}) if debug_1 else {},
+            "score_map": score_map,
+            "term_map": term_map,
+            "work_count": 0,
+            "author_count": 0,
+            "recall_vocab_count": len(score_map),
+        }
+        return [], recall.last_debug_info
+
     industrial_kws = debug_1.get("industrial_kws", [])
     anchor_skills = debug_1.get("anchor_skills", {})
+    term_role_map = debug_1.get("term_role_map") or {}
     context = {
         "score_map": score_map,
         "term_map": term_map,
+        "term_role_map": term_role_map,
         "anchor_kws": [k.lower() for k in industrial_kws],
         "active_domain_set": active_domain_set,
         "dominance": dominance,
@@ -71,16 +142,24 @@ def run_stage5(
             "year": info["year"],
             "domains": info["domains"],
         }
-        p_score, p_hits, p_rank_score, p_term_weights = paper_scoring.compute_contribution(
-            recall, paper_struct, context
-        )
+        out = paper_scoring.compute_contribution(recall, paper_struct, context)
+        p_score, p_hits, p_rank_score, p_term_weights = out[0], out[1], out[2], out[3]
+        primary_count = out[4] if len(out) > 4 else -1
+        supporting_count = out[5] if len(out) > 5 else -1
         all_works_count += 1
         if p_score <= 0:
             continue
+        # 护栏 5：论文进入高优先级候选至少满足其一：≥1 个 primary term，或 ≥2 个 primary/supporting；
+        # 纯 expansion 支撑的论文不允许排到 very top（压分）
+        if primary_count >= 0 and supporting_count >= 0:
+            if primary_count == 0 and supporting_count < 2:
+                p_score = float(p_score) * 0.05
         paper_hit_terms[wid] = p_hits
         info["score"] = float(p_score)
         info["rank_score"] = float(p_rank_score or 0)
         info["term_weights"] = dict(p_term_weights or {})
+        info["primary_count"] = primary_count
+        info["supporting_count"] = supporting_count
         papers_for_agg.append(
             {
                 "wid": wid,
@@ -88,6 +167,8 @@ def run_stage5(
                 "rank_score": float(p_rank_score or 0),
                 "term_weights": dict(p_term_weights or {}),
                 "authors": info["authors"],
+                "primary_count": primary_count,
+                "supporting_count": supporting_count,
             }
         )
 
@@ -110,6 +191,7 @@ def run_stage5(
     author_scores = agg_result.author_scores
     author_top_works = agg_result.author_top_works
     paper_scores_by_wid = {p["wid"]: float(p["score"]) for p in papers_for_agg}
+    author_evidence_by_term_role = aggregate_author_evidence_by_term_role(papers_for_agg)
 
     term_paper_contrib: Dict[str, List[Tuple[str, float]]] = collections.defaultdict(list)
     for p in papers_for_agg:
@@ -213,6 +295,7 @@ def run_stage5(
             key=lambda x: -x[1],
         )[:5]
 
+        evidence = author_evidence_by_term_role.get(aid, {})
         scored_authors.append(
             {
                 "aid": aid,
@@ -223,6 +306,10 @@ def run_stage5(
                 "top_papers": top_papers,
                 "tag_stats": tag_stats,
                 "top_terms_by_contribution": top_terms_contrib,
+                "primary_supported_score": round(evidence.get("primary_supported_score", 0.0), 6),
+                "primary_supported_wids": evidence.get("primary_supported_wids", [])[:20],
+                "expansion_supported_score": round(evidence.get("expansion_supported_score", 0.0), 6),
+                "expansion_supported_wids": evidence.get("expansion_supported_wids", [])[:20],
             }
         )
 
@@ -319,6 +406,11 @@ def run_stage5(
     recall.debug_info.top_terms_final_contrib = top20_term_debug
     recall.debug_info.top_samples = scored_authors[:50]
 
+    author_evidence_debug = {
+        aid: author_evidence_by_term_role.get(aid, {})
+        for a in scored_authors[:50]
+        for aid in [a.get("aid")]
+    }
     recall.last_debug_info = {
         "active_domains": [str(d) for d in sorted(active_domain_set)],
         "dominance": float(dominance),
@@ -326,13 +418,15 @@ def run_stage5(
         "anchor_skills": anchor_skills,
         "score_map": score_map,
         "term_map": term_map,
-        "idf_map": {},  # 目前 idf_map 结构壳，由 score_map/tag_purity_debug 中可推导
+        "term_role_map": term_role_map,
+        "idf_map": {},
         "filter_closed_loop": filter_closed_loop,
         "top_terms_final_contrib": top20_term_debug,
         "top_samples": scored_authors[:50],
         "work_count": all_works_count,
         "author_count": len(scored_authors),
         "recall_vocab_count": len(score_map),
+        "author_evidence_by_term_role": author_evidence_debug,
     }
 
     return [a["aid"] for a in scored_authors], recall.last_debug_info
