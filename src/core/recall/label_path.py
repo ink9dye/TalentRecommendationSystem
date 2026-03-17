@@ -1399,6 +1399,51 @@ class LabelRecallPath:
                 score_map[tid_str] *= factor
                 self.debug_info.cluster_rank_factors[tid_str] = float(factor)
 
+    def _build_term_uniqueness_map(self, score_map, active_domain_set):
+        """
+        按 vocabulary_domain_stats 为每个 term 计算领域纯度，供 Stage5 论文贡献度乘数使用。
+        领域专属性强的词（如 robotic arm）得高分，通用词（如 RL）得低分。
+        返回: Dict[str, float]，vid_s -> [0, 1] 的 term_uniqueness（缺统计时默认 1.0）。
+        """
+        if not score_map or not active_domain_set or not getattr(self, "stats_conn", None):
+            return {}
+        active = set(int(x) for x in active_domain_set)
+        out = {}
+        for vid_s in score_map:
+            try:
+                vid = int(vid_s)
+            except (TypeError, ValueError):
+                out[vid_s] = 1.0
+                continue
+            row = None
+            try:
+                row = self.stats_conn.execute(
+                    "SELECT work_count, domain_span, domain_dist FROM vocabulary_domain_stats WHERE voc_id=?",
+                    (vid,),
+                ).fetchone()
+            except Exception:
+                out[vid_s] = 1.0
+                continue
+            if not row or not row[2]:
+                out[vid_s] = 1.0
+                continue
+            degree_w_expanded = 0.0
+            target_degree_w = 0.0
+            try:
+                dist = json.loads(row[2]) if isinstance(row[2], str) else row[2]
+                expanded = self._expand_domain_dist(dist or {})
+                degree_w_expanded = sum(expanded.values())
+                target_degree_w = sum(expanded.get(str(d), 0) for d in active)
+            except Exception:
+                out[vid_s] = 1.0
+                continue
+            if degree_w_expanded <= 0:
+                out[vid_s] = 1.0
+                continue
+            ratio = target_degree_w / degree_w_expanded
+            out[vid_s] = max(0.0, min(1.0, float(ratio)))
+        return out
+
     def _build_term_confidence_map(self, term_role_map, term_source_map):
         """
         按来源给每个 term 可信度：exact/bridge primary 高(0.95)、similar_to primary 中(0.9)、dense 中(0.75)、cluster/cooc 低(0.6)。
@@ -1520,9 +1565,11 @@ class LabelRecallPath:
 
         # term_confidence：exact/bridge primary 高、similar_to primary 中、cluster/cooc 低，供 paper_term_contrib
         term_confidence_map = self._build_term_confidence_map(term_role_map, term_source_map)
+        term_uniqueness_map = self._build_term_uniqueness_map(score_map, active_domain_set)
         debug_1["term_role_map"] = term_role_map
         debug_1["term_source_map"] = term_source_map
         debug_1["term_confidence_map"] = term_confidence_map
+        debug_1["term_uniqueness_map"] = term_uniqueness_map
         debug_1["parent_anchor_map"] = parent_anchor_map
         debug_1["parent_primary_map"] = parent_primary_map
 
@@ -1548,7 +1595,17 @@ class LabelRecallPath:
         _emit_label_pipeline_checkpoints(checkpoints, debug_1)
 
         elapsed_ms = (time.time() - start_t) * 1000
-        return author_ids[: self.recall_limit], elapsed_ms
+        author_list = (author_ids or [])[: self.recall_limit]
+        meta_list = [
+            {
+                "author_id": str(aid),
+                "label_rank": i + 1,
+                "label_score_raw": None,
+                "label_evidence": None,
+            }
+            for i, aid in enumerate(author_list)
+        ]
+        return meta_list, elapsed_ms
 
 
 if __name__ == "__main__":

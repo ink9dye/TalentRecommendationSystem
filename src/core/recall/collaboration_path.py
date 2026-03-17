@@ -103,11 +103,19 @@ class CollaborativeRecallPath:
             _, _, time_weight = compute_author_time_features(years)
             aggregated_results[aid] = float(base_score) * float(time_weight)
 
-        # 排序并返回得分最高的候选人
-        sorted_res = sorted(aggregated_results.items(), key=lambda x: x[1], reverse=True)
+        # 排序并返回得分最高的候选人；返回 meta 列表供总召回候选池使用
+        sorted_res = sorted(aggregated_results.items(), key=lambda x: x[1], reverse=True)[: self.recall_limit]
         duration = (time.time() - start_time) * 1000
-
-        return [r[0] for r in sorted_res[:self.recall_limit]], duration
+        meta_list = [
+            {
+                "author_id": str(aid),
+                "collab_score_raw": float(score),
+                "collab_rank": i + 1,
+                "collab_evidence": None,
+            }
+            for i, (aid, score) in enumerate(sorted_res)
+        ]
+        return meta_list, duration
 
 
 if __name__ == "__main__":

@@ -67,7 +67,8 @@ TalentRecommendationSystem-master/
     │   ├── total_core.py           # 「召回 + 精排」核心编排入口
     │   ├── recall/
     │   │   ├── input_to_vector.py  # OpenVINO 加速的 SBERT 文本编码器
-    │   │   ├── total_recall.py     # 多路召回总控（向量 / 标签 / 协同）
+    │   │   ├── candidate_pool.py   # 统一候选池结构：CandidateRecord、CandidatePool、PoolDebugSummary
+    │   │   ├── total_recall.py     # 多路召回总控（向量 / 标签 / 协同）+ 候选池构建 / 打分 / enrich / 硬过滤 / 分桶
     │   │   ├── vector_path.py      # 向量路：Faiss + 向量索引召回作者
     │   │   ├── label_path.py       # 标签路入口：编排五阶段流水线（label_pipeline + label_means）
     │   │   ├── label_path_pre.py   # 标签路旧版/备用实现（内部或历史参考）
@@ -685,7 +686,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 | **输入** | JD 文本、query_vector、领域约束（domain_ids）、skills 清洗结果（来自 Job / 总控） |
 | **依赖** | **基础设施**：Neo4j、vocab_stats.db（vocabulary_domain_stats、vocabulary_cooccurrence、vocabulary_cooc_domain_ratio 等）、Faiss（Job、Vocabulary）+ 词汇向量 .npy、簇索引（cluster_members、voc_to_clusters、cluster_centroids）。**配置**：config（DB_PATH、VOCAB_P95_PAPER_COUNT、SIMILAR_TO_TOP_K/MIN_SCORE 等）、domain_config（DOMAIN_MAP、decay）、LabelRecallPath 类常量。**工具**：DomainDetector、extract_skills、DomainProcessor、time_features、get_decay_rate_for_domains。 |
 | **输出** | 候选作者 ID 列表、RecallDebugInfo（领域探测、锚点、扩展、词权重、论文/作者规模等） |
-| **核心中间产物** | **Stage1**：Stage1Result、anchor_skills、_jd_cleaned_terms、job_ids、regex_str。**Stage2A**：primary_landings（含 domain_fit）。**Stage2B**：raw_candidates（term_role、domain_fit、parent_anchor、parent_primary）。**Stage3**：score_map、term_map、idf_map、term_role_map、term_source_map、parent_anchor_map、parent_primary_map、tag_purity_debug；label_path 据此构建 term_confidence_map。**Stage4**：author_papers_list（按作者聚合的论文及 hits/weight/title/year/domains）。**Stage5**：paper_map、每篇 contribution（含 term_confidence）、作者聚合分、最终 author_id 列表。 |
+| **核心中间产物** | **Stage1**：Stage1Result、anchor_skills、_jd_cleaned_terms、job_ids、regex_str。**Stage2A**：primary_landings（含 domain_fit；_term_in_active_domains 含主领域守卫）。**Stage2B**：raw_candidates（term_role、domain_fit、parent_anchor、parent_primary）。**Stage3**：score_map、term_map、idf_map、term_role_map、term_source_map、parent_anchor_map、parent_primary_map、tag_purity_debug；label_path 据此构建 term_confidence_map、**term_uniqueness_map**。**Stage4**：author_papers_list（按作者聚合的论文及 hits/weight/title/year/domains）。**Stage5**：paper_map、每篇 contribution（含 term_confidence、**term_uniqueness**）、作者聚合分、最终 author_id 列表。 |
 | **主要问题** | 缩写歧义、任务词泛化、领域漂移、万金油词与弱相关论文需靠熔断与权重抑制 |
 
 #### 3.1 标签路数据流与阶段总览
@@ -693,7 +694,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 | 阶段 | 输入 | 输出 | 依赖的 label_means / 外部 |
 |------|------|------|---------------------------|
 | **Stage1** | query_vector, query_text, domain_id | active_domains, domain_regex, anchor_skills, Stage1Result | DomainDetector；label_anchors.extract_anchor_skills、supplement_anchors_from_jd_vector；tools.extract_skills |
-| **Stage2A** | prepared_anchors, active_domain_set, query_vector, 可选 jd_field/subfield/topic_ids | primary_landings（含 domain_fit） | retrieve_academic_term_by_similar_to；_compute_domain_fit；collect_landing_candidates；select_primary_academic_landings（domain_fit≥DOMAIN_FIT_MIN_PRIMARY 才可做 primary） |
+| **Stage2A** | prepared_anchors, active_domain_set, query_vector, 可选 jd_field/subfield/topic_ids | primary_landings（含 domain_fit） | retrieve_academic_term_by_similar_to；_term_in_active_domains（含主领域守卫）；_compute_domain_fit；select_primary_academic_landings（domain_fit≥0.45 才可做 primary） |
 | **Stage2B** | primary_landings（仅高可信参与扩散）, active_domain_set, jd_*_ids | raw_candidates（含 term_role、domain_fit、parent_primary） | expand_from_vocab_dense_neighbors/cluster_members/cooccurrence_support（domain_fit/domain_span 门控）；merge_primary_and_support_terms；_expanded_to_raw_candidates |
 | **Stage3** | raw_candidates（含 term_role、identity_score、domain_fit、parent_anchor、parent_primary）, query_vector, anchor_vids | score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map | passes_identity_gate；passes_topic_consistency；score_term_expansion_quality；compose_term_final_score（六因子：base×source_weight×domain_gate×task_consistency×role_penalty×expansion_penalty）；term_scoring |
 | **Stage4** | vocab_ids, regex_str | author_papers_list（按作者聚合的论文及 hits） | Neo4j Cypher（HAS_TOPIC + 3% 熔断）；paper_scoring 在 Stage5 用 |
@@ -755,14 +756,25 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 | 项 | 说明 |
 |----|------|
 | **作用** | 将工业侧锚点**对齐到学术主落点**（primary），不做大范围扩展；对每个候选算 **domain_fit**，仅 **domain_fit ≥ DOMAIN_FIT_MIN_PRIMARY** 的候选才允许做 primary；产出每锚点 1～2 个 primary_landings，供 Stage2B 围绕其做 dense / 簇 / 共现扩展。**高歧义锚点**（如 acronym、generic_task_term）采用更高 identity 与 domain_fit 门槛；**本锚点无 primary 时仅跳过该锚点，不短路整路**。 |
-| **候选来源（当前版本）** | 当前版本**仅一条**候选来源：**跨类型 SIMILAR_TO**。即在 Neo4j 中通过 `(锚点 Vocabulary)-[SIMILAR_TO]->(v_rel:Vocabulary)` 获取候选，约束 `v_rel.type IN ['concept','keyword']`，并按 top_k、min_score 过滤。候选逐条结合 active_domain_set 与可选 jd_field/subfield/topic_ids 做 `_term_in_active_domains` 过滤，并计算 domain_fit。*说明*：Stage1 的 `supplement_anchors_from_jd_vector` 仅用于「补锚点」，**不参与 Stage2A 候选合并**；若未来扩展 Stage2A 候选源，再以独立 source 并轨，不影响当前主流程。 |
+| **候选来源（当前版本）** | 当前版本**仅一条**候选来源：**跨类型 SIMILAR_TO**。即在 Neo4j 中通过 `(锚点 Vocabulary)-[SIMILAR_TO]->(v_rel:Vocabulary)` 获取候选，约束 `v_rel.type IN ['concept','keyword']`，并按 top_k、min_score 过滤。候选逐条结合 active_domain_set 与可选 jd_field/subfield/topic_ids 做 **`_term_in_active_domains`** 过滤（含**主领域守卫**：主领域 ∉ active_domains 则一票否决），并计算 domain_fit。*说明*：Stage1 的 `supplement_anchors_from_jd_vector` 仅用于「补锚点」，**不参与 Stage2A 候选合并**；若未来扩展 Stage2A 候选源，再以独立 source 并轨，不影响当前主流程。 |
 | **思路** | 图中 SIMILAR_TO 为**跨类型**（如 industry→concept / keyword），且边本身基于**清洗后的文本、缩写扩写与向量相似**构建，因此当前版本以「锚点 → SIMILAR_TO → 学术词」作为**唯一** primary landing 通道。随后结合激活领域与三层领域计算 domain_fit，并按 anchor_type 调整 primary 门槛，以降低高歧义锚点的误落点风险。 |
 | **逻辑流程** | ① anchor_skills 转为 **PreparedAnchor** 列表（含 **anchor_type**）；② 对每个 anchor 调用 `collect_landing_candidates`（内部仅 `retrieve_academic_term_by_similar_to`，再做领域过滤）；③ 对每个候选计算 `_compute_domain_fit`；④ `score_academic_identity`；⑤ **根据 anchor_type 计算本锚点的 min_identity 与 min_domain_fit**；⑥ `select_primary_academic_landings`（domain_fit 门控 + identity 门控）→ **primary_landings**；⑦ 若本锚点 primary 数为 0，则 continue（不短路整路）。 |
 | **输入参数（名字与含义）** | **prepared_anchors**：Stage1 的 anchor_skills 转成的 PreparedAnchor 列表（含 **anchor_type**）；**active_domain_set**：Set[int]；**query_vector**、**query_text**；**jd_field_ids** / **jd_subfield_ids** / **jd_topic_ids**：可选，三层领域 ID 集合，用于 domain_fit 与过滤。 |
 | **输出参数（名字与含义）** | 本阶段内部产出 **primary_landings**：List[PrimaryLanding]，每项含 vid、term、identity_score、source、anchor_vid、anchor_term、**domain_fit**；Stage2 整体对外输出为 **raw_candidates**（见 Stage2B），其中 primary 来源于此。 |
-| **主要公式** | **domain_fit** = 0.4×domain_overlap + 0.3×field_overlap + 0.2×subfield_overlap + 0.1×topic_overlap（无表时对应 overlap 视为 1.0）。**primary 门控**：`domain_fit ≥ min_domain_fit` 且 `identity_score ≥ min_identity`。其中普通锚点默认 min_identity = PRIMARY_MIN_IDENTITY，高歧义锚点（如 acronym、generic_task_term）使用更高 PRIMARY_MIN_IDENTITY_HIGH_AMBIGUITY；min_domain_fit 也可按 anchor_type 做更保守设置。**identity_score 在当前版本中等于 SIMILAR_TO 边权**。 |
+| **主要公式** | **domain_fit** = 0.4×domain_overlap + 0.3×field_overlap + 0.2×subfield_overlap + 0.1×topic_overlap（无表时对应 overlap 视为 1.0）。**primary 门控**：`domain_fit ≥ min_domain_fit`（当前 **DOMAIN_FIT_MIN_PRIMARY=0.45**）且 `identity_score ≥ min_identity`。其中普通锚点默认 min_identity = PRIMARY_MIN_IDENTITY，高歧义锚点（如 acronym、generic_task_term）使用更高 PRIMARY_MIN_IDENTITY_HIGH_AMBIGUITY；min_domain_fit 也可按 anchor_type 做更保守设置（broad_concept 用 DOMAIN_FIT_MIN_PRIMARY_BROAD=0.40）。**identity_score 在当前版本中等于 SIMILAR_TO 边权**。 |
 | **高歧义锚点规则** | **定义**：当前主要指 anchor_type ∈ { acronym, generic_task_term }。**规则**：① 做 primary 时采用更高 identity 门槛；② 可配更高 domain_fit 门槛；③ 本锚点若 primary 数为 0，仅跳过该锚点，不视为整路失败；④ 日志打标 `[高歧义]` 便于排查。 |
 | **调用的表/知识图谱** | **Neo4j**：**Vocabulary** 节点、**(Vocabulary)-[SIMILAR_TO]->(Vocabulary)**（跨类型，边权 sim_score）；**SQLite**：`vocabulary_domain_stats`（domain_dist）、`vocabulary_topic_stats`（field_id/subfield_id/topic_id 及 *_dist）；**Faiss**：当前 Stage2A 不直接使用。 |
+
+**领域过滤增强（主领域守卫、门槛与 Context-Aware / Term 纯度）**
+
+为减轻「多义词/跨领域词」导致的领域错配（如“机器人 JD”召回网安/航模作者），标签路在以下四处做了增强：
+
+| 增强项 | 位置 | 说明 |
+|--------|------|------|
+| **主领域守卫（Hard Domain Guard）** | `label_expansion._term_in_active_domains` | 在「有交集」通过后增加**硬约束**：候选词的 **主领域**（domain_dist 中权重最大的领域）必须在 `active_domains` 内，否则直接 discard；避免如 vibration（土木主领域）、reinforcement learning（博弈/安全主领域）误入机器人召回。 |
+| **domain_fit 门槛提高** | `config.py` | **DOMAIN_FIT_MIN_PRIMARY**：0.25 → **0.45**（做 primary 须近半“生命力”在目标领域）；**DOMAIN_FIT_HIGH_CONFIDENCE**：0.35 → **0.55**（仅主场明显的词才可参与 Stage2B 扩散）。 |
+| **Context-Aware Query** | `label_expansion.query_expansion_by_context_vector` | 构造编码输入时不再仅用裸锚点词（如“动力学”），而是拼接 JD 片段：`term + " (" + context_snippet + ")"`（context_snippet 为 query_text 前 100 字），使 embedding 向目标领域偏移，减少“运动学→体育”“控制→管理”等误匹配。 |
+| **Term 领域纯度（Stage5）** | `label_path._build_term_uniqueness_map` + `paper_scoring.compute_contribution` | 对每个 term 用 `vocabulary_domain_stats` 算**目标领域占比**（target_degree_w/degree_w_expanded）作为 **term_uniqueness**；Stage5 论文贡献度中 **paper_term_contrib** = term_weight × term_confidence × paper_match_strength × **term_uniqueness**，领域专属性强的词（如 robotic arm）抬权，通用词（如 RL）降权。 |
 
 ---
 
@@ -772,7 +784,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 |----|------|
 | **作用** | 仅围绕**高可信 primary** 做 dense / cluster / cooc 扩展；对扩展词做**领域门控**：domain_fit < DOMAIN_FIT_MIN_EXPANSION 或 domain_span > DOMAIN_SPAN_MAX_EXPANSION 的**不进最终词池**；合并 primary + 扩展为 List[ExpandedTermCandidate]，带 term_role、domain_fit、parent_primary，再转为 raw_candidates 供 Stage3。 |
 | **思路** | 不再用 SIMILAR_TO 做学术→学术。仅用：① 词汇向量索引上 primary 的**学术近邻**（dense）；② 簇成员（cluster）；③ 共现表高支持度词（cooc）。扩展前/合并前均做 **domain_fit**、**domain_span**、**topic_align** 检查，跨域或主题发散过大的词直接丢弃；合并时为每词补全 degree_w、topic_align、domain_fit、parent_primary。 |
-| **高可信 primary 定义** | **primary_high_confidence** 由**结构化条件共同决定，而非词面规则**：通常要求 identity_score ≥ PRIMARY_HIGH_CONFIDENCE_THRESHOLD、domain_fit ≥ DOMAIN_FIT_HIGH_CONFIDENCE、source ∈ TRUSTED_SOURCE_TYPES_FOR_DIFFUSION，并且在**可用时**满足较保守的 domain_span / topic_align 条件。其目标是避免「高相似但跨域或主题发散」的 primary 进入扩散。 |
+| **高可信 primary 定义** | **primary_high_confidence** 由**结构化条件共同决定，而非词面规则**：通常要求 identity_score ≥ PRIMARY_HIGH_CONFIDENCE_THRESHOLD、**domain_fit ≥ DOMAIN_FIT_HIGH_CONFIDENCE（当前 0.55）**、source ∈ TRUSTED_SOURCE_TYPES_FOR_DIFFUSION，并且在**可用时**满足较保守的 domain_span / topic_align 条件。其目标是避免「高相似但跨域或主题发散」的 primary 进入扩散。 |
 | **逻辑流程** | ① 通过 **_is_high_confidence_primary** 筛出 **diffusion_primaries**：通常同时检查 identity、domain_fit、source，并在**有对应字段时**检查 domain_span、topic_align；② `expand_from_vocab_dense_neighbors`（每 primary 最多 DENSE_MAX_PER_PRIMARY，过滤 _term_in_active_domains + domain_fit/domain_span 门控，设 parent_primary）；③ `expand_from_cluster_members`（同上门控）；④ `expand_from_cooccurrence_support`（同上门控）；⑤ `merge_primary_and_support_terms`（为 primary 与各扩展补 degree_w、topic_align、domain_fit，再次过滤 domain_fit/domain_span）；⑥ `_expanded_to_raw_candidates` 转为 **raw_candidates**（含 tid、term、term_role、identity_score、source、domain_fit、parent_anchor、parent_primary 等）。 |
 | **输入参数（名字与含义）** | 同 Stage2 总入口：**prepared_anchors**、**active_domain_set**、**query_vector**、**query_text**、**jd_field_ids** / **jd_subfield_ids** / **jd_topic_ids**；内部使用 **primary_landings**（及高可信子集 diffusion_primaries）。 |
 | **输出参数（名字与含义）** | **raw_candidates**：List[Dict]，每项含 **tid**、**term**、**term_role**（primary / dense_expansion / cluster_expansion / cooc_expansion）、**identity_score**、**source**、**degree_w**、**domain_span**、**target_degree_w**、**degree_w_expanded**、**topic_align**、**topic_level**、**topic_confidence**、**domain_fit**、**parent_anchor**、**parent_primary** 等，供 Stage3 消费。 |
@@ -825,12 +837,12 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 | 项 | 说明 |
 |----|------|
 | **作用** | 将 author_papers_list 展开为 **paper_map**，对每篇论文算**贡献度**（含 **term_confidence**、护栏 5），再按作者聚合（accumulate_author_scores）、时序与活跃度加权、最佳论文比过滤，得到最终作者排序列表与 **last_debug_info**（含 term_role_map、term_confidence_map、author_evidence_by_term_role 等）。 |
-| **思路** | 论文贡献度中，**单 term 贡献** = **term_weight × term_confidence × paper_match_strength**（即 score_map[vid] × term_confidence_map[vid] × idf_hit），再经领域纯度、综述/覆盖/紧密度/时序/簇奖励、JD 语义门得到 paper score；**护栏 5**：primary_count=0 且 supporting_count<2 的论文 score *= 0.05；作者分 = 论文贡献按署名权重拆分后取 top_k_per_author=3 累加，再乘 time_weight、recency，按 AUTHOR_BEST_PAPER_MIN_RATIO 过滤后归一化排序。 |
-| **逻辑流程** | ① 从 debug_1 读取 **term_role_map**、**term_confidence_map**（由 label_path 从 term_role_map/term_source_map 构建：primary 高、similar_to 中、cluster/cooc 低），放入 context；② 展开 author_papers_list 为 paper_map（wid→{ hits, title, year, domains, authors }）；③ 对每篇 paper 调用 **paper_scoring.compute_contribution**，得到 (score, hit_terms, rank_score, term_weights, primary_count, supporting_count)；④ 护栏 5：primary_count==0 且 supporting_count<2 则 score *= 0.05；⑤ 论文得分经 tanh 压缩（95 分位 tau）；⑥ **accumulate_author_scores**（top_k_per_author=3）→ author_scores、author_top_works；⑦ 按作者时间特征 time_weight、recency 加权；⑧ AUTHOR_BEST_PAPER_MIN_RATIO 过滤；⑨ 归一化排序，构建 scored_authors；⑩ **aggregate_author_evidence_by_term_role** 写入 last_debug_info。 |
-| **输入参数（名字与含义）** | **author_papers_list**：Stage4 输出；**score_map**、**term_map**：Stage3 输出；**active_domain_set**、**dominance**；**debug_1**：含 **term_role_map**、**term_confidence_map**、industrial_kws、anchor_skills、query_vector、filter_closed_loop 等。 |
+| **思路** | 论文贡献度中，**单 term 贡献** = **term_weight × term_confidence × paper_match_strength × term_uniqueness**（term_uniqueness 来自 vocabulary_domain_stats 的目标领域占比，领域专属性强的词抬权），再经领域纯度、综述/覆盖/紧密度/时序/簇奖励、JD 语义门得到 paper score；**护栏 5**：primary_count=0 且 supporting_count<2 的论文 score *= 0.05；作者分 = 论文贡献按署名权重拆分后取 top_k_per_author=3 累加，再乘 time_weight、recency，按 AUTHOR_BEST_PAPER_MIN_RATIO 过滤后归一化排序。 |
+| **逻辑流程** | ① 从 debug_1 读取 **term_role_map**、**term_confidence_map**、**term_uniqueness_map**（由 label_path._build_term_uniqueness_map 从 vocabulary_domain_stats 按目标领域占比构建），放入 context；② 展开 author_papers_list 为 paper_map（wid→{ hits, title, year, domains, authors }）；③ 对每篇 paper 调用 **paper_scoring.compute_contribution**，得到 (score, hit_terms, rank_score, term_weights, primary_count, supporting_count)；④ 护栏 5：primary_count==0 且 supporting_count<2 则 score *= 0.05；⑤ 论文得分经 tanh 压缩（95 分位 tau）；⑥ **accumulate_author_scores**（top_k_per_author=3）→ author_scores、author_top_works；⑦ 按作者时间特征 time_weight、recency 加权；⑧ AUTHOR_BEST_PAPER_MIN_RATIO 过滤；⑨ 归一化排序，构建 scored_authors；⑩ **aggregate_author_evidence_by_term_role** 写入 last_debug_info。 |
+| **输入参数（名字与含义）** | **author_papers_list**：Stage4 输出；**score_map**、**term_map**：Stage3 输出；**active_domain_set**、**dominance**；**debug_1**：含 **term_role_map**、**term_confidence_map**、**term_uniqueness_map**、industrial_kws、anchor_skills、query_vector、filter_closed_loop 等。 |
 | **输出参数（名字与含义）** | **author_id 列表**：按得分降序，截断 recall_limit；**last_debug_info**：active_domains、dominance、score_map、term_map、term_role_map、term_confidence_map、filter_closed_loop、top_terms_final_contrib、work_count、author_count、**author_evidence_by_term_role** 等。 |
-| **主要公式** | **单 term 对论文的贡献**：**paper_term_contrib** = **term_weight** × **term_confidence** × **paper_match_strength** = score_map[vid] × term_confidence_map[vid] × idf_hit；**rank_score** = Σ paper_term_contrib。**论文得分** score = rank_score × coverage_norm × cluster_bonus × proximity_bonus × domain_coeff × time_decay × survey_decay × jd_semantic_gate（撤稿拦截、领域纯度≤0 则直接 0）。**term_confidence**：primary 0.95、dense 0.75、cluster/cooc 0.6（见 label_path._build_term_confidence_map）。**护栏 5**：primary_count>=1 或 (primary_count+supporting_count)>=2 否则 score *= 0.05。**作者拆分**：按 AUTHORED.pos_weight 分配论文贡献，取每作者 top_k_per_author=3 篇累加，再乘 time_weight、recency。 |
-| **调用的表/知识图谱** | **内存**：score_map、term_map、term_role_map、term_confidence_map、paper_map、voc_to_clusters、all_vocab_vectors、vocab_to_idx（proximity、jd_semantic_gate）；**无直接 DB**。**works_to_authors**：accumulate_author_scores 用 papers 中的 wid、score、authors（含 pos_weight）。 |
+| **主要公式** | **单 term 对论文的贡献**：**paper_term_contrib** = **term_weight** × **term_confidence** × **paper_match_strength** × **term_uniqueness** = score_map[vid] × term_confidence_map[vid] × idf_hit × term_uniqueness_map[vid]（term_uniqueness 为 vocabulary_domain_stats 中该词在目标领域的占比，领域专属性强的词抬权、通用词降权）；**rank_score** = Σ paper_term_contrib。**论文得分** score = rank_score × coverage_norm × cluster_bonus × proximity_bonus × domain_coeff × time_decay × survey_decay × jd_semantic_gate（撤稿拦截、领域纯度≤0 则直接 0）。**term_confidence**：primary 0.95、dense 0.75、cluster/cooc 0.6（见 label_path._build_term_confidence_map）。**护栏 5**：primary_count>=1 或 (primary_count+supporting_count)>=2 否则 score *= 0.05。**作者拆分**：按 AUTHORED.pos_weight 分配论文贡献，取每作者 top_k_per_author=3 篇累加，再乘 time_weight、recency。 |
+| **调用的表/知识图谱** | **内存**：score_map、term_map、term_role_map、term_confidence_map、term_uniqueness_map、paper_map、voc_to_clusters、all_vocab_vectors、vocab_to_idx（proximity、jd_semantic_gate）；**无直接 DB**。**works_to_authors**：accumulate_author_scores 用 papers 中的 wid、score、authors（含 pos_weight）。 |
 
 #### 3.2.2 标签路必查日志（从哪一步开始跑偏）
 
@@ -943,29 +955,56 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 ### 5. 总控与融合（total_recall.py — TotalRecallSystem）
 
 **核心目的**  
-对 JD **只编码一次**得到统一 query_vec；**并行**跑向量路与标签路，再用两路 Top 100 做种子跑协同路；用 **RRF（Reciprocal Rank Fusion）** 把三路作者列表融合成一条最终排序列表（如 Top 500），并记录每个作者在各路的排名，供精排和展示用。
+对 JD **只编码一次**得到统一 query_vec；**并行**跑向量路与标签路，再用两路 Top 100 做种子跑协同路；将三路结果**构建为统一候选池**（CandidateRecord + CandidatePool），经**合并 → 打分 → 特征补全（enrich）→ 硬过滤 → 分桶**后导出，供精排与训练直接使用；同时保留 RRF 融合与 rank_map 以兼容现有调用。
 
 | 维度 | 说明 |
 |------|------|
-| **输入** | JD 文本、可选 domain_id、recall_limit、训练模式开关 |
-| **依赖** | QueryEncoder、VectorPath、LabelRecallPath、CollaborativeRecallPath、config 路径与 RRF 参数 |
-| **输出** | 融合后的作者 ID 列表（如 Top 500）、各作者在 v/l/c 三路的排名（rank_map）、总耗时 |
-| **核心中间产物** | query_vec、v_list / l_list / c_list、seeds、RRF 融合分、最终排序列表 |
-| **主要问题** | 路径权重（1.2/1.0/0.6）与 rrf_k 需与业务平衡；单次编码若失败则整次召回失败 |
+| **输入** | JD 文本、可选 domain_id、训练模式开关；三路配额 K_vector / K_label / K_collab 可配置 |
+| **依赖** | QueryEncoder、VectorPath、LabelRecallPath、CollaborativeRecallPath、candidate_pool（CandidateRecord/CandidatePool/PoolDebugSummary） |
+| **输出** | **candidate_pool**（候选主表 + 证据明细 + pool_debug_summary）、兼容的 final_top_200、rank_map、总耗时 |
+| **核心中间产物** | query_vec、三路 meta 列表、CandidateRecord 列表、RRF/candidate_pool_score、pool_debug_summary |
 
-**使用的方法**
+#### 5.1 统一候选池结构（candidate_pool.py）
+
+**CandidateRecord**（一人一条，供训练与精排直接吃）
+
+- **基础与来源**：author_id、author_name（可选）；from_vector、from_label、from_collab、path_count；vector_rank、label_rank、collab_rank；vector_score_raw、label_score_raw、collab_score_raw；rrf_score、multi_path_bonus、candidate_pool_score、is_multi_path_hit。
+- **作者静态指标**（KGAT-AX / 训练用，第一版可 None）：h_index、works_count、cited_by_count、recent_works_count、recent_citations、institution_level、top_work_quality。
+- **query-author 交叉**（精排用，第一版可粗算）：topic_similarity、skill_coverage_ratio、domain_consistency、paper_hit_strength、recent_activity_match。
+- **候选池辅助标记**：bucket_type（A/B/C/D）、passed_hard_filter、dominant_recall_path、hard_filter_reasons、bucket_reasons；vector_evidence、label_evidence、collab_evidence。
+
+**CandidatePool**（显式三块）
+
+- **candidate_records**：候选主表，一人一条 CandidateRecord。
+- **candidate_evidence_rows**：候选证据明细表，一人多条（召回路径、skill/term/paper/collab 等）。
+- **pool_debug_summary**：三路原始召回数、配额截断后数量、去重前/去重后数量、被硬过滤人数、各桶人数、最终送入精排人数；调参与排查用。
+
+#### 5.2 总召回流程（八阶段）
+
+1. **统一编码与领域探测**：raw_vec、query_vec、active_domains、applied_domain_str、vector_domains（沿用现有）。
+2. **三路独立召回**：Vector/Label/Collab 返回 (author_meta_list, duration)；meta 含 author_id、*_score_raw、*_rank、*_evidence（可为 None）。
+3. **build_candidate_records(v_meta, l_meta, c_meta)**：去重、合并三路、生成 CandidateRecord，填 rank/path/raw_score/evidence；更新 pool_debug_summary 去重前后数量。
+4. **score_candidate_pool(records)**：算 RRF、multi_path_bonus、candidate_pool_score，排序。
+5. **_enrich_candidate_features(records, active_domains, query_text)**：填作者静态指标、query-author 交叉特征、dominant_recall_path 等；训练/精排/解释共用，避免多处再查。
+6. **_apply_hard_filters(records, ...)**：**第一层（轻）**：仅协同路且 path_count==1 且无 label/vector → 过滤；无论文无指标 → 过滤。**第二层（强）**：领域不交、活跃度过低等，待作者统计接好后再开。写 hard_filter_reasons、pool_debug_summary.hard_filtered_count。
+7. **_assign_buckets(records)**：第一版规则——A：from_label 且 (path_count>=2 或 from_vector)；B：from_label 且非 A；C：from_vector 且非 A/B；D：from_collab 且非 A/B/C。写 bucket_type、bucket_reasons、pool_debug_summary 各桶人数。
+8. **组装 CandidatePool 并返回**：candidate_records、candidate_evidence_rows、pool_debug_summary；兼容 final_top_200、rank_map。
+
+#### 5.3 融合拆分为两函数
+
+- **build_candidate_records(v_meta, l_meta, c_meta)**：只做去重、合并、生成 Record 并填 rank/path/score/evidence；不计算 RRF。
+- **score_candidate_pool(records)**：只做 RRF、multi_path_bonus、candidate_pool_score 与排序。后续硬过滤、分桶、特征补全、导出训练样本均基于 records 列表，逻辑清晰。
+
+**使用的方法（与现有一致的部分）**
 
 1. **领域与 Query 预处理**  
-   若传入 domain_id，则 processed_domain 非空，否则为全领域；**Query 扩展**：若 processed_domain 有效且非训练模式，在 JD 后追加 `" | Area: {DOMAIN_PROMPTS[domain_id]}"`，加强向量路和标签路的领域偏向。
+   若传入 domain_id，则 processed_domain 非空；Query 扩展：若 processed_domain 有效且非训练模式，在 JD 后追加 `" | Area: {DOMAIN_PROMPTS[domain_id]}"`。
 
 2. **统一编码**  
-   query_vec, _ = self.encoder.encode(final_query)，再 faiss.normalize_L2(query_vec)；向量路、标签路共用这一 query_vec。
+   query_vec = self.encoder.encode(final_query)，faiss.normalize_L2(query_vec)；向量路、标签路共用。
 
 3. **并行召回**  
-   ThreadPoolExecutor：future_v = v_path.recall(query_vec, target_domains)，future_l = l_path.recall(query_vec, domain_ids)；v_list、l_list 取回后，seeds = list(set(v_list[:100] + l_list[:100]))，再 c_list, c_cost = c_path.recall(seeds)。
-
-4. **RRF 融合 `_fuse_results(v_res, l_res, c_res)`**  
-   对三路赋予路径权重：向量路 1.2、标签路 1.0、协同路 0.6；对每个作者在其出现的路径上按排名算 RRF 分：score += weight × 1/(rrf_k + rank)，rrf_k=60；同一作者多路出现则分数累加；按总分降序取前 500 个 author_id，并记录每个作者在 v/l/c 三路的排名（rank_map）。
+   ThreadPoolExecutor 调三路；seeds = 向量路与标签路 Top100 并集，再调协同路。三路建议返回 (author_meta_list, duration)，便于 build_candidate_records 直接填 score_raw 与 evidence；若仍返回 (id_list, duration)，总控内转换为 meta 再进 build_candidate_records。
 
 ---
 
@@ -977,7 +1016,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 | **向量路** | 按「与 JD 最像的论文」找作者 | 摘要 Faiss 检索、领域硬过滤、论文序→作者序映射 |
 | **标签路** | 按「岗位技能→学术词→论文→作者」+ 多维度打分 | Stage1 领域与锚点（3% 熔断、JD 补充）→ Stage2A 学术落点（跨类型 SIMILAR_TO、可选 JD 向量）→ Stage2B 学术侧补充（dense/簇/共现）→ Stage3 双闸门与两分制（身份/topic 闸门、quality、final_score）→ Stage4 论文召回 → Stage5 作者排序；依赖 `label_means` 与 `label_pipeline` 子模块；基础设施由 `label_means.infra` 管理 |
 | **协同路** | 由种子作者扩展合作者 | 种子=V+L Top100、协作表双向查询、score 聚合、按总分排序 |
-| **总控** | 单次编码、三路并行、统一排序 | Query 领域扩展、RRF 融合、路径权重 1.2/1.0/0.6 |
+| **总控** | 单次编码、三路并行、统一候选池 | Query 领域扩展、build_candidate_records → score_candidate_pool → enrich → 硬过滤 → 分桶；RRF + multi_path_bonus；路径权重 2.0/3.0/1.0 |
 
 整体上：**向量路**偏语义相似度，**标签路**偏技能/概念与图谱结构，**协同路**偏合作网络；三路在总控里用 RRF 合成一份作者列表，再交给精排与解释模块使用。
 
@@ -1276,7 +1315,8 @@ KGAT-AX 是「**知识图谱注意力网络 + 学术指标增强（AX）**」的
 | **训练** | 稳定优化并避免过拟合 | CF/KG 交替；测试集 Recall 驱动早停与 best 保存；断点续训 |
 | **评测** | 衡量精排泛化能力 | 500 人候选池重排；Recall@K、NDCG@K；mask 训练集正例 |
 
-整体上，KGAT-AX 把「岗位–作者」的协同信号与「作者–论文–技能词–岗位技能」的图谱信号放在同一张图上，用**加权图卷积 + AX 门控**学出联合表示，从而在召回结果上做**语义与影响力平衡**的精排，并为后续解释（如注意力、路径）提供接口。
+整体上，KGAT-AX 把「岗位–作者」的协同信号与「作者–论文–技能词–岗位技能」的图谱信号放在同一张图上，用**加权图卷积 + AX 门控**学出联合表示，从而在召回结果上做**语义与影响力平衡**的精排，并为后续解释（如注意力、路径）提供接口。  
+**可直接开工的规格**（四分支输入字段定义、训练数据入口与样本定义、输出分项、训练与评估建议）见本文 **[后续规划 · 两阶段架构升级与落地计划](#两阶段架构升级与落地计划成稿)** 中「KGAT-AX 在系统中的重新定位与结构升级」5.1～5.7。
 
 ---
 
@@ -1410,7 +1450,8 @@ KGAT-AX 是「**知识图谱注意力网络 + 学术指标增强（AX）**」的
 | **SIMILAR_TO > 0.7** | 解释时只用强相似边，避免证据链语义漂移。 |
 | **注意力选论文** | 多篇命中时用 KGAT 注意力选一篇作为代表作，兼顾图谱证据与模型置信度。 |
 
-整体上，精排阶段在「多路召回 + 领域过滤」之后，用 **RankScorer** 做一次「岗位–候选人」的 KGAT+AX 打分，用 **召回序分** 做稳定性约束，再用 **RankExplainer** 从图谱和注意力生成可解释的代表作与推荐理由，最终输出 Top 100 及每条的结构化详情。
+整体上，精排阶段在「多路召回 + 领域过滤」之后，用 **RankScorer** 做一次「岗位–候选人」的 KGAT+AX 打分，用 **召回序分** 做稳定性约束，再用 **RankExplainer** 从图谱和注意力生成可解释的代表作与推荐理由，最终输出 Top 100 及每条的结构化详情。  
+**可直接开工的规格**（精排三步骤职责、候选池预排序、最终稳定融合与 rule_stability 组成、解释与 CandidatePool 对齐、四段式证据链）见本文 **[后续规划 · 两阶段架构升级与落地计划](#两阶段架构升级与落地计划成稿)** 中「精排与解释的重新定义与证据链升级」6.1～6.7。
 
 ---
 
@@ -1488,12 +1529,21 @@ KGAT-AX 是「**知识图谱注意力网络 + 学术指标增强（AX）**」的
   - 自动构建「技能词动态词典」，对 JD 中命中的关键术语进行「自共振增强」；
   - 输出 `(向量, 耗时)`，供向量召回与标签路使用。
 
+- **`src/core/recall/candidate_pool.py`**  
+  - 定义 **CandidateRecord**（一人一条）：基础与来源（author_id、from_vector/from_label/from_collab、path_count、各路 rank/score_raw/evidence）、**作者静态指标**（h_index、works_count、cited_by_count、recent_works_count、recent_citations、institution_level、top_work_quality）、**query-author 交叉**（topic_similarity、skill_coverage_ratio、domain_consistency、paper_hit_strength、recent_activity_match）、候选池辅助标记（bucket_type、passed_hard_filter、dominant_recall_path、hard_filter_reasons、bucket_reasons）。
+  - 定义 **CandidatePool**：**candidate_records**（候选主表）、**candidate_evidence_rows**（证据明细表）、**pool_debug_summary**（三路召回数、去重前后、硬过滤人数、各桶人数、最终精排人数等统计）。
+  - 定义 **PoolDebugSummary**：各阶段计数，供调参与排查。
+
 - **`src/core/recall/total_recall.py`**  
   - 定义 `TotalRecallSystem`：
-    - 管理 Query 编码器与三条召回路径（向量路 / 标签路 / 协同路）；
-    - 将 JD 文本扩展为带领域 bias 的查询；
-    - 并行调用三条路径，使用 Reciprocal Rank Fusion (RRF) 融合为最终候选作者列表；
-    - 返回前 500 名候选作者以及各路召回排名信息。
+    - 管理 Query 编码器与三条召回路径（向量路 / 标签路 / 协同路），三路配额 K_vector / K_label / K_collab 可配置；
+    - 将 JD 文本扩展为带领域 bias 的查询，并行调用三路；
+    - **build_candidate_records**：去重合并三路，生成 CandidateRecord，填 rank/path/score_raw/evidence；
+    - **score_candidate_pool**：RRF、multi_path_bonus、candidate_pool_score，排序；
+    - **_enrich_candidate_features**：补全作者静态指标与 query-author 交叉特征，供训练与精排直接使用；
+    - **_apply_hard_filters**：两段式（第一层：仅协同无主题、无论文无指标；第二层待接好作者统计后再开）；
+    - **_assign_buckets**：A/B/C/D 四桶（第一版按 from_label/from_vector/from_collab、path_count 规则）；
+    - 返回 **CandidatePool**（candidate_records + candidate_evidence_rows + pool_debug_summary），并兼容 **final_top_200**、**rank_map**。
   - 同时提供命令行模式，用于单独测试召回效果。
 
 - **`src/core/recall/vector_path.py`**  
@@ -1862,6 +1912,8 @@ KGAT-AX 是「**知识图谱注意力网络 + 学术指标增强（AX）**」的
 | **标签路** | `VOCAB_P95_PAPER_COUNT` | 学术词 paper_count 上限，过滤泛词（如 800） |
 | | `SIMILAR_TO_TOP_K` | 每锚点沿 SIMILAR_TO 最多扩展词数（如 3） |
 | | `SIMILAR_TO_MIN_SCORE` | SIMILAR_TO 边权重下限（如 0.65） |
+| | `DOMAIN_FIT_MIN_PRIMARY` | Stage2A primary 门控：domain_fit 下限（当前 **0.45**，提高以压缩跨领域词） |
+| | `DOMAIN_FIT_HIGH_CONFIDENCE` | Stage2B 高可信 primary 的 domain_fit 下限，仅达标者参与扩散（当前 **0.55**） |
 
 修改上述配置后需确保：`DB_PATH` 与爬虫/合并脚本一致；Neo4j 与 KG 构建、召回使用的连接一致；索引路径与构建脚本输出一致。
 
@@ -2646,55 +2698,90 @@ def stage3_filter_and_score_terms(term_candidates, active_domains):
 
 提升线上候选池质量；降低 KGAT-AX 的清噪负担；保留路径来源，便于精排学习；统一线上与训练的数据分布；为解释模块提供更完整的中间证据。
 
-#### KGAT-AX 在系统中的重新定位与结构升级
+#### KGAT-AX 在系统中的重新定位与结构升级（可直接开工规格）
 
-##### 5.1 KGAT-AX 的重新定位
+##### 5.1 KGAT-AX 的重新定位：从“图排序模型”升级为“第二阶段候选池精排器”
 
-KGAT-AX 不再被描述为“全量作者检索模型”，而应被定义为**第二阶段深度精排器（Re-ranker）**。它的职责不是在全库里高速找人，而是在总召回产出的统一候选池中，对候选作者进行更细粒度、更高质量的排序。核心输入由四类信息共同构成：图结构信息、作者显式指标、召回来源信息、query-author 交叉特征。
+后续 KGAT-AX 不再被描述为“对全量作者直接做端到端检索”的模型，而明确定位为：
 
-##### 5.2 当前优势与需要补强的地方
+> **第二阶段深度精排器（Re-ranker）**
 
-当前 KGAT-AX 已有离线训练脚本、图索引构建工具、训练数据导出链路、`kg_final.txt -> kg_triplets` 索引底座、线上调用与排序融合能力。收益最大的做法不是“重写精排器”，而是：把总召回做成高质量候选池；把训练数据对齐线上候选池；把 KGAT-AX 输入从“图 + 少量辅助特征”升级为“图 + 指标 + 来源 + 交叉特征”的四分支融合结构。
+其职责不是在全库高速找人，而是对总召回输出的统一候选池进行精细排序，判断：
 
-##### 5.3 KGAT-AX 的升级后结构（四分支）
+- 哪些作者虽然相关，但不值得排到前面；
+- 哪些作者既相关、又活跃、又有较强学术实力；
+- 哪些作者具有更强的多路共识与图谱支撑，适合进入最终 Top-N 结果。
 
-- **图结构分支（Graph Tower）**  
-  保留 KGAT 主体，建模 Job、Vocabulary、Work、Author、Institution、Source、Author-Author；主链为 **Job → Vocabulary → Work → Author**。职责：学习多关系图上的高阶连接，为作者提供结构语义表示，为解释模块提供注意力依据。
+因此，KGAT-AX 的输入不再只是一对简单的 `(job_id, author_id)`，而应是：**图结构信息**、**作者显式指标**、**召回来源特征**、**query-author 交叉特征**。
 
-- **作者显式指标分支（Author Tower）**  
-  输入建议包括：`h_index`、`works_count`、`cited_by_count`、`recent_works_count`、`recent_citations`、`institution_level`、`source_quality_stats`、`top_work_quality`、`time_decay_features`。显式告诉模型谁学术影响力更强、谁近期更活跃、谁更符合“值得排前”的作者画像。
+后续精排能力的提升，不主要依赖“换模型”，而主要依赖：候选池质量提升；训练样本与线上候选池分布对齐；模型输入从“图 + 少量辅助特征”升级为“图 + 指标 + 来源 + 交叉特征”的**四分支融合结构**。
 
-- **召回来源分支（Recall Tower）**  
-  输入建议包括：`from_vector`、`from_label`、`from_collab`、`path_count`、`vector_rank`、`label_rank`、`collab_rank`、各路 `*_score_raw`、`bucket_type`、`is_multi_path_hit`。让模型学会多路命中通常更可信、只来自协同路且无主题支撑的候选要保守等。
+##### 5.2 KGAT-AX 四分支输入字段定义
 
-- **query-author 交叉分支（Interaction Tower）**  
-  输入建议包括：`topic_similarity`、`skill_coverage_ratio`、`academic_term_hit_strength`、`domain_consistency`、`paper_hit_strength`、`recent_activity_match`、`top_paper_match_quality`、`career_stage_match`、`institution_task_fit` 等。回答“这个作者与这个岗位，到底有多匹配？”。
+为避免工程实现时只停留在“四分支”的抽象描述，KGAT-AX 输入明确分为下列四类字段。
 
-##### 5.4 最终融合打分
+**（1）Graph Tower（图结构分支）**
 
-\[
-s(job, author)=
-w_g \cdot s_{graph}
-+ w_a \cdot s_{author}
-+ w_r \cdot s_{recall}
-+ w_i \cdot s_{interaction}
-\]
+该分支继续保留 KGAT 主干，用于学习多关系图上的高阶连接。核心节点与关系包括：`Job`、`Vocabulary`、`Work`、`Author`、`Institution`、`Source`、`Author-Author`。其中最核心的主链为 **Job → Vocabulary → Work → Author**。
 
-其中：`s_graph` 图结构分支得分；`s_author` 作者显式指标分支得分；`s_recall` 召回来源分支得分；`s_interaction` query-author 交叉分支得分。图分支负责结构语义，指标分支负责学术实力与活跃度，来源分支负责候选可信度，交叉分支负责岗位-作者直接匹配程度。
+该分支输入包括但不限于：`job_id`、`author_id`、邻居节点 id、relation id、attention edge / 子图边、图结构权重（若可提供）。输出用于表达：岗位与作者在图谱中的多跳语义关联；哪些技能词、学术词、论文边在排序中更重要；哪些图邻居对最终排序贡献更大。
 
-##### 5.5 为什么当前阶段仍然保留 KGAT-AX
+**（2）Author Tower（作者显式指标分支）**
 
-已有完整的离线训练链路、图索引与训练数据导出能力、线上推理与排序融合能力。当前更大的收益来自候选池和训练样本升级，而不是换新模型。后续工作重点：补齐总召回、补齐训练样本、补齐特征输入，让现有 KGAT-AX 真正发挥价值。
+该分支用于补充图结构难以直接表达的“作者实力与活跃度”信息。建议输入字段包括：`h_index`、`works_count`、`cited_by_count`、`recent_works_count`、`recent_citations`、`institution_level`、`source_quality_stats`、`top_work_quality`、`time_decay_features`。目标不是替代图结构分支，而是显式告诉模型：哪些作者更有学术影响力；哪些作者近年更活跃；哪些作者的代表作质量更高；哪些作者更符合“值得排前”的专家画像。
 
-#### 精排与解释的重新定义与证据链升级
+**（3）Recall Tower（召回来源分支）**
 
-##### 6.1 精排阶段的重新定义
+该分支用于建模“作者是如何进入候选池的”。建议输入字段包括：`from_vector`、`from_label`、`from_collab`、`path_count`、`vector_rank`、`label_rank`、`collab_rank`、`vector_score_raw`、`label_score_raw`、`collab_score_raw`、`candidate_pool_score`、`bucket_type`、`is_multi_path_hit`。核心作用是让模型学会：多路命中通常更可信；仅协同路命中但缺乏主题支撑的候选要谨慎；标签路强命中通常具备更高精度；向量路高分但标签路弱的候选可能只是“语义相似”，未必真正贴题。
 
-精排阶段明确分成三步：**候选池预排序** → **KGAT-AX 深度精排** → **最终稳定融合**。
+**（4）Interaction Tower（query-author 交叉分支）**
 
-##### 6.2 候选池预排序
+该分支直接建模“当前岗位与当前作者”的匹配关系。建议输入字段包括：`topic_similarity`、`skill_coverage_ratio`、`domain_consistency`、`paper_hit_strength`、`recent_activity_match`、`top_paper_match_quality`、`academic_term_hit_strength`、`institution_task_fit`（若可构造）、`career_stage_match`（若可构造）。该分支回答的核心问题是：**这个作者与这个岗位，到底有多匹配？** 相比单纯图结构分支，更贴近最终排序任务本身。
 
-目标：压缩候选池规模、清理弱候选、给 KGAT-AX 提供更高质量的输入。输入：总召回的候选池基础特征（如 `candidate_pool_score`、`path_count`、`from_label`、`from_vector`、`from_collab`、`bucket_type`、`domain_consistency`、`recent_activity_match`、`top_paper_hit_count`）。输出：规模更可控的精排候选池（例如 300→150 或 500→200）。预排序只做“粗筛”，不代替深度排序。
+##### 5.3 KGAT-AX 模型结构升级建议（四分支 + 融合层）
+
+- **保留 Graph Tower**：现有 KGAT 主体保持不变，继续负责多关系图传播、注意力聚合和图语义建模。
+- **新增 Author Tower**：使用小型 MLP 编码作者显式指标，输出 `author_repr` 或 `s_author`。
+- **新增 Recall Tower**：使用 embedding + MLP 或直接 MLP 编码召回来源特征，输出 `recall_repr` 或 `s_recall`。
+- **新增 Interaction Tower**：使用小型 MLP 编码 query-author 交叉特征，输出 `interaction_repr` 或 `s_interaction`。
+- **最终融合层**：第一版建议采用稳定、简单的融合方式：`fusion_input = concat([graph_repr, author_repr, recall_repr, interaction_repr])`，`final_score = fusion_mlp(fusion_input)`。第一阶段不建议一开始就引入过复杂门控或 mixture-of-experts，以免训练不稳定。
+
+##### 5.4 KGAT-AX 输出定义
+
+为便于调试、消融实验和解释模块复用，KGAT-AX 后续不建议只输出单一 `final_score`，而应同时保留分项输出：`s_graph`、`s_author`、`s_recall`、`s_interaction`、`final_score`。用途包括：**训练分析**（判断模型是否过度依赖显式指标、图分支是否真正学到结构信号）；**消融实验**（对比不同分支的增益与不同融合方式的收益）；**解释模块**（说明某作者排前是因为图路径、学术实力，还是多路召回共识）。
+
+##### 5.5 KGAT-AX 训练数据入口与样本定义
+
+后续 `generate_training_data.py` 不应只读取召回后的 `final_top_200`，而应明确改为：**优先基于 `candidate_pool.candidate_records` 构造训练样本**，即训练数据的主入口应与线上候选池保持一致。
+
+- **训练样本来源**：使用 `results["candidate_pool"].candidate_records`、`results["candidate_pool"].candidate_evidence_rows` 作为主要输入来源；前者用于生成 (job, author) 排序样本，后者用于构造证据强度、主题匹配和论文命中等辅助特征。
+- **正样本定义（分层）**：**Strong Positive**：满足之一或组合——`passed_hard_filter == True`、`bucket_type == 'A'`、`from_label == True`、`path_count >= 2`、具备较强主题命中与论文证据支撑。**Weak Positive**：`passed_hard_filter == True`、`bucket_type in {'A', 'B'}`、有明确主题支撑，但多路命中或作者指标不如 Strong Positive 稳定。强正样本用于学习“谁应该明显排前”，弱正样本用于保留排序边界的柔性。
+- **负样本定义（四类）**：**EasyNeg**：明显不相关、候选池外或候选池尾部弱相关作者，用于学习基础边界。**FieldNeg**：领域相近但主题偏移，用于学习同领域内的细粒度区分。**HardNeg**：与正样本处于同一 job 的同一候选池中，`from_label == True` 或 `path_count >= 2`、`passed_hard_filter == True`，排名接近正样本、指标也不差但不是最佳人选；优先从同桶或相邻桶中采样。**CollabNeg**：`from_collab == True` 但缺乏足够主题支撑，用于抑制合作关系带来的误抬升。
+- **训练样本导出字段**：除基本图边外，建议额外导出：（1）召回来源特征：`from_vector`、`from_label`、`from_collab`、`path_count`、`vector_rank`、`label_rank`、`collab_rank`、`candidate_pool_score`、`bucket_type`；（2）作者显式指标：`h_index`、`works_count`、`cited_by_count`、`recent_works_count`、`recent_citations`、`institution_level`、`top_work_quality`；（3）query-author 交叉特征：`topic_similarity`、`skill_coverage_ratio`、`domain_consistency`、`paper_hit_strength`、`recent_activity_match`、`academic_term_hit_strength`。这样四分支输入与训练数据导出字段一一对应。
+
+##### 5.6 KGAT-AX 训练与评估建议
+
+训练目标仍可保留 pairwise / BPR 风格主目标，但评估阶段应明显偏向 **top-heavy 指标**。建议重点关注：Top10 命中质量、Top20 排序稳定性、Strong Positive 的前排保持率、多路命中候选的前排占比、证据链一致性。即后续优化目标不再只是“整体平均排序误差更小”，而是：**让真正值得推荐的人，稳定地出现在前排。**
+
+##### 5.7 当前优势与为什么仍保留 KGAT-AX
+
+当前 KGAT-AX 已有离线训练脚本、图索引构建工具、训练数据导出链路、线上调用与排序融合能力。收益最大的做法不是“重写精排器”，而是：把总召回做成高质量候选池；把训练数据对齐线上候选池；把 KGAT-AX 输入升级为四分支融合结构。后续工作重点：补齐总召回、补齐训练样本与四分支字段、让现有 KGAT-AX 真正发挥价值。
+
+#### 精排与解释的重新定义与证据链升级（可直接开工规格）
+
+##### 6.1 精排阶段的完整职责划分
+
+后续精排不再被描述为“召回后再做一次融合打分”，而明确分为三个步骤：**候选池预排序（Pre-Rank）** → **KGAT-AX 深度精排（Re-Rank）** → **最终稳定融合（Stable Fusion）**。这样拆分的原因是：总召回负责构建高质量候选池；预排序负责压缩规模、去掉明显弱候选；KGAT-AX 负责在“都像相关的人”里做细粒度排序；稳定融合负责控制线上结果的稳定性与可解释性。
+
+##### 6.2 候选池预排序（ranking_engine 职责）
+
+候选池预排序建议由 **ranking_engine.py** 明确承担，而不是只停留在规划层。
+
+- **输入**：`candidate_pool.candidate_records`。
+- **预排序特征**：可优先使用轻量级特征：`candidate_pool_score`、`from_label`、`from_vector`、`from_collab`、`path_count`、`bucket_type`、`domain_consistency`、`paper_hit_strength`、`recent_activity_match`。
+- **输出**：压缩后的精排候选集，例如从 300～500 缩到 150～200；保留候选来源、分桶和证据明细。
+
+预排序的目标不是给最终排序，而是：降低 KGAT-AX 推理负担；提升精排输入质量；保留精排真正需要区分的作者。
 
 ##### 6.3 KGAT-AX 深度精排
 
@@ -2702,7 +2789,7 @@ w_g \cdot s_{graph}
 
 ##### 6.4 最终稳定融合
 
-推荐最终分数结构：
+后续线上最终排序不建议仅依据 `kgatax_score`，而建议使用：
 
 \[
 final\_score =
@@ -2711,61 +2798,69 @@ final\_score =
 \lambda_3 \cdot rule\_stability
 \]
 
-`rule_stability` 可包含：主题一致性底线、活跃度底线、多路命中 bonus、仅协同命中 penalty、缺乏强论文证据 penalty。避免模型偶发性把低可信候选排得过高，增加线上结果的可控性。
+其中：`candidate_pool_score` 为候选池阶段基础质量分；`kgatax_score` 为 KGAT-AX 深度精排得分；`rule_stability` 为稳定项，用于避免线上结果出现明显异常。
 
-##### 6.5 精排阶段的目标定义
+##### 6.5 rule_stability 的组成建议
 
-- **第一层目标**：压下明显不该排前的人（仅协同命中但主题不够相关、活跃度明显不足、没有强论文证据、学术指标偏弱且无图结构支撑）。
-- **第二层目标**：在相关作者中找出更优人选（主题更贴、近年更活跃、学术实力更强、代表作更匹配、多路共识更高）。
-- **第三层目标**：为解释提供可信排序依据（最终排名能回答：该作者为什么被召回、为什么在这些候选人中排得更前、他的核心证据链是什么）。
+后续 `rule_stability` 不应只作为抽象概念出现，而建议明确由以下项组成：**multi_path_bonus**（多路共识加成）、**label_support_bonus**（标签路支撑加成）、**collab_only_penalty**（仅协同命中惩罚）、**low_activity_penalty**（低活跃度惩罚）、**weak_paper_evidence_penalty**（弱论文证据惩罚）。即：多条召回路径共同支持的候选更可信；有明确技能→学术词→论文路径支撑的作者更应排前；仅通过合作网络进入候选池、缺乏主题支撑的作者应更谨慎处理；长期不活跃作者不应因历史指标过高而被过度抬升；若缺乏强论文命中证据，则降低最终排序稳定性。
 
-##### 6.6 证据链解释的升级方向（三层统一证据框架）
+##### 6.6 解释模块与 CandidatePool 的对齐
 
-- **第一层：召回来源证据**  
-  输出：`from_vector`、`from_label`、`from_collab`、`path_count`、`dominant_recall_path`。回答：这个作者是从哪条路进候选池的？是否命中了多条路？哪条路贡献最大？
+当前解释模块已具备图路径和注意力基础，后续建议进一步接入候选池来源信息。解释模块后续输入不应只有 `job_raw_ids`、`author_id`，还应增加：`candidate_record`、`candidate_evidence_rows`。这样解释模块才能同时回答：这个人为什么被召回？为什么排得比别人更前？关键证据链是什么？
 
-- **第二层：图路径证据**  
-  继续沿用当前 `rank_explainer.py` 的多跳路径挖掘逻辑，把候选池证据明细并入解释输入。回答：岗位哪项技能与作者哪篇论文发生了连接？命中的核心学术词、关键论文、期刊/会议、合作者或机构支撑。
+##### 6.7 四段式证据链输出格式
 
-- **第三层：排序支撑证据**  
-  统一输出：主题匹配度高、技能覆盖度高、多路召回共识强、近期活跃、学术指标较强、代表作质量好、模型注意力对关键论文赋权高。
+后续解释模块建议统一采用四段式结构。
 
-##### 6.7 证据链的最终输出格式（四段式）
+1. **召回来源摘要**：说明该作者来自哪条召回路径；是否命中多条路径；主导召回来源是什么。
+2. **主题匹配摘要**：说明岗位核心技能或主题词；对应的 academic term；命中的关键论文；论文与作者的连接路径。
+3. **学术实力摘要**：说明近年活跃程度；H-index、引用、论文数等指标；机构或发表渠道质量。
+4. **模型置信摘要**：说明 KGAT-AX 更偏向哪一类支撑（图路径 / 指标 / 召回来源 / 交叉匹配）；关键论文的注意力或贡献度；排序结果与候选池证据是否一致。
 
-- **召回摘要**：例如“该作者同时命中标签路与向量路，并由协同路进一步补强；属于多路共识候选，候选可信度较高。”
-- **主题匹配摘要**：岗位强调的方向与作者强命中论文、关键证据论文。
-- **学术实力摘要**：近三年活跃度、H-index/总引用/代表作质量、机构与发表渠道影响力。
-- **模型置信摘要**：KGAT-AX 在主链上给予的注意力、排序结果与召回来源和论文证据的一致性。
+这样最终解释就不仅是“找到一条图路径”，而是形成 **召回原因 + 排序原因 + 关键证据 + 学术实力支撑** 的完整证据链。
 
-#### 后续规划落地顺序与目标
+#### 后续规划落地顺序与目标（可直接开工）
 
 ##### 10.1 总召回升级计划
 
 优先对 `src/core/recall/total_recall.py` 做结构升级：三路独立配额控制、去重合并、路径来源特征化、硬过滤、分桶、候选池统一导出给线上与训练。同时改善线上候选池质量、训练样本质量、精排输入质量、证据链完整度。
 
-##### 10.2 KGAT-AX 训练数据升级计划
+##### 10.2 KGAT-AX 增补计划
 
-`kgat_ax/generate_training_data.py` 尽量复用线上总召回逻辑，先构造统一候选池，再在候选池内部生成排序样本。
+为进一步提升精排阶段的效果与可解释性，后续 KGAT-AX 改造重点不在于更换主模型，而在于补齐以下内容：
 
-- **训练目标**：模拟真实线上排序问题——区分“一批都相关的人中，谁更值得排前”，而非“相关 vs 完全无关”。
-- **正样本构造**：多信号共识（标签路命中强、向量路支持、领域一致、近年活跃、学术指标不差、关键论文命中强、位于高质量桶）。
-- **负样本构造**：分层负样本——**EasyNeg**（明显不相关）、**FieldNeg**（同领域但主题偏移）、**HardNeg**（主题相近、指标也不差但不是最佳人选）、**CollabNeg**（合作很近但主题不够匹配）。关键为 HardNeg 与 CollabNeg。
-- **样本字段扩充**：召回来源特征（`from_vector`、`from_label`、`from_collab`、`path_count`、`path_ranks`、`path_scores`）；交叉特征（`topic_similarity`、`skill_coverage_ratio`、`paper_hit_strength`、`domain_consistency`、`recent_activity_match`）；候选池特征（`bucket_type`、`is_multi_path_hit`、`passed_hard_filter`、`candidate_pool_score`）。
-- **训练与评估目标**：训练可保留 pairwise 主体，评估明显偏向 top-heavy 指标（Top10 命中质量、Top20 排序稳定性、多路命中候选的前排保持率、证据链一致性）。
+- **明确四分支输入字段**：Graph / Author / Recall / Interaction 四分支字段表固定下来；训练数据、dataloader、forward 保持同一口径。
+- **训练样本入口切换到 CandidatePool**：`generate_training_data.py` 优先基于 `candidate_pool.candidate_records` 构造样本；`final_top_200` 仅作为兼容接口保留。
+- **正负样本定义显式化**：Strong Positive / Weak Positive；EasyNeg / FieldNeg / HardNeg / CollabNeg（详见 5.5）。
+- **模型输出分项得分**：除 `final_score` 外，同时输出 `s_graph` / `s_author` / `s_recall` / `s_interaction`；便于调试、消融与解释。
+- **预排序职责归属明确**：由 `ranking_engine.py` 承担轻量预排序逻辑；不让“预排序”停留在规划文字层面。
+- **稳定项显式实现**：`rule_stability` 由 bonus / penalty 组成（见 6.5）；保证线上排序更稳定。
+- **解释模块对齐 CandidatePool**：让解释模块同时接入候选来源和图路径证据；统一“召回-排序-解释”的中间信息口径。
 
-##### 10.3 KGAT-AX 结构升级计划
+##### 10.3 建议新增的验收与消融实验
 
-保留 Graph Tower；增加 Author Tower、Recall Tower、Interaction Tower；将最终得分改为多分支融合。让模型不仅知道“谁和岗位有图谱连接”，也知道“谁近期更活跃、谁学术实力更强、谁被多路一致支持、谁与岗位更匹配”。
+为验证后续改造是否真正带来收益，建议在训练与离线验证中加入以下对比实验：
+
+1. **分支消融实验**：仅 Graph Tower → Graph + Author → Graph + Author + Recall → 全量四分支。
+2. **候选池策略实验**：有/无硬过滤、有/无分桶、有/无预排序。
+3. **稳定融合实验**：仅 `kgatax_score` → `candidate_pool_score + kgatax_score` → 全量 `candidate_pool_score + kgatax_score + rule_stability`。
+4. **解释一致性分析**：前排作者是否具备多路来源支撑；排序前列作者是否有关键论文证据；模型高分与证据链是否一致。
+
+这样可以避免只从单一离线指标判断模型是否“变好”，而是从**排序质量、稳定性、可解释性、工程可控性**四个维度共同评估。
 
 ##### 10.4 精排与解释升级计划
 
-精排阶段固定为：候选池预排序 → KGAT-AX 深度精排 → 最终稳定融合 → 四段式证据链输出。证据链统一覆盖：召回来源、主题匹配、学术实力、模型置信。
+精排阶段固定为：候选池预排序 → KGAT-AX 深度精排 → 最终稳定融合 → 四段式证据链输出。证据链统一覆盖：召回来源、主题匹配、学术实力、模型置信；解释模块接入 `candidate_record` 与 `candidate_evidence_rows`，输出四段式证据链（见 6.7）。
 
-##### 10.5 推荐的工程落地顺序
+##### 10.5 当前阶段的改造优先级
 
-- **第一阶段**：先改总召回（三路配额制、去重合并、来源特征化、硬过滤、分桶、候选池统一导出）。
-- **第二阶段**：再改训练数据与 KGAT-AX 输入（训练数据与候选池对齐、分层负样本、增加召回来源特征与 query-author 交叉特征、增加作者显式指标输入）。
-- **第三阶段**：最后补强精排与解释（候选池预排序、最终稳定融合、四段式证据链输出、排名结果与解释依据统一）。
+为兼顾工期与收益，建议按以下顺序推进：
+
+- **第一阶段**：先完成总召回升级——配额控制、CandidatePool、去重合并、硬过滤、分桶、统一导出给线上与训练。
+- **第二阶段**：再补齐 KGAT-AX 输入与训练数据——CandidatePool 样本入口、四分支字段导出、分层正负样本、dataloader 与模型 forward 对齐。
+- **第三阶段**：最后补强最终精排与解释——`ranking_engine` 预排序、`rule_stability`、四段式证据链、排序与解释对齐。
+
+该顺序的核心原则是：**先把候选池做成稳定的中间层，再让 KGAT-AX 学会在这个中间层上高质量排序，最后把排序原因与证据链统一表达。**
 
 ##### 10.6 升级后的总体目标
 

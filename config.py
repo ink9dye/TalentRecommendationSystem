@@ -58,7 +58,7 @@ COOC_EXPANSION_PENALTY = 0.65      # cooc_expansion 最终分乘数
 
 # 6.3 领域拟合（domain_fit）与 Stage2 门控
 DOMAIN_FIT_WEIGHTS = (0.4, 0.3, 0.2, 0.1)  # domain, field, subfield, topic
-DOMAIN_FIT_MIN_PRIMARY = 0.25      # Stage2A：domain_fit 低于此禁止做 primary
+DOMAIN_FIT_MIN_PRIMARY = 0.45      # Stage2A：domain_fit 低于此禁止做 primary（提高以压缩跨领域词）
 DOMAIN_FIT_MIN_PRIMARY_BROAD = 0.40  # Stage2A：broad_concept 锚点（如 generic_task_term）做 primary 时 domain_fit 下限，强降权
 DOMAIN_FIT_MIN_EXPANSION = 0.20   # Stage2B：扩展词 domain_fit 低于此不进词池
 DOMAIN_SPAN_MAX_EXPANSION = 12    # Stage2B：扩展词 domain_span 超过此不进词池（跨域过大）
@@ -67,7 +67,7 @@ DOMAIN_SPAN_MAX_EXPANSION = 12    # Stage2B：扩展词 domain_span 超过此不
 PRIMARY_MIN_IDENTITY_HIGH_AMBIGUITY = 0.72
 
 # Stage2B 高可信 primary：参与 dense/cluster/cooc 扩散须同时满足 identity、domain_fit、source、domain_span 等结构约束（不依赖词面黑名单）
-DOMAIN_FIT_HIGH_CONFIDENCE = 0.35   # 高可信 primary 的 domain_fit 下限
+DOMAIN_FIT_HIGH_CONFIDENCE = 0.55   # 高可信 primary 的 domain_fit 下限（提高以仅主场词参与扩散）
 TRUSTED_SOURCE_TYPES_FOR_DIFFUSION = ("similar_to", "jd_vector")  # 仅此来源的 primary 可参与扩散；当前仅 similar_to，jd_vector 预留
 
 # Stage3 final_score 公式：source_weight / domain_gate / role_penalty

@@ -673,11 +673,14 @@ def query_expansion_by_context_vector(label, anchor_skills, query_text, regex, t
     if not terms_lower:
         return []
 
+    # Context-Aware：用 JD 片段作为上下文拼接，使 embedding 向目标领域偏移，减少多义词误匹配
+    context_snippet = (query_text or "").strip()[:100].replace("(", " ").replace(")", " ")
     to_encode = []
     to_encode_keys = []
     for tkey, term in zip(terms_lower, terms_raw):
         if tkey not in label._term_vec_cache:
-            to_encode.append(term)
+            term_with_ctx = f"{term} ({context_snippet})" if context_snippet else term
+            to_encode.append(term_with_ctx)
             to_encode_keys.append(tkey)
 
     if to_encode:
@@ -1485,6 +1488,11 @@ def _term_in_active_domains(
                 active_str = set(str(d) for d in active)
                 term_domains = set(expanded.keys()) if expanded else set()
                 domain_ok = bool(active_str & term_domains)
+                # 主领域守卫：主领域（权重最大）必须在 active_domains 内，否则一票否决
+                if domain_ok and expanded:
+                    main_domain = max(expanded, key=expanded.get)
+                    if main_domain not in active_str:
+                        domain_ok = False
 
     if not domain_ok:
         return False

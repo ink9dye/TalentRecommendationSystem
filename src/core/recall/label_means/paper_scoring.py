@@ -86,6 +86,7 @@ def compute_contribution(
     term_map: Dict[str, str] = context["term_map"]
     term_role_map: Dict[str, str] = context.get("term_role_map") or {}
     term_confidence_map: Dict[str, float] = context.get("term_confidence_map") or {}
+    term_uniqueness_map: Dict[str, float] = context.get("term_uniqueness_map") or {}
 
     rank_score = 0.0
     term_weights: Dict[str, float] = {}
@@ -102,7 +103,8 @@ def compute_contribution(
         if not term_confidence_map:
             role = (term_role_map.get(vid_s) or "primary").strip().lower()
             term_confidence = TERM_ROLE_WEIGHT.get(role, 1.0)
-        w = term_weight * term_confidence * paper_match_strength
+        term_uniqueness = float(term_uniqueness_map.get(vid_s, 1.0))
+        w = term_weight * term_confidence * paper_match_strength * term_uniqueness
         rank_score += w
         term_weights[vid_s] = w
         valid_hids.append(hit["vid"])

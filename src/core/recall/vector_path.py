@@ -74,6 +74,7 @@ class VectorPath:
             if not raw_work_ids:
                 return [], (time.time() - start_t) * 1000
 
+            meta_list = []
             # --- 步骤 2: 获取论文的领域标签与元信息用于过滤与调试 ---
             placeholders = ','.join(['?'] * len(raw_work_ids))
             sql = f"SELECT work_id, domain_ids, title, year FROM works WHERE work_id IN ({placeholders})"
@@ -199,6 +200,16 @@ class VectorPath:
 
             # 重新按时间加权后的得分排序
             author_ids = [aid for aid, _ in sorted(author_scores.items(), key=lambda x: x[1], reverse=True)]
+            # 返回 meta 列表供总召回候选池使用（author_id, vector_score_raw, vector_rank）
+            meta_list = [
+                {
+                    "author_id": str(aid),
+                    "vector_score_raw": float(author_scores.get(aid, 0.0)),
+                    "vector_rank": i + 1,
+                    "vector_evidence": None,
+                }
+                for i, aid in enumerate(author_ids[: self.recall_limit])
+            ]
 
             if verbose:
                 # 构造 Top20 调试信息：对齐原有 _last_debug 结构
@@ -249,7 +260,9 @@ class VectorPath:
             conn.close()
 
         duration = (time.time() - start_t) * 1000
-        return author_ids[:self.recall_limit], duration
+        if not meta_list:
+            return [], duration
+        return meta_list, duration
 
 
 # 修改 vector_path.py 最后的 if __name__ == "__main__": 部分
