@@ -111,9 +111,12 @@ class TotalCore:
 
         print(f"[*] 语义导航完成，锁定精排锚点: {real_job_ids}")
 
-        # --- Step 2: 多路召回 (向量+标签+协同) ---
+        # --- Step 2: 多路召回 (向量+标签+协同)，得到候选池与名单 ---
         recall_res = self.recall_subsystem.execute(text_query, domain_id=target_domain)
-        candidates = recall_res.get('final_top_500', [])
+        candidate_pool = recall_res.get("candidate_pool")
+        candidates = recall_res.get("final_top_500", [])
+        if candidate_pool and getattr(candidate_pool, "candidate_records", None):
+            candidates = [r.author_id for r in candidate_pool.candidate_records]
 
         if not candidates:
             print("[Warning] 召回阶段未获得候选人。")
@@ -126,11 +129,12 @@ class TotalCore:
         mode_label = f"手动指定: {target_domain}" if target_domain else f"自动并集: {filter_pattern}"
         print(f"[*] 精排阶段启动 (模式: {mode_label})")
 
-        # --- Step 4: 权重融合精排引擎 ---
+        # --- Step 4: 三阶段精排（预排序 + KGAT-AX + 稳定融合），传入候选池以启用 rule_stability 与四段式证据 ---
         final_results = self.ranking_engine.execute_rank(
             real_job_ids,
             candidates,
-            filter_domain=filter_pattern
+            filter_domain=filter_pattern,
+            candidate_pool=candidate_pool,
         )
 
         return final_results

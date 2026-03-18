@@ -27,9 +27,9 @@ def aggregate_author_evidence_by_term_role(
     按作者区分 primary_supported 与 expansion_supported 的证据，便于可解释。
     返回: aid -> {
       "primary_supported_score": float,
-      "primary_supported_wids": List[int],
+      "primary_supported_wids": List[str],
       "expansion_supported_score": float,
-      "expansion_supported_wids": List[int],
+      "expansion_supported_wids": List[str],
     }
     """
     out: Dict[str, Dict[str, Any]] = {}
@@ -61,6 +61,11 @@ def aggregate_author_evidence_by_term_role(
     return out
 
 
+# 层级守卫方案预留：AuthorScore = PaperSum * CoverageBonus * HierarchyConsistency * FamilyBalancePenalty
+# CoverageBonus = 1 + 0.15*log(1+#term_families) + 0.12*log(1+#primary_groups)
+# FamilyBalancePenalty = 1 / (1 + rho*max_family_share)；可由 term_role_map / cluster_id 统计后接入
+
+
 def run_stage5(
     recall,
     author_papers_list: List[Dict[str, Any]],
@@ -72,6 +77,7 @@ def run_stage5(
 ) -> Tuple[List[str], Dict[str, Any]]:
     """
     阶段 5：作者打分与排序。按论文贡献度聚合、时间与活跃度加权、最佳论文比过滤后排序。
+    预留：CoverageBonus（多锚点/多 family 覆盖奖励）、HierarchyConsistency、FamilyBalancePenalty。
     返回 (author_id_list, last_debug_info)。
     """
     score_map = score_map or {}
@@ -92,6 +98,7 @@ def run_stage5(
             "work_count": 0,
             "author_count": 0,
             "recall_vocab_count": len(score_map),
+            "filter_closed_loop": (debug_1 or {}).get("filter_closed_loop") or {},
         }
         return [], recall.last_debug_info
 
@@ -238,6 +245,28 @@ def run_stage5(
             recency_by_latest = compute_author_recency_by_latest(years)
             score = float(base_score) * float(time_weight) * float(recency_by_latest)
             author_scores[aid] = score
+
+        # Family coverage bonus + family balance penalty（不依赖具体领域词，只看 family 结构）
+        term_family_keys = debug_1.get("term_family_keys") or {}
+        for aid in list(author_scores.keys()):
+            works = author_top_works.get(aid, [])
+            family_counter: Dict[str, float] = {}
+            for wid, contrib in works:
+                info = paper_map.get(wid, {})
+                tw = info.get("term_weights") or {}
+                total_w = sum(tw.values()) or 1.0
+                for vid_s, w in tw.items():
+                    vid_int = int(vid_s) if vid_s is not None else None
+                    if vid_int is None:
+                        continue
+                    fk = term_family_keys.get(vid_int) or term_family_keys.get(str(vid_int)) or f"self::{vid_s}"
+                    family_counter[fk] = family_counter.get(fk, 0.0) + float(contrib) * (float(w) / total_w)
+            family_count = len(family_counter)
+            coverage_bonus = 1.0 + 0.10 * min(family_count, 5)
+            total_fam = sum(family_counter.values()) or 1.0
+            max_family_share = max(family_counter.values()) / total_fam if family_counter else 0.0
+            family_balance_penalty = 1.0 / (1.0 + 0.6 * max_family_share)
+            author_scores[aid] = author_scores[aid] * coverage_bonus * family_balance_penalty
 
     if papers_for_agg and author_scores and author_top_works:
         paper_scores_by_wid = {p["wid"]: float(p["score"]) for p in papers_for_agg}

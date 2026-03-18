@@ -91,6 +91,18 @@ def run_label_debug_cli() -> None:
                     f"  {term[:24]:24s} | {cleaned!s:>6} | {b!s:>11} | {am!s:>11} | {at!s:>12} | {s!s:>9} | {True:>12}"
                 )
 
+            # Stage2 锚点-候选证据表（数据驱动 primary 打分，无硬编码词表）
+            stage2_evidence = db.get("stage2_anchor_evidence_table") or []
+            if stage2_evidence:
+                print("【Stage2 锚点-候选证据表】anchor | candidate(tid) | edge_affinity | anchor_align | jd_align | hierarchy_cons | neighborhood_cons | isolation_penalty | primary_score")
+                for row in stage2_evidence[:35]:
+                    anc = str(row.get("anchor") or "")[:14]
+                    cand = str(row.get("candidate") or "")[:22]
+                    tid = row.get("tid", "")
+                    print(f"  {anc:14s} | {cand!r}({tid}) | edge={row.get('edge_affinity', 0):.3f} | anchor_align={row.get('anchor_align', 0):.3f} | jd_align={row.get('jd_align', 0.5):.3f} | hier={row.get('hierarchy_consistency', 0):.3f} | neigh={row.get('neighborhood_consistency', 0.5):.3f} | isol={row.get('isolation_penalty', 0):.3f} | primary={row.get('primary_score', 0):.3f}")
+                if len(stage2_evidence) > 35:
+                    print(f"  ... 共 {len(stage2_evidence)} 条")
+
             fcl = db.get("filter_closed_loop") or {}
             raw_tids = fcl.get("similar_to_raw_tids", [])
             pass_tids = fcl.get("similar_to_pass_tids", [])

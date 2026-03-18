@@ -49,10 +49,19 @@ def parse_kgat_args():
     parser.add_argument('--mess_dropout', nargs='?', default='[0.1, 0.1]',
                         help='Dropout probability.')
 
-    # 5. 核心 AX (Academic Metrics) 插件参数
-    # 学术指标包含：H-index, Citations, Works Count
+    # 5. 核心 AX (Academic Metrics) 与四分支 v2 参数（README 5.2 / 5.3）
+    # 学术指标包含：H-index, Citations, Works Count（图塔内全息融合用）
     parser.add_argument('--n_aux_features', type=int, default=3,
-                        help='学术指标特征维度 (H-index, Citations, Works).')
+                        help='学术指标特征维度 (H-index, Citations, Works)，用于图塔全息融合。')
+    # Author Tower：12 维作者显式指标；0 表示不启用
+    parser.add_argument('--n_author_aux', type=int, default=0,
+                        help='Author Tower 输入维度（建议 12），0 表示仅用图塔+3 维 AX。')
+    # Recall Tower：召回来源特征维度；0 表示不启用
+    parser.add_argument('--n_recall_features', type=int, default=0,
+                        help='Recall Tower 输入维度（来自 CandidatePool），0 表示不启用。')
+    # Interaction Tower：query-author 交叉特征维度；0 表示不启用
+    parser.add_argument('--n_interaction_features', type=int, default=0,
+                        help='Interaction Tower 输入维度，0 表示不启用。')
     # 修改：直接指向你实际存在的学术数据库 academic_dataset_v5.db
     parser.add_argument('--db_path', type=str,
                         default='E:/PythonProject/TalentRecommendationSystem/data/academic_dataset_v5.db',

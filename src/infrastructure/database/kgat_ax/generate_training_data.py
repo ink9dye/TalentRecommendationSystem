@@ -1,3 +1,11 @@
+"""
+KGAT-AX 训练数据生成器。
+
+职责（对齐 README 修改计划 5.5）：
+- 训练样本入口优先基于 candidate_pool.candidate_records；final_top_500 仅作兼容回退。
+- 分层正负样本：Strong/Weak Positive，EasyNeg/FieldNeg/HardNeg/CollabNeg。
+- 可选导出四分支字段到 train_four_branch.json / test_four_branch.json，供 DataLoader 与四分支模型使用。
+"""
 import os
 import re
 import json
@@ -14,6 +22,14 @@ from config import (
     NEO4J_PASSWORD, NEO4J_DATABASE
 )
 from src.core.recall.total_recall import TotalRecallSystem
+
+# 分层正负样本标签（README 5.5）
+LABEL_STRONG_POS = "strong_pos"
+LABEL_WEAK_POS = "weak_pos"
+LABEL_HARD_NEG = "hard_neg"
+LABEL_COLLAB_NEG = "collab_neg"
+LABEL_FIELD_NEG = "field_neg"
+LABEL_EASY_NEG = "easy_neg"
 
 
 class KGATAXTrainingGenerator:
@@ -75,30 +91,34 @@ class KGATAXTrainingGenerator:
 
     def generate_refined_train_data(self, train_size=3000, test_size=300):
         """
-        任务 1：生成精排训练样本 (支持 75/25 领域混合策略)
-        返回：被抽样用于训练的岗位 ID 列表 (锚点)
+        任务 1：生成精排训练样本（优先基于 candidate_pool.candidate_records，分层正负样本，README 5.5）。
+        同时写入 train_four_branch.json / test_four_branch.json（四分支字段），供 DataLoader 与四分支模型使用。
+        返回：被抽样用于训练的岗位 ID 列表 (锚点)。
         """
-        print(f"\n>>> 任务 1: 生成混合排名精排数据...")
+        print(f"\n>>> 任务 1: 生成混合排名精排数据（候选池入口 + 分层正负样本 + 四分支导出）...")
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
 
-        # 【修改点 1】SQL 增加 domain_ids 字段，这是执行硬过滤的物理依据
         all_jobs = conn.execute("SELECT securityId, job_name, description, skills, domain_ids FROM jobs").fetchall()
-
-        # 抽样 3300 个基准岗位
         sampled = random.sample(all_jobs, min(len(all_jobs), train_size + test_size))
-        # 记录基准岗位原始 ID
         sampled_job_ids = [str(j['securityId']) for j in sampled]
 
         train_lines, test_lines = [], []
-        # 训练集和测试集都会遵循同样的 75/25 概率分布
+        train_four_branch, test_four_branch = {}, {}
+
         for job in tqdm(sampled[:train_size], desc="Generating Train"):
-            line = self._process_single_job(job)
-            if line: train_lines.append(line)
+            line, aux = self._process_single_job(job)
+            if line:
+                train_lines.append(line)
+                if aux:
+                    train_four_branch.update(aux)
 
         for job in tqdm(sampled[train_size:], desc="Generating Test"):
-            line = self._process_single_job(job)
-            if line: test_lines.append(line)
+            line, aux = self._process_single_job(job)
+            if line:
+                test_lines.append(line)
+                if aux:
+                    test_four_branch.update(aux)
 
         train_path = os.path.join(self.output_dir, "train.txt")
         test_path = os.path.join(self.output_dir, "test.txt")
@@ -106,60 +126,197 @@ class KGATAXTrainingGenerator:
             f.write("\n".join(train_lines))
         with open(test_path, "w", encoding='utf-8') as f:
             f.write("\n".join(test_lines))
-        conn.close()
 
-        print(f"[OK] 任务 1 完成，共生成 {len(train_lines) + len(test_lines)} 条阶梯样本。")
+        if train_four_branch:
+            with open(os.path.join(self.output_dir, "train_four_branch.json"), "w", encoding='utf-8') as f:
+                json.dump(train_four_branch, f, ensure_ascii=False, indent=2)
+        if test_four_branch:
+            with open(os.path.join(self.output_dir, "test_four_branch.json"), "w", encoding='utf-8') as f:
+                json.dump(test_four_branch, f, ensure_ascii=False, indent=2)
+
+        conn.close()
+        print(f"[OK] 任务 1 完成，共生成 {len(train_lines) + len(test_lines)} 条阶梯样本；四分支条目 train={len(train_four_branch)} test={len(test_four_branch)}。")
         return sampled_job_ids
 
     def _process_single_job(self, job):
         """
-        处理单个岗位：实现 75/25 领域混合采样策略
+        处理单个岗位：优先使用 candidate_pool.candidate_records，分层正负样本（README 5.5）；
+        不足时回退到 final_top_500 + 原四级梯度。返回 (train_line, four_branch_aux_dict 或 None)。
         """
         job_raw_id = str(job['securityId'])
-        if job_raw_id not in self.job_id_to_idx: return None
+        if job_raw_id not in self.job_id_to_idx:
+            return None, None
 
-        # 1. 拼接查询文本
         query_text = f"{job['job_name'] or ''} {job['description'] or ''} {job['skills'] or ''}"
-
-        # --- 【核心修改】75% vs 25% 混合召回策略 ---
-        # 岗位节点的 domain_ids 是数据库中已有的确定信息
         use_domain = random.random() < 0.75
-
-        # 逻辑：75% 概率传入领域 ID 触发硬过滤；25% 概率传入 None 触发全库搜索
         target_domain = job['domain_ids'] if use_domain else None
-
-        # 执行召回：此时 recall_system.execute 内部会根据 target_domain 自动处理过滤
         recall_results = self.recall_system.execute(query_text, domain_id=target_domain)
-        # ------------------------------------------
 
-        candidates = recall_results.get('final_top_500', [])
-        # 如果召回结果不足 100 人，则该岗位不具备训练价值，直接跳过
-        if len(candidates) < 100: return None
+        pool = recall_results.get("candidate_pool")
+        records = getattr(pool, "candidate_records", None) if pool else None
 
-        # 2. 融合排序与抽样逻辑 (保持原有四级梯度逻辑)
+        if records and len(records) >= 100:
+            line, aux = self._build_from_candidate_pool(job_raw_id, records)
+            return line, aux
+        # 回退：使用 final_top_500，保持原四级梯度逻辑
+        candidates = recall_results.get("final_top_500", [])
+        if len(candidates) < 100:
+            return None, None
+
         recall_ranks = {str(aid): i for i, aid in enumerate(candidates)}
-        quality_list = sorted([(str(aid), self.author_quality_map.get(str(aid), 0.0)) for aid in candidates],
-                              key=lambda x: x[1], reverse=True)
+        quality_list = sorted(
+            [(str(aid), self.author_quality_map.get(str(aid), 0.0)) for aid in candidates],
+            key=lambda x: x[1], reverse=True,
+        )
         quality_ranks = {aid: i for i, (aid, _) in enumerate(quality_list)}
-
-        # 综合考虑检索相关性与作者学术质量
-        fused = sorted([(str(aid), 0.6 * recall_ranks[str(aid)] + 0.4 * quality_ranks[str(aid)]) for aid in candidates],
-                       key=lambda x: x[1])
-
+        fused = sorted(
+            [(str(aid), 0.6 * recall_ranks[str(aid)] + 0.4 * quality_ranks[str(aid)]) for aid in candidates],
+            key=lambda x: x[1],
+        )
         num_cand = len(fused)
-        # 构建四级梯度样本：Pos (Top 100), Fair (100-400 随机), Neutral (400 以后), EasyNeg (全库随机)
-        pos_ids = [str(self.get_ent_id(f"a_{a[0]}")) for a in fused[:min(100, num_cand)]]
-        fair_ids = [str(self.get_ent_id(f"a_{a[0]}")) for a in
-                    random.sample(fused[min(100, num_cand):min(400, num_cand)],
-                                  min(100, max(0, min(400, num_cand) - 100)))]
-        neutral_ids = [str(self.get_ent_id(f"a_{a[0]}")) for a in fused[min(400, num_cand):]]
-
+        pos_ids = [str(self.get_ent_id(f"a_{a[0]}")) for a in fused[: min(100, num_cand)]]
+        fair_ids = [
+            str(self.get_ent_id(f"a_{a[0]}"))
+            for a in random.sample(
+                fused[min(100, num_cand) : min(400, num_cand)],
+                min(100, max(0, min(400, num_cand) - 100)),
+            )
+        ]
+        neutral_ids = [str(self.get_ent_id(f"a_{a[0]}")) for a in fused[min(400, num_cand) :]]
         potential_pool = list(self.author_quality_map.keys())
         easy_neg_ids = [str(self.get_ent_id(f"a_{aid}")) for aid in random.sample(potential_pool, 100)]
-
         u_id = self.get_user_id(job_raw_id)
-        # 返回格式化后的训练行
-        return f"{u_id};{','.join(pos_ids)};{','.join(fair_ids)};{','.join(neutral_ids)};{','.join(easy_neg_ids)}"
+        line = f"{u_id};{','.join(pos_ids)};{','.join(fair_ids)};{','.join(neutral_ids)};{','.join(easy_neg_ids)}"
+        return line, None
+
+    def _classify_record(self, r, rank_by_score):
+        """将一条 CandidateRecord 分为 Strong Positive / Weak Positive / HardNeg / CollabNeg / FieldNeg（README 5.5）。"""
+        if not getattr(r, "passed_hard_filter", True):
+            return LABEL_FIELD_NEG
+        bucket = (getattr(r, "bucket_type") or "").strip().upper()
+        from_label = getattr(r, "from_label", False)
+        from_collab = getattr(r, "from_collab", False)
+        path_count = getattr(r, "path_count", 0) or 0
+
+        if (bucket == "A" and (from_label or path_count >= 2)):
+            return LABEL_STRONG_POS
+        if bucket in ("A", "B") and (from_label or path_count >= 2 or getattr(r, "from_vector", False)):
+            return LABEL_WEAK_POS
+        if from_collab and path_count == 1 and not getattr(r, "from_label", False) and not getattr(r, "from_vector", False):
+            return LABEL_COLLAB_NEG
+        if (from_label or path_count >= 2) and rank_by_score.get(r.author_id, 999) > 100:
+            return LABEL_HARD_NEG
+        return LABEL_FIELD_NEG
+
+    def _build_from_candidate_pool(self, job_raw_id, records):
+        """基于 candidate_records 构建分层正负样本并生成 train 行与四分支侧车。"""
+        u_id = self.get_user_id(job_raw_id)
+        pool_aids = {r.author_id for r in records}
+        max_score = max((r.candidate_pool_score or 0.0) for r in records) or 1.0
+        rank_by_score = {}
+        for i, r in enumerate(sorted(records, key=lambda x: -(x.candidate_pool_score or 0.0))):
+            rank_by_score[r.author_id] = i
+
+        strong_pos, weak_pos, hard_neg, collab_neg, field_neg = [], [], [], [], []
+        for r in records:
+            label = self._classify_record(r, rank_by_score)
+            if label == LABEL_STRONG_POS:
+                strong_pos.append(r)
+            elif label == LABEL_WEAK_POS:
+                weak_pos.append(r)
+            elif label == LABEL_HARD_NEG:
+                hard_neg.append(r)
+            elif label == LABEL_COLLAB_NEG:
+                collab_neg.append(r)
+            else:
+                field_neg.append(r)
+
+        pos_cap = min(100, len(strong_pos) + len(weak_pos))
+        pos_pool = sorted(strong_pos + weak_pos, key=lambda x: -(x.candidate_pool_score or 0.0))
+        pos_records = pos_pool[:pos_cap]
+        if len(pos_records) < 100:
+            all_by_score = sorted(records, key=lambda x: -(x.candidate_pool_score or 0.0))
+            pos_set = {r.author_id for r in pos_records}
+            for r in all_by_score:
+                if len(pos_records) >= 100:
+                    break
+                if r.author_id not in pos_set:
+                    pos_records.append(r)
+                    pos_set.add(r.author_id)
+        rest_weak = [r for r in pos_pool if r not in pos_records]
+        fair_records = (rest_weak + hard_neg)[:100]
+        neutral_records = field_neg[:150]
+        easy_neg_aids = [aid for aid in random.sample(list(self.author_quality_map.keys()), 200) if aid not in pool_aids][:100]
+        if len(easy_neg_aids) < 100:
+            easy_neg_aids += [r.author_id for r in collab_neg[: 100 - len(easy_neg_aids)]]
+
+        pos_ids = [str(self.get_ent_id(f"a_{r.author_id}")) for r in pos_records]
+        fair_ids = [str(self.get_ent_id(f"a_{r.author_id}")) for r in fair_records]
+        neutral_ids = [str(self.get_ent_id(f"a_{r.author_id}")) for r in neutral_records]
+        easy_neg_ids = [str(self.get_ent_id(f"a_{aid}")) for aid in easy_neg_aids]
+        if len(easy_neg_ids) < 100:
+            easy_neg_ids += [str(self.get_ent_id(f"a_{r.author_id}")) for r in collab_neg[: 100 - len(easy_neg_ids)]]
+
+        four_branch = {}
+        for eid, r in zip(pos_ids, pos_records):
+            four_branch[f"u{u_id}_i{eid}"] = self._export_four_branch_row(r, max_score)
+        for eid, r in zip(fair_ids, fair_records):
+            four_branch[f"u{u_id}_i{eid}"] = self._export_four_branch_row(r, max_score)
+        for eid, r in zip(neutral_ids, neutral_records):
+            four_branch[f"u{u_id}_i{eid}"] = self._export_four_branch_row(r, max_score)
+        for aid in easy_neg_aids:
+            eid = str(self.get_ent_id(f"a_{aid}"))
+            four_branch[f"u{u_id}_i{eid}"] = self._export_four_branch_row(None, max_score)
+        for r in collab_neg[: max(0, 100 - len(easy_neg_aids))]:
+            eid = str(self.get_ent_id(f"a_{r.author_id}"))
+            four_branch[f"u{u_id}_i{eid}"] = self._export_four_branch_row(r, max_score)
+
+        line = f"{u_id};{','.join(pos_ids)};{','.join(fair_ids)};{','.join(neutral_ids)};{','.join(easy_neg_ids)}"
+        return line, four_branch
+
+    def _export_four_branch_row(self, record, max_pool_score):
+        """导出一条 (job, author) 的四分支特征列表：recall 13 维、author_aux 12 维、interaction 8 维。"""
+        if record is None:
+            return {"recall": [0.0] * 13, "author_aux": [0.0] * 12, "interaction": [0.0] * 8}
+        max_rank = 500.0
+        r = record
+        v_rank = getattr(r, "vector_rank", None) or 0
+        l_rank = getattr(r, "label_rank", None) or 0
+        c_rank = getattr(r, "collab_rank", None) or 0
+        recall = [
+            1.0 if getattr(r, "from_vector", False) else 0.0,
+            1.0 if getattr(r, "from_label", False) else 0.0,
+            1.0 if getattr(r, "from_collab", False) else 0.0,
+            (getattr(r, "path_count", 0) or 0) / 3.0,
+            1.0 - min(v_rank / max_rank, 1.0) if v_rank else 0.0,
+            1.0 - min(l_rank / max_rank, 1.0) if l_rank else 0.0,
+            1.0 - min(c_rank / max_rank, 1.0) if c_rank else 0.0,
+            (float(r.candidate_pool_score or 0.0) / max_pool_score) if max_pool_score else 0.0,
+            {"A": 0.25, "B": 0.5, "C": 0.75, "D": 1.0}.get((getattr(r, "bucket_type") or "D").strip().upper(), 0.5),
+            1.0 if getattr(r, "is_multi_path_hit", False) else 0.0,
+            float(getattr(r, "vector_score_raw") or 0.0),
+            float(getattr(r, "label_score_raw") or 0.0),
+            float(getattr(r, "collab_score_raw") or 0.0),
+        ]
+        h = getattr(r, "h_index", None)
+        w = getattr(r, "works_count", None)
+        c = getattr(r, "cited_by_count", None)
+        author_aux = [
+            np.log1p(h) if h is not None else 0.0,
+            np.log1p(c) if c is not None else 0.0,
+            np.log1p(w) if w is not None else 0.0,
+        ] + [0.0] * 9
+        interaction = [
+            float(getattr(r, "topic_similarity") or 0.0),
+            float(getattr(r, "skill_coverage_ratio") or 0.0),
+            float(getattr(r, "domain_consistency") or 0.0),
+            float(getattr(r, "paper_hit_strength") or 0.0),
+            float(getattr(r, "recent_activity_match") or 0.0),
+            0.0,
+            0.0,
+            0.0,
+        ]
+        return {"recall": recall, "author_aux": author_aux, "interaction": interaction}
 
     def generate_kg_topology(self, sampled_job_ids: list):
         """

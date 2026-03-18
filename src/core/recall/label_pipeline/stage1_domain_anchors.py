@@ -1,11 +1,160 @@
-from typing import Tuple, Set, Dict, Any
+import re
+from typing import Any, Dict, List, Set, Tuple
 
 import numpy as np
 
 from src.core.recall.label_means import label_anchors
+from src.core.recall.label_means.hierarchy_guard import parse_json_dist
+from src.core.recall.label_means.label_debug import debug_print
 from src.utils.domain_utils import DomainProcessor
 from src.utils.tools import extract_skills
 from src.core.recall.label_path import Stage1Result
+
+
+def attach_anchor_contexts(
+    anchor_skills: Dict[str, Any],
+    query_text: str,
+    window: int = 10,
+) -> None:
+    """
+    为每个锚点增加 local_context（前后窗口字符）与 phrase_context（含该词的短语）。
+    原地修改 anchor_skills 中每项的 local_context / phrase_context。
+    """
+    if not query_text or not anchor_skills:
+        return
+    # 按空格/标点切分为片段，便于取 phrase
+    segments = re.split(r"[\s,，。；;!?、]+", query_text)
+    text_lower = query_text.lower()
+    for _vid, info in anchor_skills.items():
+        term = (info.get("term") or "").strip()
+        if not term:
+            info["local_context"] = ""
+            info["phrase_context"] = ""
+            continue
+        term_lower = term.lower()
+        pos = text_lower.find(term_lower)
+        if pos >= 0:
+            start = max(0, pos - window)
+            end = min(len(query_text), pos + len(term) + window)
+            info["local_context"] = query_text[start:end].strip()
+        else:
+            info["local_context"] = query_text[: 80 + window].strip() if len(query_text) > 80 else query_text.strip()
+        phrase = ""
+        for seg in segments:
+            if term in seg or term_lower in seg.lower():
+                phrase = seg.strip()
+                break
+        info["phrase_context"] = phrase or info.get("local_context", "")[: 30]
+
+
+def build_jd_hierarchy_profile(
+    anchor_skills: Dict[str, Any],
+    query_text: str,
+    recall,
+) -> Dict[str, Any]:
+    """
+    利用锚点对应的学术落点候选（SIMILAR_TO）与 vocabulary_topic_stats / vocabulary_domain_stats
+    聚合成 JD 的四层领域画像，供 Stage2 层级守卫使用。
+    返回 jd_profile: domain_weights, field_weights, subfield_weights, topic_weights,
+    active_domains, active_fields, active_subfields, active_topics, main_*_id。
+    """
+    jd_profile: Dict[str, Any] = {
+        "domain_weights": {},
+        "field_weights": {},
+        "subfield_weights": {},
+        "topic_weights": {},
+        "active_domains": [],
+        "active_fields": [],
+        "active_subfields": [],
+        "active_topics": [],
+        "main_domain_id": None,
+        "main_field_id": None,
+        "main_subfield_id": None,
+        "main_topic_id": None,
+    }
+    if not getattr(recall, "graph", None) or not getattr(recall, "stats_conn", None):
+        return jd_profile
+    # 每个锚点 vid 查 SIMILAR_TO 取 top 学术词，用其 topic/domain 分布加权聚合
+    SIMILAR_TOP_K = 5
+    all_domain: Dict[str, float] = {}
+    all_field: Dict[str, float] = {}
+    all_subfield: Dict[str, float] = {}
+    all_topic: Dict[str, float] = {}
+    total_weight = 0.0
+    for vid_str, info in (anchor_skills or {}).items():
+        try:
+            anchor_vid = int(vid_str)
+        except (TypeError, ValueError):
+            continue
+        try:
+            rows = recall.graph.run(
+                """
+                MATCH (v:Vocabulary {id: $vid})-[r:SIMILAR_TO]->(v2:Vocabulary)
+                WHERE r.score >= 0.5 AND coalesce(v2.type, 'concept') IN ['concept', 'keyword']
+                RETURN v2.id AS tid, r.score AS s
+                ORDER BY r.score DESC
+                LIMIT $k
+                """,
+                vid=anchor_vid,
+                k=SIMILAR_TOP_K,
+            ).data()
+        except Exception:
+            continue
+        for r in rows:
+            tid = r.get("tid")
+            if tid is None:
+                continue
+            try:
+                tid = int(tid)
+            except (TypeError, ValueError):
+                continue
+            w = float(r.get("s") or 0.5)
+            # 读 topic_stats
+            row_t = recall.stats_conn.execute(
+                "SELECT field_id, subfield_id, topic_id, field_dist, subfield_dist, topic_dist FROM vocabulary_topic_stats WHERE voc_id=?",
+                (tid,),
+            ).fetchone()
+            row_d = recall.stats_conn.execute(
+                "SELECT domain_dist FROM vocabulary_domain_stats WHERE voc_id=?",
+                (tid,),
+            ).fetchone()
+            if row_t:
+                fd = parse_json_dist(row_t[3])
+                sd = parse_json_dist(row_t[4])
+                td = parse_json_dist(row_t[5])
+                for k, v in fd.items():
+                    all_field[k] = all_field.get(k, 0.0) + v * w
+                for k, v in sd.items():
+                    all_subfield[k] = all_subfield.get(k, 0.0) + v * w
+                for k, v in td.items():
+                    all_topic[k] = all_topic.get(k, 0.0) + v * w
+            if row_d and row_d[0]:
+                dd = parse_json_dist(row_d[0])
+                for k, v in dd.items():
+                    all_domain[k] = all_domain.get(k, 0.0) + v * w
+            total_weight += w
+    if total_weight <= 0:
+        return jd_profile
+    def _norm(d: Dict[str, float]) -> Dict[str, float]:
+        s = sum(d.values())
+        return {k: v / s for k, v in d.items()} if s else d
+    jd_profile["domain_weights"] = _norm(all_domain)
+    jd_profile["field_weights"] = _norm(all_field)
+    jd_profile["subfield_weights"] = _norm(all_subfield)
+    jd_profile["topic_weights"] = _norm(all_topic)
+    jd_profile["active_domains"] = list(jd_profile.get("active_domains") or []) or list(all_domain.keys())[:10]
+    jd_profile["active_fields"] = list(all_field.keys())[:15]
+    jd_profile["active_subfields"] = list(all_subfield.keys())[:20]
+    jd_profile["active_topics"] = list(all_topic.keys())[:25]
+    if all_domain:
+        jd_profile["main_domain_id"] = max(all_domain, key=all_domain.get)
+    if all_field:
+        jd_profile["main_field_id"] = max(all_field, key=all_field.get)
+    if all_subfield:
+        jd_profile["main_subfield_id"] = max(all_subfield, key=all_subfield.get)
+    if all_topic:
+        jd_profile["main_topic_id"] = max(all_topic, key=all_topic.get)
+    return jd_profile
 
 
 def run_stage1(
@@ -43,6 +192,7 @@ def run_stage1(
             jd_terms_cleaned = None
     # 每次调用都覆盖上一轮缓存，避免跨查询串扰
     setattr(recall, "_jd_cleaned_terms", jd_terms_cleaned)
+    setattr(recall, "_jd_raw_text", text_for_skills or "")
 
     # 1) 领域与岗位：优先使用 DomainDetector，缺失时回退到旧实现
     if getattr(recall, "domain_detector", None) is not None:
@@ -125,6 +275,43 @@ def run_stage1(
 
     regex_str = DomainProcessor.build_neo4j_regex(active_domain_set)
 
+    # 4) 锚点上下文化 + JD 四层领域画像（供 Stage2 层级守卫）
+    query_for_ctx = (semantic_query_text or query_text) or ""
+    attach_anchor_contexts(anchor_skills, query_for_ctx, window=12)
+    # 条件化锚点表示：泛锚点带 JD 上下文，供 Stage2A 用 conditioned_vec 做落点打分
+    encoder = getattr(recall, "_query_encoder", None)
+    if encoder and query_for_ctx and anchor_skills:
+        anchor_ctx_count = 0
+        for _vid, info in anchor_skills.items():
+            term = (info.get("term") or "").strip()
+            if not term:
+                continue
+            try:
+                ctx = label_anchors.build_conditioned_anchor_representation(
+                    term, info, anchor_skills, query_for_ctx, encoder
+                )
+                if ctx.get("conditioned_vec") is not None:
+                    info["conditioned_vec"] = ctx["conditioned_vec"]
+                    info["anchor_vec"] = ctx.get("anchor_vec")
+                    info["local_phrase_vec"] = ctx.get("local_phrase_vec")
+                    info["co_anchor_vec"] = ctx.get("co_anchor_vec")
+                    info["jd_vec"] = ctx.get("jd_vec")
+                    info["_anchor_ctx"] = ctx
+                if anchor_ctx_count < 10:
+                    debug_print(2, f"[Anchor Context] anchor={term!r}", recall)
+                    debug_print(2, f"  local_phrases={ctx.get('local_phrases', [])[:8]}", recall)
+                    debug_print(2, f"  co_anchor_terms={ctx.get('co_anchor_terms', [])[:8]}", recall)
+                    debug_print(2, (
+                        "  weights="
+                        f"{{anchor:{ctx.get('w_anchor', 0):.2f}, local:{ctx.get('w_local', 0):.2f}, "
+                        f"co:{ctx.get('w_co', 0):.2f}, jd:{ctx.get('w_jd', 0):.2f}}}"
+                    ), recall)
+                    anchor_ctx_count += 1
+            except Exception:
+                pass
+    jd_profile = build_jd_hierarchy_profile(anchor_skills, query_for_ctx, recall)
+    jd_profile["active_domains"] = list(active_domain_set)
+
     debug_1: Dict[str, Any] = {
         "job_ids": job_ids,
         "job_previews": job_previews,
@@ -132,9 +319,10 @@ def run_stage1(
         "dominance": dominance,
         "industrial_kws": industrial_kws,
         "anchor_skills": anchor_skills,
+        "jd_profile": jd_profile,
     }
 
-    # 4) 回填 Stage1Result（供调试使用）
+    # 5) 回填 Stage1Result（含 jd_profile 供 Stage2 使用）
     recall._last_stage1_result = Stage1Result(
         active_domains=set(active_domain_set),
         domain_regex=regex_str,
@@ -143,6 +331,7 @@ def run_stage1(
         job_previews=list(job_previews),
         dominance=float(dominance),
         anchor_debug=dict(anchor_debug or {}),
+        jd_profile=jd_profile,
     )
 
     return active_domain_set, regex_str, anchor_skills, debug_1

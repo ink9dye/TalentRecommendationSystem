@@ -9,6 +9,7 @@ import numpy as np
 
 from config import DB_PATH, DATA_DIR, VOCAB_P95_PAPER_COUNT
 from src.utils.tools import extract_skills
+from src.core.recall.label_means.label_debug import debug_print
 
 # backbone_score 权重：in_jd_context / is_task_like 权重大于 job_freq，避免图热词再次主导
 BACKBONE_W_JOB_FREQ = 0.15
@@ -129,6 +130,74 @@ def _is_task_like(term_text: str) -> bool:
     return any(k in t for k in task_kws)
 
 
+# ---------- 短语中心性（无硬编码词表，用于锚点重排） ----------
+PHRASE_SPECIFICITY_MIN_LEN = 2
+CONTEXT_WINDOW_CHAR = 120
+ANCHOR_PHRASE_WEIGHT_FLOOR = 0.2
+
+
+def compute_phrase_specificity(phrase: str, all_phrases: List[str]) -> float:
+    """
+    短语特异性：越具体、越少被其它长短语包含则越高。无词表。
+    """
+    if not phrase or not all_phrases:
+        return 0.5
+    phrase = phrase.strip().lower()
+    if not phrase:
+        return 0.5
+    n_tokens = len(phrase.split())
+    # 被多少其它（更长或等长）短语包含
+    num_containing = 0
+    for p in all_phrases:
+        if not p or p.strip().lower() == phrase:
+            continue
+        p_lower = p.strip().lower()
+        if len(p_lower) >= len(phrase) and phrase in p_lower:
+            num_containing += 1
+    total = max(len(all_phrases), 1)
+    contain_ratio = num_containing / total
+    # 越少被包含、token 越多，特异性越高
+    spec = 0.3 + 0.15 * min(n_tokens, 6) + 0.55 * max(0, 1.0 - contain_ratio)
+    return min(1.0, max(0.0, spec))
+
+
+def compute_phrase_context_richness(phrase: str, raw_text: str, cleaned_terms: List[str]) -> float:
+    """
+    上下文丰富度：该短语在 JD 中所在窗口内，与多少其它技能短语共现。无词表。
+    """
+    if not phrase or not raw_text or not cleaned_terms:
+        return 0.5
+    phrase_lower = phrase.strip().lower()
+    text_lower = raw_text.lower()
+    pos = text_lower.find(phrase_lower)
+    if pos < 0:
+        return 0.3
+    start = max(0, pos - CONTEXT_WINDOW_CHAR)
+    end = min(len(raw_text), pos + len(phrase) + CONTEXT_WINDOW_CHAR)
+    window = raw_text[start:end].lower()
+    count = 0
+    for t in cleaned_terms:
+        if not t or t.strip().lower() == phrase_lower:
+            continue
+        if t.strip().lower() in window:
+            count += 1
+    return min(1.0, max(0.0, 0.2 + 0.8 * min(count / 5.0, 1.0)))
+
+
+def compute_anchor_taskness(phrase: str, raw_text: str, cleaned_terms: List[str]) -> float:
+    """
+    任务性：与上下文丰富度同源，描述“是否处于任务描述密集区”。无词表。
+    """
+    return compute_phrase_context_richness(phrase, raw_text, cleaned_terms)
+
+
+def compute_local_phrase_cluster_support(phrase: str, raw_text: str, cleaned_terms: List[str]) -> float:
+    """
+    局部短语簇支持：与 context_richness 同源，表示相邻技能短语支持度。无词表。
+    """
+    return compute_phrase_context_richness(phrase, raw_text, cleaned_terms)
+
+
 def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None) -> Dict[str, Any]:
     """
     复用 LabelRecallPath._extract_anchor_skills 的逻辑（移动到独立模块，便于后续拆分）。
@@ -158,7 +227,7 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
         if not cleaned_terms:
             cleaned_terms = None
 
-    # 打印 1：JD 清洗后的短语样本（若有），便于观察与本次查询语境相关的技能集合
+    debug_print(1, "\n" + "-" * 80 + "\n[Step2] 锚点选择\n" + "-" * 80, label)
     sample_cleaned = list(cleaned_terms)[:50] if cleaned_terms else []
     if getattr(label, "verbose", False):
         print(f"[Step2 Debug] JD 清洗后技能短语样本({len(sample_cleaned)}): {sample_cleaned}")
@@ -277,8 +346,38 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
         scored.append((score, r))
 
     scored.sort(key=lambda x: x[0], reverse=True)
+    raw_text = (getattr(label, "_jd_raw_text", None) or "") or ""
+    all_phrases = list(cleaned_terms) if cleaned_terms else []
+    anchor_scored_rows: List[Dict[str, Any]] = []
+    for bb_score, r in scored:
+        term = (r.get("term") or "").strip()
+        spec = ctx = task = local = 0.5
+        if raw_text and all_phrases and term:
+            spec = compute_phrase_specificity(term, all_phrases)
+            ctx = compute_phrase_context_richness(term, raw_text, all_phrases)
+            task = compute_anchor_taskness(term, raw_text, all_phrases)
+            local = compute_local_phrase_cluster_support(term, raw_text, all_phrases)
+        w = (ANCHOR_PHRASE_WEIGHT_FLOOR + (1.0 - ANCHOR_PHRASE_WEIGHT_FLOOR) * spec) * (
+            ANCHOR_PHRASE_WEIGHT_FLOOR + (1.0 - ANCHOR_PHRASE_WEIGHT_FLOOR) * ctx
+        ) * (ANCHOR_PHRASE_WEIGHT_FLOOR + (1.0 - ANCHOR_PHRASE_WEIGHT_FLOOR) * task) * (
+            ANCHOR_PHRASE_WEIGHT_FLOOR + (1.0 - ANCHOR_PHRASE_WEIGHT_FLOOR) * local
+        )
+        final_score = bb_score * w
+        anchor_scored_rows.append({
+            "tid": r.get("vid"),
+            "term": term or r.get("term"),
+            "backbone_score": bb_score,
+            "specificity": spec,
+            "context_richness": ctx,
+            "taskness": task,
+            "local_cluster_support": local,
+            "final_anchor_score": final_score,
+            "_row": r,
+        })
+    anchor_scored_rows.sort(key=lambda x: x["final_anchor_score"], reverse=True)
     top_n = int(getattr(label, "ANCHOR_FINAL_TOP_K", 20))
-    rows = [r for _, r in scored[:top_n]]
+    rows = [x["_row"] for x in anchor_scored_rows[:top_n]]
+    borderline_rejected = anchor_scored_rows[top_n : top_n + 10]
 
     terms_after_melt = [r.get("term") or "" for r, *_ in candidates_for_score]
     stats = {
@@ -292,34 +391,193 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
         "dropped_terms": dropped_terms[:50],
         "after_topN": len(rows),
         "terms_after_topN": [r.get("term") or "" for r in rows],
+        "anchor_scored_rows": anchor_scored_rows[:50],
+        "borderline_rejected": borderline_rejected,
     }
     label.debug_info.anchor_melt_stats = stats
     label._last_anchor_melt_stats = stats
-    if getattr(label, "verbose", False):
-        n_cov = sum(1 for _, reason, _ in dropped_terms if reason == "cov_j")
-        n_len = sum(1 for _, reason, _ in dropped_terms if reason == "length")
-        print(
-            f"[Step2 Debug] REQUIRE_SKILL 原始 rows={n_original_rows}，"
-            f"层1 噪声过滤后候选={len(candidates_for_score)}；cov_j 砍掉 {n_cov} 个，length 砍掉 {n_len} 个"
-        )
-        for term, reason, value in dropped_terms[:30]:
-            print(f"[Step2 Debug] REQUIRE_SKILL 丢弃: term={term} reason={reason} value={value}")
-        print(f"[Step2 Debug] backbone_score 排序后 TopN={top_n} 样本: {[r.get('term') or '' for r in rows[:20]]}")
+
+    n_cov = sum(1 for _, reason, _ in dropped_terms if reason == "cov_j")
+    n_len = sum(1 for _, reason, _ in dropped_terms if reason == "length")
+    debug_print(1, f"[Step2] cleaned_skills 总数={len(all_phrases) or 0}", label)
+    debug_print(1, f"[Step2] REQUIRE_SKILL 原始 rows={n_original_rows}，层1过滤后候选={len(candidates_for_score)}；cov_j 砍掉 {n_cov} 个，length 砍掉 {n_len} 个", label)
+    debug_print(3, "[Step2 Reject Samples] term | reason | value", label)
+    for term, reason, value in dropped_terms[:15]:
+        debug_print(3, f"  {term[:30]} | {reason} | {value}", label)
+
+    debug_print(2, "[Step2 Anchor Score Breakdown] term | backbone | specificity | context_richness | taskness | local_cluster | final | rank", label)
+    for i, row in enumerate(anchor_scored_rows[:20], 1):
+        t = (row.get("term") or "")[:24]
+        debug_print(2, (
+            f"  {i:>2} {t:<24} | "
+            f"bb={row.get('backbone_score', 0):.3f} | "
+            f"spec={row.get('specificity', 0):.3f} | "
+            f"ctx={row.get('context_richness', 0):.3f} | "
+            f"task={row.get('taskness', 0):.3f} | "
+            f"cluster={row.get('local_cluster_support', 0):.3f} | "
+            f"final={row.get('final_anchor_score', 0):.3f} | "
+            f"rank={i}"
+        ), label)
+
+    debug_print(2, "[Step2 Borderline Rejected] term | final | reason", label)
+    for row in borderline_rejected[:10]:
+        t = (row.get("term") or "")[:30]
+        debug_print(2, f"  {t:<30} | {row.get('final_anchor_score', 0):.3f} | rank_cutoff", label)
 
     if not rows:
-        if getattr(label, "verbose", False):
-            print("[Step2 Debug] 层2 排序+TopN 后无锚点可用。")
+        debug_print(1, "[Step2] 层2 排序+TopN 后无锚点可用。", label)
         return {}
 
-    anchors = {str(r.get("vid")): {"term": r.get("term")} for r in rows}
+    all_phrases_for_spec = list(cleaned_terms) if cleaned_terms else []
+    anchors = {}
+    for i, x in enumerate(anchor_scored_rows[:top_n], 1):
+        r = x["_row"]
+        vid_str = str(r.get("vid"))
+        term = r.get("term")
+        spec = x.get("specificity", compute_phrase_specificity(term or "", all_phrases_for_spec) if all_phrases_for_spec else 0.5)
+        anchors[vid_str] = {
+            "term": term,
+            "specificity": spec,
+            "final_anchor_score": x.get("final_anchor_score"),
+            "backbone_score": x.get("backbone_score"),
+            "context_richness": x.get("context_richness"),
+            "taskness": x.get("taskness"),
+            "local_cluster_support": x.get("local_cluster_support"),
+        }
 
-    if getattr(label, "verbose", False):
-        print(f"[Step2 Debug] 最终 industrial anchors 数量: {len(anchors)}")
-        print(
-            "[Step2 Debug] 最终 anchors 词样本:",
-            [v["term"] for _, v in list(anchors.items())[:20]],
-        )
+    debug_print(1, f"[Step2] 最终 industrial anchors 数量: {len(anchors)}", label)
+    debug_print(2, "[Step2 Final Anchors] tid | term | final_anchor_score", label)
+    for vid_str, info in list(anchors.items())[:30]:
+        t = (info.get("term") or "")[:30]
+        debug_print(2, f"  {vid_str} | {t:<30} | {info.get('final_anchor_score', 0):.3f}", label)
     return anchors
+
+
+# ---------- 条件化锚点表示（带 JD 上下文，无词表） ----------
+LOCAL_CONTEXT_WINDOW = 100
+CO_ANCHOR_TOP_K = 5
+CONDITIONED_W_ANCHOR_HIGH_SPEC = 0.55
+CONDITIONED_W_LOCAL_HIGH_SPEC = 0.20
+CONDITIONED_W_CO_HIGH_SPEC = 0.15
+CONDITIONED_W_JD_HIGH_SPEC = 0.10
+CONDITIONED_W_ANCHOR_LOW_SPEC = 0.25
+CONDITIONED_W_LOCAL_LOW_SPEC = 0.35
+CONDITIONED_W_CO_LOW_SPEC = 0.25
+CONDITIONED_W_JD_LOW_SPEC = 0.15
+
+
+def build_anchor_local_context(anchor_term: str, raw_text: str, cleaned_terms: List[str], window: int = LOCAL_CONTEXT_WINDOW) -> List[str]:
+    """锚点在 JD 中的局部短语窗口（前后各 window 字符内出现的其它技能短语）。无词表。"""
+    if not anchor_term or not raw_text:
+        return []
+    anchor_lower = anchor_term.strip().lower()
+    text_lower = raw_text.lower()
+    pos = text_lower.find(anchor_lower)
+    if pos < 0:
+        return []
+    start = max(0, pos - window)
+    end = min(len(raw_text), pos + len(anchor_term) + window)
+    snippet = raw_text[start:end].lower()
+    out = []
+    for t in cleaned_terms:
+        if not t or t.strip().lower() == anchor_lower:
+            continue
+        if t.strip().lower() in snippet:
+            out.append(t.strip())
+    return out[:10]
+
+
+def collect_co_anchor_terms(anchor_term: str, selected_anchor_terms: List[str], raw_text: str, top_k: int = CO_ANCHOR_TOP_K) -> List[str]:
+    """与当前锚点在 JD 中共现的其它锚点词（同窗口内出现），用于条件化表示。无词表。"""
+    if not anchor_term or not raw_text or not selected_anchor_terms:
+        return []
+    anchor_lower = anchor_term.strip().lower()
+    text_lower = raw_text.lower()
+    pos = text_lower.find(anchor_lower)
+    if pos < 0:
+        return []
+    start = max(0, pos - LOCAL_CONTEXT_WINDOW)
+    end = min(len(raw_text), pos + len(anchor_term) + LOCAL_CONTEXT_WINDOW)
+    snippet = raw_text[start:end].lower()
+    out = []
+    for t in selected_anchor_terms:
+        if not t or t.strip().lower() == anchor_lower:
+            continue
+        if t.strip().lower() in snippet:
+            out.append(t.strip())
+    return out[:top_k]
+
+
+def build_conditioned_anchor_representation(
+    anchor_term: str,
+    anchor_info: Dict[str, Any],
+    anchor_skills: Dict[str, Any],
+    raw_text: str,
+    encoder: Any,
+) -> Dict[str, Any]:
+    """
+    构造条件化锚点表示：anchor_vec + local_phrase_vec + co_anchor_vec + jd_vec 加权组合。
+    泛锚点（specificity 低）更多依赖上下文，具体锚点更多依赖自身。无词表。
+    """
+    out: Dict[str, Any] = {
+        "anchor_vec": None,
+        "local_phrase_vec": None,
+        "co_anchor_vec": None,
+        "jd_vec": None,
+        "conditioned_vec": None,
+        "local_phrases": [],
+        "co_anchor_terms": [],
+    }
+    if not anchor_term or not raw_text or encoder is None:
+        return out
+    cleaned_list = [info.get("term") or "" for info in (anchor_skills or {}).values() if info.get("term")]
+    try:
+        v_anchor, _ = encoder.encode(anchor_term.strip()[:200])
+        if v_anchor is None:
+            return out
+        v_anchor = np.asarray(v_anchor, dtype=np.float32).flatten()
+    except Exception:
+        return out
+    v_jd, _ = encoder.encode(raw_text[:800])
+    if v_jd is None:
+        v_jd = v_anchor
+    else:
+        v_jd = np.asarray(v_jd, dtype=np.float32).flatten()
+    local_phrases = build_anchor_local_context(anchor_term, raw_text, cleaned_list)
+    other_terms = [info.get("term") or "" for vid, info in (anchor_skills or {}).items() if str(info.get("term", "")).strip().lower() != anchor_term.strip().lower()]
+    co_terms = collect_co_anchor_terms(anchor_term, other_terms, raw_text)
+    out["local_phrases"] = local_phrases
+    out["co_anchor_terms"] = co_terms
+    try:
+        if local_phrases:
+            text_local = " ; ".join(local_phrases[:5])
+            v_local, _ = encoder.encode(text_local[:300])
+            out["local_phrase_vec"] = np.asarray(v_local, dtype=np.float32).flatten() if v_local is not None else v_anchor.copy()
+        else:
+            out["local_phrase_vec"] = v_anchor.copy()
+        if co_terms:
+            text_co = " ; ".join(co_terms[:5])
+            v_co, _ = encoder.encode(text_co[:300])
+            out["co_anchor_vec"] = np.asarray(v_co, dtype=np.float32).flatten() if v_co is not None else v_anchor.copy()
+        else:
+            out["co_anchor_vec"] = v_anchor.copy()
+    except Exception:
+        out["local_phrase_vec"] = v_anchor.copy()
+        out["co_anchor_vec"] = v_anchor.copy()
+    out["anchor_vec"] = v_anchor
+    out["jd_vec"] = v_jd
+    specificity = float(anchor_info.get("specificity", 0.6))
+    if specificity >= 0.8:
+        w_a, w_l, w_c, w_j = CONDITIONED_W_ANCHOR_HIGH_SPEC, CONDITIONED_W_LOCAL_HIGH_SPEC, CONDITIONED_W_CO_HIGH_SPEC, CONDITIONED_W_JD_HIGH_SPEC
+    else:
+        w_a, w_l, w_c, w_j = CONDITIONED_W_ANCHOR_LOW_SPEC, CONDITIONED_W_LOCAL_LOW_SPEC, CONDITIONED_W_CO_LOW_SPEC, CONDITIONED_W_JD_LOW_SPEC
+    out["w_anchor"], out["w_local"], out["w_co"], out["w_jd"] = w_a, w_l, w_c, w_j
+    conditioned = w_a * v_anchor + w_l * out["local_phrase_vec"] + w_c * out["co_anchor_vec"] + w_j * v_jd
+    norm = np.linalg.norm(conditioned)
+    if norm > 1e-9:
+        conditioned = conditioned / norm
+    out["conditioned_vec"] = conditioned
+    return out
 
 
 def supplement_anchors_from_jd_vector(label, query_text, anchor_skills, total_j=None, top_k=None, active_domain_ids=None) -> None:

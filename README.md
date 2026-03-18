@@ -70,27 +70,28 @@ TalentRecommendationSystem-master/
     │   │   ├── candidate_pool.py   # 统一候选池结构：CandidateRecord、CandidatePool、PoolDebugSummary
     │   │   ├── total_recall.py     # 多路召回总控（向量 / 标签 / 协同）+ 候选池构建 / 打分 / enrich / 硬过滤 / 分桶
     │   │   ├── vector_path.py      # 向量路：Faiss + 向量索引召回作者
-    │   │   ├── label_path.py       # 标签路入口：编排五阶段流水线（label_pipeline + label_means）
+    │   │   ├── label_path.py       # 标签路入口：编排五阶段流水线（label_pipeline + label_means）；Stage1Result 含 jd_profile 传 Stage2
     │   │   ├── label_path_pre.py   # 标签路旧版/备用实现（内部或历史参考）
     │   │   ├── works_to_authors.py # 论文级得分聚合为作者级，供标签路 Stage5 使用
     │   │   ├── diagnose_embedding_neighbors.py # 嵌入邻居诊断工具（开发与调试用）
     │   │   ├── collaboration_path.py # 协同路：基于本地协作索引的协同召回
-    │   │   ├── label_means/        # 标签路子模块：基础设施、锚点、扩展、词/论文打分与调试
+    │   │   ├── label_means/        # 标签路子模块：基础设施、锚点、扩展、层级守卫、词/论文打分与调试
     │   │   │   ├── infra.py        # 资源管理：Neo4j / Faiss / vocab_stats.db / 簇中心等
     │   │   │   ├── base.py
     │   │   │   ├── label_anchors.py
-    │   │   │   ├── label_expansion.py
+    │   │   │   ├── hierarchy_guard.py  # 层级守卫：分布/纯度/熵、hierarchical_fit（缺失 topic 用 None 不按 0）、泛词惩罚、landing/expansion 打分、should_drop_term（仅 2 条硬规则）、score_term_record（主分+轻 gate）、allow_primary_to_expand（放宽）
+    │   │   │   ├── label_expansion.py  # 学术落点+扩展；get_vocab_hierarchy_snapshot、collect_landing_candidates(jd_profile)、allow_primary_to_expand
     │   │   │   ├── term_scoring.py
     │   │   │   ├── paper_scoring.py
     │   │   │   ├── simple_factors.py
     │   │   │   ├── advanced_metrics.py
     │   │   │   └── label_debug_cli.py
     │   │   └── label_pipeline/      # 标签路五阶段流水线实现
-    │   │       ├── stage1_domain_anchors.py   # 领域探测与工业侧锚点提取
-    │   │       ├── stage2_expansion.py       # 学术落点与学术侧补充：先 anchor→academic landing（跨类型 SIMILAR_TO，可选 JD 向量），再 dense/簇/共现补充
-    │   │       ├── stage3_term_filtering.py  # 词过滤与权重（IDF、纯度、语义守门等）
-    │   │       ├── stage4_paper_recall.py    # 论文召回与贡献度
-    │   │       └── stage5_author_rank.py     # 作者排序与截断
+    │   │       ├── stage1_domain_anchors.py   # 领域与锚点；attach_anchor_contexts、build_jd_hierarchy_profile，产出 jd_profile 与锚点 local_context/phrase_context
+    │   │       ├── stage2_expansion.py       # 学术落点+扩展；接收 jd_profile，raw_candidates 带 subfield_fit/topic_fit/landing_score/cluster_id 等
+    │   │       ├── stage3_term_filtering.py  # 词过滤与权重：轻硬过滤（仅 2 条）→ 按 final_score 排序保留 top_k（STAGE3_TOP_K）；score_term_record 主分+轻 gate；STAGE3_DETAIL_DEBUG 明细打印
+    │   │       ├── stage4_paper_recall.py    # 论文二层召回、领域软奖励、TERM_MAX_PAPERS/per-term 限流、MELT_RATIO
+    │   │       └── stage5_author_rank.py     # 作者排序与截断；预留 CoverageBonus/HierarchyConsistency/FamilyBalancePenalty
     │   └── ranking/
     │       ├── ranking_engine.py   # 精排引擎：融合召回与 KGAT 打分
     │       ├── rank_scorer.py      # KGAT 子空间打分逻辑
@@ -198,7 +199,7 @@ TalentRecommendationSystem-master/
      - 作者协作关系索引。
 
 4. **KGAT‑AX 训练数据与图索引构建**
-   - `kgat_ax/generate_training_data.py` 使用 `TotalRecallSystem` 在线召回，构造「岗位 → 专家」的四级梯度训练样本（Pos / Fair / Neutral / EasyNeg），并将全图导出为加权三元组 `kg_final.txt`。
+   - `kgat_ax/generate_training_data.py` 优先基于 `candidate_pool.candidate_records` 构造分层正负样本（Strong/Weak Positive、EasyNeg/FieldNeg/HardNeg/CollabNeg），产出 `train.txt` / `test.txt` 与可选四分支侧车 `train_four_branch.json` / `test_four_branch.json`，并将全图导出为加权三元组 `kg_final.txt`。
    - `kgat_ax/build_kg_index.py` 将 `kg_final.txt` 导入 SQLite，生成高性能的 `kg_triplets` 覆盖索引。
 
 5. **图神经网络训练（KGAT‑AX）**
@@ -686,7 +687,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 | **输入** | JD 文本、query_vector、领域约束（domain_ids）、skills 清洗结果（来自 Job / 总控） |
 | **依赖** | **基础设施**：Neo4j、vocab_stats.db（vocabulary_domain_stats、vocabulary_cooccurrence、vocabulary_cooc_domain_ratio 等）、Faiss（Job、Vocabulary）+ 词汇向量 .npy、簇索引（cluster_members、voc_to_clusters、cluster_centroids）。**配置**：config（DB_PATH、VOCAB_P95_PAPER_COUNT、SIMILAR_TO_TOP_K/MIN_SCORE 等）、domain_config（DOMAIN_MAP、decay）、LabelRecallPath 类常量。**工具**：DomainDetector、extract_skills、DomainProcessor、time_features、get_decay_rate_for_domains。 |
 | **输出** | 候选作者 ID 列表、RecallDebugInfo（领域探测、锚点、扩展、词权重、论文/作者规模等） |
-| **核心中间产物** | **Stage1**：Stage1Result、anchor_skills、_jd_cleaned_terms、job_ids、regex_str。**Stage2A**：primary_landings（含 domain_fit；_term_in_active_domains 含主领域守卫）。**Stage2B**：raw_candidates（term_role、domain_fit、parent_anchor、parent_primary）。**Stage3**：score_map、term_map、idf_map、term_role_map、term_source_map、parent_anchor_map、parent_primary_map、tag_purity_debug；label_path 据此构建 term_confidence_map、**term_uniqueness_map**。**Stage4**：author_papers_list（按作者聚合的论文及 hits/weight/title/year/domains）。**Stage5**：paper_map、每篇 contribution（含 term_confidence、**term_uniqueness**）、作者聚合分、最终 author_id 列表。 |
+| **核心中间产物** | **Stage1**：Stage1Result（**含 jd_profile**）、anchor_skills（含 local_context、phrase_context）、_jd_cleaned_terms、job_ids、regex_str。**Stage2A**：primary_landings（含 domain_fit、**landing_score**、**subfield_fit**、**topic_fit** 等；有 jd_profile 时做层级 fit 与硬门槛）。**Stage2B**：raw_candidates（term_role、domain_fit、parent_anchor、parent_primary、**subfield_fit**、**topic_fit**、**landing_score**、**cluster_id**、**main_subfield_match** 等）。**Stage3**：score_map、term_map、idf_map、term_role_map、term_source_map、parent_anchor_map、parent_primary_map、tag_purity_debug（经 **轻硬过滤 should_drop_term**、**score_term_record（主分+轻 gate）**、**按 final_score 排序保留 top_k**）；label_path 据此构建 term_confidence_map、term_uniqueness_map。**Stage4**：author_papers_list。**Stage5**：paper_map、contribution、作者聚合分、最终 author_id 列表。 |
 | **主要问题** | 缩写歧义、任务词泛化、领域漂移、万金油词与弱相关论文需靠熔断与权重抑制 |
 
 #### 3.1 标签路数据流与阶段总览
@@ -696,22 +697,22 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 | **Stage1** | query_vector, query_text, domain_id | active_domains, domain_regex, anchor_skills, Stage1Result | DomainDetector；label_anchors.extract_anchor_skills、supplement_anchors_from_jd_vector；tools.extract_skills |
 | **Stage2A** | prepared_anchors, active_domain_set, query_vector, 可选 jd_field/subfield/topic_ids | primary_landings（含 domain_fit） | retrieve_academic_term_by_similar_to；_term_in_active_domains（含主领域守卫）；_compute_domain_fit；select_primary_academic_landings（domain_fit≥0.45 才可做 primary） |
 | **Stage2B** | primary_landings（仅高可信参与扩散）, active_domain_set, jd_*_ids | raw_candidates（含 term_role、domain_fit、parent_primary） | expand_from_vocab_dense_neighbors/cluster_members/cooccurrence_support（domain_fit/domain_span 门控）；merge_primary_and_support_terms；_expanded_to_raw_candidates |
-| **Stage3** | raw_candidates（含 term_role、identity_score、domain_fit、parent_anchor、parent_primary）, query_vector, anchor_vids | score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map | passes_identity_gate；passes_topic_consistency；score_term_expansion_quality；compose_term_final_score（六因子：base×source_weight×domain_gate×task_consistency×role_penalty×expansion_penalty）；term_scoring |
-| **Stage4** | vocab_ids, regex_str | author_papers_list（按作者聚合的论文及 hits） | Neo4j Cypher（HAS_TOPIC + 3% 熔断）；paper_scoring 在 Stage5 用 |
-| **Stage5** | author_papers_list, score_map, term_map, debug_1（含 term_role_map、term_confidence_map） | author_id 列表、last_debug_info（含 author_evidence_by_term_role） | paper_scoring.compute_contribution（paper_term_contrib=term_weight×term_confidence×paper_match_strength；护栏 5）；accumulate_author_scores；aggregate_author_evidence_by_term_role；AUTHOR_BEST_PAPER_MIN_RATIO |
+| **Stage3** | raw_candidates（含 term_role、retrieval_role、identity_score、domain_fit、parent_anchor、parent_primary 等）, query_vector, anchor_vids | score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map, **paper_terms** | **轻硬过滤** should_drop_term（仅 2 条）；passes_identity_gate；passes_topic_consistency；**score_term_record**（base=0.35·semantic+0.20·context+0.20·subfield_fit+0.15·topic_fit+0.10·multi_source，轻 gate）；**按 final_score 排序 top_k**（STAGE3_TOP_K=20）；**select_terms_for_paper_recall** 按 family 分桶，每 family 1 primary + 1 support，cluster 不进 paper recall，上限 PAPER_RECALL_MAX_TERMS(12) |
+| **Stage4** | vocab_ids, regex_str, term_scores, term_retrieval_roles | author_papers_list（按作者聚合的论文及 hits） | 二层召回；**role_weight**（paper_primary=1.0、paper_support=0.7）；MELT_RATIO、domain 软奖励、per-term 限流；paper_scoring 在 Stage5 用 |
+| **Stage5** | author_papers_list, score_map, term_map, debug_1（含 term_role_map、term_confidence_map、**term_family_keys**） | author_id 列表、last_debug_info（含 author_evidence_by_term_role） | paper_scoring.compute_contribution（护栏 5）；accumulate_author_scores；**CoverageBonus**、**FamilyBalancePenalty**（family 覆盖与平衡）；time_weight、recency；AUTHOR_BEST_PAPER_MIN_RATIO |
 
 #### 3.2 各阶段目的、关键步骤与关键数据（概要）
 
 - **Stage1 领域与锚点**：得到 active_domains、domain_regex、工业侧锚点（+ 可选 JD 向量补充）；无锚点时后续短路。
 - **Stage2A 学术落点**：锚点 → 跨类型 SIMILAR_TO + 可选 JD 向量 → primary_landings（每锚点 1～3 个主落点）。
 - **Stage2B 学术侧补充**：围绕 primary 做 dense 近邻、簇内、共现扩展，输出 List[ExpandedTermCandidate]（term_role：primary / dense_expansion / cluster_expansion / cooc_expansion）。
-- **Stage3 词过滤与权重**：身份闸门 → topic 闸门 → quality 分 → compose 最终分 → 质量闸门；输出 score_map、term_map、idf_map、tag_purity_debug。
+- **Stage3 词过滤与权重**：**轻硬过滤**（仅 2 条：outside_subfield_mass>0.95 且 topic_fit<0.02；main_subfield_miss 且 subfield_fit<0.05 且 topic_fit<0.02）→ 身份闸门 → topic 闸门 → quality 分 → **主分+轻 gate 最终分**（base×gate，不再乘性硬杀）→ **按 final_score 排序保留 top_k**（默认 20），不断流；输出 score_map、term_map、idf_map、tag_purity_debug；可开 STAGE3_DETAIL_DEBUG 打印每词 base_score/hierarchy_score/penalties/final_score/reject_reason。
 - **Stage4 论文召回**：Neo4j HAS_TOPIC + 3% 熔断 + 可选 domain 正则 → author_papers_list（按作者聚合，单次上限 2000 篇）。
 - **Stage5 作者排序**：paper_scoring.compute_contribution（含 term_role 权重与护栏 5）→ accumulate_author_scores → AUTHOR_BEST_PAPER_MIN_RATIO 过滤 → 排序截断。
 
 #### 3.2.1 各阶段详细说明（作用、思路、逻辑、输入输出、公式、表与索引）
 
-以下按阶段给出：**作用**、**思路**、**逻辑流程**、**输入/输出参数（名字与含义）**、**主要公式**、**调用的表或知识图谱**。实现文件：`label_pipeline/stage1_domain_anchors.py`、`stage2_expansion.py`、`stage3_term_filtering.py`、`stage4_paper_recall.py`、`stage5_author_rank.py`，以及 `label_means` 下 `label_anchors`、`label_expansion`、`term_scoring`、`paper_scoring` 等。
+以下按阶段给出：**作用**、**思路**、**逻辑流程**、**输入/输出参数（名字与含义）**、**主要公式**、**调用的表或知识图谱**。实现文件：`label_pipeline/stage1_domain_anchors.py`、`stage2_expansion.py`、`stage3_term_filtering.py`、`stage4_paper_recall.py`、`stage5_author_rank.py`，以及 `label_means` 下 `label_anchors`、`label_expansion`、**`hierarchy_guard`**（分布/纯度/熵、层级 fit、泛词惩罚、landing 与 expansion 打分）、`term_scoring`、`paper_scoring` 等。
 
 ---
 
@@ -719,13 +720,13 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 
 | 项 | 说明 |
 |----|------|
-| **作用** | 确定本次召回的**活跃领域集合**（active_domain_set）与 **Neo4j 领域正则**（regex_str），并产出**工业侧锚点词**（anchor_skills：岗位技能 + 可选 JD 向量补充），供 Stage2 做「技能→学术词」落点。无锚点时整条标签路短路。 |
-| **思路** | 先由岗位/向量推断「本 query 属于哪些领域」，再在这些领域对应的岗位上抽取「高频且非泛词」的技能作为锚点；可选地用 JD 文本在词汇向量索引上做 Top-K 检索，把与 JD 语义贴近的学术词补进锚点；为每个锚点打 anchor_type，供 Stage2/3 **做门槛与扩散权限控制**。 |
-| **逻辑流程** | ① 预清洗 JD 技能（`extract_skills`）→ 写入 `recall._jd_cleaned_terms`；② 领域与岗位探测：若有 `DomainDetector` 则 `detect_from_jobs`（Job Faiss + Neo4j 统计 domain_ids）得 job_ids、inferred_domains、dominance，否则回退 `_detect_domain_context`；③ 锚点提取：`label_anchors.extract_anchor_skills`（Neo4j REQUIRE_SKILL + **3% 熔断** cov_j ≥ ANCHOR_MELT_COV_J + backbone_score 排序 + TopN）；④ 可选 `supplement_anchors_from_jd_vector`（JD 编码后在 Vocabulary Faiss 上 Top-K）；⑤ `label_anchors.classify_anchor_type` 打 anchor_type；⑥ 若指定 domain_id 则优先用，否则由 inferred_domains + 向量语义排序取 ACTIVE_DOMAINS_TOP_K；⑦ `DomainProcessor.build_neo4j_regex(active_domain_set)` 得到 regex_str；⑧ 写入 `recall._last_stage1_result`（Stage1Result）。 |
-| **输入参数（名字与含义）** | **query_vector**：JD 编码向量，用于领域语义排序与锚点 backbone 中的 sim；**query_text** / **semantic_query_text**：JD 文本，供技能清洗与 JD 向量补充；**domain_id**：可选，指定则优先作 active_domains。 |
-| **输出参数（名字与含义）** | **active_domain_set**：Set[int]，参与召回的领域 ID；**regex_str**：str，Neo4j 领域正则，供 Stage4 过滤 Work.domain_ids；**anchor_skills**：Dict[tid_str, { term, anchor_type }]，工业锚点，key 为 Vocabulary id；**debug_1**：dict，含 job_ids、job_previews、anchor_debug、dominance、industrial_kws、anchor_skills 等，供 Stage5 与调试。 |
+| **作用** | 确定本次召回的**活跃领域集合**（active_domain_set）与 **Neo4j 领域正则**（regex_str），并产出**工业侧锚点词**（anchor_skills：岗位技能 + 可选 JD 向量补充），以及**JD 四层领域画像**（jd_profile）与锚点**局部上下文**（local_context、phrase_context），供 Stage2 做「技能→学术词」落点与层级守卫。无锚点时整条标签路短路。 |
+| **思路** | 先由岗位/向量推断「本 query 属于哪些领域」，再在这些领域对应的岗位上抽取「高频且非泛词」的技能作为锚点；可选地用 JD 文本在词汇向量索引上做 Top-K 检索，把与 JD 语义贴近的学术词补进锚点；为每个锚点打 anchor_type；**新增** `attach_anchor_contexts` 为锚点附加 local_context / phrase_context，**新增** `build_jd_hierarchy_profile` 利用锚点 SIMILAR_TO 学术词与 vocabulary_topic_stats/domain_stats 聚合成 jd_profile（domain/field/subfield/topic_weights、active_*、main_*_id），供 Stage2 层级契合与泛词抑制。 |
+| **逻辑流程** | ① 预清洗 JD 技能（`extract_skills`）→ 写入 `recall._jd_cleaned_terms`、**`recall._jd_raw_text`**；② 领域与岗位探测；③ 锚点提取：`label_anchors.extract_anchor_skills`（REQUIRE_SKILL + 熔断 + **短语中心性重排**：specificity/context_richness/taskness/local_cluster_support × backbone_score，排序 + TopN）；④ 可选 `supplement_anchors_from_jd_vector`；⑤ `classify_anchor_type` 打 anchor_type；⑥ 领域 regex；⑦ **attach_anchor_contexts**；⑧ **build_conditioned_anchor_representation** 为每个锚点算 conditioned_vec 并写入 anchor_skills；⑨ **build_jd_hierarchy_profile** 产出 jd_profile；⑩ 写入 `recall._last_stage1_result`（含 jd_profile）。 |
+| **输入参数（名字与含义）** | **query_vector**：JD 编码向量；**query_text** / **semantic_query_text**：JD 文本，供技能清洗、JD 向量补充与锚点上下文化；**domain_id**：可选，指定则优先作 active_domains。 |
+| **输出参数（名字与含义）** | **active_domain_set**、**regex_str**、**anchor_skills**（每项含 term、anchor_type、**local_context**、**phrase_context**）；**debug_1** 含 job_ids、anchor_debug、**jd_profile** 等；**Stage1Result.jd_profile** 供 Stage2 传入 `run_stage2(..., jd_profile=...)`。 |
 | **主要公式** | 锚点熔断：丢弃 **cov_j ≥ ANCHOR_MELT_COV_J**（如 0.03）的词。**backbone_score**（排序用）：`BACKBONE_W_JOB_FREQ*log(1+job_freq) + BACKBONE_W_COV_J*(1-cov_j) + BACKBONE_W_SPAN*(1/(1+span)) + BACKBONE_W_IN_JD*in_jd + BACKBONE_W_TASK_LIKE*task_like + BACKBONE_W_SIM*sim`；保底词（in_jd 且 task_like）得分不低于 BACKBONE_FLOOR_FOR_BAODI。 |
-| **调用的表/知识图谱** | **Neo4j**：**Job** 节点（id, skills, domain_ids）、**Vocabulary**、边 **REQUIRE_SKILL**（Job→Vocabulary）；**Faiss**：Job 索引（领域探测）、Vocabulary 索引（JD 向量补充）；**SQLite**：`vocabulary_domain_stats`（voc_id, domain_span，用于锚点候选 span）；**外部**：`industrial_abbr_expansion.json`（缩写 key，anchor_type=acronym）。 |
+| **调用的表/知识图谱** | **Neo4j**：**Job** 节点、**Vocabulary**、边 **REQUIRE_SKILL**、**SIMILAR_TO**（build_jd_hierarchy_profile 用锚点→学术词）；**Faiss**：Job 索引、Vocabulary 索引（JD 向量补充）；**SQLite**：`vocabulary_domain_stats`（锚点候选 span、**build_jd_hierarchy_profile 聚合 domain_dist**）、**vocabulary_topic_stats**（**build_jd_hierarchy_profile 聚合 field/subfield/topic 分布**）；**外部**：`industrial_abbr_expansion.json`（缩写 key，anchor_type=acronym）。 |
 
 **锚点分型后的行为差异（Stage2A / Stage2B 约束）**
 
@@ -758,12 +759,52 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 | **作用** | 将工业侧锚点**对齐到学术主落点**（primary），不做大范围扩展；对每个候选算 **domain_fit**，仅 **domain_fit ≥ DOMAIN_FIT_MIN_PRIMARY** 的候选才允许做 primary；产出每锚点 1～2 个 primary_landings，供 Stage2B 围绕其做 dense / 簇 / 共现扩展。**高歧义锚点**（如 acronym、generic_task_term）采用更高 identity 与 domain_fit 门槛；**本锚点无 primary 时仅跳过该锚点，不短路整路**。 |
 | **候选来源（当前版本）** | 当前版本**仅一条**候选来源：**跨类型 SIMILAR_TO**。即在 Neo4j 中通过 `(锚点 Vocabulary)-[SIMILAR_TO]->(v_rel:Vocabulary)` 获取候选，约束 `v_rel.type IN ['concept','keyword']`，并按 top_k、min_score 过滤。候选逐条结合 active_domain_set 与可选 jd_field/subfield/topic_ids 做 **`_term_in_active_domains`** 过滤（含**主领域守卫**：主领域 ∉ active_domains 则一票否决），并计算 domain_fit。*说明*：Stage1 的 `supplement_anchors_from_jd_vector` 仅用于「补锚点」，**不参与 Stage2A 候选合并**；若未来扩展 Stage2A 候选源，再以独立 source 并轨，不影响当前主流程。 |
 | **思路** | 图中 SIMILAR_TO 为**跨类型**（如 industry→concept / keyword），且边本身基于**清洗后的文本、缩写扩写与向量相似**构建，因此当前版本以「锚点 → SIMILAR_TO → 学术词」作为**唯一** primary landing 通道。随后结合激活领域与三层领域计算 domain_fit，并按 anchor_type 调整 primary 门槛，以降低高歧义锚点的误落点风险。 |
-| **逻辑流程** | ① anchor_skills 转为 **PreparedAnchor** 列表（含 **anchor_type**）；② 对每个 anchor 调用 `collect_landing_candidates`（内部仅 `retrieve_academic_term_by_similar_to`，再做领域过滤）；③ 对每个候选计算 `_compute_domain_fit`；④ `score_academic_identity`；⑤ **根据 anchor_type 计算本锚点的 min_identity 与 min_domain_fit**；⑥ `select_primary_academic_landings`（domain_fit 门控 + identity 门控）→ **primary_landings**；⑦ 若本锚点 primary 数为 0，则 continue（不短路整路）。 |
-| **输入参数（名字与含义）** | **prepared_anchors**：Stage1 的 anchor_skills 转成的 PreparedAnchor 列表（含 **anchor_type**）；**active_domain_set**：Set[int]；**query_vector**、**query_text**；**jd_field_ids** / **jd_subfield_ids** / **jd_topic_ids**：可选，三层领域 ID 集合，用于 domain_fit 与过滤。 |
-| **输出参数（名字与含义）** | 本阶段内部产出 **primary_landings**：List[PrimaryLanding]，每项含 vid、term、identity_score、source、anchor_vid、anchor_term、**domain_fit**；Stage2 整体对外输出为 **raw_candidates**（见 Stage2B），其中 primary 来源于此。 |
+| **逻辑流程** | ① anchor_skills 转为 **PreparedAnchor**（含 **conditioned_vec**）；② **数据驱动两阶段选主**：对每个 anchor 调用 `collect_landing_candidates`（传入 **query_vector** 以算 jd_candidate_alignment；**有 jd_profile 时** 对候选取 hierarchy fit 与 landing_score，**无硬门槛**）；每锚保留 **top-m** 候选；③ flat_pool 上 `_compute_neighborhood_and_isolation` 与 **`_compute_conditioned_anchor_align_and_multi_anchor_support`**（conditioned_anchor_align、multi_anchor_support）；④ **primary_score** = edge_affinity + **conditioned_anchor_align**（无则用 semantic_score）+ jd_align + hierarchy_consistency + neighborhood_consistency + **multi_anchor_support** − isolation_penalty；⑤ 每锚按 primary_score 排序，满足 min_identity/domain_fit_min 的取前 PRIMARY_MAX_PER_ANCHOR 个为 primary；⑥ 产出 **stage2_anchor_evidence_table**。 |
+| **输入参数（名字与含义）** | **prepared_anchors**、**active_domain_set**、**query_vector**、**query_text**；**jd_field_ids** / **jd_subfield_ids** / **jd_topic_ids**：可选；**jd_profile**：可选，Stage1 产出的四层领域画像，用于层级 fit、landing 打分与硬门槛。 |
+| **输出参数（名字与含义）** | 本阶段内部产出 **primary_landings**，每项含 vid、term、identity_score、**landing_score**、**subfield_fit**、**topic_fit**、**outside_subfield_mass**、**topic_entropy** 等（有 jd_profile 时）；Stage2 整体输出 **raw_candidates** 见 Stage2B。 |
 | **主要公式** | **domain_fit** = 0.4×domain_overlap + 0.3×field_overlap + 0.2×subfield_overlap + 0.1×topic_overlap（无表时对应 overlap 视为 1.0）。**primary 门控**：`domain_fit ≥ min_domain_fit`（当前 **DOMAIN_FIT_MIN_PRIMARY=0.45**）且 `identity_score ≥ min_identity`。其中普通锚点默认 min_identity = PRIMARY_MIN_IDENTITY，高歧义锚点（如 acronym、generic_task_term）使用更高 PRIMARY_MIN_IDENTITY_HIGH_AMBIGUITY；min_domain_fit 也可按 anchor_type 做更保守设置（broad_concept 用 DOMAIN_FIT_MIN_PRIMARY_BROAD=0.40）。**identity_score 在当前版本中等于 SIMILAR_TO 边权**。 |
 | **高歧义锚点规则** | **定义**：当前主要指 anchor_type ∈ { acronym, generic_task_term }。**规则**：① 做 primary 时采用更高 identity 门槛；② 可配更高 domain_fit 门槛；③ 本锚点若 primary 数为 0，仅跳过该锚点，不视为整路失败；④ 日志打标 `[高歧义]` 便于排查。 |
 | **调用的表/知识图谱** | **Neo4j**：**Vocabulary** 节点、**(Vocabulary)-[SIMILAR_TO]->(Vocabulary)**（跨类型，边权 sim_score）；**SQLite**：`vocabulary_domain_stats`（domain_dist）、`vocabulary_topic_stats`（field_id/subfield_id/topic_id 及 *_dist）；**Faiss**：当前 Stage2A 不直接使用。 |
+
+**数据驱动 Primary 选主（零硬编码）**
+
+Stage2A 不再使用「subfield_fit / topic_fit / outside_subfield_mass 硬门槛一票否决」或任何词级黑/白名单，改为**纯数据驱动**的 primary 打分与两阶段选主：
+
+1. **证据量（无词表）**  
+   - **edge_affinity**：SIMILAR_TO 边权（identity/semantic_score）。  
+   - **anchor_candidate_alignment** / **conditioned_anchor_align**：候选与**当前锚点**的语义相似度；若有条件化表示则用候选与 **conditioned_vec** 的相似度，否则用边权。  
+   - **jd_candidate_alignment**：候选向量与 **JD 整体向量** 的余弦相似度。  
+   - **multi_anchor_support**：候选与**其它锚点**条件化向量的平均相似度（多锚共识）。  
+   - **hierarchical_consistency**：候选的 domain/subfield/topic 与 jd_profile 的契合度。  
+   - **local_neighborhood_consistency**：候选与当前批次其它候选的向量平均相似度。  
+   - **semantic_isolation_penalty**：与候选群整体语义的离群程度。
+
+2. **两阶段选主**  
+   - 第一阶段：对每个锚点调用 `collect_landing_candidates`（含 `query_vector` 以算 jd_candidate_alignment），保留 **top-m**（`PRIMARY_TOP_M_PER_ANCHOR`，默认 5）个候选。  
+   - 第二阶段：对所有锚点的候选组成 **flat_pool**，统一算 `_compute_neighborhood_and_isolation` 与 **`_compute_conditioned_anchor_align_and_multi_anchor_support`**，再算 **primary_score**：  
+     `primary_score = w1·edge_affinity + w2·conditioned_anchor_align + w3·jd_align + w4·hierarchy_consistency + w5·neighborhood_consistency + w6·multi_anchor_support - w7·semantic_isolation_penalty`  
+     权重见 `label_expansion.py` 中 `PRIMARY_W_EDGE_AFFINITY`、`PRIMARY_W_ANCHOR_ALIGN`、`PRIMARY_W_JD_ALIGN`、`PRIMARY_W_MULTI_ANCHOR` 等。  
+   - 每锚点按 primary_score 排序，在满足 `min_identity`、`domain_fit_min` 的前提下取前 **PRIMARY_MAX_PER_ANCHOR** 个作为 primary，再进入 Stage2B 扩散。
+
+3. **调试用证据表**  
+   - **stage2_anchor_evidence_table**：每行对应一个 (锚点, 候选)，字段包括 anchor、candidate、tid、edge_affinity、anchor_align、**conditioned_anchor_align**、**multi_anchor_support**、jd_align、hierarchy_consistency、neighborhood_consistency、isolation_penalty、primary_score。  
+   - 写入 `debug_info.stage2_anchor_evidence_table` 与 `debug_1["stage2_anchor_evidence_table"]`，诊断时看「为何某候选胜出/某候选被压」无需任何词表，只看上述结构量。  
+   - 控制台在 `LABEL_EXPANSION_DEBUG=True` 时打印表头与前 40 条；`label_debug_cli` 深度诊断中也会打印该表（前 35 条）。
+
+**最小施工单（八项，零硬编码）**
+
+在「数据驱动 Primary 选主」基础上，以下八项已落地，**不依赖任何词黑/白名单**，仅靠上下文、图结构、语义一致性与多锚共识：
+
+| 序号 | 内容 | 位置 |
+|------|------|------|
+| 1 | **Step2 锚点重排**：增加 phrase_specificity、context_richness、taskness、local_cluster_support，最终 anchor 排序用 backbone_score × 上述权重，抑制裸泛词（如「控制」「动力学」「仿真」） | `label_anchors.extract_anchor_skills`；`compute_phrase_specificity`、`compute_phrase_context_richness`、`compute_anchor_taskness`、`compute_local_phrase_cluster_support` |
+| 2 | **条件化锚点表示**：`build_conditioned_anchor_representation` 为每个锚点构造 local_phrase_vec、co_anchor_vec、jd_vec，与 anchor_vec 按 specificity 加权得到 conditioned_vec；泛锚点更多依赖上下文 | `label_anchors.build_conditioned_anchor_representation`；Stage1 中挂到 `anchor_skills[v_id]["conditioned_vec"]` |
+| 3 | **Stage2A 使用 conditioned_vec**：落点打分时若有 conditioned_vec 则用 **conditioned_anchor_align**（候选与条件化锚点向量相似度），否则回退 semantic_score | `label_expansion._compute_conditioned_anchor_align_and_multi_anchor_support`；`_primary_score_data_driven` 中 anchor_align 取 conditioned_anchor_align 或 edge |
+| 4 | **jd_global_align 入 primary 打分**：候选与 JD 整体向量的相似度（已有 jd_candidate_alignment）参与 primary_score | `collect_landing_candidates` 中 `jd_candidate_alignment`；`_primary_score_data_driven` 中 PRIMARY_W_JD_ALIGN |
+| 5 | **multi_anchor_support 入 primary 打分**：候选与**其它锚点**条件化向量的平均相似度，多锚共识高则加分，单锚误命中则自然被压 | `_compute_conditioned_anchor_align_and_multi_anchor_support`；`_primary_score_data_driven` 中 PRIMARY_W_MULTI_ANCHOR |
+| 6 | **高可信 primary 相对阈值**：不再仅用绝对 identity/domain_fit 门槛；先按 primary_score 相对筛选（如 mean − 0.2×std 或 top 一半），再套放宽后的 _is_high_confidence_primary；若仍为空则保底取该锚点 primary 的前若干 | `label_expansion.stage2_generate_academic_terms` 中 high_confidence_primaries 计算 |
+| 7 | **Stage3 全局共识因子**：cross_anchor_evidence（被多少不同 parent_anchor 支持）、cluster_cohesion（与同簇候选数）、semantic_drift_risk（outside_subfield_mass、单锚支持、低 topic_fit）；final_score 乘以 cross_anchor × cluster_cohesion / max(drift_risk, 0.01) | `stage3_term_filtering._compute_stage3_global_consensus`；`term_scoring.compose_term_final_score` 中 consensus_factor |
+| 8 | **README 与调试**：上述逻辑与证据表字段（含 conditioned_anchor_align、multi_anchor_support）已写入本文档与证据表打印 | 本节 + stage2_anchor_evidence_table 表头 |
 
 **领域过滤增强（主领域守卫、门槛与 Context-Aware / Term 纯度）**
 
@@ -784,28 +825,30 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 |----|------|
 | **作用** | 仅围绕**高可信 primary** 做 dense / cluster / cooc 扩展；对扩展词做**领域门控**：domain_fit < DOMAIN_FIT_MIN_EXPANSION 或 domain_span > DOMAIN_SPAN_MAX_EXPANSION 的**不进最终词池**；合并 primary + 扩展为 List[ExpandedTermCandidate]，带 term_role、domain_fit、parent_primary，再转为 raw_candidates 供 Stage3。 |
 | **思路** | 不再用 SIMILAR_TO 做学术→学术。仅用：① 词汇向量索引上 primary 的**学术近邻**（dense）；② 簇成员（cluster）；③ 共现表高支持度词（cooc）。扩展前/合并前均做 **domain_fit**、**domain_span**、**topic_align** 检查，跨域或主题发散过大的词直接丢弃；合并时为每词补全 degree_w、topic_align、domain_fit、parent_primary。 |
-| **高可信 primary 定义** | **primary_high_confidence** 由**结构化条件共同决定，而非词面规则**：通常要求 identity_score ≥ PRIMARY_HIGH_CONFIDENCE_THRESHOLD、**domain_fit ≥ DOMAIN_FIT_HIGH_CONFIDENCE（当前 0.55）**、source ∈ TRUSTED_SOURCE_TYPES_FOR_DIFFUSION，并且在**可用时**满足较保守的 domain_span / topic_align 条件。其目标是避免「高相似但跨域或主题发散」的 primary 进入扩散。 |
-| **逻辑流程** | ① 通过 **_is_high_confidence_primary** 筛出 **diffusion_primaries**：通常同时检查 identity、domain_fit、source，并在**有对应字段时**检查 domain_span、topic_align；② `expand_from_vocab_dense_neighbors`（每 primary 最多 DENSE_MAX_PER_PRIMARY，过滤 _term_in_active_domains + domain_fit/domain_span 门控，设 parent_primary）；③ `expand_from_cluster_members`（同上门控）；④ `expand_from_cooccurrence_support`（同上门控）；⑤ `merge_primary_and_support_terms`（为 primary 与各扩展补 degree_w、topic_align、domain_fit，再次过滤 domain_fit/domain_span）；⑥ `_expanded_to_raw_candidates` 转为 **raw_candidates**（含 tid、term、term_role、identity_score、source、domain_fit、parent_anchor、parent_primary 等）。 |
-| **输入参数（名字与含义）** | 同 Stage2 总入口：**prepared_anchors**、**active_domain_set**、**query_vector**、**query_text**、**jd_field_ids** / **jd_subfield_ids** / **jd_topic_ids**；内部使用 **primary_landings**（及高可信子集 diffusion_primaries）。 |
-| **输出参数（名字与含义）** | **raw_candidates**：List[Dict]，每项含 **tid**、**term**、**term_role**（primary / dense_expansion / cluster_expansion / cooc_expansion）、**identity_score**、**source**、**degree_w**、**domain_span**、**target_degree_w**、**degree_w_expanded**、**topic_align**、**topic_level**、**topic_confidence**、**domain_fit**、**parent_anchor**、**parent_primary** 等，供 Stage3 消费。 |
+| **高可信 primary 定义** | 先按 **相对阈值**（当前锚点候选内 primary_score 的 mean − 0.2×std，或保底取前一半）得到高可信候选，再经 **_is_high_confidence_primary**（放宽 identity/domain_fit 下限）与 **allow_primary_to_expand** 过滤；若仍为空则保底取该锚点 primary 的前若干，使 Stage2B 扩散能启动。 |
+| **逻辑流程** | ① **_is_high_confidence_primary** 筛出候选；**有 jd_profile 时**用 **allow_primary_to_expand** 再筛 → **diffusion_primaries**；② `expand_from_vocab_dense_neighbors`、`expand_from_cluster_members`、`expand_from_cooccurrence_support`（门控同前）；③ `merge_primary_and_support_terms`（为 primary/扩展补 degree_w、topic_align、domain_fit，并为每项设 **cluster_id**（voc_to_clusters），primary 传递 subfield_fit、topic_fit、landing_score 等）；④ `_expanded_to_raw_candidates` 转为 **raw_candidates**（含 **subfield_fit**、**topic_fit**、**outside_subfield_mass**、**topic_entropy**、**landing_score**、**cluster_id** 等）。 |
+| **输入参数（名字与含义）** | 同 Stage2 总入口，含 **jd_profile**（可选）；内部使用 **primary_landings** 及 **diffusion_primaries**（经 allow_primary_to_expand 时进一步收缩）。 |
+| **输出参数（名字与含义）** | **raw_candidates**：每项含 tid、term、term_role、identity_score、source、degree_w、domain_span、topic_align、domain_fit、parent_anchor、parent_primary，以及**层级守卫相关**：**subfield_fit**、**topic_fit**、**outside_subfield_mass**、**topic_entropy**、**landing_score**、**cluster_id**、**main_subfield_match** 等，供 Stage3 做 should_drop_term 与 score_term_record。 |
 | **主要公式** | **领域门控**：扩展词仅当 `domain_fit ≥ DOMAIN_FIT_MIN_EXPANSION` 且 `domain_span ≤ DOMAIN_SPAN_MAX_EXPANSION` 才进入词池。topic_align 来自 `_attach_topic_align`（vocabulary_topic_stats 层级命中 × topic_confidence）。 |
 | **调用的表/知识图谱** | **Neo4j**：**Vocabulary**；**Faiss**：Vocabulary 向量索引（dense 近邻）；**SQLite**：`vocabulary_domain_stats`（work_count、domain_span、domain_dist）、`vocabulary_cooccurrence`（term_a、term_b、freq，学术共鸣与锚点共鸣及 cooc_span/cooc_purity 均由此表读取）、`vocabulary_topic_stats`（field_id、subfield_id、topic_id、*_dist、source）；**簇数据**：cluster_members、voc_to_clusters、cluster_centroids（label_means.infra）。 |
 
 ---
 
-**Stage3：词过滤与权重（双闸门 + 六因子最终分）**
+**Stage3：词过滤与权重（轻硬过滤 + 主分+轻 gate + top_k 软排序）**
 
 | 项 | 说明 |
 |----|------|
-| **作用** | 对 raw_candidates 做**身份闸门**、**topic 闸门**、**质量分**与**六因子最终分**，产出 score_map、term_map、idf_map、term_role_map、term_source_map、parent_anchor_map、parent_primary_map，并写入 tag_purity_debug；供 Stage4 选词（final_term_ids_for_paper）、Stage5 的 term_confidence_map 与护栏 5 使用。 |
-| **思路** | 先过滤再打分：通过身份闸门与 topic 闸门的词才参与 quality 与 **compose_term_final_score**；最终分采用 **final_score = base_score × source_weight × domain_gate × task_consistency × role_penalty × expansion_penalty**，把来源、三层领域、任务一致性、角色与 cluster/cooc 惩罚全部乘回排序。**整个 Stage3 以结构化门控为主，不依赖词面黑/白名单**。 |
-| **逻辑流程** | ① **passes_identity_gate**：按 term_role 设阈值（primary≥0.62, dense/cluster≥0.45, cooc≥0.35）；② **passes_topic_consistency**；③ **score_term_expansion_quality**：idf 骨架 + 纯度 + 语义；④ **compose_term_final_score**：base_score（按 role 的 identity/quality 加权）× source_weight × domain_gate × task_consistency × role_penalty × expansion_penalty；⑤ final_score < FINAL_MIN_TERM_SCORE 则丢弃；⑥ 写入 score_map、term_map、idf_map、**term_role_map**、**term_source_map**、**parent_anchor_map**、**parent_primary_map**，并 append 到 tag_purity_debug（含 domain_fit、parent_anchor、parent_primary 等）。 |
-| **输入参数（名字与含义）** | **raw_candidates**：Stage2 输出的字典列表，含 tid、term、term_role、identity_score、source、degree_w、domain_span、topic_align、domain_fit、parent_anchor、parent_primary 等；**query_vector**：JD 向量；**anchor_vids**：可选，用于锚点距离等门控。 |
-| **输出参数（名字与含义）** | **score_map**：Dict[tid_str, float]，词最终权重；**term_map**：Dict[tid_str, term 文本]；**idf_map**：Dict[tid_str, float]，平滑 IDF；**term_role_map**：Dict[tid_str, term_role]；**term_source_map**：Dict[tid_str, source]；**parent_anchor_map** / **parent_primary_map**：Dict[tid_str, str]；**tag_purity_debug**：列表，每项含 tid、term、term_role、identity_score、quality_score、final_score、domain_fit、parent_anchor、parent_primary 等。 |
-| **主要公式** | **身份闸门**：identity_score ≥ threshold(role)，primary=0.62, dense/cluster=0.45, cooc=0.35。**quality**：`idf_val * (0.5+0.5*purity) * (0.5+0.5*min(1, sim))`。**final_score** = **base_score** × **source_weight** × **domain_gate** × **task_consistency** × **role_penalty** × **expansion_penalty**（六因子见下表）。**idf**：平滑 IDF(degree_w, degree_w_expanded)。 |
-| **调用的表/知识图谱** | **内存**：recall.total_work_count、raw_candidates 中各字段、all_vocab_vectors/vocab_to_idx（get_term_debug_metrics 等）；**无额外 DB 表**，仅用 Stage2 传入字段与 config 常量。 |
+| **作用** | 对 raw_candidates 做**两层处理**：① **第一层**只做**少量硬过滤**（**should_drop_term** 仅 2 条：outside_subfield_mass>0.95 且 topic_fit<0.02；main_subfield_miss 且 subfield_fit<0.05 且 topic_fit<0.02），只砍最离谱的；② **第二层**其余全部保留，用 **score_term_record**（主分+轻 gate）得 final_score，**按 final_score 排序保留 top_k**（STAGE3_TOP_K=20），**不再用 FINAL_MIN_TERM_SCORE 阈值淘汰**，避免断流。产出 score_map、term_map、idf_map、term_role_map、term_source_map、parent_anchor_map、parent_primary_map 与 tag_purity_debug（含 stage3_explain）；供 Stage4 选词、Stage5 的 term_confidence_map 与护栏 5 使用。 |
+| **思路** | **软排序 + 轻过滤**：硬过滤只 2 条；final_score 改为**主分 + 乘性小闸门**（base = 0.55·semantic + 0.25·context + 0.20·hierarchy_score；gate = external_penalty^0.5 × entropy_penalty^0.5 × generic_penalty^0.3；final = base × gate），惩罚项只轻压、不一票打死；**至少保留 top_k**，分数体系不完美时也不会把整条链干死。**缺失三级信息**（无 topic_dist/subfield_dist）时 hierarchy_guard 内 topic_fit=None、退化为 field_fit/domain_fit，不按 0 分处理。 |
+| **逻辑流程** | ① **\_compute_stage3_global_consensus**：对 raw_candidates 算 **cross_anchor_evidence**、**cluster_cohesion**、**semantic_drift_risk** 并写入每条 rec；② **should_drop_term(rec)**：仅 2 条规则；③ **passes_identity_gate**；④ **passes_topic_consistency**；⑤ **score_term_expansion_quality**；⑥ **compose_term_final_score**（含 **consensus_factor** = cross_anchor_evidence × cluster_cohesion / max(semantic_drift_risk, 0.01)）；⑦ **score_term_record(rec)** 得 final_score、stage3_explain；⑧ 按 final_score 降序取前 STAGE3_TOP_K；⑨ 写入 score_map、term_map、…、tag_purity_debug。 |
+| **输入参数（名字与含义）** | **raw_candidates**：Stage2 输出，含 tid、term、term_role、identity_score、source、degree_w、domain_span、topic_align、domain_fit、parent_anchor、parent_primary，及**层级字段** subfield_fit、topic_fit、outside_subfield_mass、topic_entropy、landing_score、cluster_id、**main_subfield_match** 等；**query_vector**；**anchor_vids**：可选。 |
+| **输出参数（名字与含义）** | **score_map**：Dict[tid_str, float]，词最终权重（仅 top_k 条）；**term_map**、**idf_map**、**term_role_map**、**term_source_map**、**parent_anchor_map**、**parent_primary_map** 同上；**tag_purity_debug**：每项含 tid、term、term_role、identity_score、quality_score、final_score、domain_fit、parent_anchor、parent_primary，及 **stage3_explain**（base_score、hierarchy_score、external_penalty、entropy_penalty、generic_penalty、gate、reject_reason）等。 |
+| **主要公式** | **身份闸门**：identity_score ≥ threshold(role)。**quality**：由 score_term_expansion_quality。**层级 final_score**（score_term_record）：**base** = 0.55·semantic + 0.25·context + 0.20·hierarchy_score；**gate** = external_penalty^0.5 × entropy_penalty^0.5 × generic_penalty^0.3；**final_score** = base × gate。**保留策略**：按 final_score 降序取前 **STAGE3_TOP_K**（默认 20）。**idf**：平滑 IDF(degree_w, degree_w_expanded)。 |
+| **调用的表/知识图谱** | **内存**：recall.total_work_count、raw_candidates 中各字段、all_vocab_vectors/vocab_to_idx（get_term_debug_metrics 等）；**无额外 DB 表**。**调试**：STAGE3_DETAIL_DEBUG 为 True 时打印每词 term、base_score、hierarchy_score、external_penalty、entropy_penalty、generic_penalty、final_score、reject_reason。 |
 
-**Stage3 六因子：来源与默认值策略**
+**Stage3 六因子与层级最终分**：无层级字段时仍用 **compose_term_final_score**（六因子）；有 subfield_fit/topic_fit 等时由 **score_term_record** 覆盖为 **base×gate**（见上表），不再使用六因子乘性硬杀。
+
+**Stage3 六因子：来源与默认值策略**（仅用于 compose_term_final_score 初分）
 
 | 因子 | 含义 | 来源 | 默认值/策略 |
 |------|------|------|-------------|
@@ -818,17 +861,17 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 
 ---
 
-**Stage4：论文召回**
+**Stage4：论文召回（二层召回 + 领域软奖励）**
 
 | 项 | 说明 |
 |----|------|
-| **作用** | 用 **final_term_ids_for_paper**（经 _select_terms_for_paper 从 score_map/term_map 精检后的至多 20 个词 ID）在 Neo4j 上沿 **HAS_TOPIC** 拉论文，词侧 **3% 熔断**，并按作者聚合，产出 author_papers_list，供 Stage5 算论文贡献度与作者排序。 |
-| **思路** | 词侧 (degree_w/total_w) ≥ 0.03 的泛词在 Cypher 内过滤；论文侧可选按 domain_ids 正则过滤；单次 LIMIT 2000 篇 Work；每篇 Work 收集 hit_info（vid, idf_weight=log10(total_w/(degree_w+1))），供 Stage5 作 paper_match_strength。 |
-| **逻辑流程** | ① 输入 **vocab_ids**（List[int]，即 final_term_ids_for_paper）、**regex_str**；② Cypher：MATCH (v:Vocabulary) WHERE v.id IN $v_ids，WITH 计算 degree_w，WHERE (degree_w*1.0/$total_w) < 0.03，WITH log10($total_w/(degree_w+1)) AS idf_weight；③ MATCH (v)<-[:HAS_TOPIC]-(w:Work) [可选 AND w.domain_ids =~ $regex]；④ WITH w, collect({vid, idf}) AS hit_info，LIMIT 2000；⑤ MATCH (w)<-[auth_r:AUTHORED]-(a:Author)，RETURN a.id, collect({wid, hits, weight: pos_weight, title, year, domains})；⑥ 按 aid 聚合为 **author_papers_list**。 |
-| **输入参数（名字与含义）** | **vocab_ids**：List[int]，用于论文检索的词汇 ID（来自 _select_terms_for_paper）；**regex_str**：str，Neo4j 领域正则，可为空。 |
-| **输出参数（名字与含义）** | **author_papers_list**：List[Dict]，每项为 { **"aid"**: str, **"papers"**: [ { **"wid"**, **"hits"**: [{ vid, idf }], **"weight"**, **"title"**, **"year"**, **"domains"** }, ... ] }，供 Stage5 展开为 paper_map 并算 contribution。 |
-| **主要公式** | 熔断：`(degree_w * 1.0 / total_w) < 0.03`；命中权重 **idf_weight** = `log10(total_w / (degree_w + 1))`（即 Stage5 中的 paper_match_strength）。 |
-| **调用的表/知识图谱** | **Neo4j**：**Vocabulary**（id）、**Work**（id, title, year, domain_ids）、**Author**（id）；边 **HAS_TOPIC**（Work→Vocabulary）、**AUTHORED**（Author→Work，pos_weight）。 |
+| **作用** | 用 **final_term_ids_for_paper** 在 Neo4j 上沿 **HAS_TOPIC** 做**二层召回**：先按 term 拉 Work、做 **per-term 限流** 与 **paper_score** 聚合，再**全局排序**取前 2000 篇，最后按作者聚合。**不再对论文做 domain 硬过滤**，改为**领域软奖励**（匹配则乘 DOMAIN_BONUS_MATCH，否则 1.0）；**paper_score** 纳入 **Stage3 的 term_final_score**，避免歪词/泛词单靠 idf 占坑。 |
+| **思路** | **词侧**：熔断放宽为 **MELT_RATIO**（默认 5%），(degree_w/total_w) ≥ 0.05 的泛词在 Cypher 内过滤。**论文侧**：不做 `WHERE w.domain_ids =~ $regex` 剔除，仅用 **domain_bonus**（匹配 1.2、不匹配 1.0）参与打分。**term_contrib** = term_final_score × idf_weight × domain_bonus × recency_factor；每个 term 最多保留 **TERM_MAX_PAPERS**（默认 50）篇；**paper_score** = Σ term_contrib，再全局 ORDER BY paper_score DESC、LIMIT 2000。 |
+| **逻辑流程** | ① 输入 **vocab_ids**、**regex_str**、**term_scores**（vid→Stage3 final_score）；② **第一层 Cypher**：MATCH (v:Vocabulary) WHERE v.id IN $v_ids，WITH degree_w，WHERE (degree_w/total_w) < MELT_RATIO，WITH idf_weight；MATCH (v)<-[:HAS_TOPIC]-(w:Work)，计算 domain_bonus（CASE WHEN regex 匹配 THEN 1.2 ELSE 1.0），RETURN vid, wid, idf_weight, domain_bonus, year；③ **Python**：term_contrib = term_final_score×idf×domain_bonus×recency(year)；每 term 按 term_contrib 降序取前 TERM_MAX_PAPERS；按 wid 聚合 paper_score = Σ term_contrib、hits = [ {vid, idf}, ... ]；按 paper_score 降序取前 GLOBAL_PAPER_LIMIT(2000)；④ **第二层 Cypher**：对上述 wids 查 (w:Work)-[:AUTHORED]-(a:Author)，按 aid 聚合 papers，并为每篇 paper 挂上 hits 与 score；⑤ 返回 **author_papers_list**。 |
+| **输入参数（名字与含义）** | **vocab_ids**：List[int]，即 final_term_ids_for_paper；**regex_str**：str，领域正则，用于 domain_bonus，可为空；**term_scores**：Dict[int, float]，vid→Stage3 的 final_score；**term_retrieval_roles**：Dict[int, str]，vid→paper_primary|paper_support|blocked，用于 role_weight（无则默认 1.0）。 |
+| **输出参数（名字与含义）** | **author_papers_list**：List[Dict]，每项为 { **"aid"**, **"papers"**: [ { **"wid"**, **"hits"**, **"weight"**, **"title"**, **"year"**, **"domains"**, **"score"**（Stage4 算的 paper_score，可选供 debug） }, ... ] }。 |
+| **主要公式** | 熔断：`(degree_w * 1.0 / total_w) < MELT_RATIO`（默认 0.05）；**idf_weight** = `log10(total_w / (degree_w + 1))`；**role_weight**：paper_primary=1.0、paper_support=0.7、其他=0.4（**不看领域词，只看 retrieval_role**）；**term_contrib** = **term_final_score** × **role_weight** × idf_weight × **domain_bonus** × **recency(year)**；**paper_score** = Σ term_contrib；per-term 限流 **TERM_MAX_PAPERS**（默认 50）；全局 **GLOBAL_PAPER_LIMIT** = 2000。 |
+| **调用的表/知识图谱** | **Neo4j**：**Vocabulary**（id）、**Work**（id, title, year, domain_ids）、**Author**（id）；边 **HAS_TOPIC**、**AUTHORED**（pos_weight）。**time_features.compute_paper_recency** 用于 recency_factor。 |
 
 ---
 
@@ -836,10 +879,10 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 
 | 项 | 说明 |
 |----|------|
-| **作用** | 将 author_papers_list 展开为 **paper_map**，对每篇论文算**贡献度**（含 **term_confidence**、护栏 5），再按作者聚合（accumulate_author_scores）、时序与活跃度加权、最佳论文比过滤，得到最终作者排序列表与 **last_debug_info**（含 term_role_map、term_confidence_map、author_evidence_by_term_role 等）。 |
-| **思路** | 论文贡献度中，**单 term 贡献** = **term_weight × term_confidence × paper_match_strength × term_uniqueness**（term_uniqueness 来自 vocabulary_domain_stats 的目标领域占比，领域专属性强的词抬权），再经领域纯度、综述/覆盖/紧密度/时序/簇奖励、JD 语义门得到 paper score；**护栏 5**：primary_count=0 且 supporting_count<2 的论文 score *= 0.05；作者分 = 论文贡献按署名权重拆分后取 top_k_per_author=3 累加，再乘 time_weight、recency，按 AUTHOR_BEST_PAPER_MIN_RATIO 过滤后归一化排序。 |
+| **作用** | 将 author_papers_list 展开为 **paper_map**，对每篇论文算**贡献度**（含 **term_confidence**、护栏 5），再按作者聚合（accumulate_author_scores）、时序与活跃度加权、**family coverage bonus** 与 **family balance penalty**（不依赖具体领域词），最佳论文比过滤，得到最终作者排序与 **last_debug_info**。 |
+| **思路** | 论文贡献度中，**单 term 贡献** = **term_weight × term_confidence × paper_match_strength × term_uniqueness**，再经领域纯度、综述/覆盖/紧密度/时序/簇奖励、JD 语义门得到 paper score；**护栏 5**：primary_count=0 且 supporting_count<2 的论文 score *= 0.05；作者分 = 论文贡献按署名权重拆分后取 top_k_per_author=3 累加，再乘 time_weight、recency；**CoverageBonus** = 1 + 0.10×min(family_count, 5)；**FamilyBalancePenalty** = 1/(1 + 0.6×max_family_share)；最终作者分再乘二者，按 AUTHOR_BEST_PAPER_MIN_RATIO 过滤后归一化排序。 |
 | **逻辑流程** | ① 从 debug_1 读取 **term_role_map**、**term_confidence_map**、**term_uniqueness_map**（由 label_path._build_term_uniqueness_map 从 vocabulary_domain_stats 按目标领域占比构建），放入 context；② 展开 author_papers_list 为 paper_map（wid→{ hits, title, year, domains, authors }）；③ 对每篇 paper 调用 **paper_scoring.compute_contribution**，得到 (score, hit_terms, rank_score, term_weights, primary_count, supporting_count)；④ 护栏 5：primary_count==0 且 supporting_count<2 则 score *= 0.05；⑤ 论文得分经 tanh 压缩（95 分位 tau）；⑥ **accumulate_author_scores**（top_k_per_author=3）→ author_scores、author_top_works；⑦ 按作者时间特征 time_weight、recency 加权；⑧ AUTHOR_BEST_PAPER_MIN_RATIO 过滤；⑨ 归一化排序，构建 scored_authors；⑩ **aggregate_author_evidence_by_term_role** 写入 last_debug_info。 |
-| **输入参数（名字与含义）** | **author_papers_list**：Stage4 输出；**score_map**、**term_map**：Stage3 输出；**active_domain_set**、**dominance**；**debug_1**：含 **term_role_map**、**term_confidence_map**、**term_uniqueness_map**、industrial_kws、anchor_skills、query_vector、filter_closed_loop 等。 |
+| **输入参数（名字与含义）** | **author_papers_list**：Stage4 输出；**score_map**、**term_map**：Stage3 输出；**active_domain_set**、**dominance**；**debug_1**：含 **term_role_map**、**term_confidence_map**、**term_uniqueness_map**、**term_family_keys**（vid→family_key，用于 CoverageBonus / FamilyBalancePenalty）、industrial_kws、anchor_skills、query_vector、filter_closed_loop 等。 |
 | **输出参数（名字与含义）** | **author_id 列表**：按得分降序，截断 recall_limit；**last_debug_info**：active_domains、dominance、score_map、term_map、term_role_map、term_confidence_map、filter_closed_loop、top_terms_final_contrib、work_count、author_count、**author_evidence_by_term_role** 等。 |
 | **主要公式** | **单 term 对论文的贡献**：**paper_term_contrib** = **term_weight** × **term_confidence** × **paper_match_strength** × **term_uniqueness** = score_map[vid] × term_confidence_map[vid] × idf_hit × term_uniqueness_map[vid]（term_uniqueness 为 vocabulary_domain_stats 中该词在目标领域的占比，领域专属性强的词抬权、通用词降权）；**rank_score** = Σ paper_term_contrib。**论文得分** score = rank_score × coverage_norm × cluster_bonus × proximity_bonus × domain_coeff × time_decay × survey_decay × jd_semantic_gate（撤稿拦截、领域纯度≤0 则直接 0）。**term_confidence**：primary 0.95、dense 0.75、cluster/cooc 0.6（见 label_path._build_term_confidence_map）。**护栏 5**：primary_count>=1 或 (primary_count+supporting_count)>=2 否则 score *= 0.05。**作者拆分**：按 AUTHORED.pos_weight 分配论文贡献，取每作者 top_k_per_author=3 篇累加，再乘 time_weight、recency。 |
 | **调用的表/知识图谱** | **内存**：score_map、term_map、term_role_map、term_confidence_map、term_uniqueness_map、paper_map、voc_to_clusters、all_vocab_vectors、vocab_to_idx（proximity、jd_semantic_gate）；**无直接 DB**。**works_to_authors**：accumulate_author_scores 用 papers 中的 wid、score、authors（含 pos_weight）。 |
@@ -869,12 +912,43 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 **典型排查顺序**：
 
 - 看 Stage1 的 cleaned_skills 与 anchor_skills  
-- 看 Stage2A 的 primary_landings  
+- 看 **Stage2 锚点-候选证据表**（stage2_anchor_evidence_table）：edge_affinity、**conditioned_anchor_align**、**multi_anchor_support**、jd_align、hierarchy_consistency、neighborhood_consistency、isolation_penalty、primary_score，判断为何某候选被选/被压（无词表，纯结构量）  
+- 看 Stage2A 的 primary_landings（数据驱动选主后）  
 - 看 Stage2B 的 raw_candidates  
-- 看 Stage3 的 score_map_terms  
-- 看 final_term_ids_for_paper  
+- 看 Stage3 的 score_map_terms 与 **paper_term_selection**（family 保送式）  
+- 看 final_term_ids_for_paper（含 term_role / retrieval_role）  
 - 看 Stage4 的 papers / authors  
 - 看 Stage5 的 author_evidence_by_term_role  
+
+**方便调试的打印汇总**（`LABEL_EXPANSION_DEBUG=True` 或 `verbose=True` 时）：  
+
+| 阶段 | 打印内容 |
+|------|----------|
+| Stage2A | 每锚 `collect_landing_candidates` 的候选明细：tid \| term \| semantic_score \| domain_fit \| subfield_fit \| topic_fit \| landing_score \| **jd_align** \| outside_subfield_mass |
+| Stage2 | **【Stage2 锚点-候选证据表】**：anchor \| candidate(tid) \| edge_affinity \| anchor_align \| **jd_align** \| hierarchy_cons \| **neighborhood_cons** \| **isolation_penalty** \| **primary_score**（前 40 条） |
+| Stage2 | 每锚「数据驱动 primary 数」及无 primary 时跳过原因 |
+| label_debug_cli | 深度诊断中 **【Stage2 锚点-候选证据表】** 再次打印（前 35 条），便于与最终 primary 对照 |  
+
+**标签路分区 Debug 打印（6 组）**
+
+由 `label_debug.py` 的 **DEBUG_LABEL_PIPELINE**、**DEBUG_LABEL_PIPELINE_LEVEL** 与 **debug_print(level, msg, label_or_recall)** 控制，便于一眼判断故障落在哪层。**LEVEL**：0=不打印；1=只打印汇总；2=汇总+top 明细；3=汇总+top+rejected/borderline/risky。`verbose=True` 时视为 level≥1 均打印。
+
+| 组 | 内容 | 主要打印块 |
+|----|------|------------|
+| **1. Step2 锚点** | 为何入选/落选 | `[Step2]` 分区头；`[Step2 Anchor Score Breakdown]` term \| backbone \| specificity \| context_richness \| taskness \| local_cluster \| final \| rank；`[Step2 Borderline Rejected]`；`[Step2 Final Anchors]` tid \| term \| final_anchor_score |
+| **2. 条件化锚点** | 上下文与权重 | `[Anchor Context]` anchor、local_phrases、co_anchor_terms、weights（anchor/local/co/jd） |
+| **3. Stage2A** | 候选保留/淘汰、primary 分解、多锚共识 | `[Stage2A Neighbor Compare]` raw_top / conditioned_top；`[Stage2A Primary Score Breakdown]` edge \| cond_align \| jd \| hier \| multi_anchor \| neigh \| poly_risk \| isolation \| final；`[Stage2A Cross-Anchor Evidence]` term \| support_count \| support_weight_sum \| anchors |
+| **4. Stage2B** | 为何没启动、扩散产出 | `[Stage2B Seed Eligibility]` term \| identity \| domain_fit \| domain_span \| eligible；`[Stage2B]` 高可信 seed 数、seed_terms；`[Stage2B Expansion Summary]` dense_kept \| cluster_kept \| cooc_kept |
+| **5. Stage3** | 全局重排与风险分桶 | `[Stage3]` 分区头；`[Stage3 Final Score Breakdown]` term \| stage2_rank \| cross_anchor \| cohesion \| drift_risk \| final；`[Stage3 Rerank Delta]` term \| stage2_rank \| stage3_rank \| delta；`[Stage3 Buckets]` core_terms / support_terms / risky_terms；`[Stage3 Risky Term Reasons]` term \| reasons \| final（LEVEL≥3） |
+
+**结构信号与 family 保送（无领域词硬编码）**
+
+标签路选词与打分**不依赖具体学科词**（如 control / planning / robotics 等词面），只依赖：**来源稳定性**（multi_source_support）、**上下文与层级一致性**（domain/subfield/topic fit）、**family 结构**（family_key、parent_primary、cluster_id）、**检索角色**（retrieval_role：paper_primary / paper_support / blocked）。  
+
+- **hierarchy_guard**：`build_family_key(rec)`（parent_primary > seed_group_id > cluster_id > parent_anchor > tid）、`get_retrieval_role_from_term_role`（primary→paper_primary，dense/cooc→paper_support，cluster→blocked）、`compute_multi_source_support(rec)`、`score_term_record`（base = 0.35·semantic + 0.20·context + 0.20·subfield_fit + 0.15·topic_fit + 0.10·multi_source；轻 gate）、`should_drop_term`（仅 2 条硬规则）、`allow_primary_to_expand`（只看 multi_source_support、subfield_fit、topic_fit、outside_subfield_mass，不看领域词）。  
+- **Stage3**：幸存词打 **family_key** 与 **retrieval_role**；**select_terms_for_paper_recall** 按 family 分桶，每 family 保 1 个 primary + 最多 1 个 support，**cluster(blocked) 不进 paper recall**；上限 **PAPER_RECALL_MAX_TERMS**（默认 12）。  
+- **Stage4**：**get_term_role_weight**：paper_primary=1.0、paper_support=0.7、其他=0.4；term_contrib = term_final_score × role_weight × idf × domain_bonus × recency。  
+- **Stage5**：**CoverageBonus** = 1 + 0.10×min(family_count, 5)；**FamilyBalancePenalty** = 1/(1 + 0.6×max_family_share)；作者分再乘二者（**term_family_keys** 来自 debug_1）。  
 
 #### 3.3 label_means 子模块职责（在标签路中的角色）
 
@@ -882,8 +956,9 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 |------|------|--------------|
 | **infra** | Neo4j、Job/Vocab Faiss、vocab 向量与 voc_id↔idx、vocab_stats.db、簇成员与簇中心 | 全阶段 |
 | **label_anchors** | 岗位技能清洗（clean_job_skills）、锚点提取（extract_anchor_skills）、JD 向量补充锚点（supplement_anchors_from_jd_vector） | Stage1 |
-| **label_expansion** | 学术落点（跨类型 SIMILAR_TO）与学术侧补充（dense 近邻、簇、共现）的封装 | Stage2A / Stage2B |
-| **term_scoring** | 词级最终权重（calculate_final_weights）、IDF/纯度/语义守门/source_credibility 等 | Stage3 |
+| **hierarchy_guard** | 分布/纯度/熵、层级 fit、泛词惩罚；**结构信号**：build_family_key、get_retrieval_role_from_term_role、compute_multi_source_support、compute_family_centrality；扩展门控 **allow_primary_to_expand**（只看 multi_source_support、subfield_fit、topic_fit、outside_subfield_mass）；Stage3 **仅 2 条硬规则** should_drop_term；**主分+轻 gate** score_term_record（base=0.35·semantic+0.20·context+0.20·subfield_fit+0.15·topic_fit+0.10·multi_source，gate 轻乘） | Stage2A / Stage2B / Stage3 |
+| **label_expansion** | 学术落点（跨类型 SIMILAR_TO）与学术侧补充（dense、簇、共现）；**get_vocab_hierarchy_snapshot**、**collect_landing_candidates(jd_profile)** 做层级 fit 与 landing 打分、**allow_primary_to_expand** 参与扩散门控、merge 时写 **cluster_id** 与层级字段 | Stage2A / Stage2B |
+| **term_scoring** | 词级最终权重（calculate_final_weights）、IDF/纯度/语义守门/source_credibility 等；与 hierarchy_guard.score_term_record 配合 | Stage3 |
 | **paper_scoring** | 论文贡献度（compute_contribution）：撤稿、领域纯度、标签累加（按 term_role 加权）、综述降权、紧密度、时序与署名；compute_primary_term_coverage（primary/supporting 计数供护栏 5） | Stage5 |
 | **simple_factors** | survey_decay_factor、coverage_norm_factor、paper_cluster_bonus、paper_jd_semantic_gate_factor 等论文侧因子 | paper_scoring 与词/论文打分 |
 | **advanced_metrics** | 共现/共鸣相关（term_resonance、cooc_span_penalty、cooc_purity_bonus 等，部分当前为占位 1.0） | Stage2/Stage3 词权重 |
@@ -894,10 +969,10 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 
 - **锚点太少/太多**：看 Stage1 的 ANCHOR_*、JD_VOCAB_TOP_K、ANCHOR_MELT_COV_J；以及 DomainDetector 的 Job Top-K、active_domains 数量。  
 - **学术词偏泛或偏窄**：看 Stage2 的 SIMILAR_TO_TOP_K/MIN_SCORE、vocabulary_domain_stats 的领域过滤；Stage3 的 SEMANTIC_POWER、ANCHOR_TERM_SIM_MIN、ANCHOR_BASE/ANCHOR_GAIN。  
-- **论文/作者分数异常**：看 Stage4 的 3% 熔断、domain_regex；Stage5 的 paper_scoring 各因子（综述降权、时序、署名）、AUTHOR_BEST_PAPER_MIN_RATIO；RecallDebugInfo 里各阶段统计与 last_debug_info。  
+- **论文/作者分数异常**：看 Stage4 的 MELT_RATIO、domain 软奖励、term_scores、TERM_MAX_PAPERS；Stage5 的 paper_scoring 各因子（综述降权、时序、署名）、AUTHOR_BEST_PAPER_MIN_RATIO；RecallDebugInfo 里各阶段统计与 last_debug_info。  
 - **Stage2A 落点偏移**：优先看 anchor_type、identity_score、domain_fit、本锚点 primary 数量；不要先盯作者榜。  
 - **Stage2B 噪声扩散**：优先看 primary_high_confidence 的筛选结果、domain_span、topic_align、各扩展来源数量（dense / cluster / cooc）。  
-- **Stage3 全部滤空或几乎全过**：优先看 passes_identity_gate、passes_topic_consistency、FINAL_MIN_TERM_SCORE 以及 domain_fit/topic_align 是否真实透传。
+- **Stage3 全部滤空或几乎全过**：优先看 passes_identity_gate、passes_topic_consistency；**当前已改为按 final_score 排序保留 top_k（STAGE3_TOP_K）**，不再用 FINAL_MIN_TERM_SCORE 阈值淘汰；可开 STAGE3_DETAIL_DEBUG 看每词 base_score、hierarchy_score、各 penalty、reject_reason；并确认 domain_fit/topic_align/层级字段是否真实透传。
 
 **标签路可调类常量（LabelRecallPath）**
 
@@ -917,6 +992,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 | **ANCHOR_MIN_JOB_FREQ** | 2 | 技能至少出现在几个命中岗位中才保留 |
 | **ANCHOR_TERM_SIM_MIN** | 0.45 | 学术词与任意锚点最大余弦相似度下限，低于则降权 |
 | **AUTHOR_BEST_PAPER_MIN_RATIO** | 0.05 | 作者最佳论文贡献低于全局最大此比例则不出现在排序 |
+| **PAPER_RECALL_MAX_TERMS**（stage3_term_filtering） | 12 | family 保送式选词后参与论文检索的最大词数（每 family 1 primary + 1 support） |
 | **SEMANTIC_POWER** | 3 | 词权重中语义因子 cos_sim 的次方 |
 | **ANCHOR_BASE** / **ANCHOR_GAIN** | 0.35, 0.65 | 词权重中锚点相关系数 |
 | **SPAN_PENALTY_EXPONENT** | 0.35 | 领域跨度惩罚 (1+domain_span)^exp 的指数 |
@@ -1014,11 +1090,94 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 |------|----------|----------|
 | **文本转向量** | JD → 与索引一致的语义向量，并强化核心技能词 | 动态词库、自共振增强、OpenVINO SBERT、mean pooling、L2 归一化 |
 | **向量路** | 按「与 JD 最像的论文」找作者 | 摘要 Faiss 检索、领域硬过滤、论文序→作者序映射 |
-| **标签路** | 按「岗位技能→学术词→论文→作者」+ 多维度打分 | Stage1 领域与锚点（3% 熔断、JD 补充）→ Stage2A 学术落点（跨类型 SIMILAR_TO、可选 JD 向量）→ Stage2B 学术侧补充（dense/簇/共现）→ Stage3 双闸门与两分制（身份/topic 闸门、quality、final_score）→ Stage4 论文召回 → Stage5 作者排序；依赖 `label_means` 与 `label_pipeline` 子模块；基础设施由 `label_means.infra` 管理 |
+| **标签路** | 按「岗位技能→学术词→论文→作者」+ 多维度打分与层级守卫 | Stage1 领域与锚点（3% 熔断、JD 补充、**jd_profile** 与锚点 local_context/phrase_context）→ Stage2A 学术落点（SIMILAR_TO，有 jd_profile 时层级 fit 与 landing 打分、硬门槛；**Stage2A 候选明细调试打印**）→ Stage2B 学术侧补充（**allow_primary_to_expand 放宽**：identity≥0.70、domain_fit≥0.50、source∈可信，raw_candidates 带 subfield_fit/topic_fit/cluster_id/main_subfield_match 等）→ Stage3 **轻硬过滤（仅 2 条）** + **主分+轻 gate 的 score_term_record** + **按 final_score 排序保留 top_k**（不断流）+ **STAGE3_DETAIL_DEBUG 明细打印** → Stage4 论文二层召回（领域软奖励、per-term 限流、MELT_RATIO）→ Stage5 作者排序（CoverageBonus 等预留）；依赖 `label_means`（含 **hierarchy_guard**）、`label_pipeline`；基础设施由 `label_means.infra` 管理 |
 | **协同路** | 由种子作者扩展合作者 | 种子=V+L Top100、协作表双向查询、score 聚合、按总分排序 |
 | **总控** | 单次编码、三路并行、统一候选池 | Query 领域扩展、build_candidate_records → score_candidate_pool → enrich → 硬过滤 → 分桶；RRF + multi_path_bonus；路径权重 2.0/3.0/1.0 |
 
 整体上：**向量路**偏语义相似度，**标签路**偏技能/概念与图谱结构，**协同路**偏合作网络；三路在总控里用 RRF 合成一份作者列表，再交给精排与解释模块使用。
+
+---
+
+## 层级化领域守卫与自动负向领域屏蔽改造方案（仅修改标签路）
+
+当前标签路的主要问题不是“候选完全不在目标大领域内”，而是：
+
+1. **领域守卫颗粒度过粗**：只看一级 `domain`，导致“机器人控制”“网络安全强化学习”“管理控制”都可能在一级层面被误判为可接受。
+2. **多义词学术落点错误**：如“运动学”“动力学”“控制”等工业语境中的核心词，容易被落到非目标学术方向。
+3. **泛词扩散过强**：如 `reinforcement learning`、`optimization`、`control` 这类大词，覆盖大量子方向，容易靠论文规模与共现关系霸榜。
+4. **错 primary 会继续扩散**：一旦 Stage2A 的 primary 落错，Stage2B 的 dense / cluster / cooc 扩展会把整片候选带偏。
+
+本改造方案的目标是：**不改索引构建，只利用现有统计表，在标签路内部完成四层领域画像、自动负向领域屏蔽、多义词消歧、泛词抑制与扩展门控。**
+
+---
+
+### 1. 现有索引可直接利用的统计信息
+
+在不修改索引构建代码的前提下，标签路可直接使用以下表：
+
+#### 1.1 `vocabulary_topic_stats`
+
+用于提供候选学术词的二三级领域画像：
+
+* `field_id`
+* `subfield_id`
+* `topic_id`
+* `field_dist`
+* `subfield_dist`
+* `topic_dist`
+
+用途：候选词的主 field / subfield / topic；候选词与 JD 在 field / subfield / topic 层的分布重合；自动负向领域屏蔽；在线计算 purity / entropy。
+
+#### 1.2 `vocabulary_domain_stats`
+
+用于补充一级领域与泛词强度信息：`domain_dist`、`domain_span`、`work_count`。用途：一级领域兜底守卫；自动抑制跨域过宽的大词；自动抑制论文量极大的泛词。
+
+#### 1.3 `vocabulary_cooc_domain_ratio`
+
+用于辅助共现侧的领域纯度判断：某词的共现伙伴主要活在哪些领域。用途：当 topic/subfield 信息不完整时作为弱证据；在 cooc 扩展中辅助判断“这个词虽然和 seed 共现，但是否仍然主要活在 JD 外领域”。
+
+#### 1.4 `vocabulary_cluster / cluster_members`
+
+用于扩展阶段的簇控制：词所属概念簇、簇成员列表。用途：Stage2B 的 cluster 扩展；term family / group 去重；避免某一簇的泛词刷满前排。
+
+---
+
+### 2. 总体改造思路
+
+本次改造将标签路升级为：
+
+> **Stage1：构建 JD 四层领域画像与上下文锚点** → **Stage2A：带上下文的 academic landing（解决多义词落点）** → **Stage2B：带领域引力的扩展（放宽 allow_primary_to_expand，使靠谱 primary 能带出 support term）** → **Stage3：轻硬过滤（仅 2 条）+ 主分+轻 gate 最终分 + 按 final_score 排序保留 top_k（不断流）** → **Stage4：论文层二次守卫 + 单词贡献限流** → **Stage5：作者层覆盖度与一致性排序**
+
+核心原则：同时使用 domain / field / subfield / topic 四层；使用“分布重合 + 主层级匹配 + 外部领域质量”；只有高可信 primary 才能继续扩散；引入 purity / entropy / domain_span / family coverage 抑制泛词。
+
+---
+
+### 3. 改动文件与职责划分
+
+| 阶段 | 文件 | 职责 |
+|------|------|------|
+| Stage1 | `stage1_domain_anchors.py` | 生成工业锚点、提取锚点局部上下文、构建 JD 四层领域画像 |
+| Stage2 | `stage2_expansion.py`、`label_expansion.py` | Stage2A academic landing、Stage2B expansion、层级契合度与泛词惩罚、primary 扩散门控 |
+| Stage3 | `stage3_term_filtering.py`、`term_scoring.py` | term 级过滤与重打分、family/cluster 去重、泛词抑制 |
+| Stage4 | `stage4_paper_recall.py`、`paper_scoring.py` | 二层论文召回、领域软奖励、term_final_score 入 paper_score、per-term 限流、MELT_RATIO |
+| Stage5 | `stage5_author_rank.py` | 作者层汇总、多锚点覆盖奖励、family 失衡惩罚、领域一致性排序 |
+
+---
+
+### 4. 推荐新增的辅助函数与公式（概要）
+
+- **分布与统计**：`parse_json_dist`、`compute_purity`、`compute_entropy`、`compute_dist_overlap`、`compute_outside_mass`
+- **层级 fit**：`compute_hierarchical_fit`（domain/field/subfield/topic fit、main_*_match、outside_*_mass）
+- **泛词抑制**：`compute_generic_penalty(work_count, domain_span)`、`compute_external_penalty(fit_info)`、purity_bonus、entropy_penalty
+- **Landing**：`score_landing_candidate`（BaseSemantic × ContextScore × HierarchyGate × PurityBonus × EntropyPenalty × ExternalPenalty × GenericPenalty）
+- **扩展门控**：`allow_primary_to_expand(primary_record)`；`score_expansion_candidate` 含 FieldGravity
+- **Stage3**：`should_drop_term`（仅 2 条硬规则）、`score_term_record`（主分+轻 gate：base=0.55·semantic+0.25·context+0.20·hierarchy_score，gate=external^0.5×entropy^0.5×generic^0.3）、按 final_score 排序保留 top_k、`apply_family_rank_decay`；缺失 topic/subfield 时 hierarchy 内不按 0 处理（topic_fit=None、退化为 field/domain）
+- **Stage4**：`TERM_MAX_PAPERS`、单 term 对作者贡献上限、`score_paper_record` 含 PaperHierarchyFit
+- **Stage5**：CoverageBonus、HierarchyConsistency、FamilyBalancePenalty
+
+详细公式与工程落地顺序见仓库内标签路代码注释及 `label_means/hierarchy_guard.py` 实现。
+
+**当前已落地（防断流与轻惩罚）**：① **Stage3** 改为「轻硬过滤（仅 2 条）+ 主分+轻 gate 的 final_score + 按 final_score 排序保留 top_k（STAGE3_TOP_K=20）」；不再用 FINAL_MIN_TERM_SCORE 阈值淘汰。② **score_term_record** 改为 base=0.55·semantic+0.25·context+0.20·hierarchy_score，gate=external^0.5×entropy^0.5×generic^0.3，惩罚项只轻压。③ **缺失三级信息**：无 topic_dist 时 topic_fit=None、不按 0 惩罚；缺 subfield/field 时退化为上一级。④ **allow_primary_to_expand** 放宽为 identity≥0.70、domain_fit≥0.50、source∈可信，使靠谱 primary 能带出 support term。⑤ **调试**：Stage2A 候选明细/primary 胜出明细；Stage3 每词 base_score、hierarchy_score、external/entropy/generic_penalty、final_score、reject_reason（STAGE3_DETAIL_DEBUG）。
 
 ---
 
@@ -1254,6 +1413,7 @@ KGAT-AX 是「**知识图谱注意力网络 + 学术指标增强（AX）**」的
 - **ID 映射**：读 `id_map.json`，得到 `entity_to_int`、`user_to_int`、`ENTITY_OFFSET`、`n_users_entities`、`n_users`；用于后续所有张量下标。
 - **CF 数据**：解析 `train.txt` / `test.txt`，得到 `train_user_dict` / `test_user_dict`（每个 user 对应的正例列表），以及 **tiered_cf_dict**（每个 user 的 fair/neutral/easy 负例列表），供**阶梯负采样**使用。
 - **AX 特征**：从 `feature_index.json` 读入作者（和可选机构）的归一化特征（如 h_index、cited_by_count、works_count），按 `entity_to_int` 对齐到 `aux_info_all`，形状为 `(n_users_entities, n_aux_features)`；若文件不存在则全 0。
+- **四分支侧车（已实现）**：当 `n_recall_features` / `n_author_aux` / `n_interaction_features` 任一 > 0 时，自动加载 `train_four_branch.json` / `test_four_branch.json`（若存在），键为 `u{uid}_i{iid}`，值为 recall/author_aux/interaction 向量，供四分支模型训练与评估使用。
 - **KG 子图采样**：从 `kg_index.db` 中，以「训练集里出现过的 user + entity」为种子，拉取 1-hop 边；再对涉及到的 Vocabulary 节点拉取 **SIMILAR_TO (r=6)** 的 2-hop 边，形成带权子图。边存为 `train_kg_dict`（按头节点）和 `train_relation_dict`（按关系类型），每条边带权重 `w`。
 - **加权拉普拉斯矩阵**：用上述边的权重 `w` 构建稀疏邻接矩阵，按行归一化得到 **归一化拉普拉斯**（或随机游走形式），并转为 PyTorch 稀疏张量 `A_in`，供图卷积做**消息传递**；可缓存为 `weighted_adj_cache.npz` 以加速后续运行。
 
@@ -1557,9 +1717,9 @@ KGAT-AX 是「**知识图谱注意力网络 + 学术指标增强（AX）**」的
   - 文件末尾提供独立测试脚本，可交互式体验向量路召回。
 
 - **`src/core/recall/label_path.py`**  
-  - `LabelRecallPath` 类，是 **标签路召回入口与编排**：统一调用 **label_pipeline 五阶段**（stage1_domain_anchors → stage2_expansion → stage3_term_filtering → stage4_paper_recall → stage5_author_rank）与 **label_means** 中的锚点、扩展、词/论文打分逻辑。定义 `Stage1Result`、`RecallContext`、`RecallDebugInfo` 等结构体用于阶段间状态与调试。输入输出格式不变：`recall(query_vector, domain_ids)` 仍返回 `(author_id_list, elapsed_ms)`；完整诊断链路通过 `debug_info` / `last_debug_info` 输出，便于调参与可解释性分析。
-  - **`label_means/`** 子模块：`infra` 统一管理 Neo4j、Faiss、vocab_stats.db、簇中心等资源；`label_anchors`、`label_expansion` 负责锚点提取与语义扩展；`term_scoring`、`paper_scoring`、`simple_factors`、`advanced_metrics` 负责词级与论文级打分与指标；`base`、`label_debug_cli` 提供基类与调试 CLI。
-  - **`label_pipeline/`** 子模块：五阶段实现分别对应 `stage1_domain_anchors.py`（领域探测与工业侧锚点）、`stage2_expansion.py`（学术落点与学术侧补充：先 anchor→academic landing（跨类型 SIMILAR_TO、可选 JD 向量），再 dense/簇/共现补充）、`stage3_term_filtering.py`（双闸门与两分制）、`stage4_paper_recall.py`（论文召回与贡献度）、`stage5_author_rank.py`（作者排序与截断）。
+  - `LabelRecallPath` 类，是 **标签路召回入口与编排**：统一调用 **label_pipeline 五阶段** 与 **label_means** 中的锚点、扩展、**层级守卫**（hierarchy_guard）、词/论文打分逻辑。**Stage1Result** 含 **jd_profile**（四层领域画像），recall 内将 jd_profile 传入 Stage2；定义 `RecallContext`、`RecallDebugInfo` 等用于阶段间状态与调试。输入输出格式不变：`recall(query_vector, domain_ids)` 仍返回 `(author_id_list, elapsed_ms)`；诊断通过 `debug_info` / `last_debug_info` 输出。
+  - **`label_means/`** 子模块：`infra` 统一管理 Neo4j、Faiss、vocab_stats.db、簇中心等；`label_anchors`、`label_expansion` 负责锚点提取与语义扩展（含 **get_vocab_hierarchy_snapshot**、**collect_landing_candidates(jd_profile)**、**allow_primary_to_expand**（放宽条件）；**Stage2A 候选明细/primary 胜出明细调试打印**）；**`hierarchy_guard`** 提供分布/纯度/熵、层级 fit（**缺失 topic 时 topic_fit=None，缺 subfield/field 退化为上一级**）、泛词/负向惩罚（缺失 topic 时跳过对应项）、landing/expansion 打分、**should_drop_term（仅 2 条硬规则）**、**score_term_record（主分+轻 gate）**；`term_scoring`、`paper_scoring`、`simple_factors`、`advanced_metrics` 负责词级与论文级打分；`base`、`label_debug_cli` 提供基类与调试 CLI。
+  - **`label_pipeline/`** 子模块：**stage1_domain_anchors.py**（领域与锚点；**attach_anchor_contexts**、**build_jd_hierarchy_profile**，产出 jd_profile 与锚点 local_context/phrase_context）；**stage2_expansion.py**（学术落点与扩展；接收 jd_profile，raw_candidates 带 subfield_fit/topic_fit/landing_score/cluster_id/**main_subfield_match** 等）；**stage3_term_filtering.py**（**轻硬过滤（should_drop_term 仅 2 条）**、**score_term_record（主分+轻 gate）**、**按 final_score 排序保留 top_k**、STAGE3_TOP_K/STAGE3_DETAIL_DEBUG 与明细打印）；**stage4_paper_recall.py**（二层论文召回、领域软奖励、term_scores 入 paper_score、TERM_MAX_PAPERS/per-term 限流、MELT_RATIO）；**stage5_author_rank.py**（作者排序与截断；预留 CoverageBonus/HierarchyConsistency/FamilyBalancePenalty）。
 
 - **`src/core/recall/works_to_authors.py`**  
   - 将论文级得分聚合为作者级得分，供标签路 Stage5 及总召回使用；被 `label_path` 与流水线阶段调用。
@@ -1594,8 +1754,8 @@ KGAT-AX 是「**知识图谱注意力网络 + 学术指标增强（AX）**」的
 - **`src/core/ranking/rank_scorer.py`**  
   - `RankScorer` 主要负责：
     - 将岗位锚点与候选作者原始 ID 映射到 KGAT 内部 ID 空间；
-    - 构造活跃节点子集，调用 `model.calc_cf_embeddings_subset` 获取融合 AX 特征的嵌入；
-    - 对岗位嵌入取均值得到「理想人选向量」，与候选人嵌入做点积得到综合得分；
+    - **有 candidate_records 且模型启用四分支时**：从候选记录构建 recall/author_aux/interaction 特征，调用 `model.calc_score_v2` 得到四塔融合的 `final_score`；
+    - **否则**：构造活跃节点子集，调用 `model.calc_cf_embeddings_subset` 获取融合 AX 的嵌入，对岗位嵌入取均值与候选人嵌入点积得到综合得分；
     - 打印诊断信息（分数区间 / 极差等）。
 
 - **`src/core/ranking/rank_explainer.py`**  
@@ -1712,6 +1872,7 @@ KGAT-AX 是「**知识图谱注意力网络 + 学术指标增强（AX）**」的
     - 从 `train.txt / test.txt / kg_final.txt` 中解析用户‑正样本‑负样本四级梯度结构；
     - 读取 `kg_index.db`，构建包含权重的三元组与拉普拉斯矩阵；
     - 加载 AX 特征 JSON 并映射到全局节点空间；
+    - **四分支侧车（已实现）**：当模型启用四分支时，自动加载 `train_four_branch.json` / `test_four_branch.json`（若有），提供 `get_four_branch_for_batch` 供训练/评估使用；
     - 提供 CF / KG 批次采样与数据质量检查工具。
 
 - **`trainer.py`**  
@@ -1724,15 +1885,16 @@ KGAT-AX 是「**知识图谱注意力网络 + 学术指标增强（AX）**」的
 
 - **`pipeline.py`**  
   - 封装三步流水线：
-    1. `generate_training_data.py`：生成四级梯度训练样本；
+    1. `generate_training_data.py`：生成训练样本（候选池入口 + 分层正负样本 + 可选四分支侧车）；
     2. `build_kg_index.py`：构建加权 KG 索引；
     3. `trainer.py`：执行 KGAT‑AX 训练；
   - 用于一键启动从样本生成到模型训练的全流程。
 
-- **`generate_training_data.py`**  
+- **`generate_training_data.py`**（已对齐 README 5.5 与四分支导出）  
   - `KGATAXTrainingGenerator`：
-    - 通过 `TotalRecallSystem` 对抽样岗位执行召回，将候选专家按召回排名与学术质量融合排序；
-    - 生成 `train.txt / test.txt`，每行包含 `user_id;pos;fair;neutral;easyNeg` 四级样本；
+    - **训练样本入口**：优先基于 `candidate_pool.candidate_records` 构造样本；不足时回退到 `final_top_500`。
+    - **分层正负样本**：Strong/Weak Positive、EasyNeg/FieldNeg/HardNeg/CollabNeg（README 5.5）；产出 `train.txt / test.txt`，每行 `user_id;pos;fair;neutral;easyNeg`。
+    - **四分支侧车**：可选导出 `train_four_branch.json` / `test_four_branch.json`（recall/author_aux/interaction 特征），供 DataLoader 与四分支模型使用。
     - 从 Neo4j 导出加权关系并映射到统一 ID 空间，生成 `kg_final.txt` 与 `id_map.json`。
 
 - **`build_kg_index.py`**  
@@ -2750,9 +2912,9 @@ def stage3_filter_and_score_terms(term_candidates, active_domains):
 
 为便于调试、消融实验和解释模块复用，KGAT-AX 后续不建议只输出单一 `final_score`，而应同时保留分项输出：`s_graph`、`s_author`、`s_recall`、`s_interaction`、`final_score`。用途包括：**训练分析**（判断模型是否过度依赖显式指标、图分支是否真正学到结构信号）；**消融实验**（对比不同分支的增益与不同融合方式的收益）；**解释模块**（说明某作者排前是因为图路径、学术实力，还是多路召回共识）。
 
-##### 5.5 KGAT-AX 训练数据入口与样本定义
+##### 5.5 KGAT-AX 训练数据入口与样本定义（已实现）
 
-后续 `generate_training_data.py` 不应只读取召回后的 `final_top_200`，而应明确改为：**优先基于 `candidate_pool.candidate_records` 构造训练样本**，即训练数据的主入口应与线上候选池保持一致。
+**已实现**：`generate_training_data.py` 优先基于 `candidate_pool.candidate_records` 构造训练样本；当候选池不足或不可用时回退到 `final_top_500`，训练数据主入口与线上候选池保持一致。
 
 - **训练样本来源**：使用 `results["candidate_pool"].candidate_records`、`results["candidate_pool"].candidate_evidence_rows` 作为主要输入来源；前者用于生成 (job, author) 排序样本，后者用于构造证据强度、主题匹配和论文命中等辅助特征。
 - **正样本定义（分层）**：**Strong Positive**：满足之一或组合——`passed_hard_filter == True`、`bucket_type == 'A'`、`from_label == True`、`path_count >= 2`、具备较强主题命中与论文证据支撑。**Weak Positive**：`passed_hard_filter == True`、`bucket_type in {'A', 'B'}`、有明确主题支撑，但多路命中或作者指标不如 Strong Positive 稳定。强正样本用于学习“谁应该明显排前”，弱正样本用于保留排序边界的柔性。
@@ -2830,8 +2992,8 @@ final\_score =
 为进一步提升精排阶段的效果与可解释性，后续 KGAT-AX 改造重点不在于更换主模型，而在于补齐以下内容：
 
 - **明确四分支输入字段**：Graph / Author / Recall / Interaction 四分支字段表固定下来；训练数据、dataloader、forward 保持同一口径。
-- **训练样本入口切换到 CandidatePool**：`generate_training_data.py` 优先基于 `candidate_pool.candidate_records` 构造样本；`final_top_200` 仅作为兼容接口保留。
-- **正负样本定义显式化**：Strong Positive / Weak Positive；EasyNeg / FieldNeg / HardNeg / CollabNeg（详见 5.5）。
+- **训练样本入口与 CandidatePool 对齐（已实现）**：`generate_training_data.py` 优先基于 `candidate_pool.candidate_records` 构造样本；`final_top_500` 仅作兼容回退。
+- **正负样本定义显式化（已实现）**：Strong Positive / Weak Positive；EasyNeg / FieldNeg / HardNeg / CollabNeg（详见 5.5）。
 - **模型输出分项得分**：除 `final_score` 外，同时输出 `s_graph` / `s_author` / `s_recall` / `s_interaction`；便于调试、消融与解释。
 - **预排序职责归属明确**：由 `ranking_engine.py` 承担轻量预排序逻辑；不让“预排序”停留在规划文字层面。
 - **稳定项显式实现**：`rule_stability` 由 bonus / penalty 组成（见 6.5）；保证线上排序更稳定。

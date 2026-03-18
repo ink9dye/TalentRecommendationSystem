@@ -20,7 +20,7 @@ import math
 import collections
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 from datetime import datetime
 from src.core.recall.input_to_vector import QueryEncoder
 from src.core.recall.works_to_authors import accumulate_author_scores
@@ -60,7 +60,7 @@ from src.core.recall.label_pipeline import (
 class Stage1Result:
     """
     阶段 1 结构化结果壳，用于逐步解耦领域与锚点阶段的中间状态。
-    当前仅在内部存储与调试使用，不改变外部调用签名。
+    含 jd_profile（四层领域画像）供 Stage2 层级守卫使用。
     """
     active_domains: Set[int]
     domain_regex: str
@@ -69,6 +69,7 @@ class Stage1Result:
     job_previews: List[Dict[str, Any]]
     dominance: float
     anchor_debug: Dict[str, Any]
+    jd_profile: Optional[Dict[str, Any]] = None  # domain/field/subfield/topic_weights, active_*, main_*
 
 
 @dataclass
@@ -109,6 +110,8 @@ class RecallDebugInfo:
         self.tag_purity_debug: List[Dict[str, Any]] = []
         self.cluster_rank_factors: Dict[str, float] = {}
         self.cluster_expansion_log: List[Dict[str, Any]] = []
+        # 标签路追踪：Stage3 被过滤候选及原因
+        self.dropped_with_reason: List[Dict[str, Any]] = []
 
 
 def _emit_label_pipeline_checkpoints(checkpoints, debug_1=None):
@@ -1314,10 +1317,10 @@ class LabelRecallPath:
             domain_id=domain_id,
         )
 
-    def _stage2_expand_academic_terms(self, anchor_skills, active_domain_set, regex_str, query_vector, query_text=None):
+    def _stage2_expand_academic_terms(self, anchor_skills, active_domain_set, regex_str, query_vector, query_text=None, jd_profile=None):
         """
         阶段 2：学术词扩展。边路 + 语境向量路 + 簇扩展 + 共鸣/共现，返回候选列表（不计算最终词权）。
-        返回: raw_candidates，每项含 tid, term, degree_w, target_degree_w, domain_span, cov_j, hit_count 等，供 stage3 统一公式。
+        传入 jd_profile 时启用层级守卫与泛词抑制。
         """
         return stage2_expansion.run_stage2(
             self,
@@ -1326,6 +1329,7 @@ class LabelRecallPath:
             regex_str=regex_str,
             query_vector=query_vector,
             query_text=query_text,
+            jd_profile=jd_profile,
         )
 
     def _apply_cluster_rank_decay(self, score_map: dict) -> None:
@@ -1473,12 +1477,21 @@ class LabelRecallPath:
         """
         return stage3_term_filtering.run_stage3(self, raw_candidates, query_vector, anchor_vids=anchor_vids)
 
-    def _stage4_graph_search(self, vocab_ids, regex_str):
+    def _stage4_graph_search(self, vocab_ids, regex_str, score_map=None, term_retrieval_roles=None):
         """
-        阶段 4：图检索。用学术词 ID 反查 Work 与 Author。
+        阶段 4：图检索。用学术词 ID 反查 Work 与 Author，带 Stage3 词权与 retrieval_role（paper_primary / paper_support）参与 paper_score。
         返回: list of { 'aid': str, 'papers': [ { wid, hits, weight, title, year, domains }, ... ] }。
         """
-        return stage4_paper_recall.run_stage4(self, vocab_ids, regex_str)
+        score_map = score_map or {}
+        term_scores = {
+            int(tid): float(score_map.get(str(tid)) or score_map.get(tid) or 0.0)
+            for tid in (vocab_ids or [])
+        }
+        return stage4_paper_recall.run_stage4(
+            self, vocab_ids, regex_str,
+            term_scores=term_scores,
+            term_retrieval_roles=term_retrieval_roles,
+        )
 
     def _stage5_score_and_rank_authors(self, author_papers_list, score_map, term_map, active_domain_set, dominance, debug_1):
         """
@@ -1518,43 +1531,103 @@ class LabelRecallPath:
             _emit_label_pipeline_checkpoints(checkpoints, None)
             return [], (time.time() - start_t) * 1000
 
-        # 阶段 2：学术词扩展（仅产出候选，不算权）
+        # 阶段 2：学术词扩展（仅产出候选，不算权）；传入 jd_profile 供层级守卫
+        jd_profile = getattr(self._last_stage1_result, "jd_profile", None) if getattr(self, "_last_stage1_result", None) else None
         raw_candidates = self._stage2_expand_academic_terms(
             anchor_skills,
             active_domain_set,
             regex_str,
             query_vector,
             query_text=semantic_query_text or query_text,
+            jd_profile=jd_profile,
         )
         checkpoints.append({"stage": "S2", "raw_candidates": len(raw_candidates or []), "ok": bool(raw_candidates)})
         if not raw_candidates:
             _emit_label_pipeline_checkpoints(checkpoints, debug_1)
             return [], (time.time() - start_t) * 1000
+        debug_1["stage2_anchor_evidence_table"] = getattr(self.debug_info, "stage2_anchor_evidence_table", None) or []
         self.debug_info.raw_candidate_tids = sorted(
             set(r.get("tid") for r in raw_candidates if r.get("tid") is not None)
         )
         self._last_raw_candidate_tids = self.debug_info.raw_candidate_tids
+        # 诊断：新 Stage2 产出的 raw_candidates 写入 expansion_raw_results，供 Stage3 来源回溯表显示 source（anchor/similar_to 等）
+        self.debug_info.expansion_raw_results = raw_candidates
+
+        # 诊断回填：若新 Stage2 未写入 similar_to_pass（或为空），用 raw_candidates 中 source=similar_to 的项补全，保证面板有数
+        similar_to_pass = getattr(self.debug_info, "similar_to_pass", None) or []
+        if not similar_to_pass and raw_candidates:
+            from_raw = [
+                {
+                    "tid": r.get("tid"),
+                    "term": r.get("term", ""),
+                    "sim_score": float(r.get("sim_score") or r.get("identity_score") or 0.0),
+                    "hit_count": len(r.get("src_vids") or []),
+                    "src_vids": list(r.get("src_vids") or []),
+                }
+                for r in raw_candidates
+                if (r.get("source") or r.get("origin") or "").strip().lower() == "similar_to"
+            ]
+            if from_raw:
+                self.debug_info.similar_to_pass = from_raw
+
+        # 标签路追踪：source anchor、similar_to 原始候选（便于定位从哪一步开始跑偏）
+        _label_trace = self.verbose or getattr(stage3_term_filtering, "LABEL_PATH_TRACE", False) or getattr(term_scoring, "STAGE3_DEBUG", False)
+        if _label_trace:
+            # source anchor：本 query 的锚点（来自 Stage1）
+            _anchors = list(anchor_skills.keys())[:30] if anchor_skills else []
+            _anchor_preview = []
+            for k in _anchors:
+                v = anchor_skills.get(k)
+                if isinstance(v, dict):
+                    _anchor_preview.append(f"{k}={v.get('term', v.get('skill', k))!r}")
+                else:
+                    _anchor_preview.append(str(k))
+            print("[标签路-source anchor] 锚点数量=%s 前30: %s" % (len(anchor_skills or {}), _anchor_preview[:20]))
+            # similar_to 原始候选：SIMILAR_TO 拉出的原始行（src_vid -> tid, term, sim_score）
+            raw_rows = getattr(self.debug_info, "similar_to_raw_rows", None) or []
+            print("[标签路-similar_to 原始候选] 条数=%s" % len(raw_rows))
+            for i, r in enumerate(raw_rows[:25]):
+                print("  %s src_vid=%s tid=%s term=%r sim_score=%s" % (i + 1, r.get("src_vid"), r.get("tid"), (r.get("term") or "")[:28], r.get("sim_score")))
+            if len(raw_rows) > 25:
+                print("  ... 共 %s 条" % len(raw_rows))
+            agg = getattr(self.debug_info, "similar_to_agg", None) or []
+            pass_list = getattr(self.debug_info, "similar_to_pass", None) or []
+            print("[标签路-similar_to] 聚合后候选数=%s 领域过滤通过数=%s" % (len(agg), len(pass_list)))
 
         # 阶段 3：词权重（统一走复杂公式，传入锚点 ID 供锚点距离门控）
         anchor_vids = [int(k) for k in anchor_skills.keys()] if anchor_skills else None
-        score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map = self._stage3_word_weights(
+        stage3_out = self._stage3_word_weights(
             raw_candidates, query_vector, anchor_vids=anchor_vids
         )
+        if len(stage3_out) == 8:
+            score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map, paper_terms = stage3_out
+        else:
+            score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map = stage3_out
+            paper_terms = []
         checkpoints.append({"stage": "S3", "score_map_terms": len(score_map or {}), "ok": bool(score_map)})
 
-        # 精检：仅选取少量高质量学术词参与论文检索（其余用于打分与 debug），避免大泛词统治图检索规模
-        final_term_ids_for_paper = self._select_terms_for_paper(score_map, term_map, max_terms=20)
+        # 精检：优先 family 保送式 paper_terms（每 family 1 primary + 1 support）；否则回退到 _select_terms_for_paper
+        if paper_terms:
+            final_term_ids_for_paper = [int(r.get("tid")) for r in paper_terms if r.get("tid") is not None]
+            term_scores_for_paper = {int(r["tid"]): float(r.get("final_score") or 0.0) for r in paper_terms if r.get("tid") is not None}
+            term_retrieval_roles = {int(r["tid"]): (r.get("retrieval_role") or "paper_support") for r in paper_terms if r.get("tid") is not None}
+            term_family_keys = {int(r["tid"]): (r.get("family_key") or "") for r in paper_terms if r.get("tid") is not None}
+        else:
+            final_term_ids_for_paper = self._select_terms_for_paper(score_map, term_map, max_terms=20)
+            term_scores_for_paper = None
+            term_retrieval_roles = None
+            term_family_keys = None
         checkpoints.append({"stage": "S3_select", "final_term_ids": len(final_term_ids_for_paper or []), "ok": bool(final_term_ids_for_paper)})
         if getattr(term_scoring, "STAGE3_DEBUG", False):
-            print("[final_term_ids_for_paper] tid | term | source_type | parent_anchor | parent_primary | score")
+            print("[final_term_ids_for_paper] tid | term | term_role | retrieval_role | parent_primary | score")
             for i, tid in enumerate(final_term_ids_for_paper[:30], 1):
                 tid_str = str(tid)
                 term = term_map.get(tid_str, "")
-                st = term_source_map.get(tid_str, "")
-                pa = parent_anchor_map.get(tid_str, "")
+                st = term_role_map.get(tid_str, "")
+                rr = (term_retrieval_roles or {}).get(tid) or "-"
                 pp = parent_primary_map.get(tid_str, "")
                 sc = score_map.get(tid_str, 0.0)
-                print(f"  {i} {tid} | {term!r} | {st} | {pa!r} | {pp!r} | {sc:.3f}")
+                print(f"  {i} {tid} | {term!r} | {st} | {rr} | {pp!r} | {sc:.3f}")
             if len(final_term_ids_for_paper) > 30:
                 print(f"  ... 共 {len(final_term_ids_for_paper)} 条")
         # 将闭环信息提前挂到 debug_1，供 stage5_author_rank 复用/补全
@@ -1572,14 +1645,57 @@ class LabelRecallPath:
         debug_1["term_uniqueness_map"] = term_uniqueness_map
         debug_1["parent_anchor_map"] = parent_anchor_map
         debug_1["parent_primary_map"] = parent_primary_map
+        if term_family_keys is not None:
+            debug_1["term_family_keys"] = term_family_keys
 
-        # 阶段 4：图检索
+        # 阶段 4：图检索（传入 term 分数与 retrieval_role，primary 权重大、support 次之）
         author_papers_list = self._stage4_graph_search(
             final_term_ids_for_paper,
             regex_str,
+            score_map=term_scores_for_paper if term_scores_for_paper is not None else score_map,
+            term_retrieval_roles=term_retrieval_roles,
         )
         n_papers = sum(len(p.get("papers") or []) for p in (author_papers_list or []))
         checkpoints.append({"stage": "S4", "authors": len(author_papers_list or []), "papers": n_papers, "ok": bool(author_papers_list)})
+
+        # 调试：按 term 打印 papers_before_filter / papers_after_filter / authors_before_merge / top_paper_ids
+        if getattr(term_scoring, "STAGE3_DEBUG", False) and final_term_ids_for_paper:
+            _debug_rows = {}
+            for row in (getattr(self, "_last_tag_purity_debug", None) or getattr(self.debug_info, "tag_purity_debug", None) or []):
+                tid = row.get("tid")
+                if tid is not None:
+                    _debug_rows[str(tid)] = row
+            # 从 author_papers_list 按 vid 聚合：该 term 命中的论文数、作者数、top_paper_ids
+            _papers_per_tid = collections.defaultdict(set)
+            _authors_per_tid = collections.defaultdict(set)
+            _paper_list_per_tid = collections.defaultdict(list)
+            for ap in (author_papers_list or []):
+                aid = ap.get("aid")
+                for p in ap.get("papers") or []:
+                    wid = p.get("wid")
+                    for h in p.get("hits") or []:
+                        vid = h.get("vid") if isinstance(h, dict) else getattr(h, "vid", None)
+                        if vid is not None:
+                            _papers_per_tid[int(vid)].add(wid)
+                            if aid:
+                                _authors_per_tid[int(vid)].add(str(aid))
+                            if wid is not None and len(_paper_list_per_tid[int(vid)]) < 20:
+                                _paper_list_per_tid[int(vid)].append(wid)
+            print("[final_term_ids_for_paper] tid | term | source_type | parent_primary | papers_before_filter | papers_after_filter | authors_before_merge | top_paper_ids")
+            for i, tid in enumerate(final_term_ids_for_paper[:30], 1):
+                tid_str = str(tid)
+                term = term_map.get(tid_str, "")
+                st = term_source_map.get(tid_str, "")
+                pp = parent_primary_map.get(tid_str, "")
+                row = _debug_rows.get(tid_str, {})
+                papers_before = int(row.get("degree_w") or 0)
+                papers_after = len(_papers_per_tid.get(int(tid), set()))
+                authors_before = len(_authors_per_tid.get(int(tid), set()))
+                top_ids = (_paper_list_per_tid.get(int(tid)) or [])[:10]
+                top_str = ",".join(str(x) for x in top_ids) if top_ids else "-"
+                print(f"  {i} {tid} | {term!r} | {st} | {pp!r} | {papers_before} | {papers_after} | {authors_before} | {top_str}")
+            if len(final_term_ids_for_paper) > 30:
+                print(f"  ... 共 {len(final_term_ids_for_paper)} 条")
 
         # 阶段 5：作者打分与排序（debug_1 中补上 regex_str、query_vector 供 last_debug_info 与 paper semantic gate）
         debug_1["regex_str"] = regex_str

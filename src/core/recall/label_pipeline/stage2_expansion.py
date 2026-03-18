@@ -7,6 +7,7 @@ Stage2：学术词扩展。
 from typing import Any, Dict, List, Optional, Set
 
 from src.core.recall.label_means import label_expansion
+from src.core.recall.label_means.hierarchy_guard import get_retrieval_role_from_term_role
 from src.core.recall.label_means.label_expansion import (
     PreparedAnchor,
     ExpandedTermCandidate,
@@ -16,7 +17,7 @@ from src.core.recall.label_means.label_expansion import (
 
 
 def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict[str, Any]]:
-    """将 Stage2 输出的 ExpandedTermCandidate 转为下游/Stage3 使用的 raw_candidates 字典列表。"""
+    """将 Stage2 输出的 ExpandedTermCandidate 转为下游/Stage3 使用的 raw_candidates 字典列表；携带层级 fit 等。"""
     out = []
     for c in terms:
         rec = {
@@ -41,6 +42,23 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
         rec["topic_align"] = getattr(c, "topic_align", 1.0)
         rec["topic_level"] = getattr(c, "topic_level", "missing")
         rec["topic_confidence"] = getattr(c, "topic_confidence", 1.0)
+        if getattr(c, "subfield_fit", None) is not None:
+            rec["subfield_fit"] = c.subfield_fit
+        if getattr(c, "topic_fit", None) is not None:
+            rec["topic_fit"] = c.topic_fit
+        if getattr(c, "outside_subfield_mass", None) is not None:
+            rec["outside_subfield_mass"] = c.outside_subfield_mass
+        if getattr(c, "outside_topic_mass", None) is not None:
+            rec["outside_topic_mass"] = c.outside_topic_mass
+        if getattr(c, "topic_entropy", None) is not None:
+            rec["topic_entropy"] = c.topic_entropy
+        if getattr(c, "landing_score", None) is not None:
+            rec["landing_score"] = c.landing_score
+        if getattr(c, "cluster_id", None) is not None:
+            rec["cluster_id"] = c.cluster_id
+        if getattr(c, "main_subfield_match", None) is not None:
+            rec["main_subfield_match"] = c.main_subfield_match
+        rec["retrieval_role"] = get_retrieval_role_from_term_role(c.term_role)
         out.append(rec)
     return out
 
@@ -55,13 +73,13 @@ def run_stage2(
     jd_field_ids: Optional[Set[str]] = None,
     jd_subfield_ids: Optional[Set[str]] = None,
     jd_topic_ids: Optional[Set[str]] = None,
+    jd_profile: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     阶段 2：学术词扩展。
     先转 anchor_skills 为 PreparedAnchor，再走 Stage2A 主落点 + Stage2B 仅围绕 primary 扩展；
-    返回 raw_candidates（含 term_role、identity_score、topic_align）供 Stage3 双闸门使用。
-    当前 Stage2A 仅 SIMILAR_TO 主落点，无其他候选源并轨。
-    可选 jd_field_ids/jd_subfield_ids/jd_topic_ids 供三层领域 topic_align；也可从 recall 上读取。
+    传入 jd_profile 时启用四层领域契合与泛词惩罚。
+    返回 raw_candidates（含 term_role、identity_score、topic_align、层级 fit 等）供 Stage3 使用。
     """
     prepared_anchors = _anchor_skills_to_prepared_anchors(recall, anchor_skills)
     if not prepared_anchors:
@@ -69,6 +87,10 @@ def run_stage2(
     jd_f = jd_field_ids or getattr(recall, "jd_field_ids", None)
     jd_s = jd_subfield_ids or getattr(recall, "jd_subfield_ids", None)
     jd_t = jd_topic_ids or getattr(recall, "jd_topic_ids", None)
+    if jd_profile:
+        jd_f = jd_f or (set(jd_profile.get("active_fields") or []) if jd_profile.get("field_weights") else None)
+        jd_s = jd_s or (set(jd_profile.get("active_subfields") or []) if jd_profile.get("subfield_weights") else None)
+        jd_t = jd_t or (set(jd_profile.get("active_topics") or []) if jd_profile.get("topic_weights") else None)
     terms = stage2_generate_academic_terms(
         recall,
         prepared_anchors,
@@ -79,5 +101,6 @@ def run_stage2(
         jd_field_ids=jd_f,
         jd_subfield_ids=jd_s,
         jd_topic_ids=jd_t,
+        jd_profile=jd_profile,
     )
     return _expanded_to_raw_candidates(terms)
