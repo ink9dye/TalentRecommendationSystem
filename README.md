@@ -891,6 +891,25 @@ Stage2A 从「候选平均打分器」改为「主线优先的组内选主器」
 - **`collect_landing_candidates`**：① similar_to 得初始候选；② 调 conditioned_vec 得 context_neighbors + rerank_signals；③ 为 similar_to 候选附加 context 信号并设 source_role=seed_candidate；④ 仅当候选数≤1 时从 context_neighbors 补最多 2 个 context_fallback（context_sim≥0.82）。
 - **预期日志/现象**：① **propulsion**：semantic 尚可但 context_sim 低或 context_consistency 不足 → admission 被压或 primary_score 下降；② **motion control vs motion controller**：motion control 的 context_sim 更稳、motion controller 的 context_gap 更大 → motion control 优先；③ **robotic arm vs robot hand**：双空间一致性更强的 robotic arm 被抬升；④ **pathfinding**：raw_sim 高但 context_consistency 不足时不再轻松排第一。
 
+**Stage2A 上下文条件化 + context_gain（最小修改，不新增 Step2.5）**
+
+原则：不推倒重做、不加黑白名单；把 **SIMILAR_TO** 与 **向量索引（conditioned_vec）** 当作同源证据，只补「上下文条件化」那半边。
+
+- **总思路**：保留 2A 原框架（retrieve_academic_term_by_similar_to、_retrieve_academic_terms_by_conditioned_vec、collect_landing_candidates、landing_candidates_to_stage2a、enrich_stage2a_candidates、select_primary_per_anchor、check_seed_eligibility），不拆阶段、不重命名主流程。只做四件事：① 把 conditioned_vec 从「弱补位」升格为「正式证据源」；② 给每个 candidate 显式计算 **context_gain**；③ 组选主时把 context_gain / conditioned 证据纳入主线判定；④ seed 门控再加一层「上下文不增益则不扩散」。
+- **PreparedAnchor**：增加 `local_phrases`、`co_anchor_terms`、`jd_snippet`、`surface_vec`、`conditioned_vec`（后者原有）；`_anchor_skills_to_prepared_anchors` 从 anchor_skills / _anchor_ctx 与 label 词向量补全上述字段，供后续双路检索与 context_gain 用。
+- **LandingCandidate / Stage2ACandidate**：增加 `surface_sim`、`conditioned_sim`、`context_gain`、`source_set`；merge 时保留双路信息（同一 tid 可同时来自 similar_to 与 conditioned_vec）。
+- **compute_candidate_context_gain(cand)**：`context_gain = conditioned_sim - surface_proxy`（surface_proxy 优先 surface_sim，否则 semantic_score，否则 0）。
+- **merge_landing_candidates_by_tid**：按 tid 合并时维护 `surface_sim`、`conditioned_sim`、`source_set`、`has_family_fallback`，合并后对每个候选统一算 `context_gain`。
+- **collect_landing_candidates**：① 优先两路正式证据：similar_to + conditioned_vec（conditioned_top_k ≥ max(6, STAGE2A_COLLECT_CONDITIONED_TOP_K)）；② family_landing 仅当 `len(sim_cands) + len(ctx_cands) <= 2` 时补池，且标 `family_fallback_only`、`default_expand_block_reason="family_fallback_no_expand"`，不参与主脑。
+- **_retrieve_academic_terms_by_conditioned_vec**：升格为正式分支，`use_k = max(use_k, 6)`；返回的 LandingCandidate 带 `source="conditioned_vec"`、`conditioned_sim`、`surface_sim=None`，source_role 设为 seed_candidate。
+- **build_mainline_preference**：纳入 `context_gain_score = clip01((context_gain + 0.10) / 0.20)`、`dual_support_bonus = 0.08`（当 dual_support 时）；权重改为 0.30×anchor_identity + 0.20×jd_align + 0.20×context_continuity + 0.15×context_gain_score + 0.10×hierarchy_consistency + dual_support_bonus − risk_penalties。
+- **enrich_stage2a_candidates**：为候选补 `context_gain`、`has_dynamic_support`、`has_static_support`、`dual_support`。
+- **_stage2a_rule_flags**：新增 `context_gain_ok`（context_gain ≥ 0.03）、`dynamic_support_ok`、`dual_support_ok`。
+- **select_primary_per_anchor**：可扩散不再强依赖 context_gain>0。① 硬拒绝保留：obviously_bad_branch、drift_bad、polysemous_no_context；② mainline_candidate = identity_ok 或 (anchor_identity≥ID_WEAK 且 jd_align≥JD_OK) 或 (dual_support 且 ctx_ok)；③ can_expand = mainline_candidate 且（dual_route_ok 或 strong_static_ok 或 multi_anchor_ok），family_fallback_only 则强制 can_expand=False。详见下方「Stage2A select_primary_per_anchor 可扩散规则修正」。
+- **check_seed_eligibility**：新增规则 **context_gain ≤ 0 不进 seed**（block_reason=`no_context_gain`）；调试打印中增加 `context_gain`。
+- **调试打印**：① `[Stage2A dual evidence]`：每锚点候选的 term | static_sim | conditioned_sim | context_gain | sources；② `[Stage2A mainline decision]`：term | identity | ctx_gain | dual_support | mainline_candidate | can_expand；③ `[Stage2B final seed gate]` 中带 context_gain、block_reason。
+- **预期现象**：动力学/运动学/仿真/路径规划等锚点下，conditioned_sim > static_sim、context_gain > 0 的候选有机会 primary_expandable；kinesiology 等 static 尚可但 context_gain 不佳则降级；family_landing 仅在两路都很弱时补池且不扩散。
+
 **Stage2A 最小修复补丁（防全灭）**
 
 在「上下文纠偏 + 双空间准入」基础上，为避免 Stage2A 因 identity/eligibility/admission 过严导致 **raw_candidates=0 全灭**，对以下 3 个函数做了最小放宽，目标是把系统从「全灭」拉回「能出正常 primary」：
@@ -948,6 +967,43 @@ Stage2A 从「候选平均打分器」改为「主线优先的组内选主器」
 | **select_primary_per_anchor** | `obvious_bad` = `retain_mode == "reject"` 或 `primary_score < STAGE2A_WEAK_KEEP_MIN`。`good_mainline` = `retain_mode != "reject"` 且 `mainline_pref >= STAGE2A_MAINLINE_PREF_MIN` 且 `anchor_identity >= STAGE2A_EXPANDABLE_IDENTITY_MIN` 且 `not _is_obviously_bad_branch_stage2a(c, feat)` 且 `source_type != "conditioned_vec"`。mainline_block_reason 相应改为 retain_mode_reject / primary_score_below_weak_keep / obviously_bad_branch / mainline_pref_low / anchor_identity_low / conditioned_vec_no_expand / other。 |
 
 **预期**：motion control、reinforcement learning、robotic arm、robot control、digital control、Robot manipulator、medical robotics 等由**最终分桶**按门控决定是否 primary_expandable，不再被 precheck 提前压死；dynamism、propulsion、mechanics、vibration、kinesiology、movement control、motion controller、robotic hand 等仍可落在 primary_keep_no_expand（由门控或 admission 的 weak_retain 决定）。
+
+**Stage2A select_primary_per_anchor 可扩散规则修正（让 2A 真正产出 primary_expandable）**
+
+- **目标**：不再因 `context_gain <= 0` 把明显正确的主线词全打成 `primary_keep_no_expand`，让 2A 能产出少量 `primary_expandable`。
+- **问题**：候选已找到、`mainline_candidate=True` 也成立，但原逻辑要求 `context_gain >= 0.03` 且 `has_dynamic_support` 才 `can_expand`，导致可扩词被全灭。
+- **改动要点**（只改 `select_primary_per_anchor`）：
+  1. **保留硬拒绝**：`obviously_bad_branch`、`semantic_drift_branch`、`object_or_poly_bad_branch`、`polysemous_no_context` 仍直接 reject，不动。
+  2. **主线候选放宽**：`mainline_candidate` = `identity_ok` 或（`anchor_identity >= ID_WEAK` 且 `jd_align >= JD_OK`）或（`dual_support` 且 `ctx_ok`），不再强依赖 `context_gain_ok`。
+  3. **可扩散新规则**（满足任一即可 `can_expand`，不再要求 `context_gain > 0`）：
+     - **双路一致主线**：`dual_support`、`anchor_identity >= ID_MAIN`、`context_supported`、`context_sim >= CTX_FLOOR`；
+     - **静态强匹配主线**：`source_has_similar_to`、`anchor_identity >= ID_STRONG`、`jd_align >= JD_OK`、`context_sim >= max(CTX_FLOOR, semantic_score - CTX_DROP_TOL)`；
+     - **多锚点一致主线**：`support_count >= 2`、`anchor_identity >= ID_MULTI`、`jd_align >= JD_OK`，且非 poly_bad/object_bad。
+  4. **分桶**：`can_expand` → primary_expandable；否则 mainline_candidate → primary_keep_no_expand；否则 primary_score ≥ PRIMARY_KEEP_MIN → primary_keep_no_expand，再否则 reject。
+- **新增常量**：`STAGE2A_ID_MAIN`(0.52)、`STAGE2A_ID_STRONG`(0.58)、`STAGE2A_ID_MULTI`(0.48)、`STAGE2A_ID_WEAK`(0.45)、`STAGE2A_JD_OK`(0.74)、`STAGE2A_CTX_FLOOR`(0.42)、`STAGE2A_CTX_DROP_TOL`(0.08)、`STAGE2A_PRIMARY_KEEP_MIN`(0.20)。
+- **预期现象**：motion control、reinforcement learning、robotic arm、robot control、route planning、digital control 等有机会从 keep_no_expand 变为 primary_expandable；Nonlinear system identification、simulation 谨慎放行；dynamism、propulsion、kinesiology、Leukocytopenia、Educational robotics、Telerobotics、End-to-end principle 等仍不放行。验收时看日志：primary_expandable 非空，约 4～8 个词可扩。
+
+**Stage2 最后两刀：seed 契约唯一化 + 动力学候选补池**
+
+**刀 1：2A→2B seed 判定唯一出口**  
+目标：Stage2B 只认 `check_seed_eligibility()` 的最终结果，不再出现 `can_expand=True` 或 `trusted_source=True` 旁路放行。
+
+- **check_seed_eligibility**：① 先判 `can_expand`（2A 明确不可扩散则返回 `stage2a_not_expandable`）；② 仅 `retain_mode=="normal"` 且非 `suppress_seed` 才可能进 seed；③ source 必须在 `TRUSTED_SOURCE_TYPES_FOR_DIFFUSION`；④ 语义错义 seed 禁扩；⑤ 最终准入由 `is_primary_expandable(...)` 决定；`seed_score` 只参与排序/裁剪，不翻案。⑥ 调试时打印 `[Stage2B final seed gate]`（anchor、term、can_expand、retain_mode、suppress_seed、identity、primary、jd、eligible、block_reason）。
+- **stage2_generate_academic_terms**：seed 收集**只**通过 `check_seed_eligibility(label, p, jd_profile)`；`diffusion_primaries` 仅来自 `eligible and seed_score >= SEED_SCORE_MIN`，按 `seed_score` 排序；删除任何直接依据 `p.can_expand` / `p.primary_score >= SEED_SCORE_MIN` / `p.source in TRUSTED_*` 的放行逻辑。
+
+**刀 2：动力学等核心锚点候选补池**  
+目标：`动力学` 等锚点不再只拿到 dynamism/propulsion/mechanics，而要能进池 dynamics、robot dynamics、rigid body dynamics、inverse dynamics 等。
+
+- **retrieve_family_landing_candidates(label, anchor, top_k)**：新增；面向 `canonical_academic_like` 或锚点文本在 `CANONICAL_ACADEMIC_ANCHOR_FAMILY_QUERIES` 的锚点，用轻量 family 查询词（动力学→dynamics/robot dynamics/…）在 vocabulary 中做词面/含词匹配，返回 `source="family_landing"` 的 `LandingCandidate` 列表，仅补池不保送 mainline。
+- **merge_landing_candidates_by_tid(candidates)**：新增；同 tid 保留证据最强者，合并 `all_sources`、`has_family_evidence`，供后续统一打分。
+- **collect_landing_candidates**：① 对 canonical_academic_like 锚点先调用 `retrieve_family_landing_candidates`；② 再 similar_to；③ 再 conditioned_vec，且当 `len(similar_to_candidates)==0` 时使用 `conditioned_top_k=STAGE2A_COLLECT_CONDITIONED_TOP_K_RESCUE` 多拿几条；④ 用 `merge_landing_candidates_by_tid(family_cands + similar_to_candidates + context_neighbors)` 合并后统一做 domain_fit / hierarchy / 定性 / score_academic_identity；⑤ 对 `has_family_evidence` 的候选做轻量 boost（anchor_identity_score += 0.08，primary_eligibility_reasons 追加 `family_landing_support`），不保送 primary_expandable。
+- **select_primary_per_anchor**：排序 key 中加入 `has_family_evidence`（在 mainline_pref 之后、anchor_identity 之前），优先 family candidate 但不断主线门控。
+- **_retrieve_academic_terms_by_conditioned_vec**：增加可选参数 `conditioned_top_k`，用于空池救援时加大检索条数。
+- **PrimaryLanding / ExpandedTermCandidate / _expanded_to_raw_candidates**：透传 `has_family_evidence`、`seed_block_reason` 到 Stage3 的 `_debug`，便于日志排查。
+
+**常量**：`STAGE2A_COLLECT_CONDITIONED_TOP_K_RESCUE`、`STAGE2A_FAMILY_LANDING_TOP_K`、`CANONICAL_ACADEMIC_ANCHOR_FAMILY_QUERIES`（动力学/运动学/仿真/振动抑制/路径规划/抓取/端到端等→family 查询词列表）。
+
+**预期**：刀 1 后日志中不再出现「identity&lt;SEED_MIN 但 seed_ok=True」的旁路；刀 2 后「动力学」等锚点候选池中应出现 dynamics、robot dynamics、rigid body dynamics、inverse dynamics 等，由组内选主与门控决定是否 surviving。
 
 ---
 

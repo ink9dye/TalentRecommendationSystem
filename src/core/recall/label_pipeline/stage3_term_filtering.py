@@ -510,62 +510,23 @@ def _debug_print_stage3_tables(
     survivors: List[Dict[str, Any]],
     recall: Any,
 ) -> None:
-    """三张表：A. entry group；B. admission（含 hard_drop/reason/risk_flags）；C. scoring（final_score/identity_factor/.../bucket）。"""
+    """Stage3 汇总：条数 + 前3样本，不打印完整表。"""
     stage3_debug = getattr(term_scoring, "STAGE3_DEBUG", False)
     label_trace = LABEL_PATH_TRACE or stage3_debug
     if not (label_trace or stage3_debug):
         return
-    all_terms = layered_terms
-    debug_print(2, "[Stage3 Entry Group] term | stage3_entry_group | term_role | role_in_anchor | can_expand | source_type", recall)
-    for rec in all_terms[:40]:
-        term = (rec.get("term") or "")[:28]
-        grp = rec.get("stage3_entry_group") or ""
-        tr = rec.get("term_role") or ""
-        ria = rec.get("role_in_anchor") or ""
-        ce = rec.get("can_expand") or False
-        st = (rec.get("source_type") or rec.get("source") or "")[:12]
-        debug_print(2, f"  {term!r} | {grp} | {tr} | {ria} | {ce} | {st}", recall)
-    debug_print(2, "[Stage3 Admission] term | group | hard_drop | reason | risk_flags", recall)
-    for rec in dropped_with_reason[:30]:
-        term = (rec.get("term") or "")[:28]
-        grp = rec.get("stage3_entry_group") or ""
-        reason = rec.get("reject_reason") or ""
-        flags = rec.get("risk_flags") or []
-        debug_print(2, f"  {term!r} | {grp} | True | {reason} | {flags}", recall)
-    for rec in survivors[:30]:
-        term = (rec.get("term") or "")[:28]
-        grp = rec.get("stage3_entry_group") or ""
-        debug_print(2, f"  {term!r} | {grp} | False | | {rec.get('risk_flags', [])}", recall)
-    debug_print(2, "[Stage3 Scoring] term | final_score | identity_factor | family_centrality | path_topic_consistency | generic_penalty | object_like_penalty | bucket", recall)
-    for rec in survivors[:25]:
-        term = (rec.get("term") or "")[:28]
-        ex = rec.get("stage3_explain") or {}
-        final_score = float(rec.get("final_score") or 0.0)
-        id_f = ex.get("identity_factor")
-        fc = rec.get("family_centrality")
-        ptc = ex.get("path_topic_consistency")
-        gp = ex.get("generic_penalty")
-        olp = ex.get("object_like_penalty")
-        bucket = rec.get("stage3_bucket") or ""
-        _f = lambda x: f"{x:.3f}" if x is not None and isinstance(x, (int, float)) else str(x) if x is not None else "-"
-        debug_print(2, f"  {term!r} | {final_score:.4f} | {_f(id_f)} | {_f(fc)} | {_f(ptc)} | {_f(gp)} | {_f(olp)} | {bucket}", recall)
+    entry_sample = [rec.get("term") for rec in layered_terms[:3]]
+    drop_sample = [rec.get("term") for rec in dropped_with_reason[:3]]
+    surv_sample = [rec.get("term") for rec in survivors[:3]]
+    debug_print(2, f"[Stage3] entry 共 {len(layered_terms)} 条 前3: {entry_sample} | dropped {len(dropped_with_reason)} 前3: {drop_sample} | survivors {len(survivors)} 前3: {surv_sample}", recall)
 
 
 def _debug_print_stage3_input(raw_candidates: List[Dict[str, Any]]) -> None:
-    """Stage3 输入调试打印。"""
+    """Stage3 输入：条数 + 前3样本，不打印全表。"""
     if not raw_candidates:
         return
-    print("[stage3_input] tid | term | source_type | parent_anchor | parent_primary | score")
-    for i, rec in enumerate(raw_candidates[:25]):
-        tid = rec.get("tid")
-        term = (rec.get("term") or "")[:24]
-        st = rec.get("source") or rec.get("origin") or ""
-        pa = rec.get("parent_anchor") or ""
-        pp = rec.get("parent_primary") or ""
-        sc = rec.get("identity_score") or rec.get("sim_score") or 0
-        print(f"  {i+1} {tid} | {term!r} | {st} | {pa!r} | {pp!r} | {sc:.3f}")
-    if len(raw_candidates) > 25:
-        print(f"  ... 共 {len(raw_candidates)} 条")
+    sample = [(rec.get("term") or "", rec.get("source") or rec.get("origin") or "") for rec in raw_candidates[:3]]
+    print(f"[stage3_input] 共 {len(raw_candidates)} 条 前3: {sample}")
 
 
 def _write_term_maps(
@@ -802,6 +763,25 @@ def _run_stage3_dual_gate(
             print(
                 f"[Stage3 bucket reason] term={term!r} | bucket={bucket!r} | identity_factor={identity_factor:.3f} | "
                 f"anchor_count={anchor_count} mainline_hits={mainline_hits} can_expand={can_expand} | reason_flags={reason_flags}"
+            )
+        # 排序上升/下降主导因子：便于验证 mainline_support_factor 是否罚对
+        for rec in survivors[:30]:
+            term = (rec.get("term") or "")[:28]
+            prev_rank = rec.get("stage2_rank")
+            new_rank = rec.get("stage3_rank")
+            explain = rec.get("stage3_explain") or {}
+            up_factors = [k for k, v in explain.items() if isinstance(v, (int, float)) and (v > 1.0 or (k == "base_score" and v > 0.3))]
+            down_factors = [k for k, v in explain.items() if isinstance(v, (int, float)) and 0 < v < 1.0]
+            reason_flags = rec.get("bucket_reason_flags") or []
+            missing_penalty = []
+            if "no_mainline_support" in reason_flags or "only_weak_keep_sources" in reason_flags or "conditioned_only" in reason_flags:
+                missing_penalty.append("mainline_support_factor")
+            print(
+                f"[Stage3 dominant factors] term={term!r}\n"
+                f"  prev_rank={prev_rank} new_rank={new_rank}\n"
+                f"  up_factors={up_factors}\n"
+                f"  down_factors={down_factors}\n"
+                f"  missing_penalty={missing_penalty}"
             )
     top_survivors = survivors[:STAGE3_TOP_K]
     paper_terms = select_terms_for_paper_recall(survivors, PAPER_RECALL_MAX_TERMS)

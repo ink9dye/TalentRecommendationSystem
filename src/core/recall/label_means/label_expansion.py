@@ -61,6 +61,19 @@ CONDITIONED_VEC_TOP_K = 12        # 每锚点 conditioned_vec 检索学术词 to
 # Stage2A 采集阶段放宽 top_k，主线词可能排第 4～8
 STAGE2A_COLLECT_BASE_TOP_K = 8   # base 视角取 6～8，严判在后
 STAGE2A_COLLECT_CONDITIONED_TOP_K = 8
+STAGE2A_COLLECT_CONDITIONED_TOP_K_RESCUE = 12  # similar_to 空池或极弱时 conditioned_vec 多拿几条
+STAGE2A_FAMILY_LANDING_TOP_K = 6  # canonical_academic_like 锚点 family 先手补池条数
+# 动力学/运动学/仿真等锚点 → 轻量 family 查询词（补池用，不保送 mainline）
+CANONICAL_ACADEMIC_ANCHOR_FAMILY_QUERIES: Dict[str, List[str]] = {
+    "动力学": ["dynamics", "robot dynamics", "rigid body dynamics", "inverse dynamics", "multibody dynamics"],
+    "运动学": ["kinematics", "robot kinematics"],
+    "仿真": ["simulation", "simulations"],
+    "振动抑制": ["vibration", "vibration suppression", "vibration control"],
+    "动力学参数辨识": ["dynamics", "parameter identification"],
+    "路径规划": ["path planning", "motion planning", "trajectory planning"],
+    "抓取": ["grasping", "grasp"],
+    "端到端": ["end-to-end", "end to end"],
+}
 SEED_MIN_IDENTITY = 0.65         # Stage2B seed 准入：唯一常量，不与其他阈值叠加
 DENSE_MAX_PER_PRIMARY = 4
 DENSE_PARENT_CAP = 0.85   # Stage2B：dense 扩展词 keep_score 不超过 parent primary 的此比例，避免 Motion controller > motion control
@@ -102,6 +115,15 @@ STAGE2A_WEAK_TECH_CTX_CAP = 0.55
 STAGE2A_WEAK_TECH_JD_MIN = 0.74
 STAGE2A_WEAK_TECH_POLY_CAP = 0.40
 STAGE2A_WEAK_TECH_OBJECT_CAP = 0.18
+# Stage2A 可扩散新规则（不再强依赖 context_gain>0）：双路一致/静态强匹配/多锚一致 均可扩
+STAGE2A_ID_MAIN = 0.52            # 双路一致主线 anchor_identity 下限（= EXPANDABLE_IDENTITY_MIN）
+STAGE2A_ID_STRONG = 0.58         # 静态强匹配主线 anchor_identity 下限
+STAGE2A_ID_MULTI = 0.48          # 多锚一致主线 anchor_identity 下限
+STAGE2A_ID_WEAK = 0.45           # mainline_candidate 弱线（identity_ok 或 jd 分支）
+STAGE2A_JD_OK = 0.74             # 与 STAGE2A_WEAK_TECH_JD_MIN 一致，主线 jd_align 可用线
+STAGE2A_CTX_FLOOR = 0.42         # 双路/静态时 context_sim 最低可用线
+STAGE2A_CTX_DROP_TOL = 0.08      # 静态强匹配允许 context_sim 略低于 semantic_score 的容差
+STAGE2A_PRIMARY_KEEP_MIN = 0.20  # 保守留存门槛（= WEAK_KEEP_MIN），低于则 reject
 SEED_SCORE_MIN = 0.50              # Stage2B seed 门槛：仅消费 can_expand + primary_score≥此
 
 # ---------- Stage2A 准入：仅两个门槛 + source 折扣，不再按 source 分多套阈值 ----------
@@ -203,6 +225,12 @@ class PreparedAnchor:
     conditioned_vec: Optional[np.ndarray] = None  # 条件化锚点向量，用于 Stage2A 落点打分
     source_type: str = "skill_direct"    # skill_direct | jd_vector_supplement
     source_weight: float = 1.0          # 补充锚点用较低权重，primary 打分时乘此值
+    # 上下文条件化检索：支撑 context_gain 与双路证据
+    local_phrases: List[str] = field(default_factory=list)
+    co_anchor_terms: List[str] = field(default_factory=list)
+    jd_snippet: str = ""
+    surface_vec: Optional[np.ndarray] = None   # 裸词向量（vocab 或 encode(anchor)）
+    # conditioned_vec 已在上方；此处不重复
 
 
 @dataclass
@@ -239,6 +267,12 @@ class LandingCandidate:
     identity_gate: float = 1.0
     domain_fit: float = 1.0
     domain_reason: str = ""                  # domain_conflict_strong 等，供 check_primary_eligibility
+
+    # ===== 双路证据 + context_gain（merge 后统一算） =====
+    surface_sim: Optional[float] = None      # 静态 similar_to 相似度
+    conditioned_sim: Optional[float] = None # 动态 conditioned_vec 相似度
+    context_gain: Optional[float] = None     # conditioned_sim - surface_proxy，上下文增益
+    # source_set 在 merge 时 setattr 写入，不在此定义
 
     # ===== Stage2A 定性字段（collect_landing_candidates 补齐，供 admission/mainline 用） =====
     context_continuity: float = 0.0          # 连续分，非布尔
@@ -278,6 +312,10 @@ class Stage2ACandidate:
     # 原始证据（仅用于组内相对比较）
     semantic_score: float = 0.0
     context_sim: float = 0.0
+    surface_sim: Optional[float] = None
+    conditioned_sim: Optional[float] = None
+    context_gain: float = 0.0
+    source_set: Optional[Set[str]] = None  # 合并后的来源集合 similar_to | conditioned_vec | family_landing
     jd_align: float = 0.0
     mainline_sim: Optional[float] = None
     cross_anchor_support: float = 0.0
@@ -1228,6 +1266,37 @@ def query_expansion_with_topology(label, v_ids, regex):
 HIGH_AMBIGUITY_ANCHOR_TYPES = frozenset({"acronym", "generic_task_term"})
 
 
+def _print_stage2b_seed_factors(
+    anchor_text: str,
+    primary_term: str,
+    can_expand: bool,
+    source_type_str: str,
+    dual_support: bool,
+    static_sim: float,
+    ctx_sim_val: Optional[float],
+    ctx_drop_str: str,
+    strong_static_seed: bool,
+    final_eligible: bool,
+    reason: Optional[str],
+) -> None:
+    """Stage2B seed 资格分解表：便于验证 2B 改完后是哪类 seed 被救活。"""
+    if not (LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG):
+        return
+    ctx_sim_str = f"{ctx_sim_val:.3f}" if ctx_sim_val is not None else "N/A"
+    print(
+        f"[Stage2B seed factors] anchor={anchor_text!r} term={primary_term!r}\n"
+        f"  can_expand_from_2a={can_expand}\n"
+        f"  source_type={source_type_str!r}\n"
+        f"  dual_support={dual_support}\n"
+        f"  static_sim={static_sim:.3f}\n"
+        f"  ctx_sim={ctx_sim_str}\n"
+        f"  ctx_drop={ctx_drop_str}\n"
+        f"  strong_static_seed={strong_static_seed}\n"
+        f"  final_eligible={final_eligible}\n"
+        f"  reason={reason!r}"
+    )
+
+
 def check_seed_eligibility(
     label,
     p: "PrimaryLanding",
@@ -1241,27 +1310,103 @@ def check_seed_eligibility(
     anchor_identity = float(getattr(p, "anchor_identity_score", identity) or identity)
     primary_score = float(getattr(p, "primary_score", identity) or identity)
     jd_align = float(getattr(p, "jd_align", 0.5) or 0.5)
-    src = (getattr(p, "source", "") or "").strip().lower()
+    context_gain = float(getattr(p, "context_gain", 0.0) or 0.0)
+    src = (getattr(p, "source", "") or getattr(p, "source_type", "") or "").strip().lower()
     retain_mode = getattr(p, "retain_mode", "normal") or "normal"
     suppress_seed = bool(getattr(p, "suppress_seed", True))
+    can_expand = bool(getattr(p, "can_expand", getattr(p, "expandable", False)))
     support_count = int(getattr(p, "cross_anchor_support_count", 1) or 1)
     anchor_text = getattr(p, "anchor_term", "") or ""
     primary_term = getattr(p, "term", "") or ""
+    # 供 seed factors 打印
+    static_sim = float(getattr(p, "semantic_score", None) or primary_score or 0.0)
+    ctx_sim_val = getattr(p, "conditioned_sim", None)
+    if ctx_sim_val is not None:
+        ctx_sim_val = float(ctx_sim_val)
+    ctx_drop_str = f"{static_sim - ctx_sim_val:.3f}" if (ctx_sim_val is not None and static_sim is not None) else "N/A"
+    dual_support = bool(getattr(p, "dual_support", False))
+    source_type_str = getattr(p, "source_type", None) or src or ""
 
-    # 1) weak_retain / suppress_seed 一律不扩
+    # -1. 上下文不增益则不扩散：context_gain <= 0 不进 seed
+    if context_gain <= 0.0:
+        block_reason = "no_context_gain"
+        _print_stage2b_seed_factors(
+            anchor_text, primary_term, can_expand, source_type_str, dual_support,
+            static_sim, ctx_sim_val, ctx_drop_str, False, False, block_reason,
+        )
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+            print(
+                f"[Stage2B final seed gate] anchor={anchor_text!r} term={primary_term!r} "
+                f"context_gain={context_gain:.3f} eligible=False block_reason={block_reason!r}"
+            )
+        return False, 0.0, block_reason
+
+    # 0. 2A 明确判成不可扩散的，2B 不得翻案
+    if not can_expand:
+        block_reason = "stage2a_not_expandable"
+        _print_stage2b_seed_factors(
+            anchor_text, primary_term, can_expand, source_type_str, dual_support,
+            static_sim, ctx_sim_val, ctx_drop_str, False, False, block_reason,
+        )
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+            print(
+                f"[Stage2B final seed gate] anchor={anchor_text!r} term={primary_term!r} "
+                f"context_gain={context_gain:.3f} can_expand={can_expand} retain_mode={retain_mode} suppress_seed={suppress_seed} "
+                f"identity={anchor_identity:.3f} primary={primary_score:.3f} jd={jd_align:.3f} "
+                f"eligible=False block_reason={block_reason!r}"
+            )
+        return False, 0.0, block_reason
+
+    # 1. 仅 normal 且非 suppress_seed 才可能进入 seed
     if retain_mode != "normal" or suppress_seed:
-        return False, 0.0, "weak_primary_no_expand"
+        block_reason = "weak_primary_no_expand"
+        _print_stage2b_seed_factors(
+            anchor_text, primary_term, can_expand, source_type_str, dual_support,
+            static_sim, ctx_sim_val, ctx_drop_str, False, False, block_reason,
+        )
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+            print(
+                f"[Stage2B final seed gate] anchor={anchor_text!r} term={primary_term!r} "
+                f"context_gain={context_gain:.3f} can_expand={can_expand} retain_mode={retain_mode} suppress_seed={suppress_seed} "
+                f"identity={anchor_identity:.3f} primary={primary_score:.3f} jd={jd_align:.3f} "
+                f"eligible=False block_reason={block_reason!r}"
+            )
+        return False, 0.0, block_reason
 
-    # 2) source 必须可信
+    # 2. source 必须可信
     trusted_set = {s.strip().lower() for s in (TRUSTED_SOURCE_TYPES_FOR_DIFFUSION or []) if s}
     if trusted_set and src not in trusted_set:
-        return False, 0.0, "source_not_trusted"
+        block_reason = "source_not_trusted"
+        _print_stage2b_seed_factors(
+            anchor_text, primary_term, can_expand, source_type_str, dual_support,
+            static_sim, ctx_sim_val, ctx_drop_str, False, False, block_reason,
+        )
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+            print(
+                f"[Stage2B final seed gate] anchor={anchor_text!r} term={primary_term!r} "
+                f"context_gain={context_gain:.3f} can_expand={can_expand} retain_mode={retain_mode} suppress_seed={suppress_seed} "
+                f"identity={anchor_identity:.3f} primary={primary_score:.3f} jd={jd_align:.3f} "
+                f"eligible=False block_reason={block_reason!r}"
+            )
+        return False, 0.0, block_reason
 
-    # 3) 语义错义 seed 直接禁
+    # 3. 语义错义 seed 直接禁
     if is_semantic_mismatch_seed(anchor_text, primary_term):
-        return False, 0.0, "semantic_mismatch_seed"
+        block_reason = "semantic_mismatch_seed"
+        _print_stage2b_seed_factors(
+            anchor_text, primary_term, can_expand, source_type_str, dual_support,
+            static_sim, ctx_sim_val, ctx_drop_str, False, False, block_reason,
+        )
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+            print(
+                f"[Stage2B final seed gate] anchor={anchor_text!r} term={primary_term!r} "
+                f"context_gain={context_gain:.3f} can_expand={can_expand} retain_mode={retain_mode} suppress_seed={suppress_seed} "
+                f"identity={anchor_identity:.3f} primary={primary_score:.3f} jd={jd_align:.3f} "
+                f"eligible=False block_reason={block_reason!r}"
+            )
+        return False, 0.0, block_reason
 
-    # 4) 不是所有 primary 都能扩
+    # 4. 最终唯一准入：is_primary_expandable
     if not is_primary_expandable(
         anchor_text=anchor_text,
         primary_term=primary_term,
@@ -1271,11 +1416,21 @@ def check_seed_eligibility(
         support_count=support_count,
         source_type=src,
     ):
-        if LABEL_EXPANSION_DEBUG:
-            print(f"[Stage2B] seed 禁扩 term={primary_term!r} anchor={anchor_text!r} reason=primary_not_expandable")
-        return False, 0.0, "primary_not_expandable"
+        block_reason = "primary_not_expandable"
+        _print_stage2b_seed_factors(
+            anchor_text, primary_term, can_expand, source_type_str, dual_support,
+            static_sim, ctx_sim_val, ctx_drop_str, False, False, block_reason,
+        )
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+            print(
+                f"[Stage2B final seed gate] anchor={anchor_text!r} term={primary_term!r} "
+                f"context_gain={context_gain:.3f} can_expand={can_expand} retain_mode={retain_mode} suppress_seed={suppress_seed} "
+                f"identity={anchor_identity:.3f} primary={primary_score:.3f} jd={jd_align:.3f} "
+                f"eligible=False block_reason={block_reason!r}"
+            )
+        return False, 0.0, block_reason
 
-    # seed_expand_factor：过窄支线/设备词/单锚支持 惩罚
+    # 5. seed_score 只是排序/强弱，不参与翻案
     seed_expand_factor = 1.0
     if is_narrow_method_term(primary_term):
         seed_expand_factor *= 0.75
@@ -1287,11 +1442,26 @@ def check_seed_eligibility(
     path_match = float(getattr(p, "path_match", 0.0) or 0.0)
     span_penalty = float(getattr(p, "topic_span_penalty", 1.0) or 1.0)
     seed_score = primary_score * (0.7 + 0.3 * path_match) * span_penalty * seed_expand_factor
+
+    strong_static_seed = (src == "similar_to" and anchor_identity >= 0.58 and jd_align >= 0.74)
+    _print_stage2b_seed_factors(
+        anchor_text, primary_term, can_expand, source_type_str, dual_support,
+        static_sim, ctx_sim_val, ctx_drop_str, strong_static_seed, True, "expandable_primary",
+    )
+    if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+        print(
+            f"[Stage2B final seed gate] anchor={anchor_text!r} term={primary_term!r} "
+            f"context_gain={context_gain:.3f} can_expand={can_expand} retain_mode={retain_mode} suppress_seed={suppress_seed} "
+            f"identity={anchor_identity:.3f} primary={primary_score:.3f} jd={jd_align:.3f} "
+            f"eligible=True block_reason=None"
+        )
     return True, seed_score, None
 
 
 def _anchor_skills_to_prepared_anchors(label, anchor_skills: Dict[str, Any]) -> List[PreparedAnchor]:
-    """将现有 anchor_skills (vid -> {term, anchor_type, conditioned_vec?, anchor_source?, anchor_source_weight?}) 转为 List[PreparedAnchor]。"""
+    """将现有 anchor_skills (vid -> {term, anchor_type, conditioned_vec?, _anchor_ctx?, ...}) 转为 List[PreparedAnchor]。
+    补全 local_phrases / co_anchor_terms / jd_snippet / surface_vec / conditioned_vec，供 2A 上下文条件化检索与 context_gain 用。
+    """
     load_vocab_meta(label)
     out = []
     for vid_str, info in (anchor_skills or {}).items():
@@ -1308,17 +1478,25 @@ def _anchor_skills_to_prepared_anchors(label, anchor_skills: Dict[str, Any]) -> 
             conditioned = np.asarray(conditioned, dtype=np.float32).flatten()
         source_type = (info.get("anchor_source") or "skill_direct").strip()
         source_weight = float(info.get("anchor_source_weight", 1.0))
-        out.append(
-            PreparedAnchor(
-                anchor=term,
-                vid=vid,
-                anchor_type=anchor_type,
-                expanded_forms=[term],
-                conditioned_vec=conditioned,
-                source_type=source_type,
-                source_weight=source_weight,
-            )
+        ctx = info.get("_anchor_ctx") or {}
+        local_phrases = list(ctx.get("local_phrases") or info.get("local_phrases") or [])
+        co_anchor_terms = list(ctx.get("co_anchor_terms") or info.get("co_anchor_terms") or [])
+        jd_snippet = str(info.get("jd_snippet") or ctx.get("jd_snippet") or "")
+        surface_vec = _get_candidate_vec_for_mainline(label, vid)
+        pa = PreparedAnchor(
+            anchor=term,
+            vid=vid,
+            anchor_type=anchor_type,
+            expanded_forms=[term],
+            conditioned_vec=conditioned,
+            source_type=source_type,
+            source_weight=source_weight,
+            local_phrases=local_phrases,
+            co_anchor_terms=co_anchor_terms,
+            jd_snippet=jd_snippet,
+            surface_vec=surface_vec,
         )
+        out.append(pa)
     return out
 
 
@@ -1444,6 +1622,9 @@ def retrieve_academic_term_by_similar_to(
                 semantic_score=sim,
                 anchor_vid=anchor.vid,
                 anchor_term=anchor.anchor,
+                surface_sim=sim,
+                conditioned_sim=None,
+                context_gain=None,
             )
         )
     if active_domain_set is not None or jd_field_ids or jd_subfield_ids or jd_topic_ids:
@@ -1474,13 +1655,9 @@ def retrieve_academic_term_by_similar_to(
         out = kept
         if LABEL_EXPANSION_DEBUG and n_before != len(out):
             print(f"[Stage2A] 领域过滤后 SIMILAR_TO 落点: {len(out)} 个（过滤前 {n_before}）")
-            for c, reason in dropped_with_reason:
-                print(f"[Stage2A]   领域过滤剔除 vid={c.vid} term={c.term!r} sim={c.semantic_score:.3f} 原因={reason}")
     if LABEL_EXPANSION_DEBUG and out:
-        for i, c in enumerate(out[:5]):
-            print(f"[Stage2A]   落点[{i}] vid={c.vid} term={c.term!r} sim={c.semantic_score:.3f}")
-        if len(out) > 5:
-            print(f"[Stage2A]   ... 共 {len(out)} 个落点候选")
+        sample = [f"{c.term!r}(sim={c.semantic_score:.2f})" for c in out[:3]]
+        print(f"[Stage2A] SIMILAR_TO 落点 共 {len(out)} 个 前3: {sample}")
     return out
 
 
@@ -1492,6 +1669,7 @@ def _retrieve_academic_terms_by_conditioned_vec(
     jd_field_ids: Optional[Set[str]] = None,
     jd_subfield_ids: Optional[Set[str]] = None,
     jd_topic_ids: Optional[Set[str]] = None,
+    conditioned_top_k: Optional[int] = None,
 ) -> Tuple[List[LandingCandidate], Dict[int, Dict[str, float]]]:
     """
     Stage2A 上下文纠偏：
@@ -1514,7 +1692,9 @@ def _retrieve_academic_terms_by_conditioned_vec(
             return [], {}
         vec = vec.reshape(1, -1)
         faiss.normalize_L2(vec)
-        k = min(STAGE2A_COLLECT_CONDITIONED_TOP_K, getattr(label.vocab_index, "ntotal", 100))
+        use_k = int(conditioned_top_k) if conditioned_top_k is not None else STAGE2A_COLLECT_CONDITIONED_TOP_K
+        use_k = max(use_k, 6)  # 升格为正式证据源，与 SIMILAR_TO 接近，不再弱补位
+        k = min(use_k, getattr(label.vocab_index, "ntotal", 100))
         if k <= 0:
             return [], {}
         scores, ids = label.vocab_index.search(vec, k)
@@ -1555,11 +1735,14 @@ def _retrieve_academic_terms_by_conditioned_vec(
             semantic_score=sim,
             anchor_vid=getattr(anchor, "vid", 0),
             anchor_term=getattr(anchor, "anchor", ""),
+            conditioned_sim=sim,
+            surface_sim=None,
+            context_gain=None,
         )
         cand.context_sim = sim
         cand.context_supported = sim >= max(SIMILAR_TO_MIN_SCORE, 0.78)
         cand.context_gap = 0.0
-        cand.source_role = "context_fallback"
+        cand.source_role = "seed_candidate"  # 正式证据源，非 fallback
         context_neighbors.append(cand)
         context_score_map[tid] = sim
 
@@ -1574,10 +1757,8 @@ def _retrieve_academic_terms_by_conditioned_vec(
         }
 
     if LABEL_EXPANSION_DEBUG and context_neighbors:
-        print(
-            f"[Stage2A] conditioned_vec 上下文纠偏 anchor={getattr(anchor, 'anchor', '')!r} "
-            f"-> {len(context_neighbors)} 个候选（用于重打分/弱补位）"
-        )
+        sample = [getattr(c, "term", c) for c in context_neighbors[:3]]
+        print(f"[Stage2A] conditioned_vec 上下文纠偏 anchor={getattr(anchor, 'anchor', '')!r} -> {len(context_neighbors)} 个 前3: {sample}")
     return context_neighbors, rerank_signals
 
 
@@ -1788,15 +1969,20 @@ def build_mainline_preference(cand: Any, return_breakdown: bool = False) -> Any:
         getattr(cand, "jd_align", 0) or getattr(cand, "jd_candidate_alignment", 0) or 0
     )
     hierarchy_consistency = float(getattr(cand, "hierarchy_consistency", 0) or 0)
+    context_gain = float(getattr(cand, "context_gain", 0) or 0)
+    context_gain_score = _clip01((context_gain + 0.10) / 0.20)
+    dual_support_bonus = 0.08 if getattr(cand, "dual_support", False) else 0.0
     polysemy_risk = float(getattr(cand, "polysemy_risk", 0) or 0)
     object_like_risk = float(getattr(cand, "object_like_risk", 0) or 0)
     generic_risk = float(getattr(cand, "generic_risk", 0) or 0)
 
     positive = (
-        0.34 * anchor_identity
-        + 0.28 * context_continuity
-        + 0.24 * jd_align
-        + 0.14 * hierarchy_consistency
+        0.30 * anchor_identity
+        + 0.20 * jd_align
+        + 0.20 * context_continuity
+        + 0.15 * context_gain_score
+        + 0.10 * hierarchy_consistency
+        + dual_support_bonus
     )
     negative = (
         0.10 * polysemy_risk
@@ -1811,6 +1997,8 @@ def build_mainline_preference(cand: Any, return_breakdown: bool = False) -> Any:
             "anchor_identity": anchor_identity,
             "context_continuity": context_continuity,
             "jd_align": jd_align,
+            "context_gain_score": context_gain_score,
+            "dual_support_bonus": dual_support_bonus,
             "hierarchy_consistency": hierarchy_consistency,
             "polysemy_risk": polysemy_risk,
             "object_like_risk": object_like_risk,
@@ -1944,6 +2132,10 @@ def enrich_stage2a_candidates(
 
     max_sup = max(len(v) for v in cross_anchor_index.values()) if cross_anchor_index else 1
     for c in candidates:
+        c.context_gain = float(getattr(c, "context_gain", 0) or 0.0)
+        c.has_dynamic_support = getattr(c, "conditioned_sim", None) is not None
+        c.has_static_support = getattr(c, "surface_sim", None) is not None
+        c.dual_support = c.has_dynamic_support and c.has_static_support
         c.jd_align = _compute_jd_candidate_alignment(label, c.tid, query_vector) if query_vector is not None else 0.5
         anchor_list = list(cross_anchor_index.get(c.tid, []))
         c.cross_anchor_support_count = len(anchor_list)
@@ -2024,6 +2216,9 @@ def _stage2a_rule_flags(cand: Any, feat: Any) -> Dict[str, Any]:
     tech_keep_ok = _is_weak_technical_keep_candidate(cand)
     mainline_pref_ok = feat.mainline_pref >= STAGE2A_MAINLINE_PREF_MIN
     jd_ok = feat.jd_align >= STAGE2A_WEAK_TECH_JD_MIN
+    context_gain_ok = float(getattr(cand, "context_gain", 0) or 0) >= 0.03
+    dynamic_support_ok = bool(getattr(cand, "has_dynamic_support", False))
+    dual_support_ok = bool(getattr(cand, "dual_support", False))
     return {
         "identity_ok": identity_ok,
         "ctx_ok": ctx_ok,
@@ -2035,6 +2230,9 @@ def _stage2a_rule_flags(cand: Any, feat: Any) -> Dict[str, Any]:
         "tech_keep_ok": tech_keep_ok,
         "mainline_pref_ok": mainline_pref_ok,
         "jd_ok": jd_ok,
+        "context_gain_ok": context_gain_ok,
+        "dynamic_support_ok": dynamic_support_ok,
+        "dual_support_ok": dual_support_ok,
     }
 
 
@@ -2176,13 +2374,23 @@ def select_primary_per_anchor(
 ) -> Dict[str, List["Stage2ACandidate"]]:
     """
     Stage2A 终稿：三档分桶。把真正的主线放回 primary_expandable，歧义/弱词压住。
-    obvious_bad -> reject；good_mainline -> primary_expandable；否则 -> primary_keep_no_expand。
-    不再用 mainline_admissible/suppress_seed 一票否决主线词。
+    可扩散不再强依赖 context_gain>0：双路一致 / 静态强匹配 / 多锚一致 任一满足即可扩。
+    保留硬拒绝：obviously_bad_branch、semantic_drift_branch、object_or_poly_bad_branch、polysemous_no_context。
     """
     if not candidates:
         return {"primary_expandable": [], "primary_keep_no_expand": [], "rejected": []}
 
-    sorted_cands = sorted(candidates, key=lambda x: (getattr(x, "mainline_pref_score", 0) or 0), reverse=True)
+    sorted_cands = sorted(
+        candidates,
+        key=lambda x: (
+            bool(getattr(x, "mainline_admissible", False)),
+            float(getattr(x, "mainline_pref_score", 0) or 0),
+            bool(getattr(x, "has_family_evidence", False)),
+            float(getattr(x, "anchor_identity_score", 0) or getattr(x, "family_match", 0) or 0),
+            float(getattr(x, "jd_align", 0) or getattr(x, "jd_candidate_alignment", 0.5) or 0.5),
+        ),
+        reverse=True,
+    )
     primary_expandable: List["Stage2ACandidate"] = []
     primary_keep_no_expand: List["Stage2ACandidate"] = []
     rejected: List["Stage2ACandidate"] = []
@@ -2197,82 +2405,155 @@ def select_primary_per_anchor(
         c.admission_reason = "below_retain_floor"
         retain_mode = getattr(c, "retain_mode", "normal") or "normal"
         mainline_pref = getattr(c, "mainline_pref_score", 0) or 0
-        anchor_identity = getattr(c, "anchor_identity_score", 0) or 0
+        anchor_identity = float(getattr(c, "anchor_identity_score", 0) or getattr(c, "family_match", 0) or 0)
         primary_score = getattr(c, "composite_rank_score", 0) or 0
-        feat = _get_stage2a_feat(c)
-        obviously_bad_branch = _is_obviously_bad_branch_stage2a(c, feat)
-
-        obvious_bad = (
-            retain_mode == "reject"
-            or primary_score < STAGE2A_WEAK_KEEP_MIN
-        )
-        good_mainline = (
-            retain_mode != "reject"
-            and mainline_pref >= STAGE2A_MAINLINE_PREF_MIN
-            and anchor_identity >= STAGE2A_EXPANDABLE_IDENTITY_MIN
-            and not obviously_bad_branch
-        )
+        jd_align = float(getattr(c, "jd_align", 0.5) or getattr(c, "jd_candidate_alignment", 0.5) or 0.5)
+        context_sim_raw = getattr(c, "conditioned_sim", None)
+        if context_sim_raw is None:
+            context_sim_raw = getattr(c, "context_continuity", 0) or getattr(c, "context_sim", 0)
+        context_sim = float(context_sim_raw) if context_sim_raw is not None else 0.0
+        semantic_score = float(getattr(c, "semantic_score", 0) or 0)
+        dual_support = bool(getattr(c, "dual_support", False))
+        context_supported = bool(getattr(c, "ctx_supported", getattr(c, "context_supported", False)))
+        support_count = int(getattr(c, "cross_anchor_support_count", 1) or 1)
+        source_set = getattr(c, "source_set", None) or set()
         source_type = (getattr(c, "source_type", None) or getattr(c, "source", "") or "").strip().lower()
-        if good_mainline and source_type == "conditioned_vec":
-            good_mainline = False
-        setattr(c, "is_good_mainline", good_mainline)
-        mainline_block_reason = ""
-        if obvious_bad:
-            mainline_block_reason = "obvious_bad"
-            if retain_mode == "reject":
-                mainline_block_reason = "retain_mode_reject"
-            elif primary_score < STAGE2A_WEAK_KEEP_MIN:
-                mainline_block_reason = "primary_score_below_weak_keep"
-        elif good_mainline:
-            mainline_block_reason = ""
-        else:
-            if obviously_bad_branch:
-                mainline_block_reason = "obviously_bad_branch"
-            elif mainline_pref < STAGE2A_MAINLINE_PREF_MIN:
-                mainline_block_reason = "mainline_pref_low"
-            elif anchor_identity < STAGE2A_EXPANDABLE_IDENTITY_MIN:
-                mainline_block_reason = "anchor_identity_low"
-            elif source_type == "conditioned_vec":
-                mainline_block_reason = "conditioned_vec_no_expand"
-            else:
-                mainline_block_reason = "other"
-        setattr(c, "mainline_block_reason", mainline_block_reason)
+        source_has_similar_to = (
+            "similar_to" in source_type
+            or (isinstance(source_set, (set, list)) and "similar_to" in (source_set if isinstance(source_set, set) else set(source_set)))
+        )
+        feat = _get_stage2a_feat(c)
+        flags = _stage2a_rule_flags(c, feat)
+        obviously_bad_branch = _is_obviously_bad_branch_stage2a(c, feat)
+        drift_bad = flags["drift_bad"]
+        poly_bad = flags["poly_bad"]
+        object_bad = flags["object_bad"]
+        ctx_ok = flags["ctx_ok"]
+        identity_ok = flags["identity_ok"]
 
+        # 1. 先保留现有硬拒绝（obvious_bad = 准入级；obviously_bad_branch/drift_bad = 分支级）
+        obvious_bad = retain_mode == "reject" or primary_score < STAGE2A_WEAK_KEEP_MIN
         if obvious_bad:
             c.primary_bucket = "reject"
             c.can_expand = False
             setattr(c, "bucket_reason", "obvious_bad")
             c.reject_reason = "obvious_bad"
+            setattr(c, "mainline_block_reason", "retain_mode_reject" if retain_mode == "reject" else "primary_score_below_weak_keep")
             rejected.append(c)
-        elif good_mainline:
-            source_type = (getattr(c, "source_type", None) or getattr(c, "source", "") or "").strip().lower()
-            if source_type == "conditioned_vec":
-                c.primary_bucket = "primary_keep_no_expand"
-                c.role_in_anchor = "side"
-                c.role = "side"
-                c.can_expand = False
-                c.survive_primary = True
-                c.admission_reason = "weak_keep"
-                setattr(c, "bucket_reason", "conditioned_vec_no_expand")
-                primary_keep_no_expand.append(c)
-            else:
-                c.primary_bucket = "primary_expandable"
-                c.role_in_anchor = "mainline"
-                c.role = "mainline"
-                c.can_expand = True
-                c.survive_primary = True
-                c.admission_reason = "good_mainline"
-                setattr(c, "bucket_reason", "good_mainline")
-                primary_expandable.append(c)
+            continue
+        if obviously_bad_branch or drift_bad:
+            c.primary_bucket = "reject"
+            c.can_expand = False
+            setattr(c, "bucket_reason", "obviously_bad_branch" if obviously_bad_branch else "semantic_drift_branch")
+            c.reject_reason = getattr(c, "bucket_reason", "")
+            setattr(c, "mainline_block_reason", "obviously_bad_branch" if obviously_bad_branch else "drift_bad")
+            rejected.append(c)
+            continue
+        if poly_bad and not ctx_ok:
+            c.primary_bucket = "reject"
+            c.can_expand = False
+            setattr(c, "bucket_reason", "polysemous_no_context")
+            c.reject_reason = "polysemous_no_context"
+            setattr(c, "mainline_block_reason", "polysemous_no_context")
+            rejected.append(c)
+            continue
+
+        # 2. 主线候选（放宽：不再强依赖 context_gain_ok）
+        mainline_candidate = (
+            identity_ok
+            or (anchor_identity >= STAGE2A_ID_WEAK and jd_align >= STAGE2A_JD_OK)
+            or (dual_support and ctx_ok)
+        )
+        setattr(c, "is_good_mainline", mainline_candidate)
+
+        # 3. 新的“可扩散”判定：不再强依赖 context_gain > 0
+        ctx_floor = max(STAGE2A_CTX_FLOOR, semantic_score - STAGE2A_CTX_DROP_TOL) if semantic_score else STAGE2A_CTX_FLOOR
+        strong_static_ok = (
+            source_has_similar_to
+            and anchor_identity >= STAGE2A_ID_STRONG
+            and jd_align >= STAGE2A_JD_OK
+            and context_sim >= ctx_floor
+        )
+        dual_route_ok = (
+            dual_support
+            and anchor_identity >= STAGE2A_ID_MAIN
+            and context_supported
+            and context_sim >= STAGE2A_CTX_FLOOR
+        )
+        multi_anchor_ok = (
+            support_count >= 2
+            and anchor_identity >= STAGE2A_ID_MULTI
+            and jd_align >= STAGE2A_JD_OK
+            and not poly_bad
+            and not object_bad
+        )
+        can_expand = (
+            mainline_candidate
+            and (dual_route_ok or strong_static_ok or multi_anchor_ok)
+        )
+        if getattr(c, "family_fallback_only", False):
+            can_expand = False
+
+        # mainline_block_reason 用于调试
+        if can_expand:
+            mainline_block_reason = ""
+        elif mainline_candidate:
+            mainline_block_reason = "no_expand_route"
         else:
+            mainline_block_reason = "not_mainline_candidate"
+        setattr(c, "mainline_block_reason", mainline_block_reason)
+
+        # 为什么没进 expandable 的单行汇总（便于区分：规则太严 vs 确实不该放行）
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+            anchor_term = getattr(anchor, "anchor", "") or ""
+            term_short = (getattr(c, "term", None) or "")[:28]
+            ctx_drop_val = (semantic_score - context_sim) if (semantic_score and context_sim is not None) else None
+            ctx_drop_str = f"{ctx_drop_val:.3f}" if ctx_drop_val is not None else "N/A"
+            expandable_block_reason = "" if can_expand else (
+                "expand_rule_too_strict" if mainline_candidate else mainline_block_reason
+            )
+            print(
+                f"[Stage2A expandable gate] anchor={anchor_term!r} term={term_short!r}\n"
+                f"  dual_support={dual_support} static={semantic_score:.3f} ctx={context_sim:.3f} ctx_drop={ctx_drop_str}\n"
+                f"  dual_route_ok={dual_route_ok} strong_static_ok={strong_static_ok} multi_anchor_ok={multi_anchor_ok} final_expandable={can_expand}\n"
+                f"  block_reason={expandable_block_reason!r}"
+            )
+
+        # 4. 分桶
+        if can_expand:
+            c.survive_primary = True
+            c.can_expand = True
+            c.primary_bucket = "primary_expandable"
+            c.role_in_anchor = "mainline"
+            c.role = "mainline"
+            c.admission_reason = "good_mainline"
+            setattr(c, "bucket_reason", "good_mainline")
+            primary_expandable.append(c)
+        elif mainline_candidate:
+            c.survive_primary = True
+            c.can_expand = False
             c.primary_bucket = "primary_keep_no_expand"
             c.role_in_anchor = "side"
             c.role = "side"
-            c.can_expand = False
-            c.survive_primary = True
             c.admission_reason = "weak_keep"
-            setattr(c, "bucket_reason", "weak_keep")
+            setattr(c, "bucket_reason", "no_expand_context_gate")
             primary_keep_no_expand.append(c)
+        else:
+            if primary_score >= STAGE2A_PRIMARY_KEEP_MIN:
+                c.survive_primary = True
+                c.can_expand = False
+                c.primary_bucket = "primary_keep_no_expand"
+                c.role_in_anchor = "side"
+                c.role = "side"
+                c.admission_reason = "weak_keep"
+                setattr(c, "bucket_reason", "weak_keep")
+                primary_keep_no_expand.append(c)
+            else:
+                c.primary_bucket = "reject"
+                c.can_expand = False
+                setattr(c, "bucket_reason", "below_primary_keep_min")
+                c.reject_reason = "below_primary_keep_min"
+                rejected.append(c)
 
     return {
         "primary_expandable": primary_expandable,
@@ -2401,12 +2682,19 @@ def landing_candidates_to_stage2a(landing_list: List[LandingCandidate]) -> List[
     """将 collect_landing_candidates 的 LandingCandidate 列表转为 Stage2ACandidate，并复制定性字段与分型。"""
     out: List[Stage2ACandidate] = []
     for c in landing_list:
+        src_set = getattr(c, "source_set", None) or {getattr(c, "source", "") or c.source}
+        if not isinstance(src_set, set):
+            src_set = set(src_set) if src_set else {getattr(c, "source", "") or c.source}
         out.append(Stage2ACandidate(
             tid=c.vid,
             term=(c.term or "").strip() or str(c.vid),
             source=(getattr(c, "source", "") or "similar_to").strip(),
             semantic_score=float(getattr(c, "semantic_score", 0) or 0),
             context_sim=float(getattr(c, "context_sim", 0) or 0),
+            surface_sim=getattr(c, "surface_sim", None),
+            conditioned_sim=getattr(c, "conditioned_sim", None),
+            context_gain=float(getattr(c, "context_gain", 0) or 0),
+            source_set=src_set,
             jd_align=float(getattr(c, "jd_candidate_alignment", 0.5) or 0.5),
             family_match=float(getattr(c, "anchor_identity_score", 0.5) or 0.5),
             anchor_identity_score=float(getattr(c, "anchor_identity_score", 0.5) or 0.5),
@@ -2425,6 +2713,8 @@ def landing_candidates_to_stage2a(landing_list: List[LandingCandidate]) -> List[
             source_trust=float(getattr(c, "source_trust", 1.0) or 1.0),
             ctx_supported=bool(getattr(c, "ctx_supported", getattr(c, "context_supported", False))),
         ))
+        setattr(out[-1], "has_family_evidence", getattr(c, "has_family_evidence", False))
+        setattr(out[-1], "family_fallback_only", getattr(c, "family_fallback_only", False))
     return out
 
 
@@ -3200,6 +3490,121 @@ def score_stage2a_candidate(candidate: Any) -> None:
     setattr(candidate, "is_good_mainline", False)
 
 
+def _is_canonical_academic_like_anchor(anchor: PreparedAnchor) -> bool:
+    """动力学/运动学/仿真等核心学术锚点，需先走 family landing 补池。"""
+    anchor_type = (getattr(anchor, "anchor_type", "") or "").strip().lower()
+    if anchor_type == "canonical_academic_like":
+        return True
+    anchor_text = (getattr(anchor, "anchor", "") or "").strip()
+    return anchor_text in CANONICAL_ACADEMIC_ANCHOR_FAMILY_QUERIES
+
+
+def retrieve_family_landing_candidates(
+    label,
+    anchor: PreparedAnchor,
+    top_k: int = None,
+) -> List[LandingCandidate]:
+    """
+    面向 canonical_academic_like 锚点的轻量 family 补池：先 exact/alias/family 命中，再交给 Stage2A 常规打分。
+    只负责补池，不保送 mainline。
+    """
+    top_k = int(top_k) if top_k is not None else STAGE2A_FAMILY_LANDING_TOP_K
+    anchor_text = (getattr(anchor, "anchor", "") or "").strip()
+    if not anchor_text:
+        return []
+    family_queries = CANONICAL_ACADEMIC_ANCHOR_FAMILY_QUERIES.get(anchor_text)
+    if not family_queries:
+        return []
+    load_vocab_meta(label)
+    meta = getattr(label, "_vocab_meta", None)
+    if not meta:
+        return []
+    scored: List[Tuple[float, int, str, str]] = []
+    for vid, tup in meta.items():
+        try:
+            vid_int = int(vid)
+        except (TypeError, ValueError):
+            continue
+        term = (tup[0] or "").strip() if isinstance(tup, (list, tuple)) else ""
+        vocab_type = (tup[1] or "").strip() if isinstance(tup, (list, tuple)) and len(tup) > 1 else ""
+        if vocab_type not in ("concept", "keyword", "") and vocab_type:
+            continue
+        term_lower = term.lower()
+        best = 0.0
+        for q in family_queries:
+            if q == term_lower:
+                best = max(best, 1.0)
+            elif q in term_lower or term_lower in q:
+                best = max(best, 0.85)
+        if best <= 0:
+            continue
+        scored.append((best, vid_int, term, vocab_type))
+    scored.sort(key=lambda x: (-x[0], -len(x[2])))
+    out: List[LandingCandidate] = []
+    for rank, (score, vid_int, term, _) in enumerate(scored[:top_k], start=1):
+        out.append(LandingCandidate(
+            vid=vid_int,
+            term=term,
+            source="family_landing",
+            semantic_score=score,
+            anchor_vid=getattr(anchor, "vid", 0),
+            anchor_term=anchor_text,
+        ))
+        out[-1].source_type = "family_landing"
+        out[-1].source_rank = rank
+        out[-1].source_score = score
+        setattr(out[-1], "has_family_evidence", True)
+    if LABEL_EXPANSION_DEBUG and out:
+        sample = [getattr(c, "term", str(c)) for c in out[:3]]
+        print(f"[Stage2A] family_landing anchor={anchor_text!r} -> {len(out)} 条补池 前3: {sample}")
+    return out
+
+
+def compute_candidate_context_gain(cand: LandingCandidate) -> float:
+    """context_gain = conditioned_sim - surface_proxy；surface_proxy 优先 surface_sim，否则 semantic_score，否则 0。"""
+    cond = float(getattr(cand, "conditioned_sim", None) or 0.0)
+    surf = float(
+        getattr(cand, "surface_sim", None)
+        or getattr(cand, "semantic_score", 0.0)
+        or 0.0
+    )
+    return cond - surf
+
+
+def merge_landing_candidates_by_tid(candidates: List[LandingCandidate]) -> List[LandingCandidate]:
+    """同 tid 合并：保留双路证据 surface_sim / conditioned_sim / source_set，family_landing 只留痕迹不主导主分。"""
+    merged: Dict[int, LandingCandidate] = {}
+    for c in candidates:
+        tid = int(c.vid)
+        if tid not in merged:
+            merged[tid] = c
+            source_set = {getattr(c, "source", "") or c.source}
+            setattr(merged[tid], "source_set", source_set)
+            setattr(merged[tid], "all_sources", source_set)
+            setattr(merged[tid], "has_family_evidence", getattr(c, "source", "") == "family_landing" or getattr(c, "has_family_evidence", False))
+            if getattr(c, "source", "") == "family_landing":
+                setattr(merged[tid], "has_family_fallback", True)
+            continue
+        m = merged[tid]
+        m.source_set = getattr(m, "source_set", set()) or set()
+        m.source_set.add(getattr(c, "source", "") or c.source)
+        setattr(m, "all_sources", m.source_set)
+        if getattr(c, "source", "") == "similar_to":
+            m.surface_sim = max(getattr(m, "surface_sim", None) or 0.0, getattr(c, "surface_sim", None) or c.semantic_score or 0.0)
+        if getattr(c, "source", "") == "conditioned_vec":
+            m.conditioned_sim = max(getattr(m, "conditioned_sim", None) or 0.0, getattr(c, "conditioned_sim", None) or c.semantic_score or 0.0)
+        if getattr(c, "source", "") == "family_landing":
+            setattr(m, "has_family_fallback", True)
+            setattr(m, "has_family_evidence", True)
+        m.semantic_score = max(m.semantic_score, c.semantic_score)
+        m.context_sim = max(getattr(m, "context_sim", 0) or 0, getattr(c, "context_sim", 0) or 0)
+        m.source_score = max(getattr(m, "source_score", 0) or 0, getattr(c, "source_score", 0) or 0)
+    out = list(merged.values())
+    for c in out:
+        c.context_gain = compute_candidate_context_gain(c)
+    return out
+
+
 def collect_landing_candidates(
     label,
     anchor: PreparedAnchor,
@@ -3211,12 +3616,9 @@ def collect_landing_candidates(
     query_vector=None,
 ) -> List[LandingCandidate]:
     """
-    Stage2A:
-    1) 先用 similar_to 给初始候选
-    2) 再用 conditioned_vec 做上下文纠偏（重打分信号）
-    3) 主池太弱时，才少量补 context_fallback
+    Stage2A：两路正式证据 similar_to + conditioned_vec，family_landing 仅在两路都很弱时补池且不参与主脑。
     """
-    # A. 初始候选：similar_to
+    # 1) 两路正式证据
     similar_to_candidates = retrieve_academic_term_by_similar_to(
         label, anchor,
         active_domain_set=active_domain_set,
@@ -3225,7 +3627,7 @@ def collect_landing_candidates(
         jd_topic_ids=jd_topic_ids,
         top_k=STAGE2A_COLLECT_BASE_TOP_K,
     )
-    # B. 上下文纠偏：conditioned_vec
+    ctx_top_k = max(6, STAGE2A_COLLECT_CONDITIONED_TOP_K)
     context_neighbors, rerank_signals = _retrieve_academic_terms_by_conditioned_vec(
         label, anchor,
         similar_to_candidates=similar_to_candidates,
@@ -3233,35 +3635,33 @@ def collect_landing_candidates(
         jd_field_ids=jd_field_ids,
         jd_subfield_ids=jd_subfield_ids,
         jd_topic_ids=jd_topic_ids,
+        conditioned_top_k=ctx_top_k,
     )
-    # 供 Stage2B dense support gate 使用：锚点 context 邻域与得分
+    # 2) family_landing 仅在两路都很弱时少量补
+    family_cands: List[LandingCandidate] = []
+    if len(similar_to_candidates) + len(context_neighbors) <= 2 and _is_canonical_academic_like_anchor(anchor):
+        family_cands = retrieve_family_landing_candidates(label, anchor, top_k=STAGE2A_FAMILY_LANDING_TOP_K)
+        for c in family_cands:
+            setattr(c, "family_fallback_only", True)
+            setattr(c, "default_expand_block_reason", "family_fallback_no_expand")
+
     setattr(anchor, "_context_neighbors", context_neighbors)
     setattr(anchor, "_context_score_map", {c.vid: getattr(c, "context_sim", getattr(c, "semantic_score", 0.0)) for c in context_neighbors})
-    candidates: List[LandingCandidate] = []
-    existing_vids: Set[int] = set()
-    # C. similar_to 仍是主候选池，附加 context 信号
     for cand in similar_to_candidates:
         sig = rerank_signals.get(cand.vid, {})
         cand.context_sim = float(sig.get("context_sim", 0.0) or 0.0)
         cand.context_supported = bool(sig.get("context_supported", 0.0) >= 1.0)
         cand.context_gap = float(sig.get("context_gap", 1.0) or 1.0)
         cand.source_role = "seed_candidate"
-        candidates.append(cand)
-        existing_vids.add(cand.vid)
-    # D. 只有主池太弱时，才从 context_neighbors 补 1~2 个 fallback
-    if len(candidates) <= 1:
-        added = 0
-        for cand in context_neighbors:
-            if cand.vid in existing_vids:
-                continue
-            if cand.context_sim < 0.82:
-                continue
-            candidates.append(cand)
-            existing_vids.add(cand.vid)
-            added += 1
-            if added >= 2:
-                break
-    cands = candidates
+    # 3) 按 tid merge，保留 surface_sim / conditioned_sim / source_set，merge 内已算 context_gain
+    merged_list = merge_landing_candidates_by_tid(similar_to_candidates + context_neighbors + family_cands)
+    for c in merged_list:
+        if c.vid in rerank_signals:
+            sig = rerank_signals[c.vid]
+            c.context_sim = max(c.context_sim, float(sig.get("context_sim", 0) or 0))
+            c.context_supported = c.context_supported or bool(sig.get("context_supported", 0.0) >= 1.0)
+            c.context_gap = min(getattr(c, "context_gap", 1.0), float(sig.get("context_gap", 1.0) or 1.0))
+    cands = merged_list
     for c in cands:
         c.domain_fit = _compute_domain_fit(
             label, c.vid,
@@ -3382,20 +3782,18 @@ def collect_landing_candidates(
         c.expand_block_reason = infer_expand_block_reason(c)
         c.source_trust = get_source_trust(c.source_type)
         score_academic_identity(c)
+        if getattr(c, "has_family_evidence", False):
+            prev = float(getattr(c, "anchor_identity_score", 0) or 0)
+            setattr(c, "anchor_identity_score", max(prev, prev + 0.08))
+            reasons = getattr(c, "primary_eligibility_reasons", None) or []
+            if not isinstance(reasons, list):
+                reasons = []
+            reasons.append("family_landing_support")
+            setattr(c, "primary_eligibility_reasons", reasons)
     if LABEL_EXPANSION_DEBUG:
-        print(f"[Stage2A] collect_landing_candidates anchor={anchor.anchor!r} -> {len(cands)} 个候选")
-    if STAGE2_VERBOSE_DEBUG:
-        print("[Stage2A 候选明细] tid | term | source | semantic_score | context_sim | context_supported | context_gap")
-        for i, c in enumerate(cands[:10], 1):
-            print(
-                f"  {i} {c.vid} | {c.term!r} | {c.source} "
-                f"| sem={getattr(c, 'semantic_score', 0):.3f}"
-                f" | ctx={getattr(c, 'context_sim', 0):.3f}"
-                f" | ctx_ok={getattr(c, 'context_supported', False)}"
-                f" | gap={getattr(c, 'context_gap', 1.0):.3f}"
-            )
-        if len(cands) > 10:
-            print(f"  ... 共 {len(cands)} 条")
+        print(f"[Stage2A] collect_landing_candidates anchor={anchor.anchor!r} -> {len(cands)} 个候选" + (
+            f" 前3: {[c.term for c in cands[:3]]}" if cands else ""
+        ))
     return cands
 
 
@@ -5221,6 +5619,7 @@ def merge_primary_and_support_terms(
         setattr(e, "topic_source", getattr(p, "topic_source", "missing"))
         setattr(e, "seed_blocked", getattr(p, "seed_blocked", False))
         setattr(e, "seed_block_reason", getattr(p, "seed_block_reason", None))
+        setattr(e, "has_family_evidence", getattr(p, "has_family_evidence", False))
         if getattr(p, "outside_subfield_mass", None) is not None:
             setattr(e, "outside_subfield_mass", p.outside_subfield_mass)
         if getattr(p, "outside_topic_mass", None) is not None:
@@ -5397,6 +5796,9 @@ def stage2_generate_academic_terms(
         )
         stage2a_list = landing_candidates_to_stage2a(landing_list)
         per_anchor_candidates[anchor.vid] = stage2a_list
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and landing_list:
+            sample = [c.term for c in landing_list[:3]]
+            print(f"[Stage2A dual evidence] anchor={getattr(anchor, 'anchor', '')!r} 共 {len(landing_list)} 条 前3: {sample}")
 
     cross_anchor_index = build_cross_anchor_index(per_anchor_candidates)
     all_anchor_results: List[Dict[str, Any]] = []
@@ -5450,68 +5852,14 @@ def stage2_generate_academic_terms(
             })
             if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and stage2a_hard_rejected:
                 anchor_term = getattr(anchor, "anchor", "") or ""
-                for c in stage2a_hard_rejected:
-                    feat = _get_stage2a_feat(c)
-                    print(
-                        f"[Stage2A hard reject] anchor={anchor_term!r} term={c.term!r} reason={getattr(c, 'stage2a_hard_reject_reason', '')} | "
-                        f"anchor_id={feat.anchor_id:.3f} jd_align={feat.jd_align:.3f} ctx={feat.ctx_cont:.3f} hier={feat.hier:.3f} poly={feat.poly:.3f} object={feat.object:.3f}"
-                    )
+                sample = [f"{c.term!r}={getattr(c, 'stage2a_hard_reject_reason', '')}" for c in stage2a_hard_rejected[:3]]
+                print(f"[Stage2A hard reject] anchor={anchor_term!r} 共 {len(stage2a_hard_rejected)} 条 前3: {sample}")
             continue
         selected = select_primary_per_anchor(anchor, kept)
         anchor_term = getattr(anchor, "anchor", "") or ""
         if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and stage2a_hard_rejected:
-            for c in stage2a_hard_rejected:
-                feat = _get_stage2a_feat(c)
-                print(
-                    f"[Stage2A hard reject] anchor={anchor_term!r} term={c.term!r} reason={getattr(c, 'stage2a_hard_reject_reason', '')} | "
-                    f"anchor_id={feat.anchor_id:.3f} jd_align={feat.jd_align:.3f} ctx={feat.ctx_cont:.3f} hier={feat.hier:.3f} poly={feat.poly:.3f} object={feat.object:.3f}"
-                )
-        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and enriched:
-            for c in enriched[:25]:
-                feat = _get_stage2a_feat(c)
-                flags = _stage2a_rule_flags(c, feat)
-                print(
-                    f"[Stage2A rule flags] anchor={anchor_term!r} term={(c.term or '')[:24]!r} | "
-                    f"anchor_id={feat.anchor_id:.3f} jd_align={feat.jd_align:.3f} ctx={feat.ctx_cont:.3f} hier={feat.hier:.3f} poly={feat.poly:.3f} object={feat.object:.3f} | "
-                    f"identity_ok={flags['identity_ok']} ctx_ok={flags['ctx_ok']} hier_ok={flags['hier_ok']} poly_bad={flags['poly_bad']} object_bad={flags['object_bad']} "
-                    f"drift_bad={flags['drift_bad']} obvious_bad={flags['obvious_bad']} tech_keep_ok={flags['tech_keep_ok']}"
-                )
-        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
-            for c in selected["primary_expandable"] + selected["primary_keep_no_expand"] + selected["rejected"]:
-                mainline_candidate = getattr(c, "is_good_mainline", False)
-                mainline_block = getattr(c, "mainline_block_reason", "") or ""
-                weak_keep = c.primary_bucket == "primary_keep_no_expand"
-                weak_reason = getattr(c, "bucket_reason", "") or ""
-                fb = getattr(c, "primary_bucket", "") or ""
-                print(
-                    f"[Stage2A mainline gate] anchor={anchor_term!r} term={(c.term or '')[:24]!r} | "
-                    f"mainline_candidate={mainline_candidate} mainline_block_reason={mainline_block!r} | "
-                    f"weak_keep={weak_keep} weak_keep_reason={weak_reason!r} final_bucket={fb!r}"
-                )
-            for c in selected["primary_keep_no_expand"] + selected["rejected"]:
-                ai = float(getattr(c, "anchor_identity_score", 0) or getattr(c, "family_match", 0) or 0)
-                mp = float(getattr(c, "mainline_pref_score", 0) or 0)
-                ctx = float(getattr(c, "context_continuity", 0) or getattr(c, "context_sim", 0) or 0)
-                near_mainline = ai >= 0.45 or mp >= 0.45
-                if near_mainline and getattr(c, "primary_bucket", "") != "primary_expandable":
-                    print(
-                        f"[Stage2A downgrade] anchor={anchor_term!r} term={(c.term or '')[:24]!r} | "
-                        f"reason={getattr(c, 'mainline_block_reason', '')!r} | "
-                        f"anchor_id={ai:.3f} jd_align={getattr(c, 'jd_align', 0):.3f} ctx={ctx:.3f}"
-                    )
-
-        # Stage2A 候选定性表（含 pre-primary hard_reject_reason、stage2a_reject_cls 验收）
-        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and enriched:
-            print("[Stage2A 候选定性表] anchor | term | anchor_id | jd_align | ctx_cont | hier | poly | object | hard_reject_reason | stage2a_reject_cls")
-            for c in enriched[:15]:
-                hr = getattr(c, "stage2a_hard_reject_reason", "") or "-"
-                cls = getattr(c, "stage2a_reject_cls", "") or "-"
-                print(
-                    f"  {getattr(anchor, 'anchor', '')!r} | {(c.term or '')[:22]:22s} | {c.family_match:.3f} | {c.jd_align:.3f} | "
-                    f"{c.context_continuity:.3f} | {c.hierarchy_consistency:.3f} | {c.polysemy_risk:.3f} | {c.object_like_risk:.3f} | {hr} | {cls}"
-                )
-            if len(enriched) > 15:
-                print(f"  ... 共 {len(enriched)} 条")
+            sample = [f"{c.term!r}={getattr(c, 'stage2a_hard_reject_reason', '')}" for c in stage2a_hard_rejected[:3]]
+            print(f"[Stage2A hard reject] anchor={anchor_term!r} 共 {len(stage2a_hard_rejected)} 条 前3: {sample}")
 
         # 为选中的候选挂 parent_anchor，供 merge / Stage2B 使用
         anchor_term = getattr(anchor, "anchor", "") or ""
@@ -5544,6 +5892,7 @@ def stage2_generate_academic_terms(
             setattr(p, "subfield_fit", 0.0)
             setattr(p, "topic_fit", 0.0)
             setattr(p, "cross_anchor_support_count", max(1, len(cross_anchor_index.get(cand.tid, []))))
+            setattr(p, "has_family_evidence", getattr(cand, "has_family_evidence", False))
             setattr(p, "mainline_preference", getattr(cand, "mainline_preference", None))
             setattr(p, "mainline_rank", getattr(cand, "mainline_rank", None))
             setattr(p, "anchor_internal_rank", getattr(cand, "anchor_internal_rank", None))
@@ -5552,6 +5901,12 @@ def stage2_generate_academic_terms(
             setattr(p, "sort_key_snapshot", getattr(cand, "sort_key_snapshot", None))
             setattr(p, "role_in_anchor", getattr(cand, "role_in_anchor", None))
             setattr(p, "cross_anchor_support", getattr(cand, "cross_anchor_support", None))
+            setattr(p, "context_gain", float(getattr(cand, "context_gain", 0) or 0))
+            setattr(p, "semantic_score", float(getattr(cand, "semantic_score", 0) or 0))
+            _cs = getattr(cand, "conditioned_sim", None)
+            setattr(p, "conditioned_sim", float(_cs) if _cs is not None else None)
+            setattr(p, "dual_support", bool(getattr(cand, "dual_support", False)))
+            setattr(p, "source_type", getattr(cand, "source_type", None) or getattr(cand, "source", "") or "")
             primary_landings_list.append(p)
             _mainline_num = 0.7 if cand.role == "mainline" else (0.4 if cand.role == "side" else 0.0)
             evidence_table.append({
@@ -5708,53 +6063,6 @@ def stage2_generate_academic_terms(
             })
         term_breakdown.sort(key=lambda x: -(x["final_primary_score"] or 0))
         label.debug_info.stage2a_term_source_breakdown = term_breakdown
-    debug_print(2, "[Stage2A Primary Score Breakdown] tid | term | edge | cond_align | jd_align | hier | multi_anchor | neigh | specificity | poly_risk | isolation | final", label)
-    for i, row in enumerate(evidence_table[:15], 1):
-        cond = row.get("conditioned_anchor_align")
-        cond_s = f"{cond:.3f}" if cond is not None else "-"
-        debug_print(2, (
-            f"  {i:>2} {row.get('tid')} | {(str(row.get('candidate') or ''))[:26]:<26} | "
-            f"edge={row.get('edge_affinity', 0):.3f} | cond={cond_s} | jd={row.get('jd_align', 0):.3f} | "
-            f"hier={row.get('hierarchy_consistency', 0):.3f} | multi={row.get('multi_anchor_support', 0):.3f} | "
-            f"neigh={row.get('neighborhood_consistency', 0):.3f} | spec={row.get('specificity_prior', 0):.3f} | "
-            f"poly={row.get('polysemy_risk', 0):.3f} | isol={row.get('isolation_penalty', 0):.3f} | "
-            f"final={row.get('primary_score', 0):.3f}"
-        ), label)
-    by_term_cross: Dict[Tuple[int, str], Dict[str, Any]] = {}
-    for row in evidence_table:
-        key = (row["tid"], (row.get("candidate") or "").strip())
-        if key not in by_term_cross:
-            by_term_cross[key] = {"term": row.get("candidate", ""), "supported_by_anchors": [], "support_weight_sum": 0.0}
-        by_term_cross[key]["supported_by_anchors"].append(row.get("anchor", ""))
-        by_term_cross[key]["support_weight_sum"] += float(row.get("primary_score", 0) or 0)
-    cross_list = sorted(by_term_cross.values(), key=lambda x: -x["support_weight_sum"])[:15]
-    debug_print(2, "[Stage2A Cross-Anchor Evidence] term | support_count | support_weight_sum | anchors", label)
-    for row in cross_list:
-        anchors_preview = (row.get("supported_by_anchors") or [])[:5]
-        debug_print(2, f"  {(row.get('term') or '')[:28]:<28} | cnt={len(row.get('supported_by_anchors') or []):>2} | sum={row.get('support_weight_sum', 0):.3f} | {anchors_preview}", label)
-    if LABEL_EXPANSION_DEBUG and evidence_table:
-        print("[Stage2A Identity Gate] anchor | candidate | source | identity | gate | base | final")
-        for row in evidence_table[:30]:
-            anc = (str(row.get("anchor") or ""))[:14]
-            cand = (str(row.get("candidate") or ""))[:24]
-            src = (row.get("source") or "")[:14]
-            aid = row.get("anchor_identity_score", 0.5)
-            gate = row.get("identity_gate", 1.0)
-            base = row.get("base_primary_score", 0)
-            final = row.get("primary_score", 0)
-            print(f"  {anc:14s} | {cand:24s} | {src:14s} | id={aid:.3f} | gate={gate:.2f} | base={base:.3f} | final={final:.3f}")
-        if len(evidence_table) > 30:
-            print(f"  ... 共 {len(evidence_table)} 条")
-        print("[Stage2 锚点-候选证据表] anchor | candidate(tid) | edge | cond_align | multi_anchor | jd_align | hier | neigh | isol | primary")
-        for row in evidence_table[:40]:
-            anc = (str(row.get("anchor") or ""))[:14]
-            cand = (str(row.get("candidate") or ""))[:20]
-            cond = row.get("conditioned_anchor_align")
-            cond_s = f"{cond:.3f}" if cond is not None else "-"
-            print(f"  {anc:14s} | {cand!r}({row.get('tid')}) | edge={row['edge_affinity']:.3f} | cond={cond_s} | multi={row.get('multi_anchor_support', 0.5):.3f} | jd={row['jd_align']:.3f} | hier={row['hierarchy_consistency']:.3f} | neigh={row['neighborhood_consistency']:.3f} | isol={row['isolation_penalty']:.3f} | primary={row['primary_score']:.3f}")
-        if len(evidence_table) > 40:
-            print(f"  ... 共 {len(evidence_table)} 条")
-
     for anchor in prepared_anchors:
         primary_landings = primary_landings_by_anchor.get(anchor.vid) or []
         if not primary_landings:
@@ -5769,45 +6077,43 @@ def stage2_generate_academic_terms(
             continue
         if LABEL_EXPANSION_DEBUG:
             print(f"[Stage2] 锚点 anchor={anchor.anchor!r} primary 数={len(primary_landings)}")
-        # Stage2B：仅 Stage2A 给出的 can_expand 且 primary_score≥SEED_SCORE_MIN 进扩散，不做第二轮主线审批
-        diffusion_primaries = [
-            p for p in primary_landings
-            if getattr(p, "expandable", False)
-            and (getattr(p, "primary_score", 0) or 0) >= SEED_SCORE_MIN
-        ]
-        _seed_detail: List[Tuple[Any, bool, float]] = []
+        # Stage2B：唯一 seed 准入 = check_seed_eligibility()；SEED_SCORE_MIN 仅用于 eligible 后的排序裁剪，不翻案
+        diffusion_primaries: List[Any] = []
+        _seed_detail: List[Tuple[Any, bool, float, Optional[str]]] = []
         for p in primary_landings:
-            eligible = getattr(p, "expandable", False)
-            setattr(p, "seed_blocked", not eligible)
-            setattr(p, "seed_block_reason", None if eligible else "not_primary_expandable")
-            seed_score = getattr(p, "primary_score", 0.5) or 0.5
+            eligible, seed_score, block_reason = check_seed_eligibility(label, p, jd_profile)
             setattr(p, "seed_score", seed_score)
-            _seed_detail.append((p, eligible, seed_score))
-        # 仅 primary_expandable 参与扩散
+            setattr(p, "seed_blocked", not eligible)
+            setattr(p, "seed_block_reason", block_reason)
+            _seed_detail.append((p, eligible, seed_score, block_reason))
+            if eligible and seed_score >= SEED_SCORE_MIN:
+                diffusion_primaries.append((p, seed_score))
+        diffusion_primaries.sort(key=lambda x: x[1], reverse=True)
+        seed_primaries = [p for p, _ in diffusion_primaries]
         _stage2_header(f"Stage2B seed 明细 [锚点 {getattr(anchor, 'anchor', anchor)!r}]", "-")
         if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and _seed_detail:
             _stage2_table(
                 [
-                    [(p.term or "")[:20], "Y" if el else "N", f"{sc:.3f}" if el else "-"]
-                    for (p, el, sc) in _seed_detail[:20]
+                    [(p.term or "")[:20], "Y" if el else "N", f"{sc:.3f}" if el else "-", (br or "-")[:18]]
+                    for (p, el, sc, br) in _seed_detail[:20]
                 ],
-                ["term", "eligible", "seed_score"],
-                col_widths=[22, 10, 12],
+                ["term", "eligible", "seed_score", "block_reason"],
+                col_widths=[22, 10, 12, 20],
             )
-            print(f"  diffusion_primaries({len(diffusion_primaries)}): {[p.term for p in diffusion_primaries[:10]]}")
-        debug_print(2, f"[Stage2B] anchor={anchor.anchor!r} primary 数={len(primary_landings)} seed 数={len(diffusion_primaries)}", label)
-        debug_print(1, f"[Stage2B] seed 数={len(diffusion_primaries)}/{len(primary_landings)} 参与扩散（SEED_MIN_IDENTITY={SEED_MIN_IDENTITY}）", label)
-        if diffusion_primaries:
-            debug_print(2, f"[Stage2B] seed_terms={[p.term for p in diffusion_primaries[:10]]}", label)
-        if LABEL_EXPANSION_DEBUG and (len(diffusion_primaries) != len(primary_landings) or not diffusion_primaries):
-            print(f"[Stage2B] seed 数={len(diffusion_primaries)}/{len(primary_landings)}（identity≥{SEED_MIN_IDENTITY} & source∈可信，单一决策无二次审批）")
+            print(f"  diffusion_primaries({len(seed_primaries)}): {[p.term for p in seed_primaries[:10]]}")
+        debug_print(2, f"[Stage2B] anchor={anchor.anchor!r} primary 数={len(primary_landings)} seed 数={len(seed_primaries)}", label)
+        debug_print(1, f"[Stage2B] seed 数={len(seed_primaries)}/{len(primary_landings)} 参与扩散（唯一入口 check_seed_eligibility）", label)
+        if seed_primaries:
+            debug_print(2, f"[Stage2B] seed_terms={[p.term for p in seed_primaries[:10]]}", label)
+        if LABEL_EXPANSION_DEBUG and (len(seed_primaries) != len(primary_landings) or not seed_primaries):
+            print(f"[Stage2B] seed 数={len(seed_primaries)}/{len(primary_landings)}（唯一入口 check_seed_eligibility，SEED_SCORE_MIN 仅用于 eligible 后裁剪）")
         # 为 dense/cooc 的 support_expandable_for_anchor 提供锚点 context
-        for p in diffusion_primaries:
+        for p in seed_primaries:
             setattr(p, "anchor_conditioned_vec", getattr(anchor, "conditioned_vec", None))
             setattr(p, "_context_neighbors", getattr(anchor, "_context_neighbors", None) or [])
             setattr(p, "_context_score_map", getattr(anchor, "_context_score_map", None) or {})
         dense_list = expand_from_vocab_dense_neighbors(
-            label, diffusion_primaries,
+            label, seed_primaries,
             active_domain_set=active_domains,
             jd_field_ids=jd_field_ids,
             jd_subfield_ids=jd_subfield_ids,
@@ -5815,14 +6121,14 @@ def stage2_generate_academic_terms(
             jd_profile=jd_profile,
         )
         cluster_list = expand_from_cluster_members(
-            label, diffusion_primaries,
+            label, seed_primaries,
             active_domain_set=active_domains,
             jd_field_ids=jd_field_ids,
             jd_subfield_ids=jd_subfield_ids,
             jd_topic_ids=jd_topic_ids,
         )
         cooc_list = expand_from_cooccurrence_support(
-            label, diffusion_primaries,
+            label, seed_primaries,
             active_domain_set=active_domains,
             jd_field_ids=jd_field_ids,
             jd_subfield_ids=jd_subfield_ids,

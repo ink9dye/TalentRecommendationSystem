@@ -64,6 +64,8 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
             "sort_key_snapshot": getattr(c, "sort_key_snapshot", None),
             "role_in_anchor": getattr(c, "role_in_anchor", None),
             "cross_anchor_support": getattr(c, "cross_anchor_support", None),
+            "seed_block_reason": getattr(c, "seed_block_reason", None),
+            "has_family_evidence": getattr(c, "has_family_evidence", False),
         }
         rec["retrieval_role"] = get_retrieval_role_from_term_role(c.term_role)
         # Stage3 分层与准入所需字段（顶层透传，便于 classify_stage3_entry_groups / check_stage3_admission）
