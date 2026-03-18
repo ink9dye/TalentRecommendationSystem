@@ -191,46 +191,78 @@ def _apply_family_role_constraints(survivors: List[Dict[str, Any]]) -> List[Dict
 
 
 def _collect_risky_reasons(rec: Dict[str, Any]) -> List[str]:
-    """Risky 理由：弱 family、高 drift+低 ptc、低分单锚点；不再因单锚点直接列 risky。"""
+    """Risky 理由：弱 family、高 drift+低 ptc、弱 topic 尾部；判定更严，避免正常主干词被误标。"""
     reasons: List[str] = []
     final_score = float(rec.get("final_score") or 0.0)
     drift = float(rec.get("semantic_drift_risk") or 0.0)
     ex = rec.get("stage3_explain") or {}
     ptc = float(ex.get("path_topic_consistency") or 0.0)
-    if float(rec.get("family_centrality") or 0.0) < 0.30:
+    fc = float(rec.get("family_centrality") or 0.0)
+    if fc < 0.30:
         reasons.append("weak_family_centrality")
     if drift > 0.75 and ptc < 0.30:
         reasons.append("high_drift_risk")
-    if final_score < 0.55 and int(rec.get("anchor_count") or 0) <= 1:
-        reasons.append("weak_single_anchor_term")
+    if ptc < 0.50 and final_score < 0.58:
+        reasons.append("weak_topic_fit_tail")
     return reasons
 
 
 def _bucket_stage3_terms(survivors: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """分为 core_terms、support_terms、risky_terms；core 为真正主干 primary，不因单锚点直接打下去。"""
+    """分为 core_terms、support_terms、risky_terms。core 两条路：强主干直通（primary 且 final>=0.66）或结构型主干（primary 且 final>=0.62、ptc>=0.55、cross>=0.94）。"""
     core_terms: List[Dict[str, Any]] = []
     support_terms: List[Dict[str, Any]] = []
     risky_terms: List[Dict[str, Any]] = []
     for rec in survivors:
-        final_score = float(rec.get("final_score") or 0.0)
         ex = rec.get("stage3_explain") or {}
+        final_score = float(rec.get("final_score") or 0.0)
         ptc = float(ex.get("path_topic_consistency") or 0.0)
-        drift = float(rec.get("semantic_drift_risk") or 0.0)
+        cross = float(ex.get("cross_anchor_factor") or rec.get("cross_anchor_evidence") or 1.0)
         role = (rec.get("retrieval_role") or "").lower()
         reasons = rec.get("risk_reasons") or []
-        if (
-            role == "paper_primary"
-            and final_score >= 0.64
-            and ptc >= 0.55
-            and drift <= 0.80
-            and "high_drift_risk" not in reasons
-        ):
+        is_primary = role == "paper_primary"
+        strong_primary_core = is_primary and final_score >= 0.66
+        structured_primary_core = (
+            is_primary and final_score >= 0.62 and ptc >= 0.55 and cross >= 0.94
+        )
+        if strong_primary_core or structured_primary_core:
             core_terms.append(rec)
-        elif final_score >= 0.56 and "weak_family_centrality" not in reasons:
+            continue
+        if final_score >= 0.56 and "high_drift_risk" not in reasons:
             support_terms.append(rec)
-        else:
-            risky_terms.append(rec)
+            continue
+        risky_terms.append(rec)
     return core_terms, support_terms, risky_terms
+
+
+def _debug_print_stage3_bucket_details(
+    core_terms: List[Dict[str, Any]],
+    support_terms: List[Dict[str, Any]],
+    risky_terms: List[Dict[str, Any]],
+    recall: Any,
+) -> None:
+    """打印 bucket 判定依据：term | bucket | final | ptc | cross | reasons。"""
+    debug_print(2, "[Stage3 Bucket Details] term | bucket | final | ptc | cross | reasons", recall)
+    for bucket_name, items in [
+        ("core", core_terms),
+        ("support", support_terms),
+        ("risky", risky_terms),
+    ]:
+        for rec in items:
+            explain = rec.get("stage3_explain") or {}
+            final_score = float(rec.get("final_score") or 0.0)
+            ptc = float(explain.get("path_topic_consistency") or 0.0)
+            cross = float(
+                explain.get("cross_anchor_factor")
+                or rec.get("cross_anchor_evidence")
+                or 1.0
+            )
+            reasons = rec.get("risk_reasons") or []
+            term = (rec.get("term") or "")[:32]
+            debug_print(
+                2,
+                f"  {term!r} | {bucket_name} | {final_score:.4f} | {ptc:.4f} | {cross:.4f} | {reasons}",
+                recall,
+            )
 
 
 def _is_primary_like(rec: Dict[str, Any]) -> bool:
@@ -539,6 +571,7 @@ def _debug_print_stage3_output(
     debug_print(2, f"  core_terms={[r.get('term') for r in core_terms[:15]]}", recall)
     debug_print(2, f"  support_terms={[r.get('term') for r in support_terms[:15]]}", recall)
     debug_print(2, f"  risky_terms={[r.get('term') for r in risky_terms[:15]]}", recall)
+    _debug_print_stage3_bucket_details(core_terms, support_terms, risky_terms, recall)
     debug_print(3, "[Stage3 Risky Term Reasons] term | reasons | final", recall)
     for r in risky_terms[:10]:
         t = (r.get("term") or "")[:28]
