@@ -81,10 +81,27 @@ RETAIN_MIN = 0.40                 # 仅保留（不扩）准入 retain_score 下
 STAGE2A_MAINLINE_PREF_MIN = 0.50   # 主线偏好下限 → primary_expandable
 STAGE2A_EXPANDABLE_IDENTITY_MIN = 0.52  # 锚点一致性下限 → 可扩散
 STAGE2A_WEAK_KEEP_MIN = 0.20       # 低于此且非 normal/weak_retain → reject
-# Stage2A pre-primary 明显错落点拦截（只拦大错词，不拦次优词）
-STAGE2A_REJECT_IDENTITY_FLOOR = 0.33   # 上下文不支持 + identity 低于此 → hard_reject
-STAGE2A_REJECT_MAINLINE_FLOOR = 0.40   # 上下文不支持 + mainline_pref 低于此 → hard_reject
+# Stage2A pre-primary 分桶：明显坏分支 hard_reject，弱相关技术词 primary_keep_no_expand
+STAGE2A_REJECT_IDENTITY_FLOOR = 0.33   # low_identity_no_context 阈值
+STAGE2A_REJECT_MAINLINE_FLOOR = 0.40   # low_mainline_no_context 阈值
 STAGE2A_POLY_HARD_RISK = 0.55         # 高歧义 + 无上下文 + identity<0.40 → hard_reject
+# 明显坏分支（对象/多义 或 抽象漂移）：dynamism/propulsion/surgical robot/control flow 等
+STAGE2A_BAD_OBJECT_OR_POLY_ID_CAP = 0.28
+STAGE2A_BAD_OBJECT_OR_POLY_CTX_CAP = 0.50
+STAGE2A_BAD_OBJECT_MIN = 0.18
+STAGE2A_BAD_POLY_MIN = 0.45
+STAGE2A_BAD_OBJECT_OR_POLY_HIER_CAP = 0.30
+STAGE2A_DRIFT_ID_CAP = 0.32
+STAGE2A_DRIFT_CTX_CAP = 0.50
+STAGE2A_DRIFT_MAINLINE_CAP = 0.43
+STAGE2A_DRIFT_JD_CAP = 0.79
+STAGE2A_DRIFT_HIER_CAP = 0.55
+# 弱相关但技术主干词保留：simulation/feedback control/vibration/mechanics 救回 keep_no_expand
+STAGE2A_WEAK_TECH_ID_CAP = 0.45
+STAGE2A_WEAK_TECH_CTX_CAP = 0.55
+STAGE2A_WEAK_TECH_JD_MIN = 0.74
+STAGE2A_WEAK_TECH_POLY_CAP = 0.40
+STAGE2A_WEAK_TECH_OBJECT_CAP = 0.18
 SEED_SCORE_MIN = 0.50              # Stage2B seed 门槛：仅消费 can_expand + primary_score≥此
 
 # ---------- Stage2A 准入：仅两个门槛 + source 折扣，不再按 source 分多套阈值 ----------
@@ -1977,22 +1994,179 @@ def enrich_stage2a_candidates(
     return ranked
 
 
+def _get_stage2a_feat(cand: Any) -> Any:
+    """从候选取出 2A 判定用特征（避免重复 getattr）。"""
+    ctx_cont = float(getattr(cand, "context_continuity", 0) or getattr(cand, "context_sim", 0) or 0)
+    context_supported = bool(getattr(cand, "ctx_supported", getattr(cand, "context_supported", False)))
+    if ctx_cont <= 0 and context_supported:
+        ctx_cont = 0.55
+    return SimpleNamespace(
+        anchor_id=float(getattr(cand, "anchor_identity_score", 0) or getattr(cand, "family_match", 0) or 0),
+        mainline_pref=float(getattr(cand, "mainline_pref_score", 0) or 0),
+        jd_align=float(getattr(cand, "jd_align", 0.5) or 0.5),
+        ctx_cont=ctx_cont,
+        hier=float(getattr(cand, "hierarchy_consistency", 0) or 0),
+        poly=float(getattr(cand, "polysemy_risk", 0) or 0),
+        object=float(getattr(cand, "object_like_risk", 0) or 0),
+        context_supported=context_supported,
+    )
+
+
+def _stage2a_rule_flags(cand: Any, feat: Any) -> Dict[str, Any]:
+    """判定链路调试：返回各规则布尔结果，供 [Stage2A rule flags] 打印。"""
+    identity_ok = feat.anchor_id >= STAGE2A_EXPANDABLE_IDENTITY_MIN
+    ctx_ok = feat.ctx_cont >= 0.50
+    hier_ok = feat.hier >= STAGE2A_BAD_OBJECT_OR_POLY_HIER_CAP
+    poly_bad = feat.poly >= STAGE2A_POLY_HARD_RISK
+    object_bad = feat.object >= STAGE2A_BAD_OBJECT_MIN
+    drift_bad = _is_semantic_drift_branch_stage2a(cand, feat)
+    obvious_bad = _is_obviously_bad_branch_stage2a(cand, feat)
+    tech_keep_ok = _is_weak_technical_keep_candidate(cand)
+    mainline_pref_ok = feat.mainline_pref >= STAGE2A_MAINLINE_PREF_MIN
+    jd_ok = feat.jd_align >= STAGE2A_WEAK_TECH_JD_MIN
+    return {
+        "identity_ok": identity_ok,
+        "ctx_ok": ctx_ok,
+        "hier_ok": hier_ok,
+        "poly_bad": poly_bad,
+        "object_bad": object_bad,
+        "drift_bad": drift_bad,
+        "obvious_bad": obvious_bad,
+        "tech_keep_ok": tech_keep_ok,
+        "mainline_pref_ok": mainline_pref_ok,
+        "jd_ok": jd_ok,
+    }
+
+
+def _is_object_or_poly_bad_branch_stage2a(cand: Any, feat: Any) -> bool:
+    """明显对象/多义坏分支：surgical robot、robotic surgery、dyskinesia、sports science、control (management)、control flow。"""
+    if feat.anchor_id >= STAGE2A_BAD_OBJECT_OR_POLY_ID_CAP:
+        return False
+    if feat.ctx_cont >= STAGE2A_BAD_OBJECT_OR_POLY_CTX_CAP:
+        return False
+    if feat.object < STAGE2A_BAD_OBJECT_MIN and feat.poly < STAGE2A_BAD_POLY_MIN:
+        return False
+    if feat.hier >= STAGE2A_BAD_OBJECT_OR_POLY_HIER_CAP:
+        return False
+    return True
+
+
+def _is_weak_technical_keep_candidate(cand: Any) -> bool:
+    """
+    弱技术词保活（二次修正）：simulation、vibration、feedback control 等可进 primary_keep_no_expand，
+    不被 hard_reject；在 semantic_drift / low_mainline_no_context 前生效。
+    """
+    st = (getattr(cand, "source_type", None) or getattr(cand, "source", "") or "").strip().lower()
+    if st not in ("similar_to", "conditioned_vec", "conditioned_vec_fallback", ""):
+        if st:
+            return False
+    anchor_id = float(getattr(cand, "anchor_identity_score", 0) or getattr(cand, "family_match", 0) or 0)
+    if anchor_id < 0.20:
+        return False
+    jd_align = float(getattr(cand, "jd_align", 0.5) or 0.5)
+    if jd_align < 0.74:
+        return False
+    ctx_cont = float(getattr(cand, "context_continuity", 0) or getattr(cand, "context_sim", 0) or 0)
+    if ctx_cont < 0.44:
+        return False
+    poly_risk = float(getattr(cand, "polysemy_risk", 0) or 0)
+    if poly_risk >= 0.55:
+        return False
+    object_like = float(getattr(cand, "object_like_risk", 0) or 0)
+    if object_like >= 0.35:
+        return False
+    return True
+
+
+def _is_semantic_drift_branch_stage2a(cand: Any, feat: Any) -> bool:
+    """
+    抽象漂移分支：动力学→dynamism/propulsion；二次修正：弱技术词豁免，vibration/simulation 不误杀。
+    收紧：anchor_id>=0.24 不判漂移；(anchor_id<0.24 且 jd_align<0.76) 或 (anchor_id<0.24 且 ctx_cont<0.46) 才判漂移。
+    """
+    if _is_weak_technical_keep_candidate(cand):
+        return False
+    if feat.anchor_id >= 0.24:
+        return False
+    if feat.jd_align < 0.76:
+        return True
+    if feat.ctx_cont < 0.46:
+        return True
+    return False
+
+
+def _is_obviously_bad_branch_stage2a(cand: Any, feat: Any) -> bool:
+    """明显坏分支：对象/多义坏 或 抽象漂移；dynamism/propulsion/surgical robot 等直接砍。"""
+    term = (getattr(cand, "term", None) or cand.get("term") or "").strip().lower()
+    if "(management)" in term:
+        return True
+    if _is_object_or_poly_bad_branch_stage2a(cand, feat):
+        return True
+    if _is_semantic_drift_branch_stage2a(cand, feat):
+        return True
+    return False
+
+
+def _is_weak_but_technical_keep_stage2a(cand: Any, feat: Any) -> bool:
+    """弱相关但技术主干词：simulation、feedback control、vibration、mechanics 保留进 primary_keep_no_expand。"""
+    if feat.anchor_id >= STAGE2A_WEAK_TECH_ID_CAP:
+        return False
+    if feat.ctx_cont >= STAGE2A_WEAK_TECH_CTX_CAP:
+        return False
+    if feat.jd_align < STAGE2A_WEAK_TECH_JD_MIN:
+        return False
+    if feat.poly >= STAGE2A_WEAK_TECH_POLY_CAP:
+        return False
+    if feat.object >= STAGE2A_WEAK_TECH_OBJECT_CAP:
+        return False
+    return True
+
+
 def _should_hard_reject_stage2a_candidate(cand: Any) -> Tuple[bool, str]:
     """
-    Stage2A 入 primary 前最后一道判定：只拦明显错义落点（歧义错支/上下文不支持/identity 太弱），
-    不拦可保留但不扩散的次优词；不依赖硬编码词表，仅用已有特征。
+    Stage2A 分桶判定顺序：① 明显坏分支 → hard_reject；② 弱相关技术词 → primary_keep_no_expand；
+    ③ low_identity/low_mainline_no_context → hard_reject；④ 高歧义无上下文 → hard_reject。
+    只改桶边界，不改 score 公式。
     """
-    anchor_identity = float(getattr(cand, "anchor_identity_score", 0) or getattr(cand, "family_match", 0) or 0)
-    mainline_pref = float(getattr(cand, "mainline_pref_score", 0) or 0)
-    poly_risk = float(getattr(cand, "polysemy_risk", 0) or 0)
-    context_supported = bool(getattr(cand, "ctx_supported", getattr(cand, "context_supported", False)))
+    feat = _get_stage2a_feat(cand)
+    anchor_identity = feat.anchor_id
+    mainline_pref = feat.mainline_pref
+    poly_risk = feat.poly
+    context_supported = feat.context_supported
 
-    if (not context_supported) and anchor_identity < STAGE2A_REJECT_IDENTITY_FLOOR:
+    low_identity_no_ctx = (not context_supported) and anchor_identity < STAGE2A_REJECT_IDENTITY_FLOOR
+    low_mainline_no_ctx = (not context_supported) and mainline_pref < STAGE2A_REJECT_MAINLINE_FLOOR
+    obviously_bad = _is_obviously_bad_branch_stage2a(cand, feat)
+    weak_but_technical = _is_weak_but_technical_keep_stage2a(cand, feat)
+    weak_tech_keep_candidate = _is_weak_technical_keep_candidate(cand)
+
+    if obviously_bad:
+        setattr(cand, "stage2a_reject_cls", "hard_reject")
+        if _is_semantic_drift_branch_stage2a(cand, feat):
+            return True, "semantic_drift_branch"
+        if _is_object_or_poly_bad_branch_stage2a(cand, feat):
+            return True, "object_or_poly_bad_branch"
+        return True, "obviously_bad_branch"
+    if low_mainline_no_ctx:
+        if weak_tech_keep_candidate:
+            setattr(cand, "stage2a_reject_cls", "weak_tech_keep")
+            setattr(cand, "precheck_hint", "weak_tech_keep")
+            return False, ""
+        setattr(cand, "stage2a_reject_cls", "hard_reject")
+        return True, "low_mainline_no_context"
+    if weak_but_technical or weak_tech_keep_candidate:
+        setattr(cand, "stage2a_reject_cls", "weak_tech_keep")
+        setattr(cand, "precheck_hint", "weak_tech_keep")
+        return False, ""
+    if low_identity_no_ctx:
+        setattr(cand, "stage2a_reject_cls", "hard_reject")
         return True, "low_identity_no_context"
-    if (not context_supported) and mainline_pref < STAGE2A_REJECT_MAINLINE_FLOOR:
+    if low_mainline_no_ctx:
+        setattr(cand, "stage2a_reject_cls", "hard_reject")
         return True, "low_mainline_no_context"
     if poly_risk >= STAGE2A_POLY_HARD_RISK and (not context_supported) and anchor_identity < 0.40:
+        setattr(cand, "stage2a_reject_cls", "hard_reject")
         return True, "polysemous_no_context"
+    setattr(cand, "stage2a_reject_cls", "pass")
     return False, ""
 
 
@@ -2025,17 +2199,44 @@ def select_primary_per_anchor(
         mainline_pref = getattr(c, "mainline_pref_score", 0) or 0
         anchor_identity = getattr(c, "anchor_identity_score", 0) or 0
         primary_score = getattr(c, "composite_rank_score", 0) or 0
+        feat = _get_stage2a_feat(c)
+        obviously_bad_branch = _is_obviously_bad_branch_stage2a(c, feat)
 
         obvious_bad = (
-            retain_mode not in ("normal", "weak_retain")
+            retain_mode == "reject"
             or primary_score < STAGE2A_WEAK_KEEP_MIN
         )
         good_mainline = (
-            retain_mode == "normal"
+            retain_mode != "reject"
             and mainline_pref >= STAGE2A_MAINLINE_PREF_MIN
             and anchor_identity >= STAGE2A_EXPANDABLE_IDENTITY_MIN
+            and not obviously_bad_branch
         )
+        source_type = (getattr(c, "source_type", None) or getattr(c, "source", "") or "").strip().lower()
+        if good_mainline and source_type == "conditioned_vec":
+            good_mainline = False
         setattr(c, "is_good_mainline", good_mainline)
+        mainline_block_reason = ""
+        if obvious_bad:
+            mainline_block_reason = "obvious_bad"
+            if retain_mode == "reject":
+                mainline_block_reason = "retain_mode_reject"
+            elif primary_score < STAGE2A_WEAK_KEEP_MIN:
+                mainline_block_reason = "primary_score_below_weak_keep"
+        elif good_mainline:
+            mainline_block_reason = ""
+        else:
+            if obviously_bad_branch:
+                mainline_block_reason = "obviously_bad_branch"
+            elif mainline_pref < STAGE2A_MAINLINE_PREF_MIN:
+                mainline_block_reason = "mainline_pref_low"
+            elif anchor_identity < STAGE2A_EXPANDABLE_IDENTITY_MIN:
+                mainline_block_reason = "anchor_identity_low"
+            elif source_type == "conditioned_vec":
+                mainline_block_reason = "conditioned_vec_no_expand"
+            else:
+                mainline_block_reason = "other"
+        setattr(c, "mainline_block_reason", mainline_block_reason)
 
         if obvious_bad:
             c.primary_bucket = "reject"
@@ -2044,14 +2245,25 @@ def select_primary_per_anchor(
             c.reject_reason = "obvious_bad"
             rejected.append(c)
         elif good_mainline:
-            c.primary_bucket = "primary_expandable"
-            c.role_in_anchor = "mainline"
-            c.role = "mainline"
-            c.can_expand = True
-            c.survive_primary = True
-            c.admission_reason = "good_mainline"
-            setattr(c, "bucket_reason", "good_mainline")
-            primary_expandable.append(c)
+            source_type = (getattr(c, "source_type", None) or getattr(c, "source", "") or "").strip().lower()
+            if source_type == "conditioned_vec":
+                c.primary_bucket = "primary_keep_no_expand"
+                c.role_in_anchor = "side"
+                c.role = "side"
+                c.can_expand = False
+                c.survive_primary = True
+                c.admission_reason = "weak_keep"
+                setattr(c, "bucket_reason", "conditioned_vec_no_expand")
+                primary_keep_no_expand.append(c)
+            else:
+                c.primary_bucket = "primary_expandable"
+                c.role_in_anchor = "mainline"
+                c.role = "mainline"
+                c.can_expand = True
+                c.survive_primary = True
+                c.admission_reason = "good_mainline"
+                setattr(c, "bucket_reason", "good_mainline")
+                primary_expandable.append(c)
         else:
             c.primary_bucket = "primary_keep_no_expand"
             c.role_in_anchor = "side"
@@ -3374,7 +3586,20 @@ def expand_from_vocab_dense_neighbors(
         anchor_to_primaries.setdefault(a_vid, []).append(p)
 
     for p in primary_landings:
-        ok, seed_score, _ = check_seed_eligibility(label, p, jd_profile)
+        ok, seed_score, block_reason = check_seed_eligibility(label, p, jd_profile)
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+            anchor_term = getattr(p, "anchor_term", "") or ""
+            term = getattr(p, "term", "") or ""
+            identity = float(getattr(p, "identity_score", 0) or getattr(p, "anchor_identity_score", 0) or 0)
+            src = (getattr(p, "source", "") or "").strip().lower()
+            trusted_set = {s.strip().lower() for s in (TRUSTED_SOURCE_TYPES_FOR_DIFFUSION or []) if s}
+            trusted_source = (src in trusted_set) if trusted_set else True
+            identity_ok = identity >= SEED_MIN_IDENTITY
+            print(
+                f"[Stage2B seed gate] anchor={anchor_term!r} term={term!r} | can_expand={getattr(p, 'can_expand', False)} "
+                f"identity={identity:.3f} >= {SEED_MIN_IDENTITY}? {identity_ok} trusted_source={trusted_source} "
+                f"seed_ok={ok} seed_block_reason={block_reason!r}"
+            )
         if not ok:
             continue
         max_keep = 2
@@ -3440,10 +3665,14 @@ def expand_from_vocab_dense_neighbors(
             )
             if not keep:
                 if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+                    ac = keep_meta.get("anchor_consistency")
+                    fs = keep_meta.get("family_support")
+                    ac_val = float(ac) if ac is not None else 0.0
+                    fs_val = float(fs) if fs is not None else 0.0
+                    family_ok = fs is not None and float(fs) >= 0.68
                     print(
-                        f"[Stage2B dense reject] anchor={anchor_stub.anchor_term!r} "
-                        f"parent={getattr(p, 'term', '')!r} cand={term!r} "
-                        f"reason={keep_meta.get('reason')}"
+                        f"[Stage2B dense reject] anchor={anchor_stub.anchor_term!r} parent={getattr(p, 'term', '')!r} cand={term!r} | "
+                        f"cand_sim={sim:.3f} anchor_consistency={ac_val:.3f} family_support={fs_val:.3f} family_ok={family_ok} reason={keep_meta.get('reason')!r}"
                     )
                 continue
 
@@ -5222,26 +5451,64 @@ def stage2_generate_academic_terms(
             if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and stage2a_hard_rejected:
                 anchor_term = getattr(anchor, "anchor", "") or ""
                 for c in stage2a_hard_rejected:
-                    print(f"[Stage2A hard reject] anchor={anchor_term!r} term={c.term!r} reason={getattr(c, 'stage2a_hard_reject_reason', '')}")
+                    feat = _get_stage2a_feat(c)
+                    print(
+                        f"[Stage2A hard reject] anchor={anchor_term!r} term={c.term!r} reason={getattr(c, 'stage2a_hard_reject_reason', '')} | "
+                        f"anchor_id={feat.anchor_id:.3f} jd_align={feat.jd_align:.3f} ctx={feat.ctx_cont:.3f} hier={feat.hier:.3f} poly={feat.poly:.3f} object={feat.object:.3f}"
+                    )
             continue
         selected = select_primary_per_anchor(anchor, kept)
+        anchor_term = getattr(anchor, "anchor", "") or ""
         if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and stage2a_hard_rejected:
-            anchor_term = getattr(anchor, "anchor", "") or ""
             for c in stage2a_hard_rejected:
-                print(f"[Stage2A hard reject] anchor={anchor_term!r} term={c.term!r} reason={getattr(c, 'stage2a_hard_reject_reason', '')}")
-
-        # Stage2A 候选定性表（含 pre-primary hard_reject_reason）
-        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and enriched:
-            print("[Stage2A 候选定性表] anchor | term | semantic | jd_align | ctx_cont | anchor_id | hier | poly | object | generic | retain_mode | suppress_seed | mainline_pref | hard_reject_reason")
-            for c in enriched[:15]:
-                mp = c.mainline_preference
-                mp_val = float(mp) if isinstance(mp, (int, float)) else 0.0
-                hr = getattr(c, "stage2a_hard_reject_reason", "") or "-"
+                feat = _get_stage2a_feat(c)
                 print(
-                    f"  {getattr(anchor, 'anchor', '')!r} | {(c.term or '')[:20]:20s} | {c.semantic_score:.3f} | {c.jd_align:.3f} | "
-                    f"{c.context_continuity:.3f} | {c.family_match:.3f} | {c.hierarchy_consistency:.3f} | "
-                    f"{c.polysemy_risk:.3f} | {c.object_like_risk:.3f} | {c.generic_risk:.3f} | "
-                    f"{c.retain_mode} | {'Y' if c.suppress_seed else 'N'} | {mp_val:.3f} | {hr}"
+                    f"[Stage2A hard reject] anchor={anchor_term!r} term={c.term!r} reason={getattr(c, 'stage2a_hard_reject_reason', '')} | "
+                    f"anchor_id={feat.anchor_id:.3f} jd_align={feat.jd_align:.3f} ctx={feat.ctx_cont:.3f} hier={feat.hier:.3f} poly={feat.poly:.3f} object={feat.object:.3f}"
+                )
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and enriched:
+            for c in enriched[:25]:
+                feat = _get_stage2a_feat(c)
+                flags = _stage2a_rule_flags(c, feat)
+                print(
+                    f"[Stage2A rule flags] anchor={anchor_term!r} term={(c.term or '')[:24]!r} | "
+                    f"anchor_id={feat.anchor_id:.3f} jd_align={feat.jd_align:.3f} ctx={feat.ctx_cont:.3f} hier={feat.hier:.3f} poly={feat.poly:.3f} object={feat.object:.3f} | "
+                    f"identity_ok={flags['identity_ok']} ctx_ok={flags['ctx_ok']} hier_ok={flags['hier_ok']} poly_bad={flags['poly_bad']} object_bad={flags['object_bad']} "
+                    f"drift_bad={flags['drift_bad']} obvious_bad={flags['obvious_bad']} tech_keep_ok={flags['tech_keep_ok']}"
+                )
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+            for c in selected["primary_expandable"] + selected["primary_keep_no_expand"] + selected["rejected"]:
+                mainline_candidate = getattr(c, "is_good_mainline", False)
+                mainline_block = getattr(c, "mainline_block_reason", "") or ""
+                weak_keep = c.primary_bucket == "primary_keep_no_expand"
+                weak_reason = getattr(c, "bucket_reason", "") or ""
+                fb = getattr(c, "primary_bucket", "") or ""
+                print(
+                    f"[Stage2A mainline gate] anchor={anchor_term!r} term={(c.term or '')[:24]!r} | "
+                    f"mainline_candidate={mainline_candidate} mainline_block_reason={mainline_block!r} | "
+                    f"weak_keep={weak_keep} weak_keep_reason={weak_reason!r} final_bucket={fb!r}"
+                )
+            for c in selected["primary_keep_no_expand"] + selected["rejected"]:
+                ai = float(getattr(c, "anchor_identity_score", 0) or getattr(c, "family_match", 0) or 0)
+                mp = float(getattr(c, "mainline_pref_score", 0) or 0)
+                ctx = float(getattr(c, "context_continuity", 0) or getattr(c, "context_sim", 0) or 0)
+                near_mainline = ai >= 0.45 or mp >= 0.45
+                if near_mainline and getattr(c, "primary_bucket", "") != "primary_expandable":
+                    print(
+                        f"[Stage2A downgrade] anchor={anchor_term!r} term={(c.term or '')[:24]!r} | "
+                        f"reason={getattr(c, 'mainline_block_reason', '')!r} | "
+                        f"anchor_id={ai:.3f} jd_align={getattr(c, 'jd_align', 0):.3f} ctx={ctx:.3f}"
+                    )
+
+        # Stage2A 候选定性表（含 pre-primary hard_reject_reason、stage2a_reject_cls 验收）
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and enriched:
+            print("[Stage2A 候选定性表] anchor | term | anchor_id | jd_align | ctx_cont | hier | poly | object | hard_reject_reason | stage2a_reject_cls")
+            for c in enriched[:15]:
+                hr = getattr(c, "stage2a_hard_reject_reason", "") or "-"
+                cls = getattr(c, "stage2a_reject_cls", "") or "-"
+                print(
+                    f"  {getattr(anchor, 'anchor', '')!r} | {(c.term or '')[:22]:22s} | {c.family_match:.3f} | {c.jd_align:.3f} | "
+                    f"{c.context_continuity:.3f} | {c.hierarchy_consistency:.3f} | {c.polysemy_risk:.3f} | {c.object_like_risk:.3f} | {hr} | {cls}"
                 )
             if len(enriched) > 15:
                 print(f"  ... 共 {len(enriched)} 条")
@@ -5322,6 +5589,30 @@ def stage2_generate_academic_terms(
         })
 
     final_primary_merged = merge_stage2a_primary(all_anchor_results)
+
+    if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+        for block in all_anchor_results:
+            anc = getattr(block.get("anchor"), "anchor", "") or ""
+            for group_name in ("primary_expandable", "primary_keep_no_expand"):
+                for cand in block.get(group_name, []):
+                    local_bucket = getattr(cand, "primary_bucket", "") or group_name
+                    mainline_cand = getattr(cand, "is_good_mainline", False)
+                    can_expand_local = bool(getattr(cand, "can_expand", False))
+                    local_reason = getattr(cand, "mainline_block_reason", "") or getattr(cand, "bucket_reason", "")
+                    print(
+                        f"[Stage2A merge evidence detail] term={(cand.term or '')[:28]!r} | anchor={anc!r} | "
+                        f"local_bucket={local_bucket!r} mainline_candidate={mainline_cand} can_expand_local={can_expand_local} reason={local_reason!r}"
+                    )
+        for m in final_primary_merged[:25]:
+            term = (m.get("term") or "")[:28]
+            sc = m.get("support_count", 0)
+            mh = m.get("mainline_hits", 0)
+            me = m.get("can_expand", False)
+            mb = "primary_expandable" if me else "primary_keep_no_expand"
+            print(
+                f"[Stage2A merged decision] term={term!r} | support_count={sc} mainline_hits={mh} "
+                f"merged_can_expand={me} merged_bucket={mb!r}"
+            )
 
     # Stage2A 选主结果表（含 pre-primary hard_reject）
     if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:

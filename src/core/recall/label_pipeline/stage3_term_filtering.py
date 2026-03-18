@@ -358,6 +358,35 @@ def _collect_risky_reasons(rec: Dict[str, Any]) -> List[str]:
     return reasons
 
 
+def _collect_stage3_bucket_reason_flags(rec: Dict[str, Any]) -> List[str]:
+    """判定链路：为何落入 core/support/risky，供 [Stage3 bucket reason] 打印。"""
+    flags: List[str] = []
+    mainline_hits = int(rec.get("mainline_hits") or 0)
+    anchor_count = int(rec.get("anchor_count") or 0)
+    can_expand = bool(rec.get("can_expand", False))
+    source_types = rec.get("source_types") or set()
+    if isinstance(source_types, (list, tuple)):
+        source_types = set(source_types)
+    identity_factor = float((rec.get("stage3_explain") or {}).get("identity_factor", 1.0) or 1.0)
+    obj = float(rec.get("object_like_risk") or 0.0)
+    generic = float(rec.get("generic_risk") or 0.0)
+    if mainline_hits == 0 and anchor_count > 0:
+        flags.append("no_mainline_support")
+    if mainline_hits == 0 and can_expand is False:
+        flags.append("only_weak_keep_sources")
+    if anchor_count >= 2 and mainline_hits == 0:
+        flags.append("cross_anchor_but_side_only")
+    if "conditioned_vec" in source_types and ("similar_to" not in source_types or len(source_types) == 1):
+        flags.append("conditioned_only")
+    if identity_factor < 0.60:
+        flags.append("identity_low_family")
+    if obj >= 0.50:
+        flags.append("object_like")
+    if generic >= 0.50:
+        flags.append("generic_like")
+    return flags
+
+
 def _bucket_stage3_terms(survivors: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     分为 core_terms、support_terms、risky_terms。
@@ -759,7 +788,21 @@ def _run_stage3_dual_gate(
 
     for rec in survivors:
         rec["risk_reasons"] = _collect_risky_reasons(rec)
+        rec["bucket_reason_flags"] = _collect_stage3_bucket_reason_flags(rec)
     core_terms_list, support_terms_list, risky_terms_list = _bucket_stage3_terms(survivors)
+    if LABEL_PATH_TRACE or getattr(term_scoring, "STAGE3_DEBUG", False):
+        for rec in (core_terms_list + support_terms_list + risky_terms_list)[:40]:
+            term = (rec.get("term") or "")[:28]
+            bucket = rec.get("stage3_bucket") or ""
+            identity_factor = float((rec.get("stage3_explain") or {}).get("identity_factor", 1.0) or 1.0)
+            anchor_count = int(rec.get("anchor_count") or 0)
+            mainline_hits = int(rec.get("mainline_hits") or 0)
+            can_expand = rec.get("can_expand", False)
+            reason_flags = rec.get("bucket_reason_flags") or []
+            print(
+                f"[Stage3 bucket reason] term={term!r} | bucket={bucket!r} | identity_factor={identity_factor:.3f} | "
+                f"anchor_count={anchor_count} mainline_hits={mainline_hits} can_expand={can_expand} | reason_flags={reason_flags}"
+            )
     top_survivors = survivors[:STAGE3_TOP_K]
     paper_terms = select_terms_for_paper_recall(survivors, PAPER_RECALL_MAX_TERMS)
 
