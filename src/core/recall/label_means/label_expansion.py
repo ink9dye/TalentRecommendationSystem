@@ -67,6 +67,16 @@ CLUSTER_MAX_PER_PRIMARY = 3
 COOC_SUPPORT_MIN_FREQ = 2
 COOC_MAX_PER_PRIMARY = 2
 
+# ---------- Stage2A 终稿：候选分型 + 组内选主（不硬编码、不训练集） ----------
+CTX_SUPPORT_MIN = 0.70           # 上下文支持阈值，用于 family 分型与 scene_shift 判断
+CTX_GAP_SHIFT_MIN = 0.15          # 语义-上下文差超过此视为场景漂移
+HIER_WEAK_MIN = 0.25              # 层级证据弱于此为 weak
+JD_ALIGN_WEAK_MIN = 0.45          # JD 对齐弱于此为 weak
+GENERIC_RISK_MIN = 0.45           # 泛词风险高于此为 generic_like
+POLY_RISK_MIN = 0.55              # 多义风险高于此为 generic_like
+MAINLINE_IDENTITY_MIN = 0.50      # 主线准入 identity 下限
+RETAIN_MIN = 0.40                 # 仅保留（不扩）准入 retain_score 下限
+
 # ---------- Stage2A 准入：仅两个门槛 + source 折扣，不再按 source 分多套阈值 ----------
 PRIMARY_MIN_HIERARCHY_MATCH = 0.30   # hierarchy_match = 0.4*topic + 0.4*path + 0.2*subfield，effective = hierarchy_match * source_factor
 PRIMARY_MIN_PATH_MATCH = 0.35
@@ -222,6 +232,13 @@ class LandingCandidate:
     source_type: str = "similar_to"
     source_rank: int = 0
     source_score: float = 0.0
+    # ===== Stage2A 终稿：候选分型 + 禁扩散 =====
+    family_type: str = ""                    # exact_like | near_synonym | generic | shifted
+    scene_shifted: bool = False
+    generic_like: bool = False
+    expand_block_reason: Optional[str] = None  # None | generic | scene_shift | low_identity | weak_context
+    source_trust: float = 1.0
+    ctx_supported: bool = False             # 与 context_supported 同步，供分型用
 
 
 @dataclass
@@ -280,8 +297,19 @@ class Stage2ACandidate:
     reject_reason: Optional[str] = None
     role: Optional[str] = None  # mainline | side | off | unknown
     role_in_anchor: Optional[str] = None  # mainline | side | dropped（与 role 同步）
-    primary_bucket: str = ""  # primary_expandable | primary_keep_no_expand（仅选中候选有）
+    primary_bucket: str = ""  # primary_expandable | primary_keep_no_expand | reject
     anchor_identity_score: float = 0.0  # 与 family_match 同步，供 admission/mainline 用
+    # Stage2A 终稿：分型 + 主线/保留分
+    family_type: str = ""
+    scene_shifted: bool = False
+    generic_like: bool = False
+    expand_block_reason: Optional[str] = None
+    source_trust: float = 1.0
+    ctx_supported: bool = False
+    mainline_pref_score: float = 0.0
+    retain_score: float = 0.0
+    mainline_admissible: bool = False
+    admission_reason: str = ""
 
 
 @dataclass
@@ -1925,11 +1953,13 @@ def enrich_stage2a_candidates(
         else:
             c.role_in_anchor_candidate_pool = "secondary_candidate"
 
+        score_stage2a_candidate(c)
+
     _compute_isolation_risk_for_candidates(label, candidates)
     assign_relative_scores_within_anchor(candidates)
     for c in candidates:
         c.composite_rank_score = compose_anchor_internal_rank_score(c)
-    ranked = sorted(candidates, key=build_stage2a_sort_key, reverse=True)
+    ranked = sorted(candidates, key=lambda x: (getattr(x, "mainline_pref_score", 0) or 0), reverse=True)
     for idx, c in enumerate(ranked, start=1):
         c.anchor_internal_rank = idx
         c.mainline_rank = c.relative_scores.get("mainline_rank")
@@ -1942,56 +1972,47 @@ def select_primary_per_anchor(
     candidates: List["Stage2ACandidate"],
 ) -> Dict[str, List["Stage2ACandidate"]]:
     """
-    从可保留候选里分三类输出：primary_expandable（仅 normal 且非 suppress_seed 的 top1）、
-    primary_keep_no_expand（runner-up）、rejected。
+    Stage2A 终稿：三桶分配。按 mainline_pref_score 排序后，逐候选判定：
+    mainline_admissible -> primary_expandable；否则 retain_score>=RETAIN_MIN -> primary_keep_no_expand；否则 reject。
     """
     if not candidates:
         return {"primary_expandable": [], "primary_keep_no_expand": [], "rejected": []}
 
-    kept = [c for c in candidates if c.retain_mode != "reject"]
-    rejected = [c for c in candidates if c.retain_mode == "reject"]
-
-    for c in candidates:
-        c.survive_primary = False
-        c.reject_reason = "not_selected_within_anchor"
-        c.role_in_anchor = "dropped"
-        c.role = "dropped"
-        c.can_expand = False
-
-    kept = sorted(
-        kept,
-        key=lambda x: (
-            x.retain_mode == "normal",
-            float(x.mainline_preference) if isinstance(x.mainline_preference, (int, float)) else 0.0,
-            x.cross_anchor_support,
-            x.jd_align,
-        ),
-        reverse=True,
-    )
-
+    sorted_cands = sorted(candidates, key=lambda x: (getattr(x, "mainline_pref_score", 0) or 0), reverse=True)
     primary_expandable: List["Stage2ACandidate"] = []
     primary_keep_no_expand: List["Stage2ACandidate"] = []
+    rejected: List["Stage2ACandidate"] = []
 
-    for c in kept:
-        if c.retain_mode == "normal" and not c.suppress_seed:
+    for c in sorted_cands:
+        c.survive_primary = False
+        c.reject_reason = None
+        c.role_in_anchor = "reject"
+        c.role = "reject"
+        c.can_expand = False
+        c.primary_bucket = "reject"
+        c.admission_reason = "below_retain_floor"
+        retain = getattr(c, "retain_score", 0) or 0
+        adm = getattr(c, "mainline_admissible", False)
+
+        if adm:
+            c.primary_bucket = "primary_expandable"
             c.role_in_anchor = "mainline"
             c.role = "mainline"
             c.can_expand = True
             c.survive_primary = True
-            c.primary_bucket = "primary_expandable"
+            c.admission_reason = "mainline_like"
             primary_expandable.append(c)
-            break
-
-    for c in kept:
-        if primary_expandable and c.tid == primary_expandable[0].tid:
-            continue
-        c.role_in_anchor = "side"
-        c.role = "side"
-        c.can_expand = False
-        c.survive_primary = True
-        c.primary_bucket = "primary_keep_no_expand"
-        primary_keep_no_expand.append(c)
-        break
+        elif retain >= RETAIN_MIN:
+            c.primary_bucket = "primary_keep_no_expand"
+            c.role_in_anchor = "side"
+            c.role = "side"
+            c.can_expand = False
+            c.survive_primary = True
+            c.admission_reason = "retain_only"
+            primary_keep_no_expand.append(c)
+        else:
+            c.reject_reason = "below_retain_floor"
+            rejected.append(c)
 
     return {
         "primary_expandable": primary_expandable,
@@ -2012,10 +2033,22 @@ def _update_merged_best_scores(merged_item: Dict[str, Any], cand: Any) -> None:
     merged_item["best_context_continuity"] = max(merged_item.get("best_context_continuity", 0), cc)
 
 
+def _family_type_rank(ft: str) -> int:
+    """越大越差：exact_like=0, near_synonym=1, generic=2, shifted=3。"""
+    if ft == "shifted":
+        return 3
+    if ft == "generic":
+        return 2
+    if ft == "near_synonym":
+        return 1
+    return 0
+
+
 def _init_merged_primary(cand: "Stage2ACandidate", anchor_term: str) -> Dict[str, Any]:
-    """merge_stage2a_primary 时每个 tid 的初始合并项；含 support_roles、retain_modes、best_*。"""
+    """merge_stage2a_primary 时每个 tid 的初始合并项；含 support_roles、retain_modes、best_*、family_type。"""
     role = getattr(cand, "role_in_anchor", None) or "side"
     retain = getattr(cand, "retain_mode", "normal")
+    ft = getattr(cand, "family_type", "") or ""
     return {
         "tid": cand.tid,
         "term": cand.term or str(cand.tid),
@@ -2026,6 +2059,7 @@ def _init_merged_primary(cand: "Stage2ACandidate", anchor_term: str) -> Dict[str
         "can_expand": bool(getattr(cand, "can_expand", False)),
         "support_roles": [role],
         "retain_modes": [retain],
+        "family_type": ft,
         "best_mainline_preference": float(cand.mainline_preference) if isinstance(cand.mainline_preference, (int, float)) else 0.0,
         "best_anchor_identity": float(getattr(cand, "anchor_identity_score", 0) or getattr(cand, "family_match", 0) or 0),
         "best_jd_align": float(getattr(cand, "jd_align", 0) or 0),
@@ -2060,6 +2094,9 @@ def merge_stage2a_primary(all_anchor_results: List[Dict[str, Any]]) -> List[Dict
                     merged[tid]["support_roles"].append(role)
                     merged[tid]["retain_modes"].append(retain)
                     _update_merged_best_scores(merged[tid], cand)
+                    ft_cand = getattr(cand, "family_type", "") or ""
+                    if _family_type_rank(ft_cand) > _family_type_rank(merged[tid].get("family_type", "")):
+                        merged[tid]["family_type"] = ft_cand
         # 兼容旧结构：若仍有 block["primary"] 列表也参与合并
         for cand in block.get("primary", []):
             tid = cand.tid
@@ -2078,6 +2115,21 @@ def merge_stage2a_primary(all_anchor_results: List[Dict[str, Any]]) -> List[Dict
                 merged[tid]["support_roles"].append(role)
                 merged[tid]["retain_modes"].append(retain)
                 _update_merged_best_scores(merged[tid], cand)
+                ft_cand = getattr(cand, "family_type", "") or ""
+                if _family_type_rank(ft_cand) > _family_type_rank(merged[tid].get("family_type", "")):
+                    merged[tid]["family_type"] = ft_cand
+    # Stage2A 终稿：跨锚仅弱加分，不洗白 generic/shifted
+    for term in merged.values():
+        raw_cnt = len(term["anchors"])
+        raw_bonus = min(0.10, 0.03 * max(0, raw_cnt - 1))
+        ft = term.get("family_type", "") or ""
+        if ft in ("generic", "shifted"):
+            effective_bonus = raw_bonus * 0.3
+        else:
+            effective_bonus = raw_bonus
+        term["cross_anchor_support_raw"] = raw_cnt
+        term["cross_anchor_support_effective"] = effective_bonus
+        term["cross_anchor_bonus"] = effective_bonus
     return sorted(
         merged.values(),
         key=lambda x: (x["mainline_hits"], x["support_count"], -x["best_rank"], x["can_expand"]),
@@ -2086,7 +2138,7 @@ def merge_stage2a_primary(all_anchor_results: List[Dict[str, Any]]) -> List[Dict
 
 
 def landing_candidates_to_stage2a(landing_list: List[LandingCandidate]) -> List[Stage2ACandidate]:
-    """将 collect_landing_candidates 的 LandingCandidate 列表转为 Stage2ACandidate，并复制定性字段。"""
+    """将 collect_landing_candidates 的 LandingCandidate 列表转为 Stage2ACandidate，并复制定性字段与分型。"""
     out: List[Stage2ACandidate] = []
     for c in landing_list:
         out.append(Stage2ACandidate(
@@ -2106,6 +2158,12 @@ def landing_candidates_to_stage2a(landing_list: List[LandingCandidate]) -> List[
             source_type=getattr(c, "source_type", "similar_to") or "similar_to",
             source_rank=int(getattr(c, "source_rank", 0) or 0),
             source_score=float(getattr(c, "source_score", 0) or 0),
+            family_type=getattr(c, "family_type", "") or "",
+            scene_shifted=bool(getattr(c, "scene_shifted", False)),
+            generic_like=bool(getattr(c, "generic_like", False)),
+            expand_block_reason=getattr(c, "expand_block_reason", None),
+            source_trust=float(getattr(c, "source_trust", 1.0) or 1.0),
+            ctx_supported=bool(getattr(c, "ctx_supported", getattr(c, "context_supported", False))),
         ))
     return out
 
@@ -2593,6 +2651,29 @@ def normalize_identity_surface(term: str) -> Dict[str, Any]:
     return {"raw": raw, "norm": norm, "tokens": tokens, "token_set": token_set, "head": head}
 
 
+def lexical_shape_match(anchor_term: str, candidate_term: str) -> float:
+    """
+    词形结构匹配度 0~1，用于候选分型：真近义 vs 泛词/场景漂移。
+    基于 token 重叠与规范形式，无硬编码词表。
+    """
+    a = normalize_identity_surface(anchor_term or "")
+    c = normalize_identity_surface(candidate_term or "")
+    atok = a["token_set"]
+    ctok = c["token_set"]
+    if not atok and not ctok:
+        return 1.0 if (anchor_term or "").strip() == (candidate_term or "").strip() else 0.0
+    if not atok or not ctok:
+        return 0.0
+    inter = len(atok & ctok)
+    union = len(atok | ctok)
+    jaccard = inter / union if union else 0.0
+    if a["norm"] == c["norm"]:
+        return 1.0
+    if a["norm"] in c["norm"] or c["norm"] in a["norm"]:
+        return max(jaccard, 0.85)
+    return jaccard
+
+
 def compute_anchor_identity_score(
     anchor_term: str,
     candidate_term: str,
@@ -2693,6 +2774,168 @@ def _identity_gate_from_score(anchor_identity_score: float) -> float:
         if anchor_identity_score >= thresh:
             return gate
     return 0.45
+
+
+# ---------- Stage2A 终稿：候选分型（不硬编码岗位词） ----------
+
+
+def classify_candidate_family(
+    anchor_term: str,
+    candidate_term: str,
+    semantic_score: float,
+    context_sim: float,
+) -> str:
+    """
+    轻量语义分型：候选与锚点是 真近义 / 邻域近词 / 泛词 / 场景漂移。
+    返回: exact_like | near_synonym | generic | shifted
+    """
+    lexical = lexical_shape_match(anchor_term or "", candidate_term or "")
+    ctx_ok = context_sim >= CTX_SUPPORT_MIN
+    sem = float(semantic_score)
+    if sem >= 0.82 and lexical >= 0.70 and ctx_ok:
+        return "exact_like"
+    if sem >= 0.80 and lexical >= 0.45:
+        return "near_synonym"
+    if sem >= 0.78 and lexical < 0.35 and not ctx_ok:
+        return "shifted"
+    return "generic"
+
+
+def is_candidate_generic_like(cand: Any) -> bool:
+    """泛词风险：显式布尔，用于主线准入门。"""
+    family = getattr(cand, "family_type", None) or cand.get("family_type", "")
+    if family in {"generic", "shifted"}:
+        return True
+    gr = float(getattr(cand, "generic_risk", 0) or cand.get("generic_risk", 0) or 0)
+    if gr >= GENERIC_RISK_MIN:
+        return True
+    pr = float(getattr(cand, "polysemy_risk", 0) or cand.get("polysemy_risk", 0) or 0)
+    if pr >= POLY_RISK_MIN:
+        return True
+    return False
+
+
+def is_candidate_scene_shifted(cand: Any, jd_ctx: Optional[Dict[str, Any]] = None) -> bool:
+    """语义相近但应用场景跑偏（如 kinesiology / medical robotics / propulsion）。"""
+    if getattr(cand, "family_type", None) == "shifted" or (isinstance(cand, dict) and cand.get("family_type") == "shifted"):
+        return True
+    ctx_supported = getattr(cand, "ctx_supported", None)
+    if ctx_supported is None:
+        ctx_supported = getattr(cand, "context_supported", False)
+    if isinstance(cand, dict):
+        ctx_supported = cand.get("ctx_supported", cand.get("context_supported", False))
+    ctx_gap_val = getattr(cand, "ctx_gap", 0) or getattr(cand, "context_gap", 0)
+    if isinstance(cand, dict):
+        ctx_gap_val = ctx_gap_val or cand.get("ctx_gap", cand.get("context_gap", 0))
+    ctx_gap = float(ctx_gap_val or 0)
+    if ctx_supported is False and ctx_gap >= CTX_GAP_SHIFT_MIN:
+        return True
+    hier = getattr(cand, "hierarchy_score", 0) or getattr(cand, "hierarchy_consistency", 0)
+    if isinstance(cand, dict):
+        hier = hier or cand.get("hier_score", cand.get("hierarchy_consistency", 0))
+    hier = float(hier or 0)
+    jd_align = getattr(cand, "jd_align", 0) or getattr(cand, "jd_candidate_alignment", 0.5)
+    if isinstance(cand, dict):
+        jd_align = jd_align or cand.get("jd_align", cand.get("jd_candidate_alignment", 0.5))
+    jd_align = float(jd_align or 0.5)
+    if hier < HIER_WEAK_MIN and jd_align < JD_ALIGN_WEAK_MIN:
+        return True
+    return False
+
+
+def infer_expand_block_reason(cand: Any) -> Optional[str]:
+    """禁止扩散原因：None 表示可参与扩散竞争；否则为 generic | scene_shift | low_identity | weak_context。"""
+    if is_candidate_generic_like(cand):
+        return "generic"
+    if is_candidate_scene_shifted(cand, None):
+        return "scene_shift"
+    identity = float(getattr(cand, "anchor_identity_score", 0) or getattr(cand, "identity_score", 0) or (cand.get("identity_score", 0) if isinstance(cand, dict) else 0))
+    if identity < 0.35:
+        return "low_identity"
+    ctx_ok = getattr(cand, "ctx_supported", getattr(cand, "context_supported", True))
+    if isinstance(cand, dict):
+        ctx_ok = cand.get("ctx_supported", cand.get("context_supported", True))
+    if ctx_ok is False:
+        return "weak_context"
+    return None
+
+
+def get_source_trust(source_type: str) -> float:
+    """similar_to / conditioned_vec 基础可信度，用于分型与合并。"""
+    s = (source_type or "").strip().lower()
+    if s == "similar_to":
+        return 1.0
+    if s in ("conditioned_vec", "conditioned"):
+        return 0.85
+    return 0.85
+
+
+def estimate_family_centeredness(cand: Any) -> float:
+    """家族中心性 0~1：exact_like 最高，shifted 最低。"""
+    ft = getattr(cand, "family_type", None) or (cand.get("family_type") if isinstance(cand, dict) else None) or "generic"
+    if ft == "exact_like":
+        return 1.0
+    if ft == "near_synonym":
+        return 0.85
+    if ft == "generic":
+        return 0.5
+    return 0.3
+
+
+def is_mainline_admissible(candidate: Any) -> bool:
+    """Stage2A 主线准入门：scene_shifted/generic_like 不能扩散，identity 与 family_type 需达标。"""
+    if getattr(candidate, "scene_shifted", False) or (candidate.get("scene_shifted") if isinstance(candidate, dict) else False):
+        return False
+    if getattr(candidate, "generic_like", False) or (candidate.get("generic_like") if isinstance(candidate, dict) else False):
+        return False
+    identity = float(getattr(candidate, "identity_score", 0) or getattr(candidate, "anchor_identity_score", 0) or (candidate.get("anchor_identity_score", 0) if isinstance(candidate, dict) else 0))
+    if identity < MAINLINE_IDENTITY_MIN:
+        return False
+    ft = getattr(candidate, "family_type", "") or (candidate.get("family_type", "") if isinstance(candidate, dict) else "")
+    if ft not in ("exact_like", "near_synonym"):
+        return False
+    return True
+
+
+def score_stage2a_candidate(candidate: Any) -> None:
+    """
+    主线资格分 mainline_pref_score 与保留资格分 retain_score 分开；
+    并设 mainline_admissible。原地写入 candidate。
+    """
+    identity = float(getattr(candidate, "anchor_identity_score", 0) or getattr(candidate, "identity_score", 0) or 0)
+    jd_align = float(getattr(candidate, "jd_align", 0) or getattr(candidate, "jd_candidate_alignment", 0.5) or 0.5)
+    ctx = float(getattr(candidate, "context_sim", 0) or getattr(candidate, "context_continuity", 0) or 0)
+    hier = float(getattr(candidate, "hierarchy_consistency", 0) or getattr(candidate, "hierarchy_score", 0) or 0)
+    generic_pen = float(getattr(candidate, "generic_risk", 0) or 0)
+    poly_risk = float(getattr(candidate, "polysemy_risk", 0) or 0)
+    mainline_pref = (
+        0.35 * identity
+        + 0.25 * jd_align
+        + 0.20 * ctx
+        + 0.10 * hier
+        - 0.05 * generic_pen
+        - 0.05 * poly_risk
+    )
+    retain_score = (
+        0.40 * identity
+        + 0.30 * jd_align
+        + 0.10 * ctx
+        + 0.10 * hier
+        - 0.05 * generic_pen
+        - 0.05 * poly_risk
+    )
+    mainline_pref = max(0.0, min(1.0, mainline_pref))
+    retain_score = max(0.0, min(1.0, retain_score))
+    if hasattr(candidate, "mainline_pref_score"):
+        candidate.mainline_pref_score = mainline_pref
+    if hasattr(candidate, "retain_score"):
+        candidate.retain_score = retain_score
+    setattr(candidate, "mainline_pref_score", mainline_pref)
+    setattr(candidate, "retain_score", retain_score)
+    adm = is_mainline_admissible(candidate)
+    if hasattr(candidate, "mainline_admissible"):
+        candidate.mainline_admissible = adm
+    setattr(candidate, "mainline_admissible", adm)
 
 
 def collect_landing_candidates(
@@ -2830,11 +3073,13 @@ def collect_landing_candidates(
     else:
         for c in cands:
             setattr(c, "jd_candidate_alignment", 0.5)
-    # 定性字段：只补全证据，不在此做 normal/weak_retain/reject 或 can_expand 决定（宁可多收，不要早杀）
+    # 定性字段：收集 + 分型（family_type / generic_like / scene_shifted），不在此做选主
     anchor_term = getattr(anchor, "anchor", "") or ""
     anchor_type_opt = getattr(anchor, "anchor_type", None)
     jd_profile_for_risk = jd_profile or {}
     for rank, c in enumerate(cands, start=1):
+        c.anchor_term = anchor_term
+        c.anchor_vid = getattr(anchor, "vid", 0)
         c.source_type = (getattr(c, "source", "") or "similar_to").strip()
         c.source_rank = rank
         c.source_score = float(getattr(c, "semantic_score", 0) or 0)
@@ -2843,7 +3088,6 @@ def collect_landing_candidates(
             edge_strength=float(getattr(c, "semantic_score", 0) or 0),
             context_sim=float(getattr(c, "context_sim", 0) or 0),
         )
-        c.anchor_identity_score = aid
         setattr(c, "identity_gate", _identity_gate_from_score(aid))
         ctx_cont, ctx_local, ctx_co, ctx_jd = compute_context_continuity(
             c, jd_align=float(getattr(c, "jd_candidate_alignment", 0.5) or 0.5), co_anchor_support=0.0
@@ -2865,6 +3109,17 @@ def collect_landing_candidates(
         )
         c.generic_risk = gr
         c.generic_note = gn
+        # Stage2A 终稿：候选分型 + 四段式 identity
+        c.ctx_supported = c.context_supported
+        c.ctx_gap = max(0.0, float(getattr(c, "semantic_score", 0) or 0) - float(getattr(c, "context_sim", 0) or 0))
+        c.family_type = classify_candidate_family(
+            anchor_term, c.term or "", c.semantic_score, float(getattr(c, "context_sim", 0) or 0)
+        )
+        c.generic_like = is_candidate_generic_like(c)
+        c.scene_shifted = is_candidate_scene_shifted(c, jd_profile_for_risk)
+        c.expand_block_reason = infer_expand_block_reason(c)
+        c.source_trust = get_source_trust(c.source_type)
+        score_academic_identity(c)
     if LABEL_EXPANSION_DEBUG:
         print(f"[Stage2A] collect_landing_candidates anchor={anchor.anchor!r} -> {len(cands)} 个候选")
     if STAGE2_VERBOSE_DEBUG:
@@ -3006,13 +3261,37 @@ def _compute_conditioned_anchor_align_and_multi_anchor_support(
         setattr(c, "multi_anchor_support", max(0.0, min(1.0, multi_support)))
 
 
-def score_academic_identity(c: LandingCandidate) -> float:
-    """身份分：当前 Stage2A 仅 similar_to，用边权；若未来接入 jd_vector 则用 0.5+0.5*semantic_score。"""
-    if c.source == "similar_to":
-        return max(0.0, min(1.0, c.semantic_score))
-    if c.source == "jd_vector":
-        return 0.5 + 0.5 * max(0.0, min(1.0, c.semantic_score))
-    return 0.5 + 0.5 * max(0.0, min(1.0, c.semantic_score))
+def score_academic_identity(c: Any) -> float:
+    """
+    Stage2A 终稿：四段式 identity（边语义 + 词形 + 上下文支持 + 家族中心性），
+    不再由 embedding 一项主导；写入 identity_breakdown 与 anchor_identity_score。
+    """
+    edge_sem = float(getattr(c, "semantic_score", 0) or 0)
+    anchor_term = getattr(c, "anchor_term", "") or ""
+    candidate_term = (getattr(c, "term", "") or "").strip()
+    lexical = lexical_shape_match(anchor_term, candidate_term)
+    ctx_sim = float(getattr(c, "context_sim", 0) or 0)
+    ctx_ok = getattr(c, "ctx_supported", getattr(c, "context_supported", False))
+    context_support = ctx_sim if ctx_ok else 0.0
+    family_centeredness = estimate_family_centeredness(c)
+    identity = (
+        0.45 * edge_sem
+        + 0.25 * lexical
+        + 0.20 * context_support
+        + 0.10 * family_centeredness
+    )
+    identity = max(0.0, min(1.0, identity))
+    if hasattr(c, "anchor_identity_score"):
+        c.anchor_identity_score = identity
+    if hasattr(c, "identity_score"):
+        c.identity_score = identity
+    setattr(c, "identity_breakdown", {
+        "edge_semantic": edge_sem,
+        "lexical_shape": lexical,
+        "context_support": context_support,
+        "family_centeredness": family_centeredness,
+    })
+    return identity
 
 
 # ---------- Stage2B：学术侧补充（dense / 簇 / 共现，不再用 SIMILAR_TO 学术→学术） ----------
