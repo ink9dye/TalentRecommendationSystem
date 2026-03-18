@@ -569,6 +569,16 @@ def build_conditioned_anchor_representation(
         out["co_anchor_vec"] = v_anchor.copy()
     out["anchor_vec"] = v_anchor
     out["jd_vec"] = v_jd
+    local_strength = min(1.0, len(local_phrases) / 5.0) if local_phrases else 0.0
+    co_strength = min(1.0, len(co_terms) / 5.0) if co_terms else 0.0
+    if local_strength < 0.2 and co_strength < 0.2:
+        conditioned = np.asarray(v_anchor, dtype=np.float32).flatten()
+        norm = np.linalg.norm(conditioned)
+        if norm > 1e-9:
+            conditioned = conditioned / norm
+        out["conditioned_vec"] = conditioned
+        out["w_anchor"], out["w_local"], out["w_co"], out["w_jd"] = 1.0, 0.0, 0.0, 0.0
+        return out
     specificity = float(anchor_info.get("specificity", 0.6))
     if specificity >= 0.8:
         w_a, w_l, w_c, w_j = CONDITIONED_W_ANCHOR_HIGH_SPEC, CONDITIONED_W_LOCAL_HIGH_SPEC, CONDITIONED_W_CO_HIGH_SPEC, CONDITIONED_W_JD_HIGH_SPEC

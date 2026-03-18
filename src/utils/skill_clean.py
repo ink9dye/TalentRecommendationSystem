@@ -6,6 +6,12 @@
 import re
 import unicodedata
 
+try:
+    from src.utils.text_filters import is_sentence_fragment
+except ImportError:
+    def is_sentence_fragment(text: str) -> bool:
+        return False
+
 # -------------------------------------------------
 # 1. skill 分隔符
 # -------------------------------------------------
@@ -23,7 +29,8 @@ PUNCTUATION_PREFIX_PATTERN = re.compile(
 # 2. JD 句式前缀
 # -------------------------------------------------
 PREFIX_PATTERN = re.compile(
-    r"^(发表|要求|需|需要|熟悉|了解|掌握|精通|具备|能够|可以|负责|参与|从事|有|具有|擅长|使用|应用|在)"
+    r"^(发表|要求|需|需要|熟悉|了解|掌握|精通|具备|能够|可以|负责|参与|从事|有|具有|擅长|使用|应用|在|"
+    r"利用|调研|对|研发与优化|建立|推动|开展|持续关注|包括但不限于|针对|确保)"
 )
 
 # -------------------------------------------------
@@ -37,7 +44,8 @@ SUFFIX_PATTERN = re.compile(
 # 4. JD 垃圾描述关键词
 # -------------------------------------------------
 JD_NOISE_PATTERN = re.compile(
-    r"(专业|学历|论文|竞赛|获奖|五险|出差|销售|工作语言|团队|沟通|表达|责任心|执行力|学习能力|抗压|汇报|学校|负责人|相关|经验|经验者)"
+    r"(专业|学历|论文|竞赛|获奖|五险|出差|销售|工作语言|团队|沟通|表达|责任心|执行力|学习能力|抗压|汇报|学校|负责人|相关|经验|经验者|"
+    r"任职要求|岗位职责|核心要求|加分项|基本要求|工作职责|职位描述)"
 )
 
 # -------------------------------------------------
@@ -138,9 +146,15 @@ GENERIC_JD_SUFFIXES = (
 )
 GENERIC_JD_VERB_HIGH_PERF_PREFIXES = ("建立高性能", "构建高性能", "实现高性能")
 
-FRAGMENT_ACTION_PREFIXES = ("推动", "提升", "形成", "开展", "确保")
+FRAGMENT_ACTION_PREFIXES = ("推动", "提升", "形成", "开展", "确保", "调研")
 FRAGMENT_SOFT_SUFFIXES = ("鲁棒性", "可执行性", "系统化思维", "沟通协作能力")
 FRAGMENT_EVALUATIVE = re.compile(r"(高要求|优秀|扎实|良好)")
+
+# JD 目录级标题前缀（任职要求● 掌握... → 取●后的内容再归一化）
+JD_HEADER_PREFIX = re.compile(
+    r"^(任职要求|岗位职责|核心要求|加分项|基本要求|工作职责|职位描述)[\s●▪•·]*",
+    re.IGNORECASE,
+)
 
 # -------------------------------------------------
 # skill 标准化
@@ -158,6 +172,7 @@ def normalize_skill(term: str):
     term = term.strip().lower()
     term = unicodedata.normalize("NFKC", term)
     term = re.sub(r'[\u200b\u200c\u200d]', '', term)
+    term = JD_HEADER_PREFIX.sub("", term)
     term = PUNCTUATION_PREFIX_PATTERN.sub("", term)
     term = PREFIX_PATTERN.sub("", term)
     if term.startswith("熟练使用"):
@@ -192,6 +207,12 @@ def is_generic_jd_fragment(term: str) -> bool:
 
 def is_bad_skill(term: str):
     if not term:
+        return True
+    if is_sentence_fragment(term):
+        return True
+    if len(term) > 20 and "的" in term:
+        return True
+    if any(p in term for p in ["等相关", "等工具", "等库", "等常见"]):
         return True
     if term in FORBIDDEN:
         return True
@@ -242,6 +263,10 @@ def extract_skills(text: str):
         term = normalize_skill(p)
         if not term:
             continue
+        if len(term) > 15 and " " in term:
+            first_token = term.split()[0].strip()
+            if first_token and len(first_token) <= 20:
+                term = first_token
         for sub_term in split_space_terms(term):
             if is_bad_skill(sub_term):
                 continue

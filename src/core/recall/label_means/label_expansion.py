@@ -120,6 +120,9 @@ STAGE2A_GLOBAL_FLOOR = SimpleNamespace(
     shift_quality_expand=0.55,
     primary_keep_line=0.35,
     primary_expand_line=0.50,
+    primary_keep=0.35,
+    primary_expand=0.50,
+    canonical_expand=0.45,
     ambiguity_high=0.70,
     ambiguity_mid=0.50,
     ambiguity_low=0.35,
@@ -199,6 +202,35 @@ class LandingCandidate:
     identity_gate: float = 1.0
     domain_fit: float = 1.0
     domain_reason: str = ""                  # domain_conflict_strong 等，供 check_primary_eligibility
+
+
+@dataclass
+class Stage2ACandidate:
+    """Stage2A 统一候选对象：只做证据与组内相对排序，不做固定阈值淘汰。"""
+    tid: int
+    term: str
+    source: str  # similar_to | conditioned_vec | alias_or_exact ...
+
+    # 原始证据（仅用于组内相对比较）
+    semantic_score: float = 0.0
+    context_sim: float = 0.0
+    jd_align: float = 0.0
+    mainline_sim: Optional[float] = None
+    cross_anchor_support: float = 0.0
+    family_match: float = 0.0
+    hierarchy_consistency: float = 0.0
+    polysemy_risk: float = 0.0
+    isolation_risk: float = 0.0
+
+    # 组内相对排序用（percentile 0~1，由 assign_relative_scores_within_anchor 填充）
+    relative_scores: Dict[str, float] = field(default_factory=dict)
+    composite_rank_score: float = 0.0
+
+    # 最终标签（由 select_primary_per_anchor 设置）
+    survive_primary: bool = False
+    can_expand: bool = False
+    reject_reason: Optional[str] = None
+    role: Optional[str] = None  # mainline | side | off | unknown
 
 
 @dataclass
@@ -1434,10 +1466,470 @@ def _retrieve_academic_terms_by_conditioned_vec(
     return context_neighbors, rerank_signals
 
 
-# ---------- Stage2A 四分桶：主线优先 + 同源双视角（无具体词名） ----------
+# ---------- Stage2A 极简版：3 个判断 + 1 个轻量排序，不堆参数 ----------
 
 def _clip01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
+
+
+# 极简版常量：仅用于 3 个判断，不参与总分生死
+STAGE2A_ANCHOR_BASE_MIN = 0.55
+STAGE2A_CTX_DROP_TOLERANCE = 0.08
+STAGE2A_FAMILY_MATCH_MIN = 0.45
+STAGE2A_MAINLINE_SIM_MAIN = 0.62
+STAGE2A_MAINLINE_SIM_SIDE = 0.55
+STAGE2A_MAINLINE_SIM_OFF = 0.52
+STAGE2A_BONUS_SIM_SIDE = 0.60
+STAGE2A_EXPAND_FAMILY_MIN = 0.60
+STAGE2A_EXPAND_MAINLINE_MIN = 0.65
+STAGE2A_EXPAND_OBJECT_RISK_MAX = 0.45
+
+
+# ---------- Stage2A 极简重构：组内相对排序（无固定阈值） ----------
+
+
+def _assign_rank_percentile(candidates: List["Stage2ACandidate"], key: str, out_key: str) -> None:
+    """同锚点内按 key 排序，将百分位 [0,1] 写入 relative_scores[out_key]。"""
+    if not candidates:
+        return
+    vals = [getattr(c, key, 0.0) for c in candidates]
+    n = len(vals)
+    order = sorted(range(n), key=lambda i: (vals[i], -i), reverse=True)
+    rank_by_idx = {}
+    for r, i in enumerate(order):
+        rank_by_idx[i] = 1.0 - (r / (n - 1)) if n > 1 else 1.0
+    for i, c in enumerate(candidates):
+        c.relative_scores[out_key] = rank_by_idx.get(i, 0.0)
+
+
+def _assign_rank_percentile_nullable(candidates: List["Stage2ACandidate"], key: str, out_key: str) -> None:
+    """同锚点内按 key 排序，None 不参与排序，有值的给百分位；无值写 0.5。"""
+    if not candidates:
+        return
+    valid = [(i, c) for i, c in enumerate(candidates) if getattr(c, key, None) is not None]
+    if not valid:
+        for c in candidates:
+            c.relative_scores[out_key] = 0.5
+        return
+    n = len(valid)
+    order = sorted(range(n), key=lambda j: (getattr(valid[j][1], key), -valid[j][0]), reverse=True)
+    rank_by_orig = {valid[order[r]][0]: (1.0 - (r / (n - 1)) if n > 1 else 1.0) for r in range(n)}
+    for i, c in enumerate(candidates):
+        c.relative_scores[out_key] = rank_by_orig.get(i, 0.5)
+
+
+def _assign_reverse_rank_percentile(candidates: List["Stage2ACandidate"], key: str, out_key: str) -> None:
+    """风险项：值越大越差，按 key 升序排，最小的给最高分。"""
+    if not candidates:
+        return
+    vals = [getattr(c, key, 0.0) for c in candidates]
+    n = len(vals)
+    order = sorted(range(n), key=lambda i: (vals[i], i))  # 升序，order[0]=最小
+    rank_by_idx = {order[r]: (1.0 - (r / (n - 1)) if n > 1 else 1.0) for r in range(n)}
+    for i, c in enumerate(candidates):
+        c.relative_scores[out_key] = rank_by_idx.get(i, 0.0)
+
+
+def assign_relative_scores_within_anchor(candidates: List["Stage2ACandidate"]) -> None:
+    """把绝对值转为锚点内部相对位置，不依赖固定阈值。"""
+    if not candidates:
+        return
+    _assign_rank_percentile(candidates, "semantic_score", "semantic_rank")
+    _assign_rank_percentile(candidates, "context_sim", "context_rank")
+    _assign_rank_percentile(candidates, "jd_align", "jd_rank")
+    _assign_rank_percentile_nullable(candidates, "mainline_sim", "mainline_rank")
+    _assign_rank_percentile(candidates, "cross_anchor_support", "cross_anchor_rank")
+    _assign_rank_percentile(candidates, "family_match", "family_rank")
+    _assign_rank_percentile(candidates, "hierarchy_consistency", "hier_rank")
+    _assign_reverse_rank_percentile(candidates, "polysemy_risk", "polysemy_rank")
+    _assign_reverse_rank_percentile(candidates, "isolation_risk", "isolation_rank")
+
+
+def compose_anchor_internal_rank_score(cand: "Stage2ACandidate") -> float:
+    """组内综合排序：证据均值，不加新参数。"""
+    keys = [
+        "semantic_rank", "context_rank", "jd_rank", "mainline_rank",
+        "cross_anchor_rank", "family_rank", "hier_rank",
+        "polysemy_rank", "isolation_rank",
+    ]
+    vals = [cand.relative_scores.get(k) for k in keys if cand.relative_scores.get(k) is not None]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def is_competitive_runner_up(
+    best: "Stage2ACandidate",
+    second: "Stage2ACandidate",
+    candidates: List["Stage2ACandidate"],
+) -> bool:
+    """不用固定阈值：第二名是否与第一名形成「前二集团」而值得一起保留。"""
+    if second.composite_rank_score <= 0:
+        return False
+    if len(candidates) <= 2:
+        return True
+    third = candidates[2]
+    gap12 = best.composite_rank_score - second.composite_rank_score
+    gap23 = second.composite_rank_score - third.composite_rank_score
+    return gap23 >= gap12
+
+
+def judge_expandability_relative(anchor: PreparedAnchor, cand: "Stage2ACandidate", candidates: List["Stage2ACandidate"]) -> bool:
+    """是否可扩散：仅对 surviving primary 判断，用相对证据（强维度数 >= 弱维度数）。"""
+    if not cand.survive_primary:
+        return False
+    dims = ["semantic_rank", "context_rank", "jd_rank", "mainline_rank", "cross_anchor_rank"]
+    strong = sum(1 for k in dims if (cand.relative_scores.get(k) or 0) >= 0.5)
+    weak = len(dims) - strong
+    return strong >= weak
+
+
+def build_stage2a_mainline_profile_centroid(
+    label: Any,
+    anchors: List[PreparedAnchor],
+    semantic_query_text: Optional[str] = None,
+) -> Dict[str, Any]:
+    """构建主线画像仅用于偏好排序证据，不用于硬 reject。只输出 centroid。"""
+    vecs: List[np.ndarray] = []
+    for a in anchors:
+        cv = getattr(a, "conditioned_vec", None)
+        if cv is not None:
+            try:
+                v = np.asarray(cv, dtype=np.float32).flatten()
+                if v.size > 0:
+                    vecs.append(v)
+            except Exception:
+                pass
+            continue
+        anchor_vec = _get_candidate_vec_for_mainline(label, int(getattr(a, "vid", 0) or 0))
+        if anchor_vec is not None:
+            vecs.append(anchor_vec)
+    if not vecs:
+        return {"centroid": None}
+    mat = np.array(vecs, dtype=np.float32)
+    if mat.ndim == 1:
+        mat = mat.reshape(1, -1)
+    centroid = np.mean(mat, axis=0).astype(np.float32)
+    norm = np.linalg.norm(centroid)
+    if norm > 1e-9:
+        centroid = centroid / norm
+    return {"centroid": centroid}
+
+
+def compute_mainline_similarity(
+    label: Any,
+    cand: "Stage2ACandidate",
+    mainline_profile: Dict[str, Any],
+) -> Optional[float]:
+    """候选与主线质心的相似度；无向量时返回 None（表示未知，不判死）。"""
+    cand_vec = _get_candidate_vec_for_mainline(label, cand.tid)
+    centroid = mainline_profile.get("centroid")
+    if cand_vec is None or centroid is None:
+        return None
+    return float(_cos_sim_mainline(cand_vec, centroid))
+
+
+def build_cross_anchor_index(
+    per_anchor_candidates: Dict[int, List["Stage2ACandidate"]],
+) -> Dict[int, List[int]]:
+    """tid -> 支持该候选的 anchor vid 列表，供 cross_anchor_support 证据用。"""
+    index: Dict[int, List[int]] = {}
+    for anchor_vid, cands in per_anchor_candidates.items():
+        for c in cands:
+            tid = c.tid
+            if tid not in index:
+                index[tid] = []
+            index[tid].append(anchor_vid)
+    return index
+
+
+def _compute_cross_anchor_support_score(tid: int, cross_anchor_index: Dict[int, List[int]]) -> float:
+    """0~1：该 tid 被多少锚点支持，归一化到组内。"""
+    support_list = cross_anchor_index.get(tid, [])
+    if not support_list:
+        return 0.0
+    max_sup = max(len(v) for v in cross_anchor_index.values()) if cross_anchor_index else 1
+    return len(support_list) / max(max_sup, 1)
+
+
+def _compute_hierarchy_consistency_for_candidate(
+    label: Any,
+    tid: int,
+    jd_field_ids: Optional[Set[str]],
+    jd_subfield_ids: Optional[Set[str]],
+    jd_topic_ids: Optional[Set[str]],
+) -> float:
+    """单值层级一致性，供组内相对排序用。"""
+    jd_f = set(str(x) for x in (jd_field_ids or []))
+    jd_s = set(str(x) for x in (jd_subfield_ids or []))
+    jd_t = set(str(x) for x in (jd_topic_ids or []))
+    if not jd_f and not jd_s and not jd_t:
+        return 1.0
+    ev = compute_hierarchy_evidence(label, tid, jd_f, jd_s, jd_t)
+    path = float(ev.get("effective_path_match", 0) or 0)
+    topic = float(ev.get("effective_topic_overlap", 0) or 0)
+    sub = float(ev.get("effective_subfield_overlap", 0) or 0)
+    return (0.4 * path + 0.35 * topic + 0.25 * sub)
+
+
+def _compute_isolation_risk_for_candidates(
+    label: Any,
+    candidates: List["Stage2ACandidate"],
+) -> None:
+    """原地写入每个候选的 isolation_risk（与同组其他候选的语义平均相似度越低越高）。"""
+    vocab_idx = getattr(label, "vocab_to_idx", None)
+    all_vecs = getattr(label, "all_vocab_vectors", None)
+    if not candidates or vocab_idx is None or all_vecs is None:
+        for c in candidates:
+            c.isolation_risk = 0.5
+        return
+    vecs: Dict[int, Optional[np.ndarray]] = {}
+    for c in candidates:
+        if c.tid in vecs:
+            continue
+        idx = label.vocab_to_idx.get(str(c.tid))
+        if idx is None:
+            vecs[c.tid] = None
+            continue
+        try:
+            v = np.asarray(label.all_vocab_vectors[idx], dtype=np.float32).flatten()
+            vecs[c.tid] = v
+        except Exception:
+            vecs[c.tid] = None
+    for c in candidates:
+        v = vecs.get(c.tid)
+        if v is None or v.size == 0:
+            c.isolation_risk = 0.5
+            continue
+        sims = []
+        for c2 in candidates:
+            if c2.tid == c.tid:
+                continue
+            v2 = vecs.get(c2.tid)
+            if v2 is None or v2.size != v.size:
+                continue
+            try:
+                s = float(np.dot(v, v2))
+                s = max(-1.0, min(1.0, s))
+                sims.append(s)
+            except Exception:
+                pass
+        if not sims:
+            c.isolation_risk = 0.5
+            continue
+        mean_sim = max(0.0, float(np.mean(sims)))
+        c.isolation_risk = 1.0 - mean_sim
+
+
+def enrich_stage2a_candidates(
+    label: Any,
+    anchor: PreparedAnchor,
+    candidates: List["Stage2ACandidate"],
+    anchors: List[PreparedAnchor],
+    active_domains: Optional[Set[int]],
+    semantic_query_text: Optional[str],
+    cross_anchor_index: Dict[int, List[int]],
+    query_vector: Optional[np.ndarray] = None,
+    jd_field_ids: Optional[Set[str]] = None,
+    jd_subfield_ids: Optional[Set[str]] = None,
+    jd_topic_ids: Optional[Set[str]] = None,
+) -> List["Stage2ACandidate"]:
+    """对每个候选补全证据；只算证据，不做 reject。最后按 composite_rank_score 降序。"""
+    mainline_profile = build_stage2a_mainline_profile_centroid(label, anchors, semantic_query_text)
+    jd_f = set(str(x) for x in (jd_field_ids or []))
+    jd_s = set(str(x) for x in (jd_subfield_ids or []))
+    jd_t = set(str(x) for x in (jd_topic_ids or []))
+
+    for c in candidates:
+        c.jd_align = _compute_jd_candidate_alignment(label, c.tid, query_vector) if query_vector is not None else 0.5
+        c.mainline_sim = compute_mainline_similarity(label, c, mainline_profile)
+        c.cross_anchor_support = _compute_cross_anchor_support_score(c.tid, cross_anchor_index)
+        c.family_match = compute_anchor_identity_score(
+            getattr(anchor, "anchor", "") or "",
+            c.term or "",
+            getattr(anchor, "anchor_type", None),
+        )
+        c.hierarchy_consistency = _compute_hierarchy_consistency_for_candidate(label, c.tid, jd_f, jd_s, jd_t)
+        c.polysemy_risk = 1.0 - c.family_match
+
+    _compute_isolation_risk_for_candidates(label, candidates)
+    assign_relative_scores_within_anchor(candidates)
+    for c in candidates:
+        c.composite_rank_score = compose_anchor_internal_rank_score(c)
+    return sorted(candidates, key=lambda x: x.composite_rank_score, reverse=True)
+
+
+def select_primary_per_anchor(
+    anchor: PreparedAnchor,
+    candidates: List["Stage2ACandidate"],
+) -> List["Stage2ACandidate"]:
+    """锚点内保留相对最优者为 primary；再对 primary 单独判 can_expand。"""
+    if not candidates:
+        return []
+    for c in candidates:
+        c.survive_primary = False
+        c.reject_reason = "not_selected_within_anchor"
+    best = candidates[0]
+    best.survive_primary = True
+    best.role = "mainline"
+    if len(candidates) >= 2:
+        second = candidates[1]
+        if is_competitive_runner_up(best, second, candidates):
+            second.survive_primary = True
+            second.role = "side"
+    for c in candidates:
+        if c.survive_primary:
+            c.can_expand = judge_expandability_relative(anchor, c, candidates)
+    return [c for c in candidates if c.survive_primary]
+
+
+def _init_merged_primary(cand: "Stage2ACandidate", anchor_term: str) -> Dict[str, Any]:
+    """merge_stage2a_primary 时每个 tid 的初始合并项。"""
+    return {
+        "tid": cand.tid,
+        "term": cand.term or str(cand.tid),
+        "support_anchors": [anchor_term],
+        "support_count": 1,
+        "best_score": cand.composite_rank_score,
+        "can_expand": cand.can_expand,
+    }
+
+
+def merge_stage2a_primary(all_anchor_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """跨锚汇总：同一 academic term(tid) 合并证据，按 support_count、best_score 排序。"""
+    merged: Dict[int, Dict[str, Any]] = {}
+    for block in all_anchor_results:
+        anchor = block["anchor"]
+        anchor_term = getattr(anchor, "anchor", "") or str(getattr(anchor, "vid", ""))
+        for cand in block.get("primary", []):
+            if cand.tid not in merged:
+                merged[cand.tid] = _init_merged_primary(cand, anchor_term)
+            else:
+                merged[cand.tid]["support_anchors"].append(anchor_term)
+                merged[cand.tid]["support_count"] += 1
+                merged[cand.tid]["best_score"] = max(merged[cand.tid]["best_score"], cand.composite_rank_score)
+                merged[cand.tid]["can_expand"] = merged[cand.tid]["can_expand"] or cand.can_expand
+    return sorted(
+        merged.values(),
+        key=lambda x: (x["support_count"], x["best_score"]),
+        reverse=True,
+    )
+
+
+def landing_candidates_to_stage2a(landing_list: List[LandingCandidate]) -> List[Stage2ACandidate]:
+    """将 collect_landing_candidates 的 LandingCandidate 列表转为 Stage2ACandidate，供极简 Stage2A 流水线用。"""
+    out: List[Stage2ACandidate] = []
+    for c in landing_list:
+        out.append(Stage2ACandidate(
+            tid=c.vid,
+            term=(c.term or "").strip() or str(c.vid),
+            source=(getattr(c, "source", "") or "similar_to").strip(),
+            semantic_score=float(getattr(c, "semantic_score", 0) or 0),
+            context_sim=float(getattr(c, "context_sim", 0) or 0),
+        ))
+    return out
+
+
+def _score_anchor_family_match(cand: Dict[str, Any], anchor: PreparedAnchor, _context: Dict[str, Any]) -> float:
+    """是否仍在 anchor 语义族里：alias / 近义 canonical family，非黑名单。"""
+    anchor_term = getattr(anchor, "anchor", "") or ""
+    candidate_term = (cand.get("term") or "").strip()
+    if not candidate_term:
+        return 0.0
+    return compute_anchor_identity_score(anchor_term, candidate_term, getattr(anchor, "anchor_type", None))
+
+
+def _score_similarity_to_anchor_group(
+    cand: Dict[str, Any],
+    mainline_profile: Dict[str, Any],
+    group_key: str,
+    label: Any,
+) -> float:
+    """candidate 与主线/支线 anchor 群的接近程度（用 centroid）。"""
+    tid = cand.get("tid")
+    if tid is None:
+        return 0.0
+    vec = _get_candidate_vec_for_mainline(label, int(tid))
+    if vec is None:
+        return 0.0
+    centroid = mainline_profile.get("mainline_centroid" if group_key == "mainline" else "bonus_centroid")
+    if centroid is None:
+        return 0.0
+    return _cos_sim_mainline(vec, centroid)
+
+
+def judge_anchor_validity(cand: Dict[str, Any], anchor: PreparedAnchor, context: Dict[str, Any]) -> bool:
+    """
+    是不是当前 anchor 的合理学术落点。解决 dynamism / control flow / simula / kinesiology / kinesics。
+    """
+    base_score = float(cand.get("base_score", 0) or 0)
+    ctx_score = float(cand.get("ctx_score", 0) or 0)
+    family_match = _score_anchor_family_match(cand, anchor, context)
+    if base_score < STAGE2A_ANCHOR_BASE_MIN:
+        return False
+    if ctx_score > 0 and (ctx_score + STAGE2A_CTX_DROP_TOLERANCE < base_score):
+        return False
+    if family_match < STAGE2A_FAMILY_MATCH_MIN:
+        return False
+    return True
+
+
+def judge_mainline_role(cand: Dict[str, Any], mainline_profile: Dict[str, Any], label: Any) -> str:
+    """
+    属于 JD 主线、支线还是偏题。mainline / side / off。
+    解决 medical robotics、reinforcement learning、digital control 等“能解释但不该主导”。
+    """
+    mainline_sim = _score_similarity_to_anchor_group(cand, mainline_profile, "mainline", label)
+    bonus_sim = _score_similarity_to_anchor_group(cand, mainline_profile, "bonus", label)
+    if mainline_sim >= STAGE2A_MAINLINE_SIM_MAIN:
+        return "mainline"
+    if bonus_sim >= STAGE2A_BONUS_SIM_SIDE and mainline_sim < STAGE2A_MAINLINE_SIM_SIDE:
+        return "side"
+    if mainline_sim >= STAGE2A_MAINLINE_SIM_OFF:
+        return "side"
+    return "off"
+
+
+def judge_expandability(cand: Dict[str, Any], anchor: PreparedAnchor, mainline_profile: Dict[str, Any], label: Any) -> bool:
+    """
+    保留后能否作为 Stage2B 扩散种子。robotic arm 可扩，motion control 可考虑，RL/medical robotics 不该扩。
+    """
+    family_match = _score_anchor_family_match(cand, anchor, {})
+    object_risk = compute_object_like_risk(cand)
+    mainline_sim = _score_similarity_to_anchor_group(cand, mainline_profile, "mainline", label)
+    if family_match < STAGE2A_EXPAND_FAMILY_MIN:
+        return False
+    if mainline_sim < STAGE2A_EXPAND_MAINLINE_MIN:
+        return False
+    if object_risk > STAGE2A_EXPAND_OBJECT_RISK_MAX:
+        return False
+    return True
+
+
+def bucket_stage2a_candidate(anchor_valid: bool, mainline_role: str, expandable: bool) -> str:
+    """极简分桶：先判是不是锚点落点，再判主线/支线/偏题，再判能不能扩。"""
+    if not anchor_valid:
+        return "reject"
+    if mainline_role == "off":
+        return "reject"
+    if mainline_role == "side":
+        return "primary_keep_no_expand"
+    if mainline_role == "mainline" and expandable:
+        return "primary_expandable"
+    return "primary_keep_no_expand"
+
+
+def score_stage2a_candidate(cand: Dict[str, Any], mainline_role: str, expandable: bool) -> float:
+    """轻量排序分：只用于同 bucket 内排序与 anchor 内冲突消解，不决定生死。"""
+    score = float(cand.get("base_score", 0) or 0)
+    if mainline_role == "mainline":
+        score += 0.12
+    elif mainline_role == "side":
+        score -= 0.03
+    if expandable:
+        score += 0.08
+    return max(0.0, min(1.0, score))
+
+
+# ---------- Stage2A 主线画像与合并（极简：仅 mainline/bonus 分型） ----------
 
 
 def build_stage2a_mainline_profile(
@@ -1445,12 +1937,13 @@ def build_stage2a_mainline_profile(
     jd_profile: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    从高分锚点构建主线簇，供 mainline_alignment 使用；不写词表、不黑名单。
-    输出：mainline_centroid（加权平均后 L2 归一化）、mainline_clusters、bonus_clusters。
+    极简主线画像：只构建 mainline_anchor_ids、bonus_anchor_ids、mainline_centroid、bonus_centroid。
+    前几名高分 anchor 作主线，明显 bonus 倾向的归 side；不做复杂聚类。
     """
-    vecs: List[Tuple[float, np.ndarray]] = []
-    mainline_clusters: List[Dict[str, Any]] = []
-    bonus_clusters: List[Dict[str, Any]] = []
+    vecs_main: List[Tuple[float, np.ndarray]] = []
+    vecs_bonus: List[Tuple[float, np.ndarray]] = []
+    mainline_anchor_ids: List[int] = []
+    bonus_anchor_ids: List[int] = []
     for a in anchors:
         cv = getattr(a, "conditioned_vec", None)
         if cv is None:
@@ -1461,18 +1954,18 @@ def build_stage2a_mainline_profile(
                 continue
         except Exception:
             continue
+        vid = int(getattr(a, "vid", 0) or 0)
         w = float(getattr(a, "source_weight", 1.0))
-        name = (getattr(a, "anchor", "") or "").strip() or str(getattr(a, "vid", 0))
-        cluster = {"name": name, "weight": w, "centroid": v}
         if w >= 0.85:
-            vecs.append((w, v))
-            mainline_clusters.append(cluster)
+            vecs_main.append((w, v))
+            mainline_anchor_ids.append(vid)
         else:
-            bonus_clusters.append(cluster)
+            vecs_bonus.append((w, v))
+            bonus_anchor_ids.append(vid)
     mainline_centroid = None
-    if vecs:
-        weights = np.array([x[0] for x in vecs], dtype=np.float32)
-        mat = np.array([x[1] for x in vecs], dtype=np.float32)
+    if vecs_main:
+        weights = np.array([x[0] for x in vecs_main], dtype=np.float32)
+        mat = np.array([x[1] for x in vecs_main], dtype=np.float32)
         if mat.ndim == 1:
             mat = mat.reshape(1, -1)
         weights = weights / (weights.sum() + 1e-9)
@@ -1480,15 +1973,27 @@ def build_stage2a_mainline_profile(
         norm = np.linalg.norm(mainline_centroid)
         if norm > 1e-9:
             mainline_centroid = mainline_centroid / norm
-    if mainline_centroid is None and mainline_clusters:
-        mainline_centroid = mainline_clusters[0]["centroid"].copy()
-        norm = np.linalg.norm(mainline_centroid)
-        if norm > 1e-9:
-            mainline_centroid = mainline_centroid / norm
+    if mainline_centroid is None and vecs_main:
+        mainline_centroid = np.asarray(vecs_main[0][1], dtype=np.float32).flatten()
+        n = np.linalg.norm(mainline_centroid)
+        if n > 1e-9:
+            mainline_centroid = mainline_centroid / n
+    bonus_centroid = None
+    if vecs_bonus:
+        weights_b = np.array([x[0] for x in vecs_bonus], dtype=np.float32)
+        mat_b = np.array([x[1] for x in vecs_bonus], dtype=np.float32)
+        if mat_b.ndim == 1:
+            mat_b = mat_b.reshape(1, -1)
+        weights_b = weights_b / (weights_b.sum() + 1e-9)
+        bonus_centroid = np.average(mat_b, axis=0, weights=weights_b).astype(np.float32)
+        norm_b = np.linalg.norm(bonus_centroid)
+        if norm_b > 1e-9:
+            bonus_centroid = bonus_centroid / norm_b
     return {
+        "mainline_anchor_ids": set(mainline_anchor_ids),
+        "bonus_anchor_ids": set(bonus_anchor_ids),
         "mainline_centroid": mainline_centroid,
-        "mainline_clusters": mainline_clusters,
-        "bonus_clusters": bonus_clusters,
+        "bonus_centroid": bonus_centroid,
     }
 
 
@@ -1497,7 +2002,10 @@ def unify_same_source_views(
     landing_candidates: List[LandingCandidate],
     jd_profile: Optional[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """按 tid 合并 base / conditioned 两视角，同一候选保留一条记录。"""
+    """
+    极简：同一 tid 的 base / conditioned 合并成一条 candidate 记录。
+    只输出：tid, term, base_score, ctx_score, base_hit, ctx_hit, base_rank, ctx_rank。
+    """
     merged: Dict[int, Dict[str, Any]] = {}
     base_rank_by_vid: Dict[int, int] = {}
     ctx_rank_by_vid: Dict[int, int] = {}
@@ -1516,11 +2024,6 @@ def unify_same_source_views(
                 "ctx_score": 0.0,
                 "ctx_rank": None,
                 "ctx_hit": False,
-                "anchor_align": 0.0,
-                "jd_align": getattr(c, "jd_candidate_alignment", 0.5) or 0.5,
-                "field_fit": getattr(c, "fit_info", {}).get("field_fit", 0.0) if getattr(c, "fit_info", None) else (getattr(c, "hierarchy_evidence", {}).get("field_overlap", 0.0) or 0.0),
-                "subfield_fit": getattr(c, "subfield_fit", 0.0) or 0.0,
-                "topic_fit": getattr(c, "topic_fit", 0.0) or 0.0,
             }
             merged[tid] = rec
         src = (getattr(c, "source", "") or "").strip().lower()
@@ -1546,24 +2049,7 @@ def unify_same_source_views(
                 ctx_rank_by_vid[tid] = ctx_seen
             rec["ctx_rank"] = ctx_rank_by_vid[tid]
             rec["ctx_hit"] = True
-        rec["anchor_align"] = max(rec["anchor_align"], float(getattr(c, "conditioned_anchor_align", 0) or getattr(c, "semantic_score", 0) or 0))
-        rec["jd_align"] = max(rec["jd_align"], getattr(c, "jd_candidate_alignment", 0.5) or 0.5)
-        if getattr(c, "fit_info", None):
-            rec["field_fit"] = max(rec["field_fit"], c.fit_info.get("field_fit", 0) or 0)
-            rec["subfield_fit"] = max(rec["subfield_fit"], getattr(c, "subfield_fit", 0) or 0)
-            rec["topic_fit"] = max(rec["topic_fit"], getattr(c, "topic_fit", 0) or 0)
-        ev = getattr(c, "hierarchy_evidence", {}) or {}
-        if ev:
-            rec["field_fit"] = max(rec["field_fit"], float(ev.get("field_overlap", 0) or 0))
-            rec["subfield_fit"] = max(rec["subfield_fit"], float(ev.get("subfield_overlap", 0) or 0))
-            rec["topic_fit"] = max(rec["topic_fit"], float(ev.get("topic_overlap", 0) or 0))
-
-    rows = []
-    for rec in merged.values():
-        rec["shift_gain"] = max(0.0, rec["ctx_score"] - rec["base_score"])
-        rec["shift_drop"] = max(0.0, rec["base_score"] - rec["ctx_score"])
-        rows.append(rec)
-    return rows
+    return list(merged.values())
 
 
 def _get_candidate_vec_for_mainline(label: Any, tid: int) -> Optional[np.ndarray]:
@@ -1596,27 +2082,66 @@ def _cos_sim_mainline(a: np.ndarray, b: np.ndarray) -> float:
     return float(max(0.0, min(1.0, np.dot(a, b) / n)))
 
 
-def compute_mainline_alignment(feat: Dict[str, Any], mainline_profile: Dict[str, Any], label: Any) -> float:
-    """候选与 JD 主线簇的一致性：与 mainline_centroid 的相似度 + 与多个 mainline cluster 的覆盖度。"""
-    centroid = mainline_profile.get("mainline_centroid")
+def _score_cross_anchor_support(
+    feat: Dict[str, Any],
+    all_anchors: List[PreparedAnchor],
+    current_anchor: PreparedAnchor,
+    label: Any,
+) -> float:
+    """候选得到多个主线锚点向量支持的程度（cross_anchor_support）。"""
+    return _score_co_anchor_identity_support(feat, all_anchors, current_anchor, label)
+
+
+def _score_family_resonance_with_mainline(
+    feat: Dict[str, Any], mainline_profile: Dict[str, Any], label: Any
+) -> float:
+    """候选与主线簇的家族共振：与 mainline clusters 的覆盖度。"""
     clusters = mainline_profile.get("mainline_clusters") or []
+    tid = feat.get("tid")
+    if tid is None or not clusters:
+        return 0.0
+    vec = _get_candidate_vec_for_mainline(label, int(tid))
+    if vec is None:
+        return 0.0
+    scores = []
+    for c in clusters:
+        cent = c.get("centroid")
+        if cent is not None:
+            scores.append(_cos_sim_mainline(vec, cent) * float(c.get("weight", 1.0)))
+    if not scores:
+        return 0.0
+    scores.sort(reverse=True)
+    return sum(scores[:2]) / 2.0 if len(scores) >= 2 else scores[0]
+
+
+def compute_mainline_alignment(
+    feat: Dict[str, Any],
+    mainline_profile: Dict[str, Any],
+    label: Any,
+    anchor: Optional[PreparedAnchor] = None,
+    all_anchors: Optional[List[PreparedAnchor]] = None,
+) -> float:
+    """
+    候选与 Stage1 主线 anchor 群的一致性：sim_mainline + cross_anchor_support + family_resonance。
+    回答：更像主线还是更像支线/奖励项/泛词分支。
+    """
+    centroid = mainline_profile.get("mainline_centroid")
     tid = feat.get("tid")
     if tid is None:
         return 0.0
     vec = _get_candidate_vec_for_mainline(label, int(tid))
     if vec is None:
         return 0.0
-    sim_main = _cos_sim_mainline(vec, centroid) if centroid is not None else 0.0
-    cluster_scores = []
-    for c in clusters:
-        cent = c.get("centroid")
-        if cent is not None:
-            cluster_scores.append(_cos_sim_mainline(vec, cent) * float(c.get("weight", 1.0)))
-    if not cluster_scores:
-        return _clip01(sim_main)
-    cluster_scores.sort(reverse=True)
-    mainline_cov = sum(cluster_scores[:2]) / 2.0 if len(cluster_scores) >= 2 else cluster_scores[0]
-    return _clip01(0.55 * sim_main + 0.45 * mainline_cov)
+    sim_mainline = _cos_sim_mainline(vec, centroid) if centroid is not None else 0.0
+    cross_anchor_support = 0.0
+    if anchor is not None and all_anchors:
+        cross_anchor_support = _score_cross_anchor_support(feat, all_anchors, anchor, label)
+    family_resonance = _score_family_resonance_with_mainline(feat, mainline_profile, label)
+    return _clip01(
+        0.45 * sim_mainline
+        + 0.30 * cross_anchor_support
+        + 0.25 * family_resonance
+    )
 
 
 def compute_bonus_branch_alignment(feat: Dict[str, Any], mainline_profile: Dict[str, Any], label: Any) -> float:
@@ -1721,12 +2246,26 @@ def _compute_topic_path_proximity(feat: Dict[str, Any], _jd_profile: Optional[Di
 
 
 def compute_hierarchy_consistency(feat: Dict[str, Any], jd_profile: Optional[Dict[str, Any]]) -> float:
-    """候选与 JD 主线层级路径一致性。"""
+    """
+    候选与 JD 四层层级一致性：field / subfield / topic / path_match 四段，
+    高 topic 但低 path_match 时施加惩罚（单一 topic 命中、路径不落地视为可疑）。
+    """
     field_fit = float(feat.get("field_fit", 0) or 0)
     subfield_fit = float(feat.get("subfield_fit", 0) or 0)
     topic_fit = float(feat.get("topic_fit", 0) or 0)
-    path_proximity = _compute_topic_path_proximity(feat, jd_profile)
-    return _clip01(0.20 * field_fit + 0.30 * subfield_fit + 0.30 * topic_fit + 0.20 * path_proximity)
+    path_match = float(feat.get("path_match", 0) or 0)
+    if path_match <= 0 and (subfield_fit > 0 or topic_fit > 0):
+        path_match = _compute_topic_path_proximity(feat, jd_profile)
+    raw = (
+        0.20 * field_fit
+        + 0.25 * subfield_fit
+        + 0.25 * topic_fit
+        + 0.30 * path_match
+    )
+    mismatch_penalty = 0.0
+    if topic_fit >= 0.70 and path_match < 0.25:
+        mismatch_penalty = 0.25
+    return _clip01(raw * (1.0 - mismatch_penalty))
 
 
 def compute_context_shift_quality(
@@ -1765,24 +2304,53 @@ def compute_branch_drift_risk(
     generic_risk: float,
     object_like_risk: float,
 ) -> float:
-    """支线漂移风险：mainline 弱、bonus 强、泛词/对象细粒度则高。"""
+    """
+    支线漂移风险：主线一致性越低越高；bonus/支线一致性越高越高；泛词/对象词风险越高越高。
+    用于在 Stage2A 压住 medical robotics、reinforcement learning 等支线。
+    """
     risk = 0.0
-    risk += max(0.0, 0.65 - mainline_alignment) * 0.45
+    risk += max(0.0, 0.60 - mainline_alignment) * 0.45
     risk += bonus_alignment * 0.30
     risk += generic_risk * 0.15
     risk += object_like_risk * 0.10
     return _clip01(risk)
 
 
+def _lexical_object_like_score(term: str) -> float:
+    """词形上更像具体对象/器官/部件而非 canonical 学术概念。"""
+    if not term:
+        return 0.0
+    t = term.lower()
+    object_like = ("hand", "arm", "finger", "leg", "joint", "organ", "surgical robot", "manipulator")
+    if any(x in t for x in object_like):
+        return 0.5
+    if len(t.split()) >= 4:
+        return 0.2
+    return 0.0
+
+
+def _neighborhood_specificity_score(feat: Dict[str, Any]) -> float:
+    """邻域细粒度：占位，无 label 时返回 0。"""
+    return 0.0
+
+
+def _hierarchy_tail_specificity(feat: Dict[str, Any]) -> float:
+    """层级末端细粒度：topic 过细、更像具体对象层级。占位返回 0。"""
+    return 0.0
+
+
 def compute_object_like_risk(feat: Dict[str, Any]) -> float:
-    """对象细粒度风险；占位：可由词形、邻域、topic 末端细粒度等综合，目前返回 0。"""
+    """
+    比 anchor 更细粒度、更像具体对象/器官/部件而非 canonical academic term 则加风险。
+    综合：lexical + neighborhood + hierarchy_tail。
+    """
     term = (feat.get("term") or "").strip()
     if not term:
         return 0.0
-    tokens = term.lower().split()
-    if len(tokens) >= 4:
-        return 0.15
-    return 0.0
+    lexical = _lexical_object_like_score(term)
+    neighborhood = _neighborhood_specificity_score(feat)
+    hierarchy_tail = _hierarchy_tail_specificity(feat)
+    return _clip01(0.40 * lexical + 0.35 * neighborhood + 0.25 * hierarchy_tail)
 
 
 def compute_candidate_risks(feat: Dict[str, Any], jd_profile: Optional[Dict[str, Any]]) -> Tuple[float, float]:
@@ -1793,33 +2361,58 @@ def compute_candidate_risks(feat: Dict[str, Any], jd_profile: Optional[Dict[str,
     )
 
 
+def compute_canonicalness(
+    feat: Dict[str, Any],
+    anchor: PreparedAnchor,
+    alias_match_fn=None,
+) -> float:
+    """
+    Canonical 学术表达偏好：alias 家族匹配 + cross_anchor 支持 + path_match。
+    用于抬升 motion control、压制 movement control 等非标准表述。
+    """
+    alias_match = _score_family_alias_match(anchor, feat, None) if alias_match_fn is None else alias_match_fn(feat)
+    cross_anchor = float(feat.get("cross_anchor_support", feat.get("identity", 0) or 0))
+    if cross_anchor <= 0 and feat.get("identity") is not None:
+        cross_anchor = float(feat.get("identity", 0) or 0) * 0.5
+    path_match = float(feat.get("path_match", 0) or 0)
+    if path_match <= 0:
+        path_match = 0.5 * (float(feat.get("subfield_fit", 0) or 0) + float(feat.get("topic_fit", 0) or 0))
+    return _clip01(0.40 * alias_match + 0.30 * cross_anchor + 0.30 * path_match)
+
+
 def score_stage2a_primary(feat: Dict[str, Any], W: Optional[SimpleNamespace] = None) -> float:
-    """主线优先：mainline_alignment 第一权重，view_stability 降为辅助。"""
+    """
+    主线优先 + canonical 落点：mainline_alignment / identity / canonicalness 提权，
+    view_stability 降为辅助；三项风险惩罚。
+    """
     base = (
-        0.26 * float(feat.get("mainline_alignment", 0) or 0)
-        + 0.20 * float(feat.get("identity", 0) or 0)
-        + 0.16 * float(feat.get("base_score", 0) or 0)
-        + 0.14 * float(feat.get("hierarchy", 0) or 0)
-        + 0.10 * float(feat.get("jd_align", 0) or 0)
-        + 0.08 * float(feat.get("context_shift_quality", 0) or 0)
+        0.22 * float(feat.get("mainline_alignment", 0) or 0)
+        + 0.18 * float(feat.get("identity", 0) or 0)
+        + 0.14 * float(feat.get("canonicalness", 0) or 0)
+        + 0.14 * float(feat.get("base_score", 0) or 0)
+        + 0.12 * float(feat.get("hierarchy", 0) or 0)
+        + 0.08 * float(feat.get("jd_align", 0) or 0)
+        + 0.06 * float(feat.get("context_shift_quality", 0) or 0)
         + 0.06 * float(feat.get("view_stability", 0) or 0)
     )
     penalty = (
-        (1.0 - 0.30 * float(feat.get("ambiguity_risk", 0) or 0))
-        * (1.0 - 0.35 * float(feat.get("branch_drift_risk", 0) or 0))
+        (1.0 - 0.30 * float(feat.get("branch_drift_risk", 0) or 0))
         * (1.0 - 0.20 * float(feat.get("object_like_risk", 0) or 0))
+        * (1.0 - 0.20 * float(feat.get("ambiguity_risk", 0) or 0))
     )
     return _clip01(base * max(0.0, penalty))
 
 
 def decide_stage2a_bucket(feat: Dict[str, Any], T: SimpleNamespace) -> str:
-    """主线优先：主线一致性 > 锚点身份 > 双视角稳定性；先 reject，再 expandable，再 keep_no_expand，最后 observe_only。"""
+    """
+    四分桶收紧：reject 明显错义/支线漂移；primary_expandable 需主线强+canonical+风险低；
+    primary_keep_no_expand 主线相关且可解释；其余 observe_only。
+    """
     mainline = float(feat.get("mainline_alignment", 0) or 0)
     identity = float(feat.get("identity", 0) or 0)
     branch_drift = float(feat.get("branch_drift_risk", 0) or 0)
     primary_score = float(feat.get("primary_score", 0) or 0)
-    base_score = float(feat.get("base_score", 0) or 0)
-    hierarchy = float(feat.get("hierarchy", 0) or 0)
+    canonicalness = float(feat.get("canonicalness", 0) or 0)
     object_like = float(feat.get("object_like_risk", 0) or 0)
 
     if (
@@ -1832,16 +2425,16 @@ def decide_stage2a_bucket(feat: Dict[str, Any], T: SimpleNamespace) -> str:
     if (
         mainline >= getattr(T, "mainline_expand", 0.55)
         and identity >= getattr(T, "identity_expand", 0.55)
-        and base_score >= getattr(T, "base_expand_line", 0.55)
-        and hierarchy >= getattr(T, "hierarchy_expand", 0.50)
+        and canonicalness >= getattr(T, "canonical_expand", 0.45)
         and branch_drift < getattr(T, "branch_drift_low", 0.35)
         and object_like < getattr(T, "object_like_low", 0.35)
+        and primary_score >= getattr(T, "primary_expand", 0.50)
     ):
         return "primary_expandable"
 
     if (
         mainline >= getattr(T, "mainline_keep", 0.40)
-        and primary_score >= getattr(T, "primary_keep_line", 0.35)
+        and primary_score >= getattr(T, "primary_keep", 0.35)
     ):
         return "primary_keep_no_expand"
 
@@ -1872,6 +2465,10 @@ def calibrate_anchor_thresholds(evaluated_candidates: List[Dict[str, Any]], glob
     T.view_stability_expand = max(getattr(global_floor, "view_stability_expand", 0.60), view_vals[p75] if view_vals else 0)
     T.primary_keep_line = max(getattr(global_floor, "primary_keep_line", 0.35), primary_vals[p60] if primary_vals else 0)
     T.primary_expand_line = max(getattr(global_floor, "primary_expand_line", 0.50), primary_vals[p80] if primary_vals else 0)
+    T.primary_keep = max(getattr(global_floor, "primary_keep", 0.35), primary_vals[p60] if primary_vals else 0)
+    T.primary_expand = max(getattr(global_floor, "primary_expand", 0.50), primary_vals[p80] if primary_vals else 0)
+    canonical_vals = sorted([float(c.get("canonicalness", 0) or 0) for c in evaluated_candidates])
+    T.canonical_expand = max(getattr(global_floor, "canonical_expand", 0.45), canonical_vals[p75] if canonical_vals else 0)
     T.mainline_low = max(getattr(global_floor, "mainline_low", 0.25), mainline_vals[p25] if mainline_vals else 0)
     T.mainline_keep = max(getattr(global_floor, "mainline_keep", 0.40), mainline_vals[p60] if mainline_vals else 0)
     T.mainline_expand = max(getattr(global_floor, "mainline_expand", 0.55), mainline_vals[p75] if mainline_vals else 0)
@@ -1909,35 +2506,52 @@ def evaluate_stage2a_candidate(
     thresholds: Optional[SimpleNamespace] = None,
     weights: Optional[SimpleNamespace] = None,
 ) -> Dict[str, Any]:
-    """主线优先：先算 mainline_alignment / bonus_alignment，再 identity（含 co_anchor）、context_shift_quality、风险与 primary_score、bucket。"""
-    T = thresholds or STAGE2A_GLOBAL_FLOOR
-    feat = dict(cand)
-    feat["view_stability"] = compute_view_stability(feat, T)
-    feat["hierarchy"] = compute_hierarchy_consistency(feat, jd_profile)
+    """
+    极简 Stage2A：只做 3 个判断 + 分桶 + 轻量排序分。
+    先判「是不是这个锚点的合理学术落点」→ 再判「是不是 JD 主线」→ 再判「能不能扩散」。
+    """
+    context = jd_profile if isinstance(jd_profile, dict) else {}
+    anchor_valid = judge_anchor_validity(cand, anchor, context)
+    if not anchor_valid:
+        return {
+            **cand,
+            "anchor_valid": False,
+            "mainline_role": "off",
+            "expandable": False,
+            "bucket": "reject",
+            "score": float(cand.get("base_score", 0) or 0),
+            "primary_score": float(cand.get("base_score", 0) or 0),
+            "identity": _score_anchor_family_match(cand, anchor, context),
+        }
+    mainline_role = "off"
     if mainline_profile and label:
-        feat["mainline_alignment"] = compute_mainline_alignment(feat, mainline_profile, label)
-        feat["bonus_alignment"] = compute_bonus_branch_alignment(feat, mainline_profile, label)
-    else:
-        feat["mainline_alignment"] = 0.5
-        feat["bonus_alignment"] = 0.0
-    feat["identity"] = compute_anchor_candidate_identity(
-        anchor, feat, jd_profile, all_anchors=all_anchors, label=label
-    )
-    feat["context_shift_quality"] = compute_context_shift_quality(feat, float(feat.get("mainline_alignment", 0) or 0))
-    a_risk, g_risk = compute_candidate_risks(feat, jd_profile)
-    feat["ambiguity_risk"] = a_risk
-    feat["generic_risk"] = g_risk
-    feat["object_like_risk"] = compute_object_like_risk(feat)
-    feat["branch_drift_risk"] = compute_branch_drift_risk(
-        float(feat.get("mainline_alignment", 0) or 0),
-        float(feat.get("bonus_alignment", 0) or 0),
-        feat["generic_risk"],
-        feat["object_like_risk"],
-    )
-    feat["primary_score"] = score_stage2a_primary(feat, weights)
-    feat["bucket"] = decide_stage2a_bucket(feat, T)
-    feat["expandable"] = feat["bucket"] == "primary_expandable"
-    return feat
+        mainline_role = judge_mainline_role(cand, mainline_profile, label)
+    if mainline_role == "off":
+        return {
+            **cand,
+            "anchor_valid": True,
+            "mainline_role": "off",
+            "expandable": False,
+            "bucket": "reject",
+            "score": float(cand.get("base_score", 0) or 0),
+            "primary_score": float(cand.get("base_score", 0) or 0),
+            "identity": _score_anchor_family_match(cand, anchor, context),
+        }
+    expandable = False
+    if mainline_role == "mainline" and mainline_profile and label:
+        expandable = judge_expandability(cand, anchor, mainline_profile, label)
+    bucket = bucket_stage2a_candidate(anchor_valid=anchor_valid, mainline_role=mainline_role, expandable=expandable)
+    score = score_stage2a_candidate(cand=cand, mainline_role=mainline_role, expandable=expandable)
+    return {
+        **cand,
+        "anchor_valid": anchor_valid,
+        "mainline_role": mainline_role,
+        "expandable": expandable,
+        "bucket": bucket,
+        "score": score,
+        "primary_score": score,
+        "identity": _score_anchor_family_match(cand, anchor, context),
+    }
 
 
 def resolve_anchor_primary_candidates(
@@ -1946,43 +2560,37 @@ def resolve_anchor_primary_candidates(
     jd_profile: Optional[Dict[str, Any]],
     mainline_profile: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
-    """冲突消解时优先级：mainline_alignment > primary_score > identity > view_stability；每桶 cap=2。"""
+    """
+    极简冲突消解：只看 bucket 再 score。每个 anchor 最多 1 个 keep_no_expand + 1 个 expandable。
+    """
+    ordered = sorted(
+        evaluated_candidates,
+        key=lambda x: (
+            x.get("bucket") == "primary_expandable",
+            x.get("bucket") == "primary_keep_no_expand",
+            float(x.get("score", x.get("primary_score", 0)) or 0),
+        ),
+        reverse=True,
+    )
     rejects: List[Dict[str, Any]] = []
-    observe_only: List[Dict[str, Any]] = []
     keep_no_expand: List[Dict[str, Any]] = []
     expandable: List[Dict[str, Any]] = []
-
-    def sort_key(x: Dict[str, Any]) -> tuple:
-        return (
-            1 if (x.get("bucket") == "primary_expandable") else 0,
-            float(x.get("mainline_alignment", 0) or 0),
-            float(x.get("primary_score", 0) or 0),
-            float(x.get("identity", 0) or 0),
-            float(x.get("view_stability", 0) or 0),
-        )
-
-    sorted_items = sorted(evaluated_candidates, key=sort_key, reverse=True)
-    for item in sorted_items:
-        b = item.get("bucket", "observe_only")
+    for row in ordered:
+        b = row.get("bucket", "reject")
         if b == "reject":
-            rejects.append(item)
-        elif b == "observe_only":
-            observe_only.append(item)
+            rejects.append(row)
         elif b == "primary_keep_no_expand":
-            keep_no_expand.append(item)
+            keep_no_expand.append(row)
         elif b == "primary_expandable":
-            expandable.append(item)
-
-    cap = 2
-    keep_no_expand = sorted(keep_no_expand, key=lambda x: (-(x.get("mainline_alignment") or 0), -(x.get("primary_score") or 0)))[:cap]
-    expandable = sorted(expandable, key=lambda x: (-(x.get("mainline_alignment") or 0), -(x.get("primary_score") or 0)))[:cap]
-
+            expandable.append(row)
+    keep_no_expand = sorted(keep_no_expand, key=lambda x: -(float(x.get("score", 0) or 0)))[:1]
+    expandable = sorted(expandable, key=lambda x: -(float(x.get("score", 0) or 0)))[:1]
     return {
         "rejects": rejects,
-        "observe_only": observe_only,
+        "observe_only": [],
         "primary_keep_no_expand": keep_no_expand,
         "primary_expandable": expandable,
-        "debug_rows": rejects + observe_only + keep_no_expand + expandable,
+        "debug_rows": rejects + keep_no_expand + expandable,
     }
 
 
@@ -4204,12 +4812,12 @@ def stage2_generate_academic_terms(
         jd_sub = len(jd_subfield_ids) if jd_subfield_ids else 0
         jd_top = len(jd_topic_ids) if jd_topic_ids else 0
         print(f"  锚点数: {len(prepared_anchors)}  |  active_domains: {len(active_domains)}  |  有 JD: {has_jd}")
-        print(f"  JD 维度: field={jd_fields}  subfield={jd_sub}  topic={jd_top}  |  PRIMARY_TOP_M_PER_ANCHOR={PRIMARY_TOP_M_PER_ANCHOR}")
+        print(f"  JD 维度: field={jd_fields}  subfield={jd_sub}  topic={jd_top}  |  Stage2A=组内相对选主（无固定阈值）")
         print(f"  锚点列表: {[getattr(a, 'anchor', a) for a in prepared_anchors]}")
-    # ---------- 数据驱动两阶段选主：先每锚 top-m 候选，再全局邻域/离群算 primary_score，最后每锚取 top primary ----------
-    anchor_cands_list: List[Tuple[PreparedAnchor, List[LandingCandidate]]] = []
+    # ---------- Stage2A 极简重构：每锚点收集候选 → 证据 → 组内相对排序 → 选 primary → 仅 primary 再判 can_expand ----------
+    per_anchor_candidates: Dict[int, List[Stage2ACandidate]] = {}
     for anchor in prepared_anchors:
-        candidates = collect_landing_candidates(
+        landing_list = collect_landing_candidates(
             label, anchor,
             active_domain_set=active_domains,
             jd_field_ids=jd_field_ids,
@@ -4218,107 +4826,92 @@ def stage2_generate_academic_terms(
             jd_profile=jd_profile,
             query_vector=query_vector,
         )
-        for c in candidates:
-            setattr(c, "identity_score", score_academic_identity(c))
-        sort_key = lambda x: (getattr(x, "landing_score", None) is not None, getattr(x, "landing_score", 0.0) or getattr(x, "identity_score", 0.0))
-        top_m = sorted(candidates, key=sort_key, reverse=True)[: PRIMARY_TOP_M_PER_ANCHOR]
-        if top_m:
-            anchor_cands_list.append((anchor, candidates))
+        stage2a_list = landing_candidates_to_stage2a(landing_list)
+        per_anchor_candidates[anchor.vid] = stage2a_list
 
-    jd_f = set(str(x) for x in (jd_field_ids or []))
-    jd_s = set(str(x) for x in (jd_subfield_ids or []))
-    jd_t = set(str(x) for x in (jd_topic_ids or []))
+    cross_anchor_index = build_cross_anchor_index(per_anchor_candidates)
+    all_anchor_results: List[Dict[str, Any]] = []
     primary_landings_by_anchor: Dict[int, List[PrimaryLanding]] = {}
     evidence_table: List[Dict[str, Any]] = []
-    hier_cache: Dict[int, Dict[str, Any]] = {}
 
-    mainline_profile = build_stage2a_mainline_profile(prepared_anchors, jd_profile)
-
-    # ---------- Stage2A 四分桶：主线优先 unify -> evaluate -> calibrate -> resolve ----------
-    _stage2_header("Stage2A 四分桶（主线优先）", "-")
-    for anchor, candidates in anchor_cands_list:
-        for c in candidates:
-            if c.vid not in hier_cache:
-                hier_cache[c.vid] = compute_hierarchy_evidence(label, c.vid, jd_f, jd_s, jd_t)
-            setattr(c, "hierarchy_evidence", hier_cache[c.vid])
-        flat_anchor = [(anchor, c) for c in candidates]
-        if flat_anchor:
-            _compute_conditioned_anchor_align_and_multi_anchor_support(label, flat_anchor, prepared_anchors)
-        merged = unify_same_source_views(anchor, candidates, jd_profile)
-        if not merged:
+    _stage2_header("Stage2A 极简：组内相对排序选主落点（无固定阈值）", "-")
+    for anchor in prepared_anchors:
+        candidates = per_anchor_candidates.get(anchor.vid, [])
+        if not candidates:
             primary_landings_by_anchor[anchor.vid] = []
+            all_anchor_results.append({"anchor": anchor, "candidates": [], "primary": []})
             continue
-        evaluated = [
-            evaluate_stage2a_candidate(
-                anchor, m, jd_profile,
-                mainline_profile=mainline_profile,
-                all_anchors=prepared_anchors,
-                label=label,
-            )
-            for m in merged
-        ]
-        T = calibrate_anchor_thresholds(evaluated, STAGE2A_GLOBAL_FLOOR)
-        for e in evaluated:
-            e["bucket"] = decide_stage2a_bucket(e, T)
-            e["expandable"] = e["bucket"] == "primary_expandable"
-        bucketed = resolve_anchor_primary_candidates(anchor, evaluated, jd_profile, mainline_profile=mainline_profile)
+        enriched = enrich_stage2a_candidates(
+            label, anchor, candidates, prepared_anchors, active_domains, query_text,
+            cross_anchor_index,
+            query_vector=query_vector,
+            jd_field_ids=jd_field_ids,
+            jd_subfield_ids=jd_subfield_ids,
+            jd_topic_ids=jd_topic_ids,
+        )
+        selected = select_primary_per_anchor(anchor, enriched)
         primary_landings_list = []
-        for item in bucketed["primary_keep_no_expand"] + bucketed["primary_expandable"]:
+        for cand in selected:
             p = PrimaryLanding(
-                vid=item["tid"],
-                term=item["term"],
-                identity_score=float(item.get("identity", 0.5) or 0.5),
-                source="similar_to",
+                vid=cand.tid,
+                term=cand.term or str(cand.tid),
+                identity_score=cand.family_match,
+                source=cand.source,
                 anchor_vid=anchor.vid,
                 anchor_term=anchor.anchor,
                 domain_fit=1.0,
             )
-            setattr(p, "primary_score", float(item.get("primary_score", 0) or 0))
-            setattr(p, "anchor_identity_score", float(item.get("identity", 0.5) or 0.5))
-            setattr(p, "retain_mode", "normal" if item.get("expandable") else "weak_retain")
-            setattr(p, "suppress_seed", not item.get("expandable", False))
+            setattr(p, "primary_score", cand.composite_rank_score)
+            setattr(p, "anchor_identity_score", cand.family_match)
+            setattr(p, "retain_mode", "normal" if cand.can_expand else "weak_retain")
+            setattr(p, "suppress_seed", not cand.can_expand)
             setattr(p, "topic_source", "missing")
-            setattr(p, "jd_align", float(item.get("jd_align", 0.5) or 0.5))
-            setattr(p, "bucket", item.get("bucket", "observe_only"))
-            setattr(p, "expandable", item.get("expandable", False))
-            setattr(p, "field_fit", float(item.get("field_fit", 0) or 0))
+            setattr(p, "jd_align", cand.jd_align)
+            setattr(p, "bucket", "primary_expandable" if cand.can_expand else "primary_keep_no_expand")
+            setattr(p, "expandable", cand.can_expand)
+            setattr(p, "field_fit", 0.0)
             setattr(p, "path_match", 0.0)
             setattr(p, "topic_span_penalty", 1.0)
-            setattr(p, "subfield_fit", float(item.get("subfield_fit", 0) or 0))
-            setattr(p, "topic_fit", float(item.get("topic_fit", 0) or 0))
+            setattr(p, "subfield_fit", 0.0)
+            setattr(p, "topic_fit", 0.0)
+            setattr(p, "cross_anchor_support_count", max(1, len(cross_anchor_index.get(cand.tid, []))))
             primary_landings_list.append(p)
+            _mainline_num = 0.7 if cand.role == "mainline" else (0.4 if cand.role == "side" else 0.0)
             evidence_table.append({
                 "anchor": anchor.anchor,
                 "anchor_vid": anchor.vid,
-                "candidate": item["term"],
-                "tid": item["tid"],
-                "bucket": item.get("bucket"),
-                "primary_score": item.get("primary_score"),
-                "mainline_alignment": item.get("mainline_alignment", 0.5),
-                "expandable": item.get("expandable"),
-                "source": "similar_to",
-                "semantic_score": item.get("base_score", 0),
-                "jd_align": item.get("jd_align", 0.5),
-                "anchor_identity_score": item.get("identity", 0.5),
+                "candidate": cand.term,
+                "tid": cand.tid,
+                "bucket": "primary_expandable" if cand.can_expand else "primary_keep_no_expand",
+                "primary_score": cand.composite_rank_score,
+                "mainline_alignment": _mainline_num,
+                "expandable": cand.can_expand,
+                "source": cand.source,
+                "semantic_score": cand.semantic_score,
+                "jd_align": cand.jd_align,
+                "anchor_identity_score": cand.family_match,
                 "identity_gate": 1.0,
-                "base_primary_score": item.get("primary_score", 0),
-                "edge_affinity": item.get("identity", 0.5),
+                "base_primary_score": cand.composite_rank_score,
+                "edge_affinity": cand.family_match,
                 "conditioned_anchor_align": None,
-                "multi_anchor_support": 0.5,
-                "hierarchy_consistency": item.get("hierarchy", 0.5),
+                "multi_anchor_support": cand.cross_anchor_support,
+                "hierarchy_consistency": cand.hierarchy_consistency,
                 "neighborhood_consistency": 0.5,
-                "isolation_penalty": 0.0,
-                "polysemy_risk": 0.5,
+                "isolation_penalty": cand.isolation_risk,
+                "polysemy_risk": cand.polysemy_risk,
                 "specificity_prior": 0.5,
             })
         primary_landings_by_anchor[anchor.vid] = primary_landings_list
+        all_anchor_results.append({"anchor": anchor, "candidates": enriched, "primary": selected})
 
-    _stage2_header("Stage2A 每锚 primary（四分桶后）", "-")
+    final_primary_merged = merge_stage2a_primary(all_anchor_results)
+
+    _stage2_header("Stage2A 每锚 primary（组内相对选主）", "-")
     if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
         rows_summary = []
         for a in prepared_anchors:
             plist = primary_landings_by_anchor.get(a.vid, [])
-            n_cand = next((len(cands) for (anc, cands) in anchor_cands_list if anc.vid == a.vid), 0)
+            n_cand = len(per_anchor_candidates.get(a.vid, []))
             rows_summary.append([
                 getattr(a, "anchor", str(a))[:18],
                 str(n_cand),
@@ -4441,10 +5034,10 @@ def stage2_generate_academic_terms(
             if LABEL_EXPANSION_DEBUG:
                 anchor_type_lower = (getattr(anchor, "anchor_type", "") or "").strip().lower()
                 amb_tag = " [高歧义]" if anchor_type_lower in HIGH_AMBIGUITY_ANCHOR_TYPES else ""
-                n_cand = next((len(cands) for (a, cands) in anchor_cands_list if a.vid == anchor.vid), 0)
+                n_cand = len(per_anchor_candidates.get(anchor.vid, []))
                 print(
                     f"[Stage2] 锚点 anchor={anchor.anchor!r} vid={anchor.vid}{amb_tag} 无 primary，跳过 | "
-                    f"原因: 本锚点经四分桶后无 primary（候选数={n_cand}）"
+                    f"原因: 本锚点组内相对选主后无 primary（候选数={n_cand}）"
                 )
             continue
         if LABEL_EXPANSION_DEBUG:
