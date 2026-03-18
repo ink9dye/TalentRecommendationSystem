@@ -84,6 +84,8 @@ DENSE_SUPPORT_PRIMARY_CONSISTENCY_MIN = 0.72   # 候选与 parent primary 向量
 DENSE_SUPPORT_ANCHOR_CONSISTENCY_MIN = 0.70   # 候选与 anchor conditioned_vec 一致性
 DENSE_SUPPORT_CONTEXT_STABILITY_MIN = 0.72    # 候选在 anchor context 邻域中的稳定性
 DENSE_SUPPORT_FAMILY_SUPPORT_MIN = 0.68      # 候选对同锚 surviving primary family 的支撑
+# 强冲突领域 ID：term 主领域在此集且与激活领域无交时返回 domain_conflict_strong（医学/社科/管理等），空集则所有 domain_no_match 仅做 soft retain
+STRONG_CONFLICT_DOMAIN_IDS: Set[str] = set()
 # ---------- Primary 排序：只保留一套权重（PRIMARY_SCORE_W_*），不再使用 PRIMARY_W_* ----------
 PRIMARY_SCORE_W_SEMANTIC = 0.22
 PRIMARY_SCORE_W_IDENTITY = 0.18
@@ -1257,8 +1259,15 @@ def retrieve_academic_term_by_similar_to(
                 kept.append(c)
                 if reason and LABEL_EXPANSION_DEBUG:
                     print(f"[Stage2A] 保留（层级未命中）vid={c.vid} term={c.term!r} sim={c.semantic_score:.3f} reason={reason}")
-            else:
+            elif reason == "domain_conflict_strong":
                 dropped_with_reason.append((c, reason))
+            else:
+                # domain_no_match：上位通用主词（mechanics/simulation/route planning）保留但降权，进后续 admission
+                setattr(c, "soft_domain_retain", True)
+                setattr(c, "domain_fit", 0.85)
+                kept.append(c)
+                if LABEL_EXPANSION_DEBUG:
+                    print(f"[Stage2A] 软保留（domain_no_match）vid={c.vid} term={c.term!r} sim={c.semantic_score:.3f}")
         out = kept
         if LABEL_EXPANSION_DEBUG and n_before != len(out):
             print(f"[Stage2A] 领域过滤后 SIMILAR_TO 落点: {len(out)} 个（过滤前 {n_before}）")
@@ -1383,6 +1392,7 @@ ANCHOR_IDENTITY_ALIASES: Dict[str, Set[str]] = {
     "动力学": {"dynamics", "dynamic", "mechanics", "kinetics"},
     "运动学": {"kinematics", "kinesiology"},
     "仿真": {"simulation", "simulate", "simulator"},
+    "路径规划": {"route planning", "path planning", "motion planning", "trajectory planning"},
     "控制": {"control", "controller", "control engineering"},
     "运动控制": {"motion control", "movement control", "motion controller"},
     "机械臂": {"robotic arm", "robot arm", "manipulator"},
@@ -1579,6 +1589,8 @@ def collect_landing_candidates(
             jd_subfield_ids=jd_subfield_ids,
             jd_topic_ids=jd_topic_ids,
         )
+        if getattr(c, "soft_domain_retain", False):
+            c.domain_fit = (getattr(c, "domain_fit", 1.0) or 1.0) * 0.85
     # 在 candidate 上保留层级状态，供 primary 打分惩罚（topic=1.0, subfield=0.65, field=0.35, none=0.10）
     jd_f = set(str(x) for x in (jd_field_ids or []))
     jd_s = set(str(x) for x in (jd_subfield_ids or []))
@@ -2202,6 +2214,11 @@ def _term_in_active_domains_with_reason(
                     main_domain = max(expanded, key=expanded.get)
                     if main_domain not in active_str:
                         domain_ok = False
+                # 强冲突：主领域在医学/社科/管理等且与激活领域无交时硬拒（见 README Stage2A 漏点修复）
+                if not domain_ok and expanded and STRONG_CONFLICT_DOMAIN_IDS:
+                    main_domain = max(expanded, key=expanded.get)
+                    if str(main_domain) in STRONG_CONFLICT_DOMAIN_IDS:
+                        return (False, "domain_conflict_strong")
 
     if not domain_ok:
         return (False, "domain_no_match")
@@ -2966,12 +2983,36 @@ def support_expandable_for_anchor(
             "family_support": family_support,
         }
 
+    # 新增：dense support 对锚点的 identity 约束，抑制 robotic arm -> robotic hand 等 family 漂移
+    anchor_term = getattr(anchor, "anchor_term", "") or getattr(anchor, "anchor", "") or ""
+    anchor_identity_for_support = compute_anchor_identity_score(anchor_term, candidate_term)
+    if anchor_identity_for_support < 0.16:
+        return False, {"reason": "low_anchor_identity_support", "anchor_identity_for_support": anchor_identity_for_support}
+
+    # 新增：family 漂移惩罚（候选只极贴某一 primary 而对整锚支撑不均衡时降分）
+    drift_penalty = max(0.0, primary_consistency - family_support)
+
     keep_score = (
-        0.30 * primary_consistency
-        + 0.30 * anchor_consistency
-        + 0.25 * context_stability
-        + 0.15 * family_support
+        0.26 * primary_consistency
+        + 0.26 * anchor_consistency
+        + 0.22 * context_stability
+        + 0.16 * family_support
+        + 0.10 * anchor_identity_for_support
     )
+    keep_score = keep_score - 0.18 * drift_penalty
+
+    if keep_score < 0.76:
+        return False, {
+            "reason": "keep_score_too_low",
+            "keep_score": keep_score,
+            "primary_consistency": primary_consistency,
+            "anchor_consistency": anchor_consistency,
+            "context_stability": context_stability,
+            "family_support": family_support,
+            "anchor_identity_for_support": anchor_identity_for_support,
+            "drift_penalty": drift_penalty,
+        }
+
     return True, {
         "reason": "ok",
         "keep_score": keep_score,
@@ -2979,6 +3020,8 @@ def support_expandable_for_anchor(
         "anchor_consistency": anchor_consistency,
         "context_stability": context_stability,
         "family_support": family_support,
+        "anchor_identity_for_support": anchor_identity_for_support,
+        "drift_penalty": drift_penalty,
     }
 
 
@@ -3098,6 +3141,18 @@ def check_primary_admission(
         meta["suppress_seed"] = True
         meta["retain_reason"] = "hierarchy_supported_but_context_borderline"
         return True, ["context_borderline"], rescued, meta
+
+    # 通用主词弱放行：simulation / mechanics / route planning 等合理但 hierarchy 弱的主词
+    if (
+        semantic_score >= 0.80
+        and jd_align >= 0.78
+        and context_consistency >= 0.68
+        and anchor_identity >= 0.16
+    ):
+        meta["retain_mode"] = "weak_retain"
+        meta["suppress_seed"] = True
+        meta["retain_reason"] = "generic_main_term_supported"
+        return True, ["generic_main_term"], rescued, meta
 
     reasons.append("dual_space_not_stable")
     return False, reasons, rescued, meta

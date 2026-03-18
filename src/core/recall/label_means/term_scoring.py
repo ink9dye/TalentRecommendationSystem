@@ -591,49 +591,49 @@ EXPANSION_ROLES = frozenset({"dense_expansion", "cluster_expansion", "cooc_expan
 
 
 def passes_identity_gate(rec: Dict[str, Any]) -> bool:
-    """按 term_role 判身份闸门。支持 primary | dense_expansion | cluster_expansion | cooc_expansion。"""
+    """身份闸门：primary/similar_to 阈值略低(0.62)，support 阈值略高(0.68)。"""
+    identity = float(rec.get("identity_score") or rec.get("sim_score") or 0.0)
     role = (rec.get("term_role") or "").strip().lower()
-    identity = float(rec.get("identity_score") or 0.0)
-    tid = rec.get("tid") or rec.get("vid") or ""
-    term = (rec.get("term") or "")[:24]
-    if not role:
-        return True
-    threshold = None
-    if role == "primary":
-        threshold = PRIMARY_MIN_IDENTITY_GATE
-        passed = identity >= threshold
-    elif role == "dense_expansion" or role == "cluster_expansion":
-        threshold = DENSE_CLUSTER_MIN_IDENTITY_GATE
-        passed = identity >= threshold
-    elif role == "cooc_expansion":
-        threshold = COOC_MIN_IDENTITY_GATE
-        passed = identity >= threshold
-    else:
-        threshold = COOC_MIN_IDENTITY_GATE
-        passed = identity >= threshold
-    if STAGE3_DEBUG and not passed:
-        print(f"[Stage3] identity_gate 未通过 tid={tid} term={term!r} role={role} identity={identity:.3f} < {threshold}")
-    return passed
+    source = (rec.get("source_type") or rec.get("source") or rec.get("origin") or "").strip().lower()
+    if role == "primary" or source == "similar_to":
+        return identity >= 0.62
+    return identity >= 0.68
 
 
 def passes_topic_consistency(rec: Dict[str, Any], active_domains: Optional[Any] = None) -> bool:
-    """Topic 一致性闸门。先跑通阶段直接通过，后续再接 vocabulary_topic_stats。"""
+    """
+    Topic 一致性闸门：只拦 support-like；primary-like 默认通过，软惩罚交给 score_term_record 的 path_topic_consistency。
+    """
+    source_type = (rec.get("source_type") or rec.get("source") or rec.get("origin") or "").strip().lower()
+    term_role = (rec.get("term_role") or "").strip().lower()
+    is_primary_like = (
+        bool(rec.get("has_primary_role"))
+        or term_role == "primary"
+        or source_type == "similar_to"
+        or int(rec.get("anchor_count") or 0) >= 2
+    )
+    if is_primary_like:
+        return True
+    topic_fit = rec.get("topic_fit")
+    if topic_fit is None:
+        topic_fit = rec.get("subfield_fit")
+    if topic_fit is None:
+        topic_fit = rec.get("field_fit")
+    if topic_fit is None:
+        topic_fit = rec.get("domain_fit")
+    topic_fit = float(topic_fit or 0.0)
+    outside = float(rec.get("outside_subfield_mass") or 0.0)
+    if topic_fit < 0.05 and outside > 0.95:
+        return False
     return True
 
 
 def score_term_expansion_quality(label, rec: Dict[str, Any]) -> float:
-    """质量分：仅衡量「作为召回 term 好不好用」。先简化为 idf 骨架 + 语义/纯度。"""
-    tid = rec.get("tid")
-    degree_w = int(rec.get("degree_w") or 0)
-    degree_w_expanded = int(rec.get("degree_w_expanded") or 0) or max(degree_w, 1)
-    target_degree_w = int(rec.get("target_degree_w") or 0)
-    total_work_count = float(getattr(label, "total_work_count", 1e6) or 1e6)
-    idf_backbone = _idf_backbone(total_work_count, degree_w_expanded)
-    idf_val = _smoothed_idf(degree_w, idf_backbone)
-    purity = target_degree_w / degree_w_expanded if degree_w_expanded else 0.0
-    sim = max(0.0, float(rec.get("sim_score") or 0.0))
-    quality = idf_val * (0.5 + 0.5 * purity) * (0.5 + 0.5 * min(1.0, sim))
-    return max(0.0, min(1.0, quality))
+    """质量分：仅用于 debug，不进入 final_score。0.50*semantic + 0.30*topic_fit + 0.20*anchor_bonus。"""
+    semantic = float(rec.get("identity_score") or rec.get("sim_score") or 0.0)
+    topic_fit = float(rec.get("topic_fit") or rec.get("subfield_fit") or 0.5)
+    anchor_bonus = min(1.0, 0.6 + 0.1 * int(rec.get("anchor_count") or 0))
+    return 0.50 * semantic + 0.30 * topic_fit + 0.20 * anchor_bonus
 
 
 def get_topic_weight_by_role(term_role: str) -> float:
@@ -704,9 +704,9 @@ def _get_expansion_penalty(rec: Dict[str, Any]) -> float:
 
 def compose_term_final_score(rec: Dict[str, Any]) -> float:
     """
+    Deprecated in Stage3 mainline. Stage3 唯一主分由 hierarchy_guard.score_term_record 承担；
+    此函数仅保留兼容旧实验，不再被 Stage3 主链调用。
     final_score = base_score * source_weight * domain_gate * task_consistency * role_penalty * expansion_penalty
-    其中：source_weight 看来源；domain_gate 看三层领域匹配；task_consistency 看 JD 语义+强锚点共振；
-    role_penalty 看是否任务核心/抽象/载体/噪声；expansion_penalty 对 cluster/cooc 额外惩罚。
     """
     identity = float(rec.get("identity_score") or 0.0)
     quality = float(rec.get("quality_score") or 0.0)

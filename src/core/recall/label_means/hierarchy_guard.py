@@ -425,19 +425,52 @@ def compute_family_centrality(rec: Dict[str, Any], family_members: list) -> floa
 # ---------- Stage3 硬过滤与 term 打分 ----------
 
 
+def _get_topic_like_fit(rec: Dict[str, Any]) -> float:
+    """topic_fit 退化：topic_fit → subfield_fit → field_fit → domain_fit。"""
+    topic_fit = rec.get("topic_fit")
+    if topic_fit is None:
+        topic_fit = rec.get("subfield_fit")
+    if topic_fit is None:
+        topic_fit = rec.get("field_fit")
+    if topic_fit is None:
+        topic_fit = rec.get("domain_fit")
+    return float(topic_fit or 0.0)
+
+
 def should_drop_term(record: Dict[str, Any]) -> Tuple[bool, str]:
     """
-    只做极少数硬过滤，不做领域词硬编码。
-    规则 1：outside_subfield_mass > 0.97 且 topic_fit < 0.02
-    规则 2：cluster 来源且 family_centrality < 0.2 视为弱簇噪声
+    轻硬过滤：primary-like 主落点只能软惩罚，不能硬删。
+    仅两条规则，且只对「非 primary-like」生效：
+    1）明显错域离群：outside_subfield > 0.97 且 topic_fit < 0.02
+    2）极弱证据噪声：anchor_count<=1 且 evidence_count<=1 且 path_topic<0.15
     """
-    if record.get("outside_subfield_mass", 1.0) is not None and record.get("topic_fit", 0.0) is not None:
-        if (record.get("outside_subfield_mass") or 1.0) > 0.97 and (record.get("topic_fit") or 0.0) < 0.02:
-            return True, "outside_subfield_mass_too_high"
-    if (record.get("source") or record.get("origin") or "").strip().lower() in ("cluster_expansion", "cluster"):
-        fc = record.get("family_centrality")
-        if fc is not None and float(fc) < 0.2:
-            return True, "weak_cluster_noise"
+    outside_subfield = float(record.get("outside_subfield_mass") or 0.0)
+    topic_fit = _get_topic_like_fit(record)
+    source_type = (record.get("source_type") or record.get("source") or record.get("origin") or "").strip().lower()
+    term_role = (record.get("term_role") or "").strip().lower()
+    is_primary_like = (
+        bool(record.get("has_primary_role"))
+        or term_role == "primary"
+        or source_type == "similar_to"
+        or int(record.get("anchor_count") or 0) >= 2
+    )
+
+    if outside_subfield > 0.97 and topic_fit < 0.02:
+        if not is_primary_like:
+            return True, "outside_subfield_and_no_topic_fit"
+
+    anchor_count = int(record.get("anchor_count") or 0)
+    evidence_count = int(record.get("evidence_count") or 0)
+    path_topic = float(record.get("path_topic_consistency") or 0.0)
+    if path_topic <= 0.0:
+        subfield_fit = record.get("subfield_fit")
+        if subfield_fit is None:
+            subfield_fit = record.get("field_fit")
+        if subfield_fit is None:
+            subfield_fit = record.get("domain_fit")
+        path_topic = 0.55 * topic_fit + 0.35 * float(subfield_fit or 0.0)
+    if anchor_count <= 1 and evidence_count <= 1 and path_topic < 0.15 and not is_primary_like:
+        return True, "weak_evidence_noise"
     return False, ""
 
 
@@ -454,60 +487,89 @@ def _hierarchy_score_for_term(record: Dict[str, Any], fit_info: Dict[str, Any]) 
     return 0.4 * domain_fit + 0.3 * field_fit + 0.3 * subfield_fit
 
 
+def _get_subfield_like_fit(rec: Dict[str, Any]) -> float:
+    """subfield_fit 退化：subfield_fit → field_fit → domain_fit。"""
+    subfield_fit = rec.get("subfield_fit")
+    if subfield_fit is None:
+        subfield_fit = rec.get("field_fit")
+    if subfield_fit is None:
+        subfield_fit = rec.get("domain_fit")
+    return float(subfield_fit or 0.5)
+
+
+def _get_topic_like_fit_eff(rec: Dict[str, Any]) -> float:
+    """topic_fit 退化：topic_fit → subfield_fit → field_fit → domain_fit。"""
+    topic_fit = rec.get("topic_fit")
+    if topic_fit is None:
+        topic_fit = rec.get("subfield_fit")
+    if topic_fit is None:
+        topic_fit = rec.get("field_fit")
+    if topic_fit is None:
+        topic_fit = rec.get("domain_fit")
+    return float(topic_fit or 0.5)
+
+
 def score_term_record(record: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
     """
-    Stage3 最终分只保留 4 类正交量，避免重复风险建模：
-    base_score、path_topic_consistency、generic_penalty、cross_anchor_factor。
-    cluster_cohesion、semantic_drift_risk、outside_subfield_mass、outside_topic_mass 不参与计算，仅写入 explain 供 debug。
+    Stage3 唯一主分函数。path_topic_consistency 吸收 primary-like 身份；generic_penalty 只轻惩罚不杀穿主干。
+    final = base_score * gate * cross_anchor_factor，gate = 0.75 + 0.15*path_topic_consistency + 0.10*generic_penalty。
     """
-    identity_score = float(record.get("identity_score") or record.get("sim_score") or 0.0)
-    quality_score = float(record.get("quality_score") if record.get("quality_score") is not None else 0.5)
-    role = (record.get("term_role") or "").strip().lower()
-    if role == "primary":
-        base_score = 0.7 * identity_score + 0.3 * quality_score
-    elif role in ("dense_expansion", "cluster_expansion"):
-        base_score = 0.4 * identity_score + 0.6 * quality_score
-    elif role == "cooc_expansion":
-        base_score = 0.3 * identity_score + 0.7 * quality_score
-    else:
-        base_score = 0.5 * identity_score + 0.5 * quality_score
-
-    path_match = float(record.get("path_match") if record.get("path_match") is not None else 0.5)
-    topic_fit_raw = record.get("topic_fit")
-    topic_fit = float(topic_fit_raw) if topic_fit_raw is not None else 0.5
-    path_topic_consistency = (0.5 + 0.5 * max(0, min(1, path_match))) * (0.5 + 0.5 * max(0, min(1, topic_fit)))
-
-    genericity_penalty = record.get("genericity_penalty")
-    if genericity_penalty is None:
-        work_count = record.get("work_count") or 0
-        domain_span = record.get("domain_span") or 0
-        genericity_penalty = compute_generic_penalty(work_count, domain_span)
-    else:
-        genericity_penalty = float(genericity_penalty)
-
-    cross_anchor = float(record.get("cross_anchor_evidence") if record.get("cross_anchor_evidence") is not None else 1.0)
-    cross_anchor_factor = 0.5 + 0.5 * max(0, min(1, cross_anchor))
-
-    final_score = base_score * path_topic_consistency * genericity_penalty * cross_anchor_factor
-
+    semantic = float(record.get("identity_score") or record.get("sim_score") or 0.0)
+    context = float(record.get("quality_score") or 0.0)
+    subfield_fit_eff = _get_subfield_like_fit(record)
+    topic_fit_eff = _get_topic_like_fit_eff(record)
+    source_count = len(record.get("source_types") or [])
+    multi_source_support = min(1.0, 0.5 + 0.25 * source_count)
+    base_score = (
+        0.35 * semantic
+        + 0.20 * context
+        + 0.20 * subfield_fit_eff
+        + 0.15 * topic_fit_eff
+        + 0.10 * multi_source_support
+    )
+    source_type = (record.get("source_type") or record.get("source") or record.get("origin") or "").strip().lower()
+    is_primary_like = (
+        bool(record.get("has_primary_role"))
+        or (record.get("term_role") or "").strip().lower() == "primary"
+        or source_type == "similar_to"
+        or int(record.get("anchor_count") or 0) >= 2
+    )
+    primary_bonus = 1.0 if record.get("has_primary_role") else 0.0
+    similar_bonus = 1.0 if source_type == "similar_to" else 0.0
+    anchor_bonus = min(1.0, int(record.get("anchor_count") or 0) / 2.0)
+    path_topic_consistency = (
+        0.45 * topic_fit_eff
+        + 0.30 * subfield_fit_eff
+        + 0.15 * primary_bonus
+        + 0.05 * similar_bonus
+        + 0.05 * anchor_bonus
+    )
+    if is_primary_like:
+        path_topic_consistency = max(path_topic_consistency, 0.45)
+    path_topic_consistency = min(1.0, max(0.0, path_topic_consistency))
+    record["path_topic_consistency"] = path_topic_consistency
+    outside = float(record.get("outside_subfield_mass") or 0.0)
+    generic_penalty = 1.00 - 0.12 * min(1.0, outside)
+    if is_primary_like:
+        generic_penalty = max(generic_penalty, 0.90)
+    if int(record.get("anchor_count") or 0) >= 2:
+        generic_penalty = max(generic_penalty, 0.92)
+    generic_penalty = min(1.00, max(0.82, generic_penalty))
+    cross_anchor_factor = float(record.get("cross_anchor_evidence") or 1.0)
+    cross_anchor_factor = min(1.10, max(0.90, cross_anchor_factor))
+    gate = 0.75 + 0.15 * path_topic_consistency + 0.10 * generic_penalty
+    final_score = base_score * gate * cross_anchor_factor
     explain = {
         "base_score": base_score,
         "path_topic_consistency": path_topic_consistency,
-        "generic_penalty": genericity_penalty,
+        "generic_penalty": generic_penalty,
         "cross_anchor_factor": cross_anchor_factor,
         "final_score": final_score,
-        "reject_reason": "",
+        "semantic_drift_risk": float(record.get("semantic_drift_risk") or 0.0),
+        "outside_subfield_mass": outside,
+        "outside_topic_mass": float(record.get("outside_topic_mass") or 0.0),
+        "family_centrality": float(record.get("family_centrality") or 0.0),
     }
-    if record.get("outside_subfield_mass") is not None:
-        explain["outside_subfield_mass"] = record["outside_subfield_mass"]
-    if record.get("outside_topic_mass") is not None:
-        explain["outside_topic_mass"] = record["outside_topic_mass"]
-    if record.get("main_subfield_match") is not None:
-        explain["main_subfield_match"] = record["main_subfield_match"]
-    if record.get("cluster_cohesion") is not None:
-        explain["cluster_cohesion"] = record["cluster_cohesion"]
-    if record.get("semantic_drift_risk") is not None:
-        explain["semantic_drift_risk"] = record["semantic_drift_risk"]
     return final_score, explain
 
 
