@@ -17,69 +17,43 @@ from config import (
     TOPIC_ALIGN_SUBFIELD,
     TOPIC_ALIGN_FIELD,
     TOPIC_ALIGN_NONE,
-    HIERARCHY_NORM_TOPIC,
-    HIERARCHY_NORM_SUBFIELD,
-    HIERARCHY_NORM_FIELD,
-    HIERARCHY_NORM_NONE,
-    HIERARCHY_IDENTITY_THRESHOLD,
-    HIERARCHY_IDENTITY_DISCOUNT,
-    DOMAIN_FIT_MIN_PRIMARY,
-    DOMAIN_FIT_MIN_PRIMARY_BROAD,
-    DOMAIN_FIT_MIN_EXPANSION,
-    DOMAIN_SPAN_MAX_EXPANSION,
-    PRIMARY_MIN_IDENTITY_HIGH_AMBIGUITY,
-    DOMAIN_FIT_HIGH_CONFIDENCE,
     TRUSTED_SOURCE_TYPES_FOR_DIFFUSION,
 )
 from src.core.recall.label_means.hierarchy_guard import (
-    allow_primary_to_expand,
-    compute_entropy,
     compute_hierarchical_fit,
     compute_purity,
-    score_landing_candidate,
 )
 from src.utils.domain_utils import DomainProcessor
 from src.core.recall.label_means.label_debug import debug_print
 
-# ---------- Stage2/3 保守常量：先跑通再精调 ----------
+# ---------- Stage2/3 保守常量：单一决策链，无冗余阈值（详见 README） ----------
 LABEL_EXPANSION_DEBUG = True  # 调试时打印 Stage2A/2B 流程
-PRIMARY_MIN_IDENTITY = 0.62
-IDENTITY_MARGIN = 0.08
-PRIMARY_MAX_PER_ANCHOR = 2  # 保守：每锚点最多 2 个 primary
-PRIMARY_TOP_M_PER_ANCHOR = 5  # 数据驱动 primary：每锚先保留 top-m 候选再全局一致性重排
-CONDITIONED_VEC_TOP_K = 12    # Stage2A 召回时用 gte+JD 上下文：每锚点 conditioned_vec 检索学术词 top-k，与 SIMILAR_TO 合并
-PRIMARY_HIGH_CONFIDENCE_THRESHOLD = 0.75  # Stage2B 仅高可信 primary 才参与 dense/cluster/cooc 扩散
-DENSE_MAX_PER_PRIMARY = 4   # Stage2B 每个 primary 最多 dense 近邻数
-CLUSTER_MAX_PER_PRIMARY = 3 # Stage2B 每个 primary 最多簇内支持词数
+PRIMARY_MIN_IDENTITY = 0.62       # Stage2A 准入：identity 下限（与 PRIMARY_MIN_PATH_MATCH 共同构成准入）
+PRIMARY_MAX_PER_ANCHOR = 2        # 每锚点最多 primary 数
+PRIMARY_TOP_M_PER_ANCHOR = 5      # 每锚先保留 top-m 候选再准入与冲突消解
+CONDITIONED_VEC_TOP_K = 12        # 每锚点 conditioned_vec 检索学术词 top-k，与 SIMILAR_TO 合并
+SEED_MIN_IDENTITY = 0.65         # Stage2B seed 准入：唯一常量，不与其他阈值叠加
+DENSE_MAX_PER_PRIMARY = 4
+CLUSTER_MAX_PER_PRIMARY = 3
 COOC_SUPPORT_MIN_FREQ = 2
 COOC_MAX_PER_PRIMARY = 2
 
-# ---------- 数据驱动 primary 打分权重（零硬编码：由锚点-候选-JD-层级-邻域一致性决定） ----------
-PRIMARY_W_EDGE_AFFINITY = 0.20   # edge_affinity = identity/semantic_score
-PRIMARY_W_ANCHOR_ALIGN = 0.20    # conditioned_anchor_align 或 semantic_score（与锚点/条件化锚点语义）
-PRIMARY_W_JD_ALIGN = 0.25        # jd_candidate_alignment（与 JD 整体向量）
-PRIMARY_W_HIERARCHY = 0.20      # hierarchical_consistency（domain/subfield/topic fit）
-PRIMARY_W_NEIGHBORHOOD = 0.05    # local_neighborhood_consistency（与其它候选成团）
-PRIMARY_W_MULTI_ANCHOR = 0.10   # multi_anchor_support（与其它锚点条件化表示一致性）
-PRIMARY_W_ISOLATION = 0.15       # semantic_isolation_penalty 惩罚（离群则减分）
-
-# ---------- 第一轮改造：Stage2A 三层领域准入与裁判（三层领域从“打分项”升级为“主落点准入门槛”） ----------
-USE_HIERARCHY_PRIMARY_ADMISSION = True  # 为 True 时启用 check_primary_admission + resolve_anchor_local_conflicts
-PRIMARY_MIN_TOPIC_OVERLAP_SIMILAR = 0.20
-PRIMARY_MIN_SUBFIELD_OVERLAP_SIMILAR = 0.35
-PRIMARY_MIN_PATH_MATCH_SIMILAR = 0.40
-PRIMARY_MIN_TOPIC_OVERLAP_CONDVEC = 0.30
-PRIMARY_MIN_PATH_MATCH_CONDVEC = 0.50
-PRIMARY_LOW_IDENTITY_RESCUE_TOPIC = 0.45
-PRIMARY_LOW_IDENTITY_RESCUE_JD_ALIGN = 0.80
-PRIMARY_LOW_IDENTITY_RESCUE_SEMANTIC = 0.78
-PRIMARY_RESCUE_CROSS_ANCHOR_MIN = 2
+# ---------- Stage2A 准入：仅两个门槛 + source 折扣，不再按 source 分多套阈值 ----------
+PRIMARY_MIN_HIERARCHY_MATCH = 0.30   # hierarchy_match = 0.4*topic + 0.4*path + 0.2*subfield，effective = hierarchy_match * source_factor
+PRIMARY_MIN_PATH_MATCH = 0.35
+CONDVEC_SOURCE_FACTOR = 0.85         # conditioned_vec 来源时 effective_hierarchy = hierarchy_match * 0.85；similar_to = 1.0
+PRIMARY_RESCUE_CROSS_ANCHOR_MIN = 2  # rescue：多锚支持 + path/jd/semantic 足够时可准入
 PRIMARY_RESCUE_PATH_MATCH_MIN = 0.45
+PRIMARY_RESCUE_JD_ALIGN_MIN = 0.80
+PRIMARY_RESCUE_SEMANTIC_MIN = 0.78
 HIERARCHY_LEVEL_TOPIC_EXACT = "topic_exact"
 HIERARCHY_LEVEL_SUBFIELD_MATCH = "subfield_match"
 HIERARCHY_LEVEL_FIELD_ONLY = "field_only"
 HIERARCHY_LEVEL_OFF_PATH = "off_path"
-TOPIC_SPAN_PENALTY_FACTOR = 0.2   # topic_span_penalty = 1/(1 + factor * max(0, span-1))
+TOPIC_SPAN_PENALTY_FACTOR = 0.2   # 泛化软惩罚：topic_span_penalty = 1/(1 + factor * max(0, span-1))
+DOMAIN_SPAN_EXTREME = 24          # support 扩散仅在极端异常时硬拒绝（>24）；泛化主要由 topic_span_penalty 表达
+SUPPORT_MIN_DOMAIN_FIT = 0.20     # Stage2B support 准入：domain_fit 低于此不进词池（唯一 support 门槛）
+# ---------- Primary 排序：只保留一套权重（PRIMARY_SCORE_W_*），不再使用 PRIMARY_W_* ----------
 PRIMARY_SCORE_W_SEMANTIC = 0.22
 PRIMARY_SCORE_W_IDENTITY = 0.18
 PRIMARY_SCORE_W_JD_ALIGN = 0.18
@@ -991,68 +965,33 @@ def query_expansion_with_topology(label, v_ids, regex):
 # ---------- Stage2A：学术落点（跨类型 SIMILAR_TO 为主，可选 JD 向量） ----------
 
 
-# 高歧义锚点：缩写(acronym)、泛任务词(generic_task_term) 做 primary 时需更高 identity 门槛，避免歧义落点
+# 仅用于 debug 打印标签 [高歧义]，不参与准入或打分
 HIGH_AMBIGUITY_ANCHOR_TYPES = frozenset({"acronym", "generic_task_term"})
-# 泛概念/宽锚点（broad_concept）：做 primary 时 domain_fit 要求更高，不允许“单独触发”低领域一致性的 primary
-BROAD_CONCEPT_ANCHOR_TYPES = frozenset({"generic_task_term"})
-
-def _get_primary_domain_span(label, vid: int) -> int:
-    """查 vocabulary_domain_stats 得 domain_span，用于高可信 primary 结构约束。"""
-    if not getattr(label, "stats_conn", None):
-        return 0
-    try:
-        row = label.stats_conn.execute(
-            "SELECT domain_span FROM vocabulary_domain_stats WHERE voc_id=?",
-            (vid,),
-        ).fetchone()
-        return int(row[0]) if row and row[0] is not None else 0
-    except Exception:
-        return 0
 
 
-def _is_high_confidence_primary(
+def check_seed_eligibility(
     label,
     p: "PrimaryLanding",
-    identity_threshold: float,
-    domain_fit_threshold: float,
-    trusted_sources: Tuple[str, ...],
-    domain_span_max: int,
-) -> bool:
+    jd_profile: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, float]:
     """
-    高可信 primary 判定：identity、domain_fit、source、domain_span 等结构约束均满足方可参与扩散。
-    仅高可信 primary 才参与 Stage2B dense/cluster/cooc 扩散。
+    Stage2B 唯一 seed 决策入口：只保留一层。eligible = identity≥SEED_MIN_IDENTITY 且 source∈可信；
+    seed_score = primary_score * (0.7+0.3*path_match) * genericity_penalty。
+    不再调用 allow_primary_to_expand，无二次审批。
+    返回 (eligible, seed_score)。
     """
-    ok, _ = _is_high_confidence_primary_reason(
-        label, p, identity_threshold, domain_fit_threshold, trusted_sources, domain_span_max
-    )
-    return ok
-
-
-def _is_high_confidence_primary_reason(
-    label,
-    p: "PrimaryLanding",
-    identity_threshold: float,
-    domain_fit_threshold: float,
-    trusted_sources: Tuple[str, ...],
-    domain_span_max: int,
-) -> Tuple[bool, List[str]]:
-    """
-    同 _is_high_confidence_primary，但返回 (是否通过, 未通过时的原因列表)。
-    用于打印 Seed Eligibility 时标明每条不满足的维度。
-    """
-    reasons = []
-    if getattr(p, "identity_score", 0.0) < identity_threshold:
-        reasons.append(f"identity={getattr(p, 'identity_score', 0):.3f}<{identity_threshold}")
-    if getattr(p, "domain_fit", 1.0) < domain_fit_threshold:
-        reasons.append(f"domain_fit={getattr(p, 'domain_fit', 0):.3f}<{domain_fit_threshold}")
+    identity = getattr(p, "identity_score", 0.0) or 0.0
     src = (getattr(p, "source", "") or "").strip().lower()
-    trusted_set = {s.strip().lower() for s in trusted_sources if s}
+    trusted_set = {s.strip().lower() for s in TRUSTED_SOURCE_TYPES_FOR_DIFFUSION if s}
+    if identity < SEED_MIN_IDENTITY:
+        return False, 0.0
     if trusted_set and src not in trusted_set:
-        reasons.append(f"source={src!r} not in trusted")
-    domain_span = _get_primary_domain_span(label, p.vid)
-    if domain_span > domain_span_max:
-        reasons.append(f"domain_span={domain_span}>{domain_span_max}")
-    return (len(reasons) == 0, reasons)
+        return False, 0.0
+    primary_score = getattr(p, "primary_score", identity) or identity
+    path_match = float(getattr(p, "path_match", 0) or 0)
+    genericity_penalty = float(getattr(p, "topic_span_penalty", 1.0) or 1.0)
+    seed_score = primary_score * (0.7 + 0.3 * path_match) * genericity_penalty
+    return True, seed_score
 
 
 def _anchor_skills_to_prepared_anchors(label, anchor_skills: Dict[str, Any]) -> List[PreparedAnchor]:
@@ -1306,7 +1245,6 @@ def _retrieve_academic_terms_by_conditioned_vec(
 
 
 # ---------- Identity Gate：候选与锚点“本义”一致性，用于压制错义（propulsion/kinesics/simula 等） ----------
-IDENTITY_GATE_BETA = 0.08   # primary 最终分上的 anchor_identity 小幅正向 bonus
 # 软闸门：identity_score -> gate 乘数，不硬删
 IDENTITY_GATE_THRESHOLDS = [(0.75, 1.00), (0.55, 0.90), (0.35, 0.72)]  # (min_score, gate); else 0.45
 # 错义/泛词惩罚：candidate 为这些词时 identity 压低（与锚点无稳定 lexical family 时不得过高）
@@ -1515,13 +1453,14 @@ def collect_landing_candidates(
             setattr(c, "topic_fit", fit_info.get("topic_fit", 0))
             setattr(c, "outside_subfield_mass", fit_info.get("outside_subfield_mass", 0))
             setattr(c, "outside_topic_mass", fit_info.get("outside_topic_mass", 0))
-            setattr(c, "topic_entropy", compute_entropy(snap.get("topic_dist") or {}))
+            setattr(c, "topic_entropy", 0.0)
             fit_info["subfield_dist"] = snap.get("subfield_dist") or {}
             fit_info["topic_dist"] = snap.get("topic_dist") or {}
-            cand_dict = {"fit_info": fit_info, "work_count": snap.get("work_count"), "domain_span": snap.get("domain_span")}
-            land_score, _ = score_landing_candidate(
-                cand_dict, {"term": anchor.anchor}, jd_profile, c.semantic_score, 1.0
-            )
+            # 内联 landing 排序分：仅用于 top-m 排序，不依赖 hierarchy_guard 旧体系
+            df = fit_info.get("domain_fit") or 0.5
+            span = int(snap.get("domain_span") or 0)
+            genericity = 1.0 / (1.0 + TOPIC_SPAN_PENALTY_FACTOR * max(0, span - 1))
+            land_score = (c.semantic_score or 0) * (0.5 + 0.5 * df) * genericity
             setattr(c, "landing_score", land_score)
             # 零硬编码：不再用 subfield_fit/topic_fit/outside_subfield_mass 硬门槛一票否决；
             # 层级信息仅参与 landing_score，最终由 primary_score（含 jd_align、neighborhood、isolation）统一排序
@@ -1688,32 +1627,6 @@ def _compute_conditioned_anchor_align_and_multi_anchor_support(
         setattr(c, "multi_anchor_support", max(0.0, min(1.0, multi_support)))
 
 
-def _primary_score_data_driven(c: LandingCandidate, hierarchy_norm: float) -> float:
-    """数据驱动 primary 综合分（base）：edge + conditioned_anchor_align + jd_align + hierarchy + neighborhood + multi_anchor_support - isolation。
-    不在本函数内乘 identity_gate，由调用方统一做 base * identity_gate * (1 + beta * anchor_identity_score)。
-    """
-    edge = max(0.0, min(1.0, getattr(c, "semantic_score", 0) or 0))
-    anchor_align = getattr(c, "conditioned_anchor_align", None)
-    if anchor_align is None:
-        anchor_align = edge
-    else:
-        anchor_align = max(0.0, min(1.0, float(anchor_align)))
-    jd_align = max(0.0, min(1.0, getattr(c, "jd_candidate_alignment", 0.5) or 0.5))
-    hierarchy = max(0.0, min(1.0, hierarchy_norm))
-    neighborhood = max(0.0, min(1.0, getattr(c, "neighborhood_consistency", 0.5) or 0.5))
-    multi_anchor = max(0.0, min(1.0, getattr(c, "multi_anchor_support", 0.5) or 0.5))
-    isolation = max(0.0, min(1.0, getattr(c, "semantic_isolation_penalty", 0) or 0))
-    return (
-        PRIMARY_W_EDGE_AFFINITY * edge
-        + PRIMARY_W_ANCHOR_ALIGN * anchor_align
-        + PRIMARY_W_JD_ALIGN * jd_align
-        + PRIMARY_W_HIERARCHY * hierarchy
-        + PRIMARY_W_NEIGHBORHOOD * neighborhood
-        + PRIMARY_W_MULTI_ANCHOR * multi_anchor
-        - PRIMARY_W_ISOLATION * isolation
-    )
-
-
 def score_academic_identity(c: LandingCandidate) -> float:
     """身份分：当前 Stage2A 仅 similar_to，用边权；若未来接入 jd_vector 则用 0.5+0.5*semantic_score。"""
     if c.source == "similar_to":
@@ -1721,67 +1634,6 @@ def score_academic_identity(c: LandingCandidate) -> float:
     if c.source == "jd_vector":
         return 0.5 + 0.5 * max(0.0, min(1.0, c.semantic_score))
     return 0.5 + 0.5 * max(0.0, min(1.0, c.semantic_score))
-
-
-def select_primary_academic_landings(
-    candidates: List[LandingCandidate],
-    anchor_vid: int,
-    min_identity: float = PRIMARY_MIN_IDENTITY,
-    identity_margin: float = IDENTITY_MARGIN,
-    max_per_anchor: int = PRIMARY_MAX_PER_ANCHOR,
-    domain_fit_min: float = None,
-) -> List[PrimaryLanding]:
-    """保守：只留 identity 高且领先足够的；有 landing_score 时按 landing_score 排序；domain_fit 低于 domain_fit_min 禁止做 primary。"""
-    if domain_fit_min is None:
-        domain_fit_min = DOMAIN_FIT_MIN_PRIMARY
-    if not candidates:
-        return []
-    for c in candidates:
-        setattr(c, "identity_score", score_academic_identity(c))
-    sort_key = lambda x: (getattr(x, "landing_score", None) is not None, getattr(x, "landing_score", 0.0) or getattr(x, "identity_score", 0.0))
-    sorted_c = sorted(candidates, key=sort_key, reverse=True)
-    out = []
-    for i, c in enumerate(sorted_c):
-        sc = getattr(c, "identity_score", 0.0)
-        if sc < min_identity:
-            continue
-        df = getattr(c, "domain_fit", 1.0)
-        if df < domain_fit_min:
-            if LABEL_EXPANSION_DEBUG:
-                print(f"[Stage2A] 禁止 primary: vid={c.vid} term={c.term!r} domain_fit={df:.3f} < {domain_fit_min}")
-            continue
-        if i >= 1:
-            prev_score = getattr(sorted_c[i - 1], "identity_score", 0.0)
-            if prev_score - sc < identity_margin:
-                continue
-        if len(out) >= max_per_anchor:
-            break
-        p = PrimaryLanding(
-            vid=c.vid,
-            term=c.term,
-            identity_score=sc,
-            source=c.source,
-            anchor_vid=c.anchor_vid,
-            anchor_term=c.anchor_term,
-            domain_fit=df,
-        )
-        if getattr(c, "fit_info", None) is not None:
-            setattr(p, "fit_info", c.fit_info)
-            setattr(p, "subfield_fit", getattr(c, "subfield_fit", 0))
-            setattr(p, "topic_fit", getattr(c, "topic_fit", 0))
-            setattr(p, "outside_subfield_mass", getattr(c, "outside_subfield_mass", 0))
-            setattr(p, "topic_entropy", getattr(c, "topic_entropy", 0))
-            setattr(p, "landing_score", getattr(c, "landing_score", 0))
-        out.append(p)
-    if LABEL_EXPANSION_DEBUG:
-        print(f"[Stage2A] select_primary 候选数={len(candidates)} min_identity={min_identity} domain_fit_min={domain_fit_min} -> primary 数={len(out)}")
-        print("[Stage2A primary 胜出明细] tid | term | source | identity_score | domain_fit | landing_score | subfield_fit | topic_fit | 为何胜出(按 landing/identity 排序)")
-        for idx, p in enumerate(out):
-            land = getattr(p, "landing_score", None)
-            sf = getattr(p, "subfield_fit", None)
-            tf = getattr(p, "topic_fit", None)
-            print(f"  {idx+1} {p.vid} | {p.term!r} | {p.source} | identity={p.identity_score:.3f} domain_fit={getattr(p, 'domain_fit', 1):.3f} landing={land} subfield_fit={sf} topic_fit={tf}")
-    return out
 
 
 # ---------- Stage2B：学术侧补充（dense / 簇 / 共现，不再用 SIMILAR_TO 学术→学术） ----------
@@ -1841,7 +1693,7 @@ def expand_from_vocab_dense_neighbors(
                 jd_subfield_ids=jd_subfield_ids,
                 jd_topic_ids=jd_topic_ids,
             )
-            if domain_fit < DOMAIN_FIT_MIN_EXPANSION:
+            if domain_fit < SUPPORT_MIN_DOMAIN_FIT:
                 continue
             domain_span = 0
             if getattr(label, "stats_conn", None):
@@ -1851,7 +1703,7 @@ def expand_from_vocab_dense_neighbors(
                 ).fetchone()
                 if row:
                     domain_span = int(row[0] or 0)
-            if domain_span > DOMAIN_SPAN_MAX_EXPANSION:
+            if domain_span > DOMAIN_SPAN_EXTREME:
                 continue
             seen.add(tid)
             out.append(
@@ -1929,7 +1781,7 @@ def expand_from_cluster_members(
                 jd_subfield_ids=jd_subfield_ids,
                 jd_topic_ids=jd_topic_ids,
             )
-            if domain_fit < DOMAIN_FIT_MIN_EXPANSION:
+            if domain_fit < SUPPORT_MIN_DOMAIN_FIT:
                 continue
             domain_span = 0
             if getattr(label, "stats_conn", None):
@@ -1939,7 +1791,7 @@ def expand_from_cluster_members(
                 ).fetchone()
                 if row:
                     domain_span = int(row[0] or 0)
-            if domain_span > DOMAIN_SPAN_MAX_EXPANSION:
+            if domain_span > DOMAIN_SPAN_EXTREME:
                 continue
             seen.add(vid)
             out.append(
@@ -2022,7 +1874,7 @@ def expand_from_cooccurrence_support(
                 jd_subfield_ids=jd_subfield_ids,
                 jd_topic_ids=jd_topic_ids,
             )
-            if domain_fit < DOMAIN_FIT_MIN_EXPANSION:
+            if domain_fit < SUPPORT_MIN_DOMAIN_FIT:
                 continue
             domain_span = 0
             if getattr(label, "stats_conn", None):
@@ -2032,7 +1884,7 @@ def expand_from_cooccurrence_support(
                 ).fetchone()
                 if row:
                     domain_span = int(row[0] or 0)
-            if domain_span > DOMAIN_SPAN_MAX_EXPANSION:
+            if domain_span > DOMAIN_SPAN_EXTREME:
                 continue
             seen.add(vid_other)
             meta = label._vocab_meta.get(vid_other, ("", ""))
@@ -2494,7 +2346,7 @@ def check_primary_admission(
     cross_anchor_support_count: int,
 ) -> Tuple[bool, List[str], bool]:
     """
-    Stage2A 主落点准入：三层领域为必要条件之一，避免 propulsion/simula/kinesics/Data retrieval 等错词进 primary。
+    Stage2A 主落点准入：仅两个量 hierarchy_match、path_match + source 折扣；rescue 用统一下限。
     返回 (admitted, reasons, rescued)。
     """
     reasons = []
@@ -2502,27 +2354,23 @@ def check_primary_admission(
         return False, ["lexical_not_term"], False
     if hierarchy_evidence.get("hierarchy_level") == HIERARCHY_LEVEL_OFF_PATH:
         reasons.append("hierarchy_off_path")
-    src = (source_type or "").strip().lower()
-    if src == "similar_to":
-        hier_ok = (
-            hierarchy_evidence.get("topic_overlap", 0) >= PRIMARY_MIN_TOPIC_OVERLAP_SIMILAR
-            or hierarchy_evidence.get("subfield_overlap", 0) >= PRIMARY_MIN_SUBFIELD_OVERLAP_SIMILAR
-            or hierarchy_evidence.get("path_match", 0) >= PRIMARY_MIN_PATH_MATCH_SIMILAR
-        )
-        if not hier_ok:
-            reasons.append("similar_to_hierarchy_weak")
-    elif src == "conditioned_vec":
-        hier_ok = (
-            hierarchy_evidence.get("topic_overlap", 0) >= PRIMARY_MIN_TOPIC_OVERLAP_CONDVEC
-            or hierarchy_evidence.get("path_match", 0) >= PRIMARY_MIN_PATH_MATCH_CONDVEC
-        )
-        if not hier_ok:
-            reasons.append("condvec_hierarchy_weak")
+    topic = hierarchy_evidence.get("topic_overlap", 0)
+    subfield = hierarchy_evidence.get("subfield_overlap", 0)
+    path = hierarchy_evidence.get("path_match", 0)
+    has_jd_hierarchy = topic > 0 or subfield > 0 or path > 0
+    if has_jd_hierarchy:
+        hierarchy_match = 0.4 * topic + 0.4 * path + 0.2 * subfield
+        src = (source_type or "").strip().lower()
+        source_factor = CONDVEC_SOURCE_FACTOR if src == "conditioned_vec" else 1.0
+        effective_hierarchy = hierarchy_match * source_factor
+        if effective_hierarchy < PRIMARY_MIN_HIERARCHY_MATCH:
+            reasons.append("hierarchy_weak")
+        if path < PRIMARY_MIN_PATH_MATCH:
+            reasons.append("path_weak")
     if anchor_identity < 0.20:
         if not (
-            hierarchy_evidence.get("topic_overlap", 0) >= PRIMARY_LOW_IDENTITY_RESCUE_TOPIC
-            and jd_align >= PRIMARY_LOW_IDENTITY_RESCUE_JD_ALIGN
-            and semantic_score >= PRIMARY_LOW_IDENTITY_RESCUE_SEMANTIC
+            jd_align >= PRIMARY_RESCUE_JD_ALIGN_MIN
+            and semantic_score >= PRIMARY_RESCUE_SEMANTIC_MIN
         ):
             reasons.append("low_identity_not_rescued")
     is_generic = getattr(anchor_meta, "is_generic_anchor", False)
@@ -2532,9 +2380,9 @@ def check_primary_admission(
     if reasons:
         if (
             cross_anchor_support_count >= PRIMARY_RESCUE_CROSS_ANCHOR_MIN
-            and hierarchy_evidence.get("path_match", 0) >= PRIMARY_RESCUE_PATH_MATCH_MIN
-            and jd_align >= PRIMARY_LOW_IDENTITY_RESCUE_JD_ALIGN
-            and semantic_score >= PRIMARY_LOW_IDENTITY_RESCUE_SEMANTIC
+            and path >= PRIMARY_RESCUE_PATH_MATCH_MIN
+            and jd_align >= PRIMARY_RESCUE_JD_ALIGN_MIN
+            and semantic_score >= PRIMARY_RESCUE_SEMANTIC_MIN
         ):
             rescued = True
             reasons = []
@@ -2778,6 +2626,9 @@ def merge_primary_and_support_terms(
             setattr(e, "subfield_fit", p.subfield_fit)
         if getattr(p, "topic_fit", None) is not None:
             setattr(e, "topic_fit", p.topic_fit)
+        setattr(e, "field_fit", getattr(p, "field_fit", 0))
+        setattr(e, "path_match", getattr(p, "path_match", 0))
+        setattr(e, "genericity_penalty", getattr(p, "topic_span_penalty", 1.0))
         if getattr(p, "outside_subfield_mass", None) is not None:
             setattr(e, "outside_subfield_mass", p.outside_subfield_mass)
         if getattr(p, "outside_topic_mass", None) is not None:
@@ -2813,7 +2664,7 @@ def merge_primary_and_support_terms(
             c.target_degree_w = sum(expanded.get(str(d), 0) for d in active)
         c.topic_align, c.topic_level, c.topic_confidence = _attach_topic_align(label, c.vid, jd_f, jd_s, jd_t)
         c.domain_fit = _compute_domain_fit(label, c.vid, active_domain_set=active_domains, jd_field_ids=jd_field_ids, jd_subfield_ids=jd_subfield_ids, jd_topic_ids=jd_topic_ids)
-        if c.domain_fit < DOMAIN_FIT_MIN_EXPANSION or (getattr(c, "domain_span", 0) or 0) > DOMAIN_SPAN_MAX_EXPANSION:
+        if c.domain_fit < SUPPORT_MIN_DOMAIN_FIT or (getattr(c, "domain_span", 0) or 0) > DOMAIN_SPAN_EXTREME:
             continue
         if getattr(label, "voc_to_clusters", None):
             clusters = label.voc_to_clusters.get(int(c.vid)) or []
@@ -2840,7 +2691,7 @@ def merge_primary_and_support_terms(
             c.target_degree_w = sum(expanded.get(str(d), 0) for d in active)
         c.topic_align, c.topic_level, c.topic_confidence = _attach_topic_align(label, c.vid, jd_f, jd_s, jd_t)
         c.domain_fit = _compute_domain_fit(label, c.vid, active_domain_set=active_domains, jd_field_ids=jd_field_ids, jd_subfield_ids=jd_subfield_ids, jd_topic_ids=jd_topic_ids)
-        if c.domain_fit < DOMAIN_FIT_MIN_EXPANSION or (getattr(c, "domain_span", 0) or 0) > DOMAIN_SPAN_MAX_EXPANSION:
+        if c.domain_fit < SUPPORT_MIN_DOMAIN_FIT or (getattr(c, "domain_span", 0) or 0) > DOMAIN_SPAN_EXTREME:
             continue
         if getattr(label, "voc_to_clusters", None):
             clusters = label.voc_to_clusters.get(int(c.vid)) or []
@@ -2867,7 +2718,7 @@ def merge_primary_and_support_terms(
             c.target_degree_w = sum(expanded.get(str(d), 0) for d in active)
         c.topic_align, c.topic_level, c.topic_confidence = _attach_topic_align(label, c.vid, jd_f, jd_s, jd_t)
         c.domain_fit = _compute_domain_fit(label, c.vid, active_domain_set=active_domains, jd_field_ids=jd_field_ids, jd_subfield_ids=jd_subfield_ids, jd_topic_ids=jd_topic_ids)
-        if c.domain_fit < DOMAIN_FIT_MIN_EXPANSION or (getattr(c, "domain_span", 0) or 0) > DOMAIN_SPAN_MAX_EXPANSION:
+        if c.domain_fit < SUPPORT_MIN_DOMAIN_FIT or (getattr(c, "domain_span", 0) or 0) > DOMAIN_SPAN_EXTREME:
             continue
         if getattr(label, "voc_to_clusters", None):
             clusters = label.voc_to_clusters.get(int(c.vid)) or []
@@ -2955,8 +2806,8 @@ def stage2_generate_academic_terms(
     primary_landings_by_anchor: Dict[int, List[PrimaryLanding]] = {}
     evidence_table: List[Dict[str, Any]] = []
 
-    if USE_HIERARCHY_PRIMARY_ADMISSION and flat_pool and (jd_f or jd_s or jd_t):
-        # 第一轮改造：三层领域准入 + 锚点内冲突消解，再生成 primary_landings
+    if flat_pool:
+        # 唯一 primary 链：准入(check_primary_admission) -> 打分(compute_primary_score) -> 冲突消解(resolve_anchor_local_conflicts) -> primary_landings
         by_term_cross: Dict[Tuple[int, str], Set[int]] = {}
         for a, c in flat_pool:
             key = (c.vid, (c.term or "").strip())
@@ -3020,6 +2871,10 @@ def stage2_generate_academic_terms(
                 setattr(p, "primary_score", getattr(c, "primary_score", 0))
                 setattr(p, "anchor_identity_score", getattr(c, "anchor_identity_score", 0.5))
                 setattr(p, "identity_gate", getattr(c, "identity_gate", 1.0))
+                ev = getattr(c, "hierarchy_evidence", {}) or {}
+                setattr(p, "field_fit", ev.get("field_overlap", 0))
+                setattr(p, "path_match", ev.get("path_match", 0))
+                setattr(p, "topic_span_penalty", ev.get("topic_span_penalty", 1.0))
                 if getattr(c, "fit_info", None) is not None:
                     setattr(p, "fit_info", c.fit_info)
                     setattr(p, "subfield_fit", getattr(c, "subfield_fit", 0))
@@ -3054,63 +2909,6 @@ def stage2_generate_academic_terms(
                 "identity_gate": getattr(c, "identity_gate", 1.0),
                 "base_primary_score": getattr(c, "primary_score", 0),
                 "primary_score": getattr(c, "primary_score", 0),
-            })
-    else:
-        # 原有逻辑：hierarchy_norm + 统一 primary_score + 按锚点选 primary
-        # hierarchy_norm：优先用 candidate 上的 hierarchy_level（保守映射：topic=0.75, subfield=0.45, field=0.20, none=0.05），否则用 domain_fit + subfield_fit/topic_fit
-        def _hierarchy_norm(c: LandingCandidate) -> float:
-            level = getattr(c, "hierarchy_level", None)
-            if level == "topic":
-                return HIERARCHY_NORM_TOPIC
-            if level == "subfield":
-                return HIERARCHY_NORM_SUBFIELD
-            if level == "field":
-                return HIERARCHY_NORM_FIELD
-            if level == "none":
-                return HIERARCHY_NORM_NONE
-            df = getattr(c, "domain_fit", 1.0) or 1.0
-            sf = getattr(c, "subfield_fit", None)
-            tf = getattr(c, "topic_fit", None)
-            if sf is not None and tf is not None:
-                return 0.5 * df + 0.25 * max(0, float(sf)) + 0.25 * max(0, float(tf))
-            return max(0.0, min(1.0, float(df)))
-        evidence_table.clear()
-        for anchor, c in flat_pool:
-            hierarchy_n = _hierarchy_norm(c)
-            anchor_id = getattr(c, "anchor_identity_score", 0.5)
-            if anchor_id < HIERARCHY_IDENTITY_THRESHOLD:
-                hierarchy_n = hierarchy_n * HIERARCHY_IDENTITY_DISCOUNT
-            base_primary = _primary_score_data_driven(c, hierarchy_n)
-            identity_gate = getattr(c, "identity_gate", 1.0)
-            ps = base_primary * identity_gate * (1.0 + IDENTITY_GATE_BETA * anchor_id)
-            anchor_prior = getattr(anchor, "source_weight", 1.0)
-            ps = ps * anchor_prior
-            setattr(c, "primary_score", ps)
-            setattr(c, "base_primary_score", base_primary)
-            anchor_align_val = getattr(c, "conditioned_anchor_align", None)
-            if anchor_align_val is None:
-                anchor_align_val = getattr(c, "semantic_score", 0)
-            evidence_table.append({
-                "anchor": anchor.anchor,
-                "anchor_vid": anchor.vid,
-                "candidate": c.term,
-                "tid": c.vid,
-                "source": getattr(c, "source", "") or "",
-                "semantic_score": getattr(c, "semantic_score", 0) or 0,
-                "edge_affinity": getattr(c, "identity_score", 0),
-                "anchor_align": anchor_align_val,
-                "conditioned_anchor_align": getattr(c, "conditioned_anchor_align", None),
-                "multi_anchor_support": getattr(c, "multi_anchor_support", 0.5),
-                "jd_align": getattr(c, "jd_candidate_alignment", 0.5),
-                "hierarchy_consistency": hierarchy_n,
-                "neighborhood_consistency": getattr(c, "neighborhood_consistency", 0.5),
-                "isolation_penalty": getattr(c, "semantic_isolation_penalty", 0),
-                "polysemy_risk": getattr(c, "outside_subfield_mass", 0.5) or 0.5,
-                "specificity_prior": 0.5,
-                "anchor_identity_score": anchor_id,
-                "identity_gate": identity_gate,
-                "base_primary_score": base_primary,
-                "primary_score": ps,
             })
     if getattr(label, "debug_info", None) is not None:
         label.debug_info.stage2_anchor_evidence_table = evidence_table
@@ -3198,46 +2996,6 @@ def stage2_generate_academic_terms(
             print(f"  {anc:14s} | {cand!r}({row.get('tid')}) | edge={row['edge_affinity']:.3f} | cond={cond_s} | multi={row.get('multi_anchor_support', 0.5):.3f} | jd={row['jd_align']:.3f} | hier={row['hierarchy_consistency']:.3f} | neigh={row['neighborhood_consistency']:.3f} | isol={row['isolation_penalty']:.3f} | primary={row['primary_score']:.3f}")
         if len(evidence_table) > 40:
             print(f"  ... 共 {len(evidence_table)} 条")
-        # 按锚点选 primary：每锚按 primary_score 排序，满足 min_identity 与 domain_fit_min 的取前 max_per_anchor 个
-        for anchor in prepared_anchors:
-            anchor_type_lower = (getattr(anchor, "anchor_type", "") or "").strip().lower()
-            is_high_ambiguity = anchor_type_lower in HIGH_AMBIGUITY_ANCHOR_TYPES
-            min_identity = float(PRIMARY_MIN_IDENTITY_HIGH_AMBIGUITY) if is_high_ambiguity else PRIMARY_MIN_IDENTITY
-            domain_fit_min = float(DOMAIN_FIT_MIN_PRIMARY_BROAD) if anchor_type_lower in BROAD_CONCEPT_ANCHOR_TYPES else DOMAIN_FIT_MIN_PRIMARY
-            pool_for_anchor = [(a, c) for (a, c) in flat_pool if a.vid == anchor.vid]
-            # primary 先选非 secondary_only，再按 primary_score 降序
-            pool_for_anchor.sort(
-                key=lambda x: (getattr(x[1], "primary_cap", None) == "secondary_only", -(getattr(x[1], "primary_score", 0.0) or 0)),
-            )
-            primary_landings = []
-            for _, c in pool_for_anchor:
-                if getattr(c, "identity_score", 0) < min_identity:
-                    continue
-                if getattr(c, "domain_fit", 1.0) < domain_fit_min:
-                    continue
-                if len(primary_landings) >= PRIMARY_MAX_PER_ANCHOR:
-                    break
-                p = PrimaryLanding(
-                    vid=c.vid,
-                    term=c.term,
-                    identity_score=getattr(c, "identity_score", 0),
-                    source=c.source,
-                    anchor_vid=c.anchor_vid,
-                    anchor_term=c.anchor_term,
-                    domain_fit=getattr(c, "domain_fit", 1.0),
-                )
-                setattr(p, "primary_score", getattr(c, "primary_score", getattr(c, "identity_score", 0)))
-                setattr(p, "anchor_identity_score", getattr(c, "anchor_identity_score", 0.5))
-                setattr(p, "identity_gate", getattr(c, "identity_gate", 1.0))
-                if getattr(c, "fit_info", None) is not None:
-                    setattr(p, "fit_info", c.fit_info)
-                    setattr(p, "subfield_fit", getattr(c, "subfield_fit", 0))
-                    setattr(p, "topic_fit", getattr(c, "topic_fit", 0))
-                    setattr(p, "outside_subfield_mass", getattr(c, "outside_subfield_mass", 0))
-                    setattr(p, "topic_entropy", getattr(c, "topic_entropy", 0))
-                    setattr(p, "landing_score", getattr(c, "landing_score", 0))
-                primary_landings.append(p)
-            primary_landings_by_anchor[anchor.vid] = primary_landings
 
     for anchor in prepared_anchors:
         primary_landings = primary_landings_by_anchor.get(anchor.vid) or []
@@ -3249,97 +3007,35 @@ def stage2_generate_academic_terms(
                 if not pool_for_anchor:
                     print(
                         f"[Stage2] 锚点 anchor={anchor.anchor!r} vid={anchor.vid}{amb_tag} 无 primary，跳过 | "
-                        f"原因: 本锚点无候选进入 flat_pool（SIMILAR_TO 与 conditioned_vec 合并后为 0 或领域过滤后全被剔除）"
+                        f"原因: 本锚点无候选进入 flat_pool"
                     )
                 else:
-                    min_identity = float(PRIMARY_MIN_IDENTITY_HIGH_AMBIGUITY) if anchor_type_lower in HIGH_AMBIGUITY_ANCHOR_TYPES else PRIMARY_MIN_IDENTITY
-                    domain_fit_min = float(DOMAIN_FIT_MIN_PRIMARY_BROAD) if anchor_type_lower in BROAD_CONCEPT_ANCHOR_TYPES else DOMAIN_FIT_MIN_PRIMARY
                     print(
                         f"[Stage2] 锚点 anchor={anchor.anchor!r} vid={anchor.vid}{amb_tag} 无 primary，跳过 | "
-                        f"原因: 本锚点有 {len(pool_for_anchor)} 个候选进入 flat_pool，但均未通过 primary 门控（identity>={min_identity} & domain_fit>={domain_fit_min}）"
+                        f"原因: 本锚点有 {len(pool_for_anchor)} 个候选均未通过 check_primary_admission"
                     )
                     for _, c in pool_for_anchor[:5]:
-                        id_ok = getattr(c, "identity_score", 0) >= min_identity
-                        df_ok = getattr(c, "domain_fit", 1.0) >= domain_fit_min
-                        why = []
-                        if not id_ok:
-                            why.append(f"identity={getattr(c, 'identity_score', 0):.3f}<{min_identity}")
-                        if not df_ok:
-                            why.append(f"domain_fit={getattr(c, 'domain_fit', 0):.3f}<{domain_fit_min}")
-                        print(f"[Stage2]   候选 tid={c.vid} term={c.term!r} | {'; '.join(why)}")
+                        print(f"[Stage2]   候选 tid={c.vid} term={c.term!r} identity={getattr(c, 'identity_score', 0):.3f} domain_fit={getattr(c, 'domain_fit', 0):.3f}")
                     if len(pool_for_anchor) > 5:
                         print(f"[Stage2]   ... 共 {len(pool_for_anchor)} 个候选均未通过")
             continue
         if LABEL_EXPANSION_DEBUG:
-            print(f"[Stage2] 锚点 anchor={anchor.anchor!r} 数据驱动 primary 数={len(primary_landings)}")
-        # Stage2B：高可信 primary 用相对阈值（当前锚点候选内相对高即可），避免全空
-        scores = [getattr(p, "primary_score", getattr(p, "identity_score", 0.0)) for p in primary_landings]
-        if len(scores) >= 2:
-            mean_s = float(np.mean(scores))
-            std_s = float(np.std(scores)) or 1e-6
-            rel_threshold = max(0.0, mean_s - 0.2 * std_s)
-            high_confidence_primaries = [p for p in primary_landings if getattr(p, "primary_score", p.identity_score) >= rel_threshold]
-        else:
-            high_confidence_primaries = list(primary_landings)
-        # 仍做绝对下限与结构约束过滤，但不一刀切
-        high_confidence_primaries = [
-            p for p in high_confidence_primaries
-            if _is_high_confidence_primary(
-                label,
-                p,
-                identity_threshold=min(PRIMARY_HIGH_CONFIDENCE_THRESHOLD, 0.65),
-                domain_fit_threshold=min(DOMAIN_FIT_HIGH_CONFIDENCE, 0.45),
-                trusted_sources=TRUSTED_SOURCE_TYPES_FOR_DIFFUSION,
-                domain_span_max=DOMAIN_SPAN_MAX_EXPANSION,
-            )
-        ]
-        if not high_confidence_primaries and primary_landings:
-            high_confidence_primaries = sorted(primary_landings, key=lambda x: getattr(x, "primary_score", x.identity_score), reverse=True)[: max(1, len(primary_landings) // 2)]
-        debug_print(2, f"[Stage2B] anchor={anchor.anchor!r} primary 数={len(primary_landings)}", label)
-        debug_print(2, "[Stage2B Seed Eligibility] term | identity | domain_fit | domain_span | eligible [未通过原因]", label)
-        hc_set = {id(p) for p in high_confidence_primaries}
-        id_th = min(PRIMARY_HIGH_CONFIDENCE_THRESHOLD, 0.65)
-        df_th = min(DOMAIN_FIT_HIGH_CONFIDENCE, 0.45)
-        for p in primary_landings[:10]:
-            span = _get_primary_domain_span(label, p.vid)
-            eligible = p in high_confidence_primaries or id(p) in hc_set
-            reason_str = ""
-            if not eligible:
-                _, reasons = _is_high_confidence_primary_reason(
-                    label, p, id_th, df_th,
-                    TRUSTED_SOURCE_TYPES_FOR_DIFFUSION, DOMAIN_SPAN_MAX_EXPANSION,
-                )
-                reason_str = " | " + "; ".join(reasons) if reasons else ""
-            debug_print(2, f"  {(p.term or '')[:28]:<28} | id={getattr(p, 'identity_score', 0):.3f} | domain={getattr(p, 'domain_fit', 0):.3f} | span={span} | eligible={eligible}{reason_str}", label)
-        debug_print(1, f"[Stage2B] 高可信 seed 数={len(high_confidence_primaries)}/{len(primary_landings)} 参与扩散", label)
-        if high_confidence_primaries:
-            debug_print(2, f"[Stage2B] seed_terms={[p.term for p in high_confidence_primaries[:10]]}", label)
-        if jd_profile and high_confidence_primaries:
-            primary_as_dict = lambda p: {
-                "identity_score": getattr(p, "identity_score", 0) or getattr(p, "landing_score", 0),
-                "domain_fit": getattr(p, "domain_fit", 0),
-                "source": getattr(p, "source", "") or "",
-                "origin": getattr(p, "origin", "") or "",
-            }
-            high_confidence_primaries = [p for p in high_confidence_primaries if allow_primary_to_expand(primary_as_dict(p))]
-        if LABEL_EXPANSION_DEBUG and (high_confidence_primaries != primary_landings or not high_confidence_primaries):
-            print(
-                f"[Stage2B] 高可信 primary 数={len(high_confidence_primaries)}/{len(primary_landings)}"
-                f"（identity≥{PRIMARY_HIGH_CONFIDENCE_THRESHOLD} & domain_fit≥{DOMAIN_FIT_HIGH_CONFIDENCE} & source∈可信 & domain_span≤{DOMAIN_SPAN_MAX_EXPANSION}）参与扩散"
-            )
-            hc_ids = {id(p) for p in high_confidence_primaries}
-            id_th = min(PRIMARY_HIGH_CONFIDENCE_THRESHOLD, 0.65)
-            df_th = min(DOMAIN_FIT_HIGH_CONFIDENCE, 0.45)
-            for p in primary_landings:
-                if id(p) in hc_ids:
-                    continue
-                _, reasons = _is_high_confidence_primary_reason(
-                    label, p, id_th, df_th,
-                    TRUSTED_SOURCE_TYPES_FOR_DIFFUSION, DOMAIN_SPAN_MAX_EXPANSION,
-                )
-                if reasons:
-                    print(f"[Stage2B 高可信未通过] term={p.term!r} | {'; '.join(reasons)}")
-        diffusion_primaries = high_confidence_primaries if high_confidence_primaries else []
+            print(f"[Stage2] 锚点 anchor={anchor.anchor!r} primary 数={len(primary_landings)}")
+        # Stage2B：唯一 seed 决策入口 check_seed_eligibility(primary, jd_profile) -> (eligible, seed_score)
+        diffusion_primaries = []
+        for p in primary_landings:
+            eligible, seed_score = check_seed_eligibility(label, p, jd_profile)
+            if eligible:
+                setattr(p, "seed_score", seed_score)
+                diffusion_primaries.append(p)
+        if not diffusion_primaries and primary_landings:
+            diffusion_primaries = sorted(primary_landings, key=lambda x: getattr(x, "primary_score", x.identity_score), reverse=True)[: max(1, len(primary_landings) // 2)]
+        debug_print(2, f"[Stage2B] anchor={anchor.anchor!r} primary 数={len(primary_landings)} seed 数={len(diffusion_primaries)}", label)
+        debug_print(1, f"[Stage2B] seed 数={len(diffusion_primaries)}/{len(primary_landings)} 参与扩散（SEED_MIN_IDENTITY={SEED_MIN_IDENTITY}）", label)
+        if diffusion_primaries:
+            debug_print(2, f"[Stage2B] seed_terms={[p.term for p in diffusion_primaries[:10]]}", label)
+        if LABEL_EXPANSION_DEBUG and (len(diffusion_primaries) != len(primary_landings) or not diffusion_primaries):
+            print(f"[Stage2B] seed 数={len(diffusion_primaries)}/{len(primary_landings)}（identity≥{SEED_MIN_IDENTITY} & source∈可信，单一决策无二次审批）")
         dense_list = expand_from_vocab_dense_neighbors(
             label, diffusion_primaries,
             active_domain_set=active_domains,

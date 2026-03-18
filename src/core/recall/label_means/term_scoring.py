@@ -731,11 +731,10 @@ def compose_term_final_score(rec: Dict[str, Any]) -> float:
     expansion_penalty = _get_expansion_penalty(rec)
 
     cross_anchor = float(rec.get("cross_anchor_evidence", 1.0))
-    cluster_cohesion = float(rec.get("cluster_cohesion", 1.0))
-    drift_risk = max(0.01, float(rec.get("semantic_drift_risk", 0.5)))
-    consensus_factor = cross_anchor * cluster_cohesion / drift_risk
+    cross_anchor_factor = 0.5 + 0.5 * max(0, min(1, cross_anchor))
+    # cluster_cohesion、semantic_drift_risk 仅作 debug/explain，不参与最终分
 
-    final_score = base_score * source_weight * domain_gate * task_consistency * role_penalty * expansion_penalty * consensus_factor
+    final_score = base_score * source_weight * domain_gate * task_consistency * role_penalty * expansion_penalty * cross_anchor_factor
 
     if STAGE3_DEBUG and final_score < FINAL_MIN_TERM_SCORE:
         tid = rec.get("tid") or rec.get("vid") or ""

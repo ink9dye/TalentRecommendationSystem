@@ -29,8 +29,9 @@ def _compute_stage3_global_consensus(
     raw_candidates: List[Dict[str, Any]],
 ) -> None:
     """
-    为每条候选计算 cross_anchor_evidence、cluster_cohesion、semantic_drift_risk，原地写入 rec。
-    无词表，仅用候选池内统计与图谱结构。
+    为每条候选写入 cross_anchor_evidence（参与最终分）、cluster_cohesion、semantic_drift_risk（仅 debug/explain）。
+    最终分只使用：base_score、path_topic_consistency、generic_penalty、cross_anchor_factor。
+    cluster_cohesion、semantic_drift_risk、outside_subfield_mass、outside_topic_mass 不参与 final_score，仅供 explain/分桶展示。
     """
     if not raw_candidates:
         return
@@ -312,19 +313,18 @@ def _run_stage3_dual_gate(
         if len(paper_terms) > 30:
             print(f"  ... 共 {len(paper_terms)} 条")
         print(f"[Stage3] 轻过滤+top_k 输入={len(raw_candidates)} 硬过滤后幸存={len(survivors)} 保留 top_k={len(top_survivors)} 输出词数={len(score_map)} paper_terms={len(paper_terms)}")
-        print("[Stage3 final_score 明细] term | base_score | hierarchy_score | external_penalty | entropy_penalty | generic_penalty | final_score | reject_reason")
+        print("[Stage3 final_score 明细] term | base_score | path_topic | generic_penalty | cross_anchor | final_score | reject_reason")
         for i, rec in enumerate(top_survivors[:20]):
             term = (rec.get("term") or "")[:28]
             ex = rec.get("stage3_explain") or {}
             base_score = ex.get("base_score", rec.get("final_score")) or 0.0
-            hierarchy_score = ex.get("hierarchy_score")
-            ext_pen = ex.get("external_penalty")
-            ent_pen = ex.get("entropy_penalty")
+            path_topic = ex.get("path_topic_consistency")
             gen_pen = ex.get("generic_penalty")
+            cross_anchor = ex.get("cross_anchor_factor")
             final_score = rec.get("final_score", 0) or 0.0
             reject = rec.get("reject_reason", "")
-            _fmt = lambda x: f"{x:.3f}" if isinstance(x, (int, float)) else str(x)
-            print(f"  {i+1} {term!r} | base={_fmt(base_score)} | hier={_fmt(hierarchy_score)} | ext={_fmt(ext_pen)} | ent={_fmt(ent_pen)} | gen={_fmt(gen_pen)} | final={final_score:.4f} | {reject!r}")
+            _fmt = lambda x: f"{x:.3f}" if x is not None and isinstance(x, (int, float)) else str(x) if x is not None else "-"
+            print(f"  {i+1} {term!r} | base={_fmt(base_score)} | path_topic={_fmt(path_topic)} | gen={_fmt(gen_pen)} | cross={_fmt(cross_anchor)} | final={final_score:.4f} | {reject!r}")
         if len(top_survivors) > 20:
             print(f"  ... 共 {len(top_survivors)} 条")
 

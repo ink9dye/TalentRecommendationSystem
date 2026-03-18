@@ -17,7 +17,7 @@ from src.core.recall.label_means.label_expansion import (
 
 
 def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict[str, Any]]:
-    """将 Stage2 输出的 ExpandedTermCandidate 转为下游/Stage3 使用的 raw_candidates 字典列表；携带层级 fit 等。"""
+    """Stage2 -> Stage3：只传 5 个正交层级字段 + 必要标识；冗余字段仅入 _debug 供排查。"""
     out = []
     for c in terms:
         rec = {
@@ -38,26 +38,25 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
             "domain_fit": getattr(c, "domain_fit", 1.0),
             "parent_anchor": c.anchor_term,
             "parent_primary": getattr(c, "parent_primary", c.term) or c.term,
+            "field_fit": float(getattr(c, "field_fit", 0) or 0),
+            "subfield_fit": float(getattr(c, "subfield_fit", 0) or 0),
+            "topic_fit": float(getattr(c, "topic_fit", 0) or 0) if getattr(c, "topic_fit", None) is not None else None,
+            "path_match": float(getattr(c, "path_match", 0) or 0),
+            "genericity_penalty": float(getattr(c, "genericity_penalty", 1.0) or 1.0),
         }
-        rec["topic_align"] = getattr(c, "topic_align", 1.0)
-        rec["topic_level"] = getattr(c, "topic_level", "missing")
-        rec["topic_confidence"] = getattr(c, "topic_confidence", 1.0)
-        if getattr(c, "subfield_fit", None) is not None:
-            rec["subfield_fit"] = c.subfield_fit
-        if getattr(c, "topic_fit", None) is not None:
-            rec["topic_fit"] = c.topic_fit
-        if getattr(c, "outside_subfield_mass", None) is not None:
-            rec["outside_subfield_mass"] = c.outside_subfield_mass
-        if getattr(c, "outside_topic_mass", None) is not None:
-            rec["outside_topic_mass"] = c.outside_topic_mass
-        if getattr(c, "topic_entropy", None) is not None:
-            rec["topic_entropy"] = c.topic_entropy
-        if getattr(c, "landing_score", None) is not None:
-            rec["landing_score"] = c.landing_score
         if getattr(c, "cluster_id", None) is not None:
             rec["cluster_id"] = c.cluster_id
-        if getattr(c, "main_subfield_match", None) is not None:
-            rec["main_subfield_match"] = c.main_subfield_match
+        if getattr(c, "outside_subfield_mass", None) is not None:
+            rec["outside_subfield_mass"] = c.outside_subfield_mass
+        rec["_debug"] = {
+            "topic_align": getattr(c, "topic_align", 1.0),
+            "topic_level": getattr(c, "topic_level", "missing"),
+            "topic_confidence": getattr(c, "topic_confidence", 1.0),
+            "outside_topic_mass": getattr(c, "outside_topic_mass", None),
+            "topic_entropy": getattr(c, "topic_entropy", None),
+            "main_subfield_match": getattr(c, "main_subfield_match", None),
+            "landing_score": getattr(c, "landing_score", None),
+        }
         rec["retrieval_role"] = get_retrieval_role_from_term_role(c.term_role)
         out.append(rec)
     return out
