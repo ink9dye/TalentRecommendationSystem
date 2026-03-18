@@ -766,17 +766,80 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 
 **Stage2A：学术落点（Academic Landing）**
 
+Stage2A 采用**主线优先 + 同源双视角**设计：判定顺序为**主线一致性 > 锚点身份 > 双视角稳定性**。目标是把主线词救回来、把伪稳定坏词压下去；similar_to 与 conditioned_vec 属同一语义空间两种 query 视角，不做多路投票，输出四分桶。
+
 | 项 | 说明 |
 |----|------|
-| **作用** | 将工业侧锚点**对齐到学术主落点**（primary），不做大范围扩展。**一个 admission**（`check_primary_admission`）+ **一个 primary_score**（`compute_primary_score`）决定 primary_landings，无旧 domain_fit/min_identity 门控常量；产出每锚点 1～2 个 primary_landings，供 Stage2B 扩散。本锚点无 primary 时仅跳过该锚点，不短路整路。 |
-| **候选来源（当前版本）** | **similar_to 为主池** + **conditioned_vec 为上下文复核**：① **跨类型 SIMILAR_TO** 给出初始候选；② **conditioned_vec** 在同一学术词索引上检索，**不直接并池**，而是为每个 similar_to 候选生成 **context_sim / context_supported / context_gap** 重打分信号；③ 仅当主池候选数 ≤1 时，才从 conditioned_vec 检索结果中补最多 2 个 **context_fallback**（context_sim≥0.82）。领域过滤使用 `_term_in_active_domains_with_reason`，仅强冲突剔除。 |
-| **思路** | 图中 SIMILAR_TO 提供**建图时**的工业→学术边；**conditioned_vec** 不再作为「第二路候选源」，而是作为 **similar_to 的上下文复核器**：raw_sim 与 context_sim 越一致，说明该词在「无上下文」与「有 JD 上下文」下都站得住，可压制 propulsion、simula、kinesics 等错义；准入与 primary_score 均纳入 **compute_context_consistency** 与 **check_primary_eligibility**。 |
-| **逻辑流程** | ① anchor_skills 转为 **PreparedAnchor**（含 **conditioned_vec**）；② `collect_landing_candidates`：similar_to 初始池 → `_retrieve_academic_terms_by_conditioned_vec` 返回 context_neighbors + **rerank_signals**，为 similar_to 候选挂 **context_sim/context_supported/context_gap/source_role**，主池≤1 时补 1～2 个 fallback；③ flat_pool 上邻域与 conditioned_anchor_align；④ **资格赛**：`check_primary_eligibility`（identity/context 门槛、domain_conflict_strong）；⑤ **准入**：`check_primary_admission`（双空间一致、rescue、context_fallback 通道）；⑥ **打分**：`compute_primary_score`（identity + context_consistency + jd 主干，hierarchy 微调，similar_to 无上下文支持时 ×0.90）；⑦ **冲突消解** → primary_landings。 |
-| **输入参数（名字与含义）** | **prepared_anchors**、**active_domain_set**、**query_vector**、**query_text**；**jd_field_ids** / **jd_subfield_ids** / **jd_topic_ids**：可选；**jd_profile**：可选，Stage1 产出的四层领域画像，用于层级 fit、landing 打分与硬门槛。 |
-| **输出参数（名字与含义）** | 本阶段内部产出 **primary_landings**，每项含 vid、term、identity_score、**landing_score**、**subfield_fit**、**topic_fit**、**outside_subfield_mass**、**topic_entropy** 等（有 jd_profile 时）；Stage2 整体输出 **raw_candidates** 见 Stage2B。 |
-| **主要公式** | **domain_fit** 仍用于候选排序与 support 门控（公式同前）。**primary 准入**仅由 **check_primary_admission**（PRIMARY_MIN_HIERARCHY_MATCH、PRIMARY_MIN_PATH_MATCH、CONDVEC_SOURCE_FACTOR）决定；**primary 排序**仅由 **compute_primary_score**（PRIMARY_SCORE_W_*）决定。不再使用 DOMAIN_FIT_MIN_PRIMARY/PRIMARY_MIN_IDENTITY_HIGH_AMBIGUITY 等旧门控常量。**identity_score** 在当前版本中等于 SIMILAR_TO 边权。 |
-| **高歧义锚点规则** | **定义**：当前主要指 anchor_type ∈ { acronym, generic_task_term }。**规则**：① 做 primary 时采用更高 identity 门槛；② 可配更高 domain_fit 门槛；③ 本锚点若 primary 数为 0，仅跳过该锚点，不视为整路失败；④ 日志打标 `[高歧义]` 便于排查。 |
-| **调用的表/知识图谱** | **Neo4j**：**Vocabulary** 节点、**(Vocabulary)-[SIMILAR_TO]->(Vocabulary)**（跨类型，边权 sim_score）；**SQLite**：`vocabulary_domain_stats`（domain_dist）、`vocabulary_topic_stats`（field_id/subfield_id/topic_id 及 *_dist）；**Faiss**：**vocab_index**（conditioned_vec 检索学术词，用于上下文纠偏与 rerank_signals）。 |
+| **职责** | **主线优先的落点裁判**：对每个工业锚点，Stage2A 先看候选是否贴 JD 主线任务链（mainline_alignment），再看是否保持锚点身份、同源双视角是否稳定、是否适合扩散。核心输出为四分桶：**reject** / **observe_only** / **primary_keep_no_expand** / **primary_expandable**。 |
+| **候选来源** | **similar_to**（base 视角，`STAGE2A_COLLECT_BASE_TOP_K=8`）与 **conditioned_vec**（conditioned 视角，`STAGE2A_COLLECT_CONDITIONED_TOP_K=8`）；`collect_landing_candidates` 产出两路候选，`unify_same_source_views` 按 tid 合并为一条记录（base_* / ctx_*）。后面严判，采集阶段不早剪枝。 |
+| **逻辑流程** | ① `build_stage2a_mainline_profile(anchors, jd_profile)` 从高分锚点构建主线簇（mainline_centroid、mainline_clusters、bonus_clusters）；② 每锚 `collect_landing_candidates` → `unify_same_source_views`；③ `evaluate_stage2a_candidate(..., mainline_profile, all_anchors, label)` 算齐特征（含 mainline_alignment、bonus_alignment、object_like_risk）并初判 bucket；④ `calibrate_anchor_thresholds` 含 mainline_*、object_like_low；⑤ `decide_stage2a_bucket(feat, T)` 主线优先分桶；⑥ `resolve_anchor_primary_candidates(..., mainline_profile)` 冲突消解优先级 mainline_alignment > primary_score > identity > view_stability，每桶 cap=2；⑦ **仅 primary_expandable 进入 Stage2B**。 |
+| **输入/输出** | 输入：prepared_anchors、active_domain_set、query_vector、jd_*_ids、jd_profile、label。输出：每锚 primary_landings（含 bucket、expandable、mainline_alignment），Stage2B 仅取 expandable。 |
+
+**Stage2A 要计算的特征（无具体词名）**
+
+- **主线相关（新增/主判据）**：**mainline_alignment**（候选与主线簇 centroid + 多 cluster 覆盖度）、**bonus_alignment**（与 bonus 支线簇贴合度，高则易为奖励项支线）。
+- **原始/上下文视角**：base_score、base_rank、base_hit；ctx_score、ctx_rank、ctx_hit；shift_gain、shift_drop。
+- **同源双视角稳定性（降权为辅助）**：view_stability（overlap、score_gap/0.20、rank_gap/5.0），不再主导生死。
+- **锚点身份**：identity（base_anchor_match、stable_overlap、alias_family_match、**co_anchor_identity** 与其它主线锚点协同度）。
+- **主线一致性**：hierarchy（field/subfield/topic/path_proximity）、jd_align；**context_shift_quality** 仅当 ctx 偏移让候选更贴主线时为正收益（含 mainline_alignment）。
+- **风险**：ambiguity_risk、generic_risk；**branch_drift_risk**（mainline 弱、bonus 强、generic/object_like 高）；**object_like_risk**（对象细粒度风险，占位可扩展）。
+
+**四分桶规则与判定顺序（主线优先）**
+
+1. **reject**：mainline_alignment 低 **且** identity 低 **且** branch_drift_risk 高。
+2. **primary_expandable**：mainline_alignment ≥ mainline_expand、identity ≥ identity_expand、base_score ≥ base_expand、hierarchy ≥ hierarchy_expand，且 branch_drift_risk 低、object_like_risk 低。
+3. **primary_keep_no_expand**：mainline_alignment ≥ mainline_keep **且** primary_score ≥ primary_keep；保留为可解释落点，**不进入 Stage2B**。
+4. **observe_only**：其余；与主线有关系但不够 primary，或主线弱稳词先保观察。
+
+**判定顺序**：先 reject → 再 primary_expandable → 再 primary_keep_no_expand → 最后兜底 observe_only。
+
+**Stage2A 到 Stage2B 的接口**
+
+- **能进 Stage2B**：仅 **primary_expandable**（`select_stage2b_seeds(bucketed)` 取 expandable）。
+- **不能进 Stage2B**：reject、observe_only、primary_keep_no_expand。
+
+**统一 primary_score 与风险惩罚（主线优先权重）**
+
+- primary_score = **0.26×mainline_alignment** + 0.20×identity + 0.16×base_score + 0.14×hierarchy + 0.10×jd_align + 0.08×context_shift_quality + **0.06×view_stability**，再乘以 (1 - 0.30×ambiguity_risk)×(1 - 0.35×branch_drift_risk)×(1 - 0.20×object_like_risk)。
+- 阈值：`calibrate_anchor_thresholds` 含 mainline_low/keep/expand、object_like_low，与 `STAGE2A_GLOBAL_FLOOR` 取 max。
+
+**conditioned 向量权重（label_anchors）**
+
+- 主线优先、轻度偏移：**0.68×anchor + 0.17×local + 0.10×co_anchor + 0.05×jd**，降低 JD 整体比重，避免 ctx 漂到错误义项。
+
+**逐函数骨架（label_expansion）**
+
+- `build_stage2a_mainline_profile(anchors, jd_profile)`：从高分锚点（source_weight≥0.85）构建 mainline_centroid、mainline_clusters，其余为 bonus_clusters；无词表。
+- `collect_landing_candidates`：base top_k=8、conditioned top_k=8，返回两路候选。
+- `unify_same_source_views(anchor, landing_candidates, jd_profile)`：按 tid 合并 base/ctx，输出 shift_gain、shift_drop 等。
+- `compute_mainline_alignment(feat, mainline_profile, label)`：候选向量与 mainline_centroid 及 mainline_clusters 的相似度合成。
+- `compute_bonus_branch_alignment(feat, mainline_profile, label)`：候选与 bonus_clusters 最大贴合度。
+- `compute_view_stability(feat, T)`：辅助项，overlap×(1 - score_gap/0.20×0.45)×(1 - rank_gap/5×0.25)。
+- `compute_anchor_candidate_identity(anchor, feat, jd_profile, all_anchors, label)`：含 co_anchor_identity（与其它主线锚点协同）。
+- `compute_context_shift_quality(feat, mainline_alignment)`：gain_term、mainline_alignment、jd_align、drop_term。
+- `compute_hierarchy_consistency(feat, jd_profile)`：field/subfield/topic/path_proximity。
+- `compute_object_like_risk(feat)`：对象细粒度风险（占位可扩展）。
+- `compute_branch_drift_risk(mainline_alignment, bonus_alignment, generic_risk, object_like_risk)`：支线漂移。
+- `compute_candidate_risks(feat, jd_profile)`：返回 (ambiguity_risk, generic_risk)。
+- `score_stage2a_primary(feat, W)`：主线权重 + 三项风险惩罚。
+- `decide_stage2a_bucket(feat, T)`：主线优先四桶。
+- `evaluate_stage2a_candidate(anchor, cand, jd_profile, mainline_profile, all_anchors, label, ...)`：算齐特征、primary_score、bucket、expandable。
+- `resolve_anchor_primary_candidates(anchor, evaluated_candidates, jd_profile, mainline_profile)`：排序键 (expandable, mainline_alignment, primary_score, identity, view_stability)，cap=2。
+- `calibrate_anchor_thresholds(evaluated_candidates, global_floor)`：含 mainline_*、object_like_low。
+- `select_stage2b_seeds(bucketed)`：仅返回 primary_expandable 且 expandable 的项。
+
+**一句话总结**
+
+Stage2A 的主判据从「局部稳定性」改为「主线一致性」：先看是否贴 JD 主线任务链（mainline_alignment），再看锚点身份与双视角稳定性；主线弱稳词优先进 observe_only/keep_no_expand，支线稳词不轻易给活；不依赖具体词名、不靠黑白名单。
+
+---
+
+**Stage2A 候选来源与数据结构（实现细节）**
+
+| 项 | 说明 |
+|----|------|
+| **候选来源（实现）** | **similar_to** 为主池 + **conditioned_vec** 为上下文复核；`_retrieve_academic_terms_by_conditioned_vec` 返回 context_neighbors + rerank_signals；主池≤1 时补最多 2 个 context_fallback（context_sim≥0.82）。领域过滤使用 `_term_in_active_domains_with_reason`，仅强冲突剔除。 |
+| **调用的表/知识图谱** | **Neo4j**：Vocabulary、SIMILAR_TO；**SQLite**：vocabulary_domain_stats、vocabulary_topic_stats；**Faiss**：vocab_index（conditioned_vec 检索）。 |
 
 **Stage2A 上下文纠偏与双空间准入（conditioned_vec 作复核器）**
 
@@ -810,7 +873,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 **Stage2/Stage3 收缩设计与原则（无冗余参数、无硬编码）**
 
 - **Stage2A 固定成两个入口**：**一个 admission**（`check_primary_admission`）、**一个 primary_score**（`compute_primary_score`）。主流程仅保留：`collect_landing_candidates → check_primary_admission → compute_primary_score → resolve_anchor_local_conflicts → primary_landings`。旧体系（`select_primary_academic_landings`、`_primary_score_data_driven`、PRIMARY_W_*、DOMAIN_FIT_MIN_PRIMARY/DOMAIN_FIT_MIN_PRIMARY_BROAD/PRIMARY_MIN_IDENTITY_HIGH_AMBIGUITY/DOMAIN_FIT_HIGH_CONFIDENCE、`score_landing_candidate`）已全部退场；不再从 config 或 hierarchy_guard 引入上述常量/函数。
-- **Stage2B 固定成两层门**：**Seed 门**（谁能扩）：`check_seed_eligibility` 判 retain_mode==normal、非 suppress_seed、source∈可信、**is_primary_expandable** 通过、**无 fallback 兜底**（无可扩 seed 则 diffusion_primaries=[]）；**Support 门**（扩出来的词谁能留）：dense/cooc 候选须过 **support_expandable_for_anchor**（锚点语义复核），domain_fit≥0.72、sim≥0.55、设备/对象词默认拒。**Cluster 当前全关**（`expand_from_cluster_members` 直接 return []）。
+- **Stage2B 固定成两层门**：**Seed 门**（谁能扩）：由 Stage2A 四分桶决定，**仅 primary_expandable** 进入 diffusion_primaries，无 fallback（无可扩 seed 则 diffusion_primaries=[]）；**Support 门**（扩出来的词谁能留）：dense/cooc 候选须过 **support_expandable_for_anchor**，domain_fit≥0.72、sim≥0.55，设备/对象词默认拒。**Cluster 当前全关**（`expand_from_cluster_members` 直接 return []）。
 - **准入与排序**：Stage2A 准入仅 **PRIMARY_MIN_HIERARCHY_MATCH**、**PRIMARY_MIN_PATH_MATCH** + **CONDVEC_SOURCE_FACTOR**；primary 排序只一套 **PRIMARY_SCORE_W_***。不再新增参数。
 - **Stage3 彻底移除 cluster 依赖**：最终分 = base_score×gate×cross_anchor_factor×**backbone_boost**×**object_like_penalty**×**bonus_term_penalty**；base 权重 0.36·semantic+0.18·context+0.20·subfield_fit+0.14·topic_fit+0.12·multi_source；gate=0.75+0.15×path_topic+0.10×generic_penalty。**backbone_boost** 轻推 control 主轴（primary、多锚点、高 cross_anchor）；**object_like_penalty** 轻压 arm/manipulator/hand 类；**bonus_term_penalty** 轻压 reinforcement learning/q-learning/medical robotics。risky 理由（判定更严，避免主干词误标）：weak_family_centrality、high_drift_risk（drift>0.75 且 ptc<0.30）、weak_topic_fit_tail（ptc<0.50 且 final<0.58）。bucket：**core 两条路任选一**——路 A 强主干直通（paper_primary 且 final≥0.66），路 B 结构型主干（paper_primary 且 final≥0.62、ptc≥0.55、cross≥0.94）；support 为 final≥0.56 且无 high_drift_risk；其余 risky。日志 **[Stage3 Bucket Details]** 打印 term | bucket | final | ptc | cross | reasons。
 - **泛化只软惩罚**：seed 不做 domain_span 硬杀；support 仅在 **DOMAIN_SPAN_EXTREME** 以上硬拒绝，其余由 **topic_span_penalty** 表达。
