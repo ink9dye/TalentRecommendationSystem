@@ -14,6 +14,7 @@ from config import (
     COOC_EXPANSION_PENALTY,
     SOURCE_WEIGHT_SIMILAR_TO,
     SOURCE_WEIGHT_JD_VECTOR,
+    SOURCE_WEIGHT_CONDITIONED_VEC,
     SOURCE_WEIGHT_DENSE,
     SOURCE_WEIGHT_CLUSTER,
     SOURCE_WEIGHT_COOC,
@@ -656,6 +657,8 @@ def _get_source_weight(rec: Dict[str, Any]) -> float:
         return SOURCE_WEIGHT_SIMILAR_TO
     if s == "jd_vector":
         return SOURCE_WEIGHT_JD_VECTOR
+    if s == "conditioned_vec":
+        return SOURCE_WEIGHT_CONDITIONED_VEC
     if s == "dense":
         return SOURCE_WEIGHT_DENSE
     if s == "cluster":

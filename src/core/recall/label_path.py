@@ -1593,6 +1593,21 @@ class LabelRecallPath:
             agg = getattr(self.debug_info, "similar_to_agg", None) or []
             pass_list = getattr(self.debug_info, "similar_to_pass", None) or []
             print("[标签路-similar_to] 聚合后候选数=%s 领域过滤通过数=%s" % (len(agg), len(pass_list)))
+            # Stage2A 双路来源：term | sources | similar_to_score | conditioned_score | final_primary_score
+            breakdown = getattr(self.debug_info, "stage2a_term_source_breakdown", None) or []
+            if breakdown:
+                print("[Stage2A 双路来源] term | sources | similar_to_score | conditioned_score | final_primary_score")
+                for row in breakdown[:50]:
+                    term = (row.get("term") or "")[:32]
+                    srcs = ",".join(row.get("sources") or []) or "-"
+                    sim_s = row.get("similar_to_score")
+                    cond_s = row.get("conditioned_score")
+                    sim_str = "%.3f" % sim_s if sim_s is not None else "-"
+                    cond_str = "%.3f" % cond_s if cond_s is not None else "-"
+                    prim = row.get("final_primary_score") or 0
+                    print("  %s | %s | %s | %s | %.3f" % (term, srcs, sim_str, cond_str, prim))
+                if len(breakdown) > 50:
+                    print("  ... 共 %s 条" % len(breakdown))
 
         # 阶段 3：词权重（统一走复杂公式，传入锚点 ID 供锚点距离门控）
         anchor_vids = [int(k) for k in anchor_skills.keys()] if anchor_skills else None

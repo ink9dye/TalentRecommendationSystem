@@ -7,7 +7,7 @@ from typing import Dict, Any, Set, List, Tuple
 import faiss
 import numpy as np
 
-from config import DB_PATH, DATA_DIR, VOCAB_P95_PAPER_COUNT
+from config import DB_PATH, DATA_DIR, VOCAB_P95_PAPER_COUNT, ANCHOR_SOURCE_WEIGHT_JD_SUPPLEMENT
 from src.utils.tools import extract_skills
 from src.core.recall.label_means.label_debug import debug_print
 
@@ -443,6 +443,8 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
             "context_richness": x.get("context_richness"),
             "taskness": x.get("taskness"),
             "local_cluster_support": x.get("local_cluster_support"),
+            "anchor_source": "skill_direct",
+            "anchor_source_weight": 1.0,
         }
 
     debug_print(1, f"[Step2] 最终 industrial anchors 数量: {len(anchors)}", label)
@@ -719,7 +721,11 @@ def supplement_anchors_from_jd_vector(label, query_text, anchor_skills, total_j=
         tid = item["tid"]
         term = item["term"]
         cov_j = item["cov_j"]
-        anchor_skills[str(tid)] = {"term": term}
+        anchor_skills[str(tid)] = {
+            "term": term,
+            "anchor_source": "jd_vector_supplement",
+            "anchor_source_weight": ANCHOR_SOURCE_WEIGHT_JD_SUPPLEMENT,
+        }
         added.append((tid, term, round(item["score"], 4), round(cov_j, 4), round(item["domain_ratio"], 4)))
 
     label.debug_info.supplement_anchors = added

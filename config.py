@@ -46,6 +46,17 @@ SIMILAR_TO_MIN_SCORE = 0.65   # SIMILAR_TO 边权重下限，防止扩散过强
 # --- 6.2 三层领域（Stage2B/Stage3 topic_align，见 README 修订版方案）---
 TOPIC_ALIGN_SUBFIELD = 0.65   # 仅 subfield 对齐时的层级分
 TOPIC_ALIGN_FIELD = 0.35     # 仅 field 对齐时的层级分
+TOPIC_ALIGN_NONE = 0.10      # 层级无命中时的层级分（用于 primary 惩罚，不在此一票否决）
+# primary 打分中 hierarchy_norm 的保守映射（仅 _hierarchy_norm 使用，不影响 topic_align）
+HIERARCHY_NORM_TOPIC = 0.75    # topic 命中
+HIERARCHY_NORM_SUBFIELD = 0.45 # subfield 命中
+HIERARCHY_NORM_FIELD = 0.20    # field 命中
+HIERARCHY_NORM_NONE = 0.05     # 无命中
+# hierarchy 的 identity 联动上限：anchor_identity_score < 阈值时，hierarchy 乘折扣再进 primary（避免 propulsion/simula/control flow 等 topic 命中但本义不对的词拿满 hier）
+HIERARCHY_IDENTITY_THRESHOLD = 0.50   # identity 低于此视为“本义不对齐”
+HIERARCHY_IDENTITY_DISCOUNT = 0.50    # 上述情况下 hierarchy 乘数（0.5 = 最多只当一半用）
+# 补充锚点来源权重：JD 向量补充的锚点在 primary 打分时乘此值，避免 Robotics/Robot control 把 Telerobotics 等顶到最前
+ANCHOR_SOURCE_WEIGHT_JD_SUPPLEMENT = 0.65   # jd_vector_supplement 锚点的 source_weight（0.6~0.75）
 TOPIC_WEIGHT_PRIMARY = 0.10   # primary 的 topic 权重
 TOPIC_WEIGHT_DENSE = 0.25    # dense_expansion 的 topic 权重
 TOPIC_WEIGHT_CLUSTER = 0.35  # cluster_expansion 的 topic 权重
@@ -68,11 +79,12 @@ PRIMARY_MIN_IDENTITY_HIGH_AMBIGUITY = 0.72
 
 # Stage2B 高可信 primary：参与 dense/cluster/cooc 扩散须同时满足 identity、domain_fit、source、domain_span 等结构约束（不依赖词面黑名单）
 DOMAIN_FIT_HIGH_CONFIDENCE = 0.55   # 高可信 primary 的 domain_fit 下限（提高以仅主场词参与扩散）
-TRUSTED_SOURCE_TYPES_FOR_DIFFUSION = ("similar_to", "jd_vector")  # 仅此来源的 primary 可参与扩散；当前仅 similar_to，jd_vector 预留
+TRUSTED_SOURCE_TYPES_FOR_DIFFUSION = ("similar_to", "jd_vector", "conditioned_vec")  # 召回时 gte+JD 上下文(conditioned_vec) 与 similar_to/jd_vector 均可参与扩散
 
 # Stage3 final_score 公式：source_weight / domain_gate / role_penalty
 SOURCE_WEIGHT_SIMILAR_TO = 1.0    # primary 来自 similar_to
 SOURCE_WEIGHT_JD_VECTOR = 0.95   # primary 来自 jd_vector
+SOURCE_WEIGHT_CONDITIONED_VEC = 0.95   # primary 来自 conditioned_vec（召回时 gte+JD 上下文检索）
 SOURCE_WEIGHT_DENSE = 0.85       # dense_expansion
 SOURCE_WEIGHT_CLUSTER = 0.75    # cluster_expansion
 SOURCE_WEIGHT_COOC = 0.70       # cooc_expansion
