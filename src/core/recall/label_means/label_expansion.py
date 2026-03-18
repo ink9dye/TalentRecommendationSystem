@@ -4,6 +4,7 @@ import math
 import re
 import sqlite3
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import faiss
@@ -78,6 +79,11 @@ HIERARCHY_LEVEL_OFF_PATH = "off_path"
 TOPIC_SPAN_PENALTY_FACTOR = 0.2   # 泛化软惩罚：topic_span_penalty = 1/(1 + factor * max(0, span-1))
 DOMAIN_SPAN_EXTREME = 24          # support 扩散仅在极端异常时硬拒绝（>24）；泛化主要由 topic_span_penalty 表达
 SUPPORT_MIN_DOMAIN_FIT = 0.20     # Stage2B support 准入：domain_fit 低于此不进词池（唯一 support 门槛）
+# ---------- Dense 最小修复补丁：support 锚点语义复核四道门（不靠硬编码） ----------
+DENSE_SUPPORT_PRIMARY_CONSISTENCY_MIN = 0.72   # 候选与 parent primary 向量一致性
+DENSE_SUPPORT_ANCHOR_CONSISTENCY_MIN = 0.70   # 候选与 anchor conditioned_vec 一致性
+DENSE_SUPPORT_CONTEXT_STABILITY_MIN = 0.72    # 候选在 anchor context 邻域中的稳定性
+DENSE_SUPPORT_FAMILY_SUPPORT_MIN = 0.68      # 候选对同锚 surviving primary family 的支撑
 # ---------- Primary 排序：只保留一套权重（PRIMARY_SCORE_W_*），不再使用 PRIMARY_W_* ----------
 PRIMARY_SCORE_W_SEMANTIC = 0.22
 PRIMARY_SCORE_W_IDENTITY = 0.18
@@ -1025,52 +1031,59 @@ def check_seed_eligibility(
     jd_profile: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, float, Optional[str]]:
     """
-    Stage2B 唯一 seed 决策入口：identity/source 通过后，再判 weak_retain/错义/cooc 严格 bar。
-    返回 (eligible, seed_score, block_reason)；block_reason 仅在 eligible=False 时有值。
+    Stage2B 唯一 seed 决策入口：只有「适合扩散的 primary」才能扩；无 fallback 兜底。
+    返回 (eligible, seed_score, block_reason)。
     """
-    identity = getattr(p, "identity_score", 0.0) or 0.0
+    identity = float(getattr(p, "identity_score", 0.0) or 0.0)
+    anchor_identity = float(getattr(p, "anchor_identity_score", identity) or identity)
+    primary_score = float(getattr(p, "primary_score", identity) or identity)
+    jd_align = float(getattr(p, "jd_align", 0.5) or 0.5)
     src = (getattr(p, "source", "") or "").strip().lower()
-    trusted_set = {s.strip().lower() for s in TRUSTED_SOURCE_TYPES_FOR_DIFFUSION if s}
-    if identity < SEED_MIN_IDENTITY:
-        return False, 0.0, "seed_score_too_low"
+    retain_mode = getattr(p, "retain_mode", "normal") or "normal"
+    suppress_seed = bool(getattr(p, "suppress_seed", True))
+    support_count = int(getattr(p, "cross_anchor_support_count", 1) or 1)
+    anchor_text = getattr(p, "anchor_term", "") or ""
+    primary_term = getattr(p, "term", "") or ""
+
+    # 1) weak_retain / suppress_seed 一律不扩
+    if retain_mode != "normal" or suppress_seed:
+        return False, 0.0, "weak_primary_no_expand"
+
+    # 2) source 必须可信
+    trusted_set = {s.strip().lower() for s in (TRUSTED_SOURCE_TYPES_FOR_DIFFUSION or []) if s}
     if trusted_set and src not in trusted_set:
         return False, 0.0, "source_not_trusted"
-    retain_mode = getattr(p, "retain_mode", "normal") or "normal"
-    suppress_seed = getattr(p, "suppress_seed", True)
-    if retain_mode == "weak_retain" and suppress_seed:
-        return False, 0.0, "weak_primary_no_expand"
-    anchor_text = getattr(p, "anchor_term", "") or ""
-    if is_semantic_mismatch_seed(anchor_text, getattr(p, "term", "") or ""):
-        return False, 0.0, "semantic_mismatch_seed"
-    topic_source = getattr(p, "topic_source", "missing") or "missing"
-    if topic_source == "cooc":
-        sem = float(getattr(p, "semantic_score", 0) or 0)
-        jd_align = float(getattr(p, "jd_align", 0.5) or 0.5)
-        aid = float(getattr(p, "anchor_identity_score", identity) or identity)
-        if not (sem >= 0.84 and jd_align >= 0.82 and aid >= 0.35):
-            return False, 0.0, "cooc_seed_blocked"
-    primary_score = getattr(p, "primary_score", identity) or identity
-    path_match = float(getattr(p, "path_match", 0) or 0)
-    genericity_penalty = float(getattr(p, "topic_span_penalty", 1.0) or 1.0)
-    seed_score = primary_score * (0.7 + 0.3 * path_match) * genericity_penalty
 
-    jd_align = float(getattr(p, "jd_align", 0.5) or 0.5)
-    support_count = int(getattr(p, "cross_anchor_support_count", 1) or 1)
-    blocked, block_reason = should_block_seed_expansion(
+    # 3) 语义错义 seed 直接禁
+    if is_semantic_mismatch_seed(anchor_text, primary_term):
+        return False, 0.0, "semantic_mismatch_seed"
+
+    # 4) 不是所有 primary 都能扩
+    if not is_primary_expandable(
         anchor_text=anchor_text,
-        primary_term=getattr(p, "term", "") or "",
+        primary_term=primary_term,
         primary_score=primary_score,
-        anchor_identity=getattr(p, "anchor_identity_score", identity) or identity,
+        anchor_identity=anchor_identity,
         jd_align=jd_align,
-        source_type=src,
         support_count=support_count,
-        retain_mode=retain_mode,
-        suppress_seed=suppress_seed,
-    )
-    if blocked:
+        source_type=src,
+    ):
         if LABEL_EXPANSION_DEBUG:
-            print(f"[Stage2B] seed 禁扩 term={getattr(p, 'term', '')!r} anchor={anchor_text!r} reason={block_reason}")
-        return False, 0.0, block_reason
+            print(f"[Stage2B] seed 禁扩 term={primary_term!r} anchor={anchor_text!r} reason=primary_not_expandable")
+        return False, 0.0, "primary_not_expandable"
+
+    # seed_expand_factor：过窄支线/设备词/单锚支持 惩罚
+    seed_expand_factor = 1.0
+    if is_narrow_method_term(primary_term):
+        seed_expand_factor *= 0.75
+    if is_device_or_object_term(primary_term):
+        seed_expand_factor *= 0.65
+    if support_count == 1:
+        seed_expand_factor *= 0.85
+
+    path_match = float(getattr(p, "path_match", 0.0) or 0.0)
+    span_penalty = float(getattr(p, "topic_span_penalty", 1.0) or 1.0)
+    seed_score = primary_score * (0.7 + 0.3 * path_match) * span_penalty * seed_expand_factor
     return True, seed_score, None
 
 
@@ -1530,6 +1543,9 @@ def collect_landing_candidates(
         jd_subfield_ids=jd_subfield_ids,
         jd_topic_ids=jd_topic_ids,
     )
+    # 供 Stage2B dense support gate 使用：锚点 context 邻域与得分
+    setattr(anchor, "_context_neighbors", context_neighbors)
+    setattr(anchor, "_context_score_map", {c.vid: getattr(c, "context_sim", getattr(c, "semantic_score", 0.0)) for c in context_neighbors})
     candidates: List[LandingCandidate] = []
     existing_vids: Set[int] = set()
     # C. similar_to 仍是主候选池，附加 context 信号
@@ -1799,7 +1815,7 @@ def expand_from_vocab_dense_neighbors(
     jd_topic_ids: Optional[Set[str]] = None,
     jd_profile: Optional[Dict[str, Any]] = None,
 ) -> List[ExpandedTermCandidate]:
-    """从词汇向量索引取 primary 的学术近邻；入口先审 seed，支撑词再过滤语义偏航。term_role=dense_expansion。"""
+    """从词汇向量索引取 primary 的学术近邻；候选须过 support_expandable_for_anchor 四道门（primary/anchor/context/family）。"""
     top_k_per_primary = top_k_per_primary or DENSE_MAX_PER_PRIMARY
     if not primary_landings or not getattr(label, "vocab_index", None) or not getattr(label, "vocab_to_idx", None):
         return []
@@ -1808,28 +1824,51 @@ def expand_from_vocab_dense_neighbors(
     load_vocab_meta(label)
     seen = set(p.vid for p in primary_landings)
     out = []
+    support_domain_min = max(SUPPORT_MIN_DOMAIN_FIT, 0.72)
+
+    anchor_to_primaries: Dict[int, List[Any]] = {}
     for p in primary_landings:
-        ok, _, _ = check_seed_eligibility(label, p, jd_profile)
+        a_vid = getattr(p, "anchor_vid", 0)
+        anchor_to_primaries.setdefault(a_vid, []).append(p)
+
+    for p in primary_landings:
+        ok, seed_score, _ = check_seed_eligibility(label, p, jd_profile)
         if not ok:
             continue
+        max_keep = 2
+        if seed_score >= 0.40 and int(getattr(p, "cross_anchor_support_count", 1) or 1) >= 2:
+            max_keep = 3
         idx = label.vocab_to_idx.get(str(p.vid))
         if idx is None:
             continue
         vec = np.asarray(label.all_vocab_vectors[idx], dtype=np.float32).reshape(1, -1)
-        k = min(top_k_per_primary + 5, 30)
+        k = min(top_k_per_primary + 6, 20)
         scores, ids = label.vocab_index.search(vec, k)
-        count = 0
+        kept = 0
+        anchor_term = getattr(p, "anchor_term", "") or ""
+
+        anchor_stub = SimpleNamespace(
+            anchor_term=anchor_term,
+            anchor_vid=getattr(p, "anchor_vid", 0),
+            conditioned_vec=getattr(p, "anchor_conditioned_vec", None),
+            _context_score_map=getattr(p, "_context_score_map", None) or {},
+            _context_neighbors=getattr(p, "_context_neighbors", None) or [],
+            _stage2b_anchor_primaries=anchor_to_primaries.get(getattr(p, "anchor_vid", 0), []),
+        )
+
         for score, tid in zip(scores[0], ids[0]):
-            if count >= top_k_per_primary:
+            if kept >= max_keep:
                 break
             tid = int(tid)
             if tid <= 0 or tid in seen:
                 continue
             meta = label._vocab_meta.get(tid, ("", ""))
-            if meta[1] not in ("concept", "keyword", "") and meta[1]:
+            term = (meta[0] or "").strip() or str(tid)
+            vocab_type = meta[1] or ""
+            if vocab_type not in ("concept", "keyword", "") and vocab_type:
                 continue
             sim = max(0.0, min(1.0, float(score)))
-            if sim < 0.3:
+            if sim < 0.55:
                 continue
             if active_domain_set is not None or jd_field_ids or jd_subfield_ids or jd_topic_ids:
                 if not _term_in_active_domains(
@@ -1847,9 +1886,26 @@ def expand_from_vocab_dense_neighbors(
                 jd_subfield_ids=jd_subfield_ids,
                 jd_topic_ids=jd_topic_ids,
             )
-            if domain_fit < SUPPORT_MIN_DOMAIN_FIT:
+            if domain_fit < support_domain_min:
                 continue
-            if _is_bad_support_for_anchor(getattr(p, "anchor_term", "") or "", meta[0] or ""):
+
+            keep, keep_meta = support_expandable_for_anchor(
+                label=label,
+                anchor=anchor_stub,
+                parent_primary=p,
+                candidate_vid=tid,
+                candidate_term=term,
+            )
+            if not keep:
+                if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+                    print(
+                        f"[Stage2B dense reject] anchor={anchor_stub.anchor_term!r} "
+                        f"parent={getattr(p, 'term', '')!r} cand={term!r} "
+                        f"reason={keep_meta.get('reason')}"
+                    )
+                continue
+
+            if is_device_or_object_term(term) and not anchor_allows_device_expansion(anchor_term):
                 continue
             domain_span = 0
             if getattr(label, "stats_conn", None):
@@ -1862,12 +1918,13 @@ def expand_from_vocab_dense_neighbors(
             if domain_span > DOMAIN_SPAN_EXTREME:
                 continue
             seen.add(tid)
+            keep_score = float(keep_meta.get("keep_score", sim))
             out.append(
                 ExpandedTermCandidate(
                     vid=tid,
-                    term=meta[0] or str(tid),
+                    term=term,
                     term_role="dense_expansion",
-                    identity_score=sim,
+                    identity_score=keep_score,
                     source="dense",
                     anchor_vid=p.anchor_vid,
                     anchor_term=p.anchor_term,
@@ -1877,7 +1934,13 @@ def expand_from_vocab_dense_neighbors(
                     parent_primary=p.term,
                 )
             )
-            count += 1
+            kept += 1
+            if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+                print(
+                    f"[stage2b_expanded] tid={tid} term={term!r} source_type=dense "
+                    f"parent_anchor={p.anchor_term!r} parent_primary={p.term!r} "
+                    f"score={sim:.3f} keep_score={keep_score:.3f}"
+                )
     if LABEL_EXPANSION_DEBUG:
         print(f"[Stage2B] expand_from_vocab_dense_neighbors primary数={len(primary_landings)} -> dense_expansion {len(out)} 个")
         for i, c in enumerate(out[:8]):
@@ -1896,85 +1959,8 @@ def expand_from_cluster_members(
     jd_subfield_ids: Optional[Set[str]] = None,
     jd_topic_ids: Optional[Set[str]] = None,
 ) -> List[ExpandedTermCandidate]:
-    """从簇内取同簇支持词；仅保留与激活领域（及可选三级领域）一致的词。term_role=cluster_expansion。"""
-    max_per_primary = max_per_primary or CLUSTER_MAX_PER_PRIMARY
-    voc_to_clusters = getattr(label, "voc_to_clusters", None) or {}
-    cluster_members = getattr(label, "cluster_members", None) or {}
-    if not primary_landings or not voc_to_clusters or not cluster_members:
-        return []
-    load_vocab_meta(label)
-    seen = set(p.vid for p in primary_landings)
-    out = []
-    for p in primary_landings:
-        if getattr(p, "retain_mode", "normal") != "normal":
-            continue
-        if (getattr(p, "topic_source", "missing") or "missing") == "cooc":
-            continue
-        if (getattr(p, "primary_score", 0) or 0) < 0.40:
-            continue
-        clusters = voc_to_clusters.get(p.vid)
-        if not clusters:
-            continue
-        cid, _ = max(clusters, key=lambda x: x[1])
-        members = cluster_members.get(cid) or []
-        count = 0
-        for vid in members:
-            if count >= max_per_primary:
-                break
-            vid = int(vid)
-            if vid in seen:
-                continue
-            meta = label._vocab_meta.get(vid, ("", ""))
-            if meta[1] not in ("concept", "keyword", "") and meta[1]:
-                continue
-            if active_domain_set is not None or jd_field_ids or jd_subfield_ids or jd_topic_ids:
-                if not _term_in_active_domains(
-                    label, vid,
-                    active_domain_set=active_domain_set,
-                    jd_field_ids=jd_field_ids,
-                    jd_subfield_ids=jd_subfield_ids,
-                    jd_topic_ids=jd_topic_ids,
-                ):
-                    continue
-            domain_fit = _compute_domain_fit(
-                label, vid,
-                active_domain_set=active_domain_set,
-                jd_field_ids=jd_field_ids,
-                jd_subfield_ids=jd_subfield_ids,
-                jd_topic_ids=jd_topic_ids,
-            )
-            if domain_fit < SUPPORT_MIN_DOMAIN_FIT:
-                continue
-            domain_span = 0
-            if getattr(label, "stats_conn", None):
-                row = label.stats_conn.execute(
-                    "SELECT domain_span FROM vocabulary_domain_stats WHERE voc_id=?",
-                    (vid,),
-                ).fetchone()
-                if row:
-                    domain_span = int(row[0] or 0)
-            if domain_span > DOMAIN_SPAN_EXTREME:
-                continue
-            seen.add(vid)
-            out.append(
-                ExpandedTermCandidate(
-                    vid=vid,
-                    term=meta[0] or str(vid),
-                    term_role="cluster_expansion",
-                    identity_score=0.5,
-                    source="cluster",
-                    anchor_vid=p.anchor_vid,
-                    anchor_term=p.anchor_term,
-                    semantic_score=0.0,
-                    src_vids=[p.vid],
-                    hit_count=1,
-                    parent_primary=p.term,
-                )
-            )
-            count += 1
-    if LABEL_EXPANSION_DEBUG:
-        print(f"[Stage2B] expand_from_cluster_members primary数={len(primary_landings)} -> cluster_expansion {len(out)} 个")
-    return out
+    """Cluster 扩散当前默认关闭（全关），避免脏簇成员混入。term_role=cluster_expansion。"""
+    return []
 
 
 def expand_from_cooccurrence_support(
@@ -1984,8 +1970,9 @@ def expand_from_cooccurrence_support(
     jd_field_ids: Optional[Set[str]] = None,
     jd_subfield_ids: Optional[Set[str]] = None,
     jd_topic_ids: Optional[Set[str]] = None,
+    jd_profile: Optional[Dict[str, Any]] = None,
 ) -> List[ExpandedTermCandidate]:
-    """共现高支持度学术词；仅允许 strong normal + direct 且 primary_score>=0.45 的 seed。term_role=cooc_expansion。"""
+    """共现支持词；仅允许强 normal + 多锚 + 高 jd_align 的 seed，support 须过 support_expandable_for_anchor，每 seed 最多 2 条。"""
     if not primary_landings or not getattr(label, "stats_conn", None):
         return []
     load_vocab_meta(label)
@@ -1997,25 +1984,39 @@ def expand_from_cooccurrence_support(
     strong_primaries = [
         p for p in primary_landings
         if getattr(p, "retain_mode", "normal") == "normal"
-        and (getattr(p, "topic_source", "missing") or "missing") == "direct"
-        and (getattr(p, "primary_score", 0) or 0) >= 0.45
+        and float(getattr(p, "primary_score", 0) or 0) >= 0.70
+        and float(getattr(p, "jd_align", 0) or 0) >= 0.82
+        and int(getattr(p, "cross_anchor_support_count", 1) or 1) >= 2
     ]
-    vid_to_term = {p.vid: (p.term, p.anchor_vid, p.anchor_term) for p in strong_primaries}
+    anchor_to_primaries: Dict[int, List[Any]] = {}
+    for p in primary_landings:
+        a_vid = getattr(p, "anchor_vid", 0)
+        anchor_to_primaries.setdefault(a_vid, []).append(p)
     out = []
     seen = set(p.vid for p in primary_landings)
-    for vid, (term, anchor_vid, anchor_term) in vid_to_term.items():
+    cooc_min_freq = max(COOC_SUPPORT_MIN_FREQ, 2)
+    for p in strong_primaries:
+        term = getattr(p, "term", "") or ""
         if not term:
             continue
         try:
             rows = label.stats_conn.execute(
                 "SELECT term_a, term_b, freq FROM vocabulary_cooccurrence WHERE (term_a = ? OR term_b = ?) AND freq >= ?",
-                (term, term, COOC_SUPPORT_MIN_FREQ),
+                (term, term, cooc_min_freq),
             ).fetchall()
         except Exception:
             continue
-        count = 0
+        anchor_stub = SimpleNamespace(
+            anchor_term=getattr(p, "anchor_term", "") or "",
+            anchor_vid=getattr(p, "anchor_vid", 0),
+            conditioned_vec=getattr(p, "anchor_conditioned_vec", None),
+            _context_score_map=getattr(p, "_context_score_map", None) or {},
+            _context_neighbors=getattr(p, "_context_neighbors", None) or [],
+            _stage2b_anchor_primaries=anchor_to_primaries.get(getattr(p, "anchor_vid", 0), []),
+        )
+        kept = 0
         for row in rows:
-            if count >= COOC_MAX_PER_PRIMARY:
+            if kept >= 2:
                 break
             ta, tb, freq = row[0], row[1], row[2]
             other = (tb if ta == term else ta) or ""
@@ -2026,6 +2027,9 @@ def expand_from_cooccurrence_support(
                 continue
             if vid_other in seen:
                 continue
+            if (freq or 0) < 3:
+                continue
+            cooc_strength = min(1.0, float(freq or 0) / 5.0)
             if active_domain_set is not None or jd_field_ids or jd_subfield_ids or jd_topic_ids:
                 if not _term_in_active_domains(
                     label, vid_other,
@@ -2042,16 +2046,25 @@ def expand_from_cooccurrence_support(
                 jd_subfield_ids=jd_subfield_ids,
                 jd_topic_ids=jd_topic_ids,
             )
-            if domain_fit < SUPPORT_MIN_DOMAIN_FIT:
+            if domain_fit < 0.75:
+                continue
+            keep, _ = support_expandable_for_anchor(
+                label=label,
+                anchor=anchor_stub,
+                parent_primary=p,
+                candidate_vid=int(vid_other),
+                candidate_term=other,
+            )
+            if not keep:
                 continue
             domain_span = 0
             if getattr(label, "stats_conn", None):
-                row = label.stats_conn.execute(
+                r = label.stats_conn.execute(
                     "SELECT domain_span FROM vocabulary_domain_stats WHERE voc_id=?",
                     (vid_other,),
                 ).fetchone()
-                if row:
-                    domain_span = int(row[0] or 0)
+                if r:
+                    domain_span = int(r[0] or 0)
             if domain_span > DOMAIN_SPAN_EXTREME:
                 continue
             seen.add(vid_other)
@@ -2061,17 +2074,17 @@ def expand_from_cooccurrence_support(
                     vid=vid_other,
                     term=meta[0] or other,
                     term_role="cooc_expansion",
-                    identity_score=0.4,  # 共现给予固定身份分以过闸门 0.35
+                    identity_score=cooc_strength,
                     source="cooc",
                     anchor_vid=anchor_vid,
                     anchor_term=anchor_term,
-                    semantic_score=0.0,
+                    semantic_score=cooc_strength,
                     src_vids=[vid],
                     hit_count=int(freq),
                     parent_primary=term,
                 )
             )
-            count += 1
+            kept += 1
     if LABEL_EXPANSION_DEBUG:
         print(f"[Stage2B] expand_from_cooccurrence_support primary数={len(primary_landings)} -> cooc_expansion {len(out)} 个")
     return out
@@ -2608,6 +2621,103 @@ def _is_bad_support_for_anchor(anchor_text: str, support_term: str) -> bool:
     return is_semantic_mismatch_seed(anchor_text, support_term)
 
 
+def _get_vocab_vec(label: Any, vid: int) -> Optional[np.ndarray]:
+    """取词汇向量，供 dense support gate 使用。"""
+    idx = getattr(label, "vocab_to_idx", None)
+    if idx is None:
+        return None
+    i = idx.get(str(vid)) if isinstance(idx, dict) else None
+    if i is None:
+        i = idx.get(vid)
+    if i is None:
+        return None
+    all_vecs = getattr(label, "all_vocab_vectors", None)
+    if all_vecs is None:
+        return None
+    try:
+        vec = np.asarray(all_vecs[i], dtype=np.float32)
+    except Exception:
+        return None
+    if vec.ndim != 1:
+        vec = vec.flatten()
+    return vec
+
+
+def _cos_sim(a: np.ndarray, b: np.ndarray) -> float:
+    """余弦相似度，限制到 [0, 1]。"""
+    a = np.asarray(a, dtype=np.float32).flatten()
+    b = np.asarray(b, dtype=np.float32).flatten()
+    if a.size != b.size or a.size == 0:
+        return 0.0
+    n = np.linalg.norm(a) * np.linalg.norm(b)
+    if n <= 1e-9:
+        return 0.0
+    return float(max(0.0, min(1.0, np.dot(a, b) / n)))
+
+
+def _estimate_context_support(
+    label: Any,
+    anchor: Any,
+    candidate_vid: int,
+    candidate_vec: Optional[np.ndarray] = None,
+) -> float:
+    """
+    候选是否也出现在 anchor 的 conditioned top-k 附近。
+    优先查缓存的 _context_score_map；没有则和 _context_neighbors 比局部相似度。
+    """
+    context_score_map = getattr(anchor, "_context_score_map", None) or {}
+    if candidate_vid in context_score_map:
+        try:
+            return float(context_score_map[candidate_vid])
+        except Exception:
+            pass
+    context_neighbors = getattr(anchor, "_context_neighbors", None) or []
+    if not context_neighbors:
+        return 0.0
+    if candidate_vec is None:
+        candidate_vec = _get_vocab_vec(label, candidate_vid)
+    if candidate_vec is None:
+        return 0.0
+    best = 0.0
+    for n in context_neighbors:
+        n_vid = getattr(n, "vid", n) if not isinstance(n, int) else n
+        n_vec = _get_vocab_vec(label, int(n_vid))
+        if n_vec is None:
+            continue
+        best = max(best, _cos_sim(candidate_vec, n_vec))
+    return best
+
+
+def _estimate_anchor_family_support(
+    label: Any,
+    candidate_vec: np.ndarray,
+    surviving_primaries: List[Any],
+) -> float:
+    """
+    候选是否得到同锚 surviving primary family 的共同支持。
+    防止只贴某一个旁支 primary（drift_penalty）。
+    """
+    if not surviving_primaries:
+        return 0.0
+    sims: List[float] = []
+    for p in surviving_primaries:
+        p_vid = getattr(p, "vid", None)
+        if p_vid is None:
+            continue
+        p_vec = _get_vocab_vec(label, int(p_vid))
+        if p_vec is None:
+            continue
+        sims.append(_cos_sim(candidate_vec, p_vec))
+    if not sims:
+        return 0.0
+    mean_sim = sum(sims) / len(sims)
+    max_sim = max(sims)
+    min_sim = min(sims)
+    drift_penalty = max(0.0, max_sim - min_sim)
+    score = mean_sim - 0.25 * drift_penalty
+    return max(0.0, min(1.0, score))
+
+
 def is_semantic_mismatch_seed(anchor_text: str, primary_term: str) -> bool:
     """
     临时护栏：明显错义/偏义 seed 禁止扩散。
@@ -2683,6 +2793,193 @@ def should_block_seed_expansion(
     if src == "conditioned_vec" and anchor_identity < 0.35 and support_count < 2:
         return True, "weak_condvec_seed"
     return False, None
+
+
+# ---------- Stage2B 双层门：seed gate（谁能扩）+ support gate（扩出来的词谁能留） ----------
+
+# 禁止作为扩散 seed 的窄方法/器件支线词（做 primary 可保留，做 seed 会带偏 dense/cluster）
+NARROW_METHOD_OR_BRANCH_TERMS = frozenset({
+    "q-learning", "digital control", "automatic control", "route planning",
+    "pathfinding", "servo control", "machine control", "instrument control",
+    "radio control", "electronic control unit", "automatic train control",
+    "automatic frequency control", "digitally controlled oscillator",
+})
+
+# 设备/对象/组件/应用支线词：dense 默认不进入 support，除非锚点本身允许
+DEVICE_OBJECT_TERM_PATTERNS = (
+    "oscillator", "radio control", "train control", "unit", "ecu",
+    "instrument control", "comparator", "discharge machining", "frequency",
+    "decimal", "design strategy", "two-sided market", "protocol", "resolution",
+    "social computing", "social software", "electrical discharge",
+    "frenet", "serret", "center frequency",
+)
+
+
+def is_narrow_method_term(primary_term: str) -> bool:
+    """是否属于窄方法/支线词，不宜作为扩散 seed（seed_expand_factor 惩罚）。"""
+    if not primary_term:
+        return False
+    t = (primary_term or "").strip().lower()
+    if t in NARROW_METHOD_OR_BRANCH_TERMS:
+        return True
+    for k in NARROW_METHOD_OR_BRANCH_TERMS:
+        if k in t or t in k:
+            return True
+    return False
+
+
+def is_device_or_object_term(term: str) -> bool:
+    """是否像设备/对象/组件/应用支线词，dense 默认不进入 support。"""
+    if not term:
+        return False
+    t = (term or "").strip().lower()
+    for pat in DEVICE_OBJECT_TERM_PATTERNS:
+        if pat in t:
+            return True
+    return False
+
+
+def anchor_allows_device_expansion(anchor_text: str) -> bool:
+    """锚点是否允许设备类扩展（如「医疗机器人」可带出部分设备词）。当前保守：一律不允许。"""
+    if not anchor_text:
+        return False
+    a = (anchor_text or "").strip().lower()
+    # 若以后要对「医疗机器人」「手术机器人」等开放，在此加白名单
+    return False
+
+
+def is_primary_expandable(
+    anchor_text: str,
+    primary_term: str,
+    primary_score: float,
+    anchor_identity: float,
+    jd_align: float,
+    support_count: int,
+    source_type: str,
+) -> bool:
+    """
+    只有「适合扩散的 primary」才能扩。
+    允许：本体主词（motion control, robot control, medical robotics, robotic arm, reinforcement learning）、
+    多锚支持且上下文稳定的骨干词。
+    禁止：q-learning、digital control、automatic control、route planning 等窄支线；
+    任何 weak_retain + suppress_seed=True。
+    """
+    anchor = (anchor_text or "").strip().lower()
+    term = (primary_term or "").strip().lower()
+    if not term:
+        return False
+    # 窄方法/支线词禁止扩散
+    if is_narrow_method_term(primary_term):
+        return False
+    # 本体主词或骨干词：identity 或 多锚+jd 稳定
+    if support_count >= 2 and jd_align >= 0.78 and primary_score >= 0.35:
+        return True
+    if anchor_identity >= 0.40 and jd_align >= 0.75:
+        return True
+    # 主词白名单式放行
+    expandable_heads = (
+        "motion control", "robot control", "medical robotics", "robotic arm",
+        "reinforcement learning", "path planning", "simulation", "control engineering",
+    )
+    if any(h in term for h in expandable_heads) and anchor_identity >= 0.22:
+        return True
+    return False
+
+
+def support_expandable_for_anchor(
+    label: Any,
+    anchor: Any,
+    parent_primary: Any,
+    candidate_vid: int,
+    candidate_term: str,
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Dense support 最小修复 gate：不靠硬编码词表，只靠语义一致性 + 上下文稳定性 + family 支撑。
+    四道门：primary_consistency、anchor_consistency、context_stability、family_support。
+    返回 (keep, meta)；meta 含 reason、keep_score、各分量。
+    """
+    candidate_vec = _get_vocab_vec(label, candidate_vid)
+    if candidate_vec is None:
+        return False, {"reason": "missing_candidate_vec"}
+
+    primary_vid = getattr(parent_primary, "vid", None)
+    if primary_vid is None:
+        return False, {"reason": "missing_primary_vid"}
+    primary_vec = _get_vocab_vec(label, int(primary_vid))
+    if primary_vec is None:
+        return False, {"reason": "missing_primary_vec"}
+
+    primary_consistency = _cos_sim(primary_vec, candidate_vec)
+
+    anchor_consistency = 0.0
+    conditioned = getattr(anchor, "conditioned_vec", None)
+    if conditioned is not None:
+        try:
+            cv = np.asarray(conditioned, dtype=np.float32).flatten()
+            if cv.size > 0:
+                anchor_consistency = _cos_sim(cv, candidate_vec)
+        except Exception:
+            pass
+    has_anchor_vec = conditioned is not None
+    if not has_anchor_vec:
+        anchor_consistency = 1.0  # 无 conditioned_vec 时跳过此项门控
+
+    context_stability = _estimate_context_support(
+        label=label,
+        anchor=anchor,
+        candidate_vid=candidate_vid,
+        candidate_vec=candidate_vec,
+    )
+    ctx_map = getattr(anchor, "_context_score_map", None) or {}
+    ctx_neighbors = getattr(anchor, "_context_neighbors", None) or []
+    has_context_data = bool(ctx_neighbors) or (candidate_vid in ctx_map)
+    if not has_context_data:
+        context_stability = 1.0  # 无 context 数据时跳过此项门控
+
+    surviving_primaries = getattr(anchor, "_stage2b_anchor_primaries", None) or []
+    family_support = _estimate_anchor_family_support(
+        label=label,
+        candidate_vec=candidate_vec,
+        surviving_primaries=surviving_primaries,
+    )
+    if not surviving_primaries:
+        family_support = 1.0  # 无同锚 primary 时跳过此项门控
+
+    if primary_consistency < DENSE_SUPPORT_PRIMARY_CONSISTENCY_MIN:
+        return False, {
+            "reason": "low_primary_consistency",
+            "primary_consistency": primary_consistency,
+        }
+    if has_anchor_vec and anchor_consistency < DENSE_SUPPORT_ANCHOR_CONSISTENCY_MIN:
+        return False, {
+            "reason": "low_anchor_consistency",
+            "anchor_consistency": anchor_consistency,
+        }
+    if has_context_data and context_stability < DENSE_SUPPORT_CONTEXT_STABILITY_MIN:
+        return False, {
+            "reason": "low_context_stability",
+            "context_stability": context_stability,
+        }
+    if surviving_primaries and family_support < DENSE_SUPPORT_FAMILY_SUPPORT_MIN:
+        return False, {
+            "reason": "low_family_support",
+            "family_support": family_support,
+        }
+
+    keep_score = (
+        0.30 * primary_consistency
+        + 0.30 * anchor_consistency
+        + 0.25 * context_stability
+        + 0.15 * family_support
+    )
+    return True, {
+        "reason": "ok",
+        "keep_score": keep_score,
+        "primary_consistency": primary_consistency,
+        "anchor_consistency": anchor_consistency,
+        "context_stability": context_stability,
+        "family_support": family_support,
+    }
 
 
 def compute_context_consistency(c: LandingCandidate) -> float:
@@ -3581,8 +3878,7 @@ def stage2_generate_academic_terms(
             if eligible:
                 setattr(p, "seed_score", seed_score)
                 diffusion_primaries.append(p)
-        if not diffusion_primaries and primary_landings:
-            diffusion_primaries = sorted(primary_landings, key=lambda x: getattr(x, "primary_score", x.identity_score), reverse=True)[: max(1, len(primary_landings) // 2)]
+        # 无 fallback 兜底：只有 check_seed_eligibility 通过的 primary 才参与扩散
         _stage2_header(f"Stage2B seed 明细 [锚点 {getattr(anchor, 'anchor', anchor)!r}]", "-")
         if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and _seed_detail:
             _stage2_table(
@@ -3600,6 +3896,11 @@ def stage2_generate_academic_terms(
             debug_print(2, f"[Stage2B] seed_terms={[p.term for p in diffusion_primaries[:10]]}", label)
         if LABEL_EXPANSION_DEBUG and (len(diffusion_primaries) != len(primary_landings) or not diffusion_primaries):
             print(f"[Stage2B] seed 数={len(diffusion_primaries)}/{len(primary_landings)}（identity≥{SEED_MIN_IDENTITY} & source∈可信，单一决策无二次审批）")
+        # 为 dense/cooc 的 support_expandable_for_anchor 提供锚点 context
+        for p in diffusion_primaries:
+            setattr(p, "anchor_conditioned_vec", getattr(anchor, "conditioned_vec", None))
+            setattr(p, "_context_neighbors", getattr(anchor, "_context_neighbors", None) or [])
+            setattr(p, "_context_score_map", getattr(anchor, "_context_score_map", None) or {})
         dense_list = expand_from_vocab_dense_neighbors(
             label, diffusion_primaries,
             active_domain_set=active_domains,
@@ -3621,6 +3922,7 @@ def stage2_generate_academic_terms(
             jd_field_ids=jd_field_ids,
             jd_subfield_ids=jd_subfield_ids,
             jd_topic_ids=jd_topic_ids,
+            jd_profile=jd_profile,
         )
         _stage2_header("Stage2B 扩展汇总（dense / cluster / cooc）", "-")
         if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
