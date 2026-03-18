@@ -105,13 +105,38 @@ class PreparedAnchor:
 
 @dataclass
 class LandingCandidate:
-    """Stage2A 落点候选。"""
+    """Stage2A 落点候选。similar_to 初始近邻 + conditioned_vec 上下文纠偏。"""
     vid: int
     term: str
-    source: str  # similar_to（当前 Stage2A 唯一来源）；jd_vector 预留
+    source: str  # similar_to | conditioned_vec
     semantic_score: float
     anchor_vid: int = 0
     anchor_term: str = ""
+
+    # ===== Stage2A 上下文纠偏 / 准入 / 打分 =====
+    context_sim: float = 0.0                 # conditioned_vec 下的相似度；若无则 0
+    context_supported: bool = False          # 是否得到上下文支持
+    context_gap: float = 1.0                 # raw_sim - context_sim 的差，越大越可疑
+    source_role: str = "seed_candidate"     # seed_candidate | context_fallback
+    primary_eligible: bool = False
+    primary_eligibility_reasons: List[str] = field(default_factory=list)
+
+    # ===== 已显式化（原 setattr 动态塞入） =====
+    anchor_identity_score: float = 0.5
+    jd_candidate_alignment: float = 0.5
+    neighborhood_consistency: float = 0.5
+    local_neighborhood_consistency: float = 0.5
+    cross_anchor_support_count: int = 1
+    hierarchy_evidence: Dict[str, Any] = field(default_factory=dict)
+    primary_score: float = 0.0
+    retain_mode: str = "normal"
+    suppress_seed: bool = False
+    retain_reason: Optional[str] = None
+    topic_source: str = "missing"
+    identity_score: float = 0.0
+    identity_gate: float = 1.0
+    domain_fit: float = 1.0
+    domain_reason: str = ""                  # domain_conflict_strong 等，供 check_primary_eligibility
 
 
 @dataclass
@@ -1237,30 +1262,43 @@ def retrieve_academic_term_by_similar_to(
 def _retrieve_academic_terms_by_conditioned_vec(
     label,
     anchor: PreparedAnchor,
+    similar_to_candidates: Optional[List[LandingCandidate]] = None,
     active_domain_set: Optional[Set[int]] = None,
     jd_field_ids: Optional[Set[str]] = None,
     jd_subfield_ids: Optional[Set[str]] = None,
     jd_topic_ids: Optional[Set[str]] = None,
-) -> List[LandingCandidate]:
-    """Stage2A 召回时用 gte+JD 上下文：用锚点 conditioned_vec 在学术词索引中检索，仅返回 concept/keyword 且通过领域过滤的候选。"""
+) -> Tuple[List[LandingCandidate], Dict[int, Dict[str, float]]]:
+    """
+    Stage2A 上下文纠偏：
+    1) 用 conditioned_vec 查学术词索引
+    2) 返回 context_neighbors
+    3) 同时给 similar_to 候选生成 context 重打分信号
+
+    返回:
+    - context_neighbors: 带上下文检索到的候选
+    - rerank_signals: {vid: {"context_sim": x, "context_supported": 0|1, "context_gap": y}}
+    """
     if getattr(anchor, "conditioned_vec", None) is None:
-        return []
+        return [], {}
     if not getattr(label, "vocab_index", None) or not getattr(label, "_vocab_meta", None):
-        return []
+        return [], {}
     load_vocab_meta(label)
     try:
         vec = np.asarray(anchor.conditioned_vec, dtype=np.float32).flatten()
         if vec.size == 0:
-            return []
+            return [], {}
         vec = vec.reshape(1, -1)
         faiss.normalize_L2(vec)
         k = min(CONDITIONED_VEC_TOP_K, getattr(label.vocab_index, "ntotal", 100))
         if k <= 0:
-            return []
+            return [], {}
         scores, ids = label.vocab_index.search(vec, k)
     except Exception:
-        return []
-    out = []
+        return [], {}
+
+    context_neighbors: List[LandingCandidate] = []
+    context_score_map: Dict[int, float] = {}
+
     for score, tid in zip(scores[0], ids[0]):
         try:
             tid = int(tid)
@@ -1269,34 +1307,53 @@ def _retrieve_academic_terms_by_conditioned_vec(
         if tid <= 0 or tid == getattr(anchor, "vid", -1):
             continue
         meta = label._vocab_meta.get(tid, ("", ""))
-        if meta[1] not in ("concept", "keyword") and meta[1]:
+        term = (meta[0] or "").strip() or str(tid)
+        vocab_type = meta[1] or ""
+        if vocab_type not in ("concept", "keyword") and vocab_type:
             continue
         sim = max(0.0, min(1.0, float(score)))
         if sim < SIMILAR_TO_MIN_SCORE:
             continue
-        if active_domain_set is not None or jd_field_ids or jd_subfield_ids or jd_topic_ids:
-            if not _term_in_active_domains(
-                label, tid,
-                active_domain_set=active_domain_set,
-                jd_field_ids=jd_field_ids,
-                jd_subfield_ids=jd_subfield_ids,
-                jd_topic_ids=jd_topic_ids,
-            ):
-                continue
-        term = (meta[0] or "").strip() or str(tid)
-        out.append(
-            LandingCandidate(
-                vid=tid,
-                term=term,
-                source="conditioned_vec",
-                semantic_score=sim,
-                anchor_vid=getattr(anchor, "vid", 0),
-                anchor_term=getattr(anchor, "anchor", ""),
-            )
+        ok, reason = _term_in_active_domains_with_reason(
+            label, tid,
+            active_domain_set=active_domain_set,
+            jd_field_ids=jd_field_ids,
+            jd_subfield_ids=jd_subfield_ids,
+            jd_topic_ids=jd_topic_ids,
         )
-    if LABEL_EXPANSION_DEBUG and out:
-        print(f"[Stage2A] conditioned_vec 检索 anchor={getattr(anchor, 'anchor', '')!r} -> {len(out)} 个学术词候选（与 SIMILAR_TO 合并）")
-    return out
+        if not ok:
+            continue
+        cand = LandingCandidate(
+            vid=tid,
+            term=term,
+            source="conditioned_vec",
+            semantic_score=sim,
+            anchor_vid=getattr(anchor, "vid", 0),
+            anchor_term=getattr(anchor, "anchor", ""),
+        )
+        cand.context_sim = sim
+        cand.context_supported = sim >= max(SIMILAR_TO_MIN_SCORE, 0.78)
+        cand.context_gap = 0.0
+        cand.source_role = "context_fallback"
+        context_neighbors.append(cand)
+        context_score_map[tid] = sim
+
+    rerank_signals: Dict[int, Dict[str, float]] = {}
+    similar_to_candidates = similar_to_candidates or []
+    for cand in similar_to_candidates:
+        ctx_sim = context_score_map.get(cand.vid, 0.0)
+        rerank_signals[cand.vid] = {
+            "context_sim": ctx_sim,
+            "context_supported": 1.0 if ctx_sim >= 0.78 else 0.0,
+            "context_gap": max(0.0, float(getattr(cand, "semantic_score", 0.0) or 0.0) - ctx_sim),
+        }
+
+    if LABEL_EXPANSION_DEBUG and context_neighbors:
+        print(
+            f"[Stage2A] conditioned_vec 上下文纠偏 anchor={getattr(anchor, 'anchor', '')!r} "
+            f"-> {len(context_neighbors)} 个候选（用于重打分/弱补位）"
+        )
+    return context_neighbors, rerank_signals
 
 
 # ---------- Identity Gate：候选与锚点“本义”一致性，用于压制错义（propulsion/kinesics/simula 等） ----------
@@ -1438,27 +1495,54 @@ def collect_landing_candidates(
     jd_profile: Optional[Dict[str, Any]] = None,
     query_vector=None,
 ) -> List[LandingCandidate]:
-    """Stage2A：跨类型 SIMILAR_TO + 召回时 gte+JD 上下文（conditioned_vec 检索学术词）；有 jd_profile 时做层级 fit 与 landing 打分。"""
-    similar_list = retrieve_academic_term_by_similar_to(
+    """
+    Stage2A:
+    1) 先用 similar_to 给初始候选
+    2) 再用 conditioned_vec 做上下文纠偏（重打分信号）
+    3) 主池太弱时，才少量补 context_fallback
+    """
+    # A. 初始候选：similar_to
+    similar_to_candidates = retrieve_academic_term_by_similar_to(
         label, anchor,
         active_domain_set=active_domain_set,
         jd_field_ids=jd_field_ids,
         jd_subfield_ids=jd_subfield_ids,
         jd_topic_ids=jd_topic_ids,
     )
-    by_vid = {c.vid: c for c in similar_list}
-    # 召回时用 gte+JD 上下文：conditioned_vec 检索学术词，与 SIMILAR_TO 合并（同 vid 保留 SIMILAR_TO）
-    ctx_list = _retrieve_academic_terms_by_conditioned_vec(
+    # B. 上下文纠偏：conditioned_vec
+    context_neighbors, rerank_signals = _retrieve_academic_terms_by_conditioned_vec(
         label, anchor,
+        similar_to_candidates=similar_to_candidates,
         active_domain_set=active_domain_set,
         jd_field_ids=jd_field_ids,
         jd_subfield_ids=jd_subfield_ids,
         jd_topic_ids=jd_topic_ids,
     )
-    for c in ctx_list:
-        if c.vid not in by_vid:
-            by_vid[c.vid] = c
-    cands = list(by_vid.values())
+    candidates: List[LandingCandidate] = []
+    existing_vids: Set[int] = set()
+    # C. similar_to 仍是主候选池，附加 context 信号
+    for cand in similar_to_candidates:
+        sig = rerank_signals.get(cand.vid, {})
+        cand.context_sim = float(sig.get("context_sim", 0.0) or 0.0)
+        cand.context_supported = bool(sig.get("context_supported", 0.0) >= 1.0)
+        cand.context_gap = float(sig.get("context_gap", 1.0) or 1.0)
+        cand.source_role = "seed_candidate"
+        candidates.append(cand)
+        existing_vids.add(cand.vid)
+    # D. 只有主池太弱时，才从 context_neighbors 补 1~2 个 fallback
+    if len(candidates) <= 1:
+        added = 0
+        for cand in context_neighbors:
+            if cand.vid in existing_vids:
+                continue
+            if cand.context_sim < 0.82:
+                continue
+            candidates.append(cand)
+            existing_vids.add(cand.vid)
+            added += 1
+            if added >= 2:
+                break
+    cands = candidates
     for c in cands:
         c.domain_fit = _compute_domain_fit(
             label, c.vid,
@@ -1542,19 +1626,18 @@ def collect_landing_candidates(
             setattr(c, "primary_cap", None)
     if LABEL_EXPANSION_DEBUG:
         print(f"[Stage2A] collect_landing_candidates anchor={anchor.anchor!r} -> {len(cands)} 个候选")
-        print("[Stage2A 候选明细] tid | term | source | semantic_score | domain_fit | anchor_identity | identity_gate | landing_score | jd_align")
-        for i, c in enumerate(cands[:25]):
-            sem = getattr(c, "semantic_score", 0)
-            df = getattr(c, "domain_fit", 1.0)
-            aid = getattr(c, "anchor_identity_score", 0.5)
-            gate = getattr(c, "identity_gate", 1.0)
-            land = getattr(c, "landing_score", None)
-            jd_a = getattr(c, "jd_candidate_alignment", None)
-            cap = getattr(c, "primary_cap", None)
-            cap_s = f" [{cap}]" if cap else ""
-            print(f"  {i+1} {c.vid} | {c.term!r} | {c.source} | sem={sem:.3f} | df={df:.3f} | identity={aid:.3f} | gate={gate:.2f}{cap_s} | landing={land} | jd_align={jd_a}")
-        if len(cands) > 25:
-            print(f"[stage2a_candidates] ... 共 {len(cands)} 条")
+    if STAGE2_VERBOSE_DEBUG:
+        print("[Stage2A 候选明细] tid | term | source | semantic_score | context_sim | context_supported | context_gap")
+        for i, c in enumerate(cands[:10], 1):
+            print(
+                f"  {i} {c.vid} | {c.term!r} | {c.source} "
+                f"| sem={getattr(c, 'semantic_score', 0):.3f}"
+                f" | ctx={getattr(c, 'context_sim', 0):.3f}"
+                f" | ctx_ok={getattr(c, 'context_supported', False)}"
+                f" | gap={getattr(c, 'context_gap', 1.0):.3f}"
+            )
+        if len(cands) > 10:
+            print(f"  ... 共 {len(cands)} 条")
     return cands
 
 
@@ -2590,6 +2673,50 @@ def should_block_seed_expansion(
     return False, None
 
 
+def compute_context_consistency(c: LandingCandidate) -> float:
+    """
+    raw semantic_score 与 conditioned_vec context_sim 的一致性。
+    越一致，说明这个词在「无上下文近邻」和「有上下文近邻」里都站得住。
+    """
+    raw_sim = max(0.0, min(1.0, float(getattr(c, "semantic_score", 0.0) or 0.0)))
+    ctx_sim = max(0.0, min(1.0, float(getattr(c, "context_sim", 0.0) or 0.0)))
+    if ctx_sim <= 0.0:
+        return raw_sim * 0.65
+    consistency = 1.0 - abs(raw_sim - ctx_sim)
+    score = 0.45 * raw_sim + 0.45 * ctx_sim + 0.10 * consistency
+    return max(0.0, min(1.0, score))
+
+
+def check_primary_eligibility(
+    anchor: PreparedAnchor,
+    c: LandingCandidate,
+    hier_ev: Dict[str, Any],
+) -> Tuple[bool, List[str]]:
+    """资格赛：该候选是否有资格争 primary。返回 (eligible, reasons)。"""
+    reasons: List[str] = []
+    aid = float(getattr(c, "anchor_identity_score", 0.0) or 0.0)
+    ctx_sim = float(getattr(c, "context_sim", 0.0) or 0.0)
+    ctx_supported = bool(getattr(c, "context_supported", False))
+    source_role = (getattr(c, "source_role", "") or "").strip()
+
+    if aid < 0.30:
+        reasons.append("identity_too_low")
+    if c.source == "similar_to":
+        if ctx_sim < 0.74:
+            reasons.append("context_not_supporting_similar_to")
+    if source_role == "context_fallback":
+        if ctx_sim < 0.82:
+            reasons.append("context_fallback_not_strong_enough")
+        if aid < 0.50:
+            reasons.append("context_fallback_identity_weak")
+    domain_reason = getattr(c, "domain_reason", "") or ""
+    if domain_reason == "domain_conflict_strong":
+        reasons.append("domain_conflict_strong")
+
+    eligible = len(reasons) == 0
+    return eligible, reasons
+
+
 def check_primary_admission(
     anchor_text: str,
     anchor_meta: Any,
@@ -2602,48 +2729,64 @@ def check_primary_admission(
     cross_anchor_support_count: int,
 ) -> Tuple[bool, List[str], bool, Dict[str, Any]]:
     """
-    Stage2A 主落点准入：domain 强冲突才硬拒；topic/path 弱改为 weak_retain，不再误杀主干词。
-    返回 (admitted, reasons, rescued, meta)；meta 含 retain_mode（normal|weak_retain）、suppress_seed、retain_reason。
+    返回 (admitted, reasons, rescued, admission_meta)。
+    准入纳入「上下文是否仍然支持」：双空间一致 + rescue/context_fallback 通道。
     """
-    src = (source_type or "").strip().lower()
     reasons: List[str] = []
+    rescued = False
+    meta: Dict[str, Any] = {"retain_mode": "reject", "suppress_seed": False, "retain_reason": None}
+
     if not _lexical_term_sanity(getattr(candidate, "term", "") or "", None):
-        return False, ["lexical_not_term"], False, {"retain_mode": "reject"}
+        return False, ["lexical_not_term"], rescued, meta
 
-    # 大领域强冲突：三层 overlap 全为 0 时硬拒
-    field_o = hierarchy_evidence.get("field_overlap", 0) or 0
-    sub_o = hierarchy_evidence.get("subfield_overlap", 0) or 0
-    topic_o = hierarchy_evidence.get("topic_overlap", 0) or 0
-    if field_o == 0 and sub_o == 0 and topic_o == 0:
-        # 无 JD 时也为 0，用 semantic/jd 救回；有 JD 时全 0 即强冲突
-        if semantic_score < 0.78 or jd_align < 0.76:
-            return False, ["domain_conflict_strong"], False, {"retain_mode": "reject"}
+    eligible, eligibility_reasons = check_primary_eligibility(anchor_meta, candidate, hierarchy_evidence)
+    if not eligible:
+        reasons.extend(eligibility_reasons)
+        return False, reasons, rescued, meta
 
-    if anchor_identity < 0.20:
-        if not (jd_align >= PRIMARY_RESCUE_JD_ALIGN_MIN and semantic_score >= PRIMARY_RESCUE_SEMANTIC_MIN):
-            reasons.append("low_identity_not_rescued")
-    is_generic = getattr(anchor_meta, "is_generic_anchor", False)
-    if is_generic and src == "conditioned_vec" and cross_anchor_support_count < 2:
-        reasons.append("generic_anchor_condvec_needs_multi_support")
-    if reasons:
-        return False, reasons, False, {"retain_mode": "reject"}
+    path_match = float(hierarchy_evidence.get("path_match", 0.0) or 0.0)
+    topic_overlap = float(hierarchy_evidence.get("topic_overlap", 0.0) or 0.0)
+    subfield_overlap = float(hierarchy_evidence.get("subfield_overlap", 0.0) or 0.0)
+    context_consistency = compute_context_consistency(candidate)
+    ctx_sim = float(getattr(candidate, "context_sim", 0.0) or 0.0)
+    source_role = (getattr(candidate, "source_role", "") or "").strip()
 
-    ev_topic = hierarchy_evidence.get("effective_topic_overlap", hierarchy_evidence.get("topic_overlap", 0)) or 0
-    ev_path = hierarchy_evidence.get("effective_path_match", hierarchy_evidence.get("path_match", 0)) or 0
+    # 主通道：双空间都站得住
+    if (
+        semantic_score >= 0.80
+        and jd_align >= 0.80
+        and anchor_identity >= 0.35
+        and context_consistency >= 0.78
+    ):
+        meta["retain_mode"] = "normal"
+        meta["suppress_seed"] = False
+        meta["retain_reason"] = "dual_space_supported"
+        return True, reasons, rescued, meta
 
-    # 主干语义保护：双高直接弱保留且可做 seed
-    if semantic_score >= 0.82 and jd_align >= 0.80:
-        return True, [], False, {"retain_mode": "weak_retain", "suppress_seed": False, "retain_reason": "strong_semantic"}
+    # rescue：多锚支持 + 上下文不差 + 层级不差
+    if (
+        cross_anchor_support_count >= PRIMARY_RESCUE_CROSS_ANCHOR_MIN
+        and path_match >= PRIMARY_RESCUE_PATH_MATCH_MIN
+        and jd_align >= PRIMARY_RESCUE_JD_ALIGN_MIN
+        and semantic_score >= PRIMARY_RESCUE_SEMANTIC_MIN
+        and context_consistency >= 0.74
+    ):
+        rescued = True
+        meta["retain_mode"] = "weak_retain"
+        meta["suppress_seed"] = True
+        meta["retain_reason"] = "cross_anchor_context_rescue"
+        return True, reasons, rescued, meta
 
-    # hierarchy 很强，正常通过
-    if ev_topic >= PRIMARY_MIN_HIERARCHY_MATCH and ev_path >= PRIMARY_MIN_PATH_MATCH:
-        return True, [], False, {"retain_mode": "normal", "suppress_seed": False}
+    # conditioned_vec 弱补位通道：必须非常强
+    if source_role == "context_fallback":
+        if ctx_sim >= 0.84 and jd_align >= 0.82 and anchor_identity >= 0.55:
+            meta["retain_mode"] = "weak_retain"
+            meta["suppress_seed"] = True
+            meta["retain_reason"] = "context_fallback_supported"
+            return True, reasons, rescued, meta
 
-    # hierarchy 弱但 semantic/jd 足够，弱保留且默认不扩散
-    if semantic_score >= 0.78 and jd_align >= 0.76:
-        return True, ["hierarchy_weak"], False, {"retain_mode": "weak_retain", "suppress_seed": True, "retain_reason": "borderline_hierarchy"}
-
-    return False, ["hierarchy_weak", "path_weak"], False, {"retain_mode": "reject"}
+    reasons.append("dual_space_not_stable")
+    return False, reasons, rescued, meta
 
 
 def _piecewise_identity_factor(anchor_identity: float) -> float:
@@ -2668,25 +2811,43 @@ def compute_primary_score(
     source_type: str,
 ) -> float:
     """
-    对已准入的候选排序；hierarchy 作强加分项，不做硬生杀；weak_retain 轻降权 0.85。
+    本义 + 双空间一致性做主干，hierarchy 只微调；不再让 path/topic/span 单独翻盘。
     """
+    raw_sim = max(0.0, min(1.0, float(semantic_score or 0.0)))
+    identity = max(0.0, min(1.0, float(anchor_identity or 0.0)))
+    jd = max(0.0, min(1.0, float(jd_align or 0.0)))
+    cross = max(0.0, min(1.0, min(int(cross_anchor_support_count or 0), 2) / 2.0))
+    neigh = max(0.0, min(1.0, float(local_neighborhood_consistency or 0.0)))
+    context_consistency = compute_context_consistency(candidate)
+
     base = (
-        0.35 * max(0, min(1, semantic_score))
-        + 0.25 * max(0, min(1, jd_align))
-        + 0.15 * max(0, min(1, anchor_identity))
-        + 0.10 * min(cross_anchor_support_count / 2.0, 1.0)
-        + 0.15 * max(0, min(1, local_neighborhood_consistency))
+        0.30 * identity
+        + 0.26 * context_consistency
+        + 0.24 * jd
+        + 0.10 * raw_sim
+        + 0.06 * cross
+        + 0.04 * neigh
     )
-    eff_sub = hierarchy_evidence.get("effective_subfield_overlap", hierarchy_evidence.get("subfield_overlap", 0)) or 0
-    eff_topic = hierarchy_evidence.get("effective_topic_overlap", hierarchy_evidence.get("topic_overlap", 0)) or 0
-    eff_path = hierarchy_evidence.get("effective_path_match", hierarchy_evidence.get("path_match", 0)) or 0
-    spec = hierarchy_evidence.get("topic_specificity", 0) or 0
-    hierarchy_score = 0.20 * eff_sub + 0.30 * eff_topic + 0.30 * eff_path + 0.20 * spec
-    span_factor = hierarchy_evidence.get("topic_span_penalty", 1.0) or 1.0
-    final = (base + hierarchy_score) * span_factor
+    field_fit = max(0.0, min(1.0, float(hierarchy_evidence.get("field_overlap", 0.0) or 0.0)))
+    subfield_fit = max(0.0, min(1.0, float(hierarchy_evidence.get("subfield_overlap", 0.0) or 0.0)))
+    topic_fit = max(0.0, min(1.0, float(hierarchy_evidence.get("topic_overlap", 0.0) or 0.0)))
+    path_match = max(0.0, min(1.0, float(hierarchy_evidence.get("path_match", 0.0) or 0.0)))
+    topic_span_penalty = max(0.0, min(1.0, float(hierarchy_evidence.get("topic_span_penalty", 1.0) or 1.0)))
+    topic_specificity = max(0.0, min(1.0, float(hierarchy_evidence.get("topic_specificity", 0.0) or 0.0)))
+    hierarchy_bonus = (
+        0.04 * field_fit
+        + 0.05 * subfield_fit
+        + 0.05 * topic_fit
+        + 0.03 * path_match
+        + 0.02 * topic_specificity
+    )
+    span_factor = 0.95 + 0.05 * topic_span_penalty
+    final = (base + hierarchy_bonus) * span_factor
     if getattr(candidate, "retain_mode", "normal") == "weak_retain":
-        final *= 0.85
-    return final
+        final *= 0.92
+    if getattr(candidate, "source", "") == "similar_to" and not getattr(candidate, "context_supported", False):
+        final *= 0.90
+    return max(0.0, min(1.0, final))
 
 
 # 主词优先：锚点->主干表达给小幅加分，避免 robot hand 长期压过 robotic arm
@@ -3133,6 +3294,17 @@ def stage2_generate_academic_terms(
             aid = getattr(c, "anchor_identity_score", 0.5) or 0.5
             jd_a = getattr(c, "jd_candidate_alignment", 0.5) or 0.5
             src = (getattr(c, "source", "") or "").strip()
+            # 强领域冲突时打标，供 check_primary_eligibility 读取
+            field_o = hier_ev.get("field_overlap", 0) or 0
+            sub_o = hier_ev.get("subfield_overlap", 0) or 0
+            topic_o = hier_ev.get("topic_overlap", 0) or 0
+            if field_o == 0 and sub_o == 0 and topic_o == 0 and (sem < 0.78 or jd_a < 0.76):
+                setattr(c, "domain_reason", "domain_conflict_strong")
+            else:
+                setattr(c, "domain_reason", "")
+            eligible, eligibility_reasons = check_primary_eligibility(anchor, c, hier_ev)
+            c.primary_eligible = eligible
+            c.primary_eligibility_reasons = eligibility_reasons
             admitted, reasons, rescued, admission_meta = check_primary_admission(
                 getattr(anchor, "anchor", ""),
                 anchor,

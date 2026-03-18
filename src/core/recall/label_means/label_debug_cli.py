@@ -54,7 +54,7 @@ def run_label_debug_cli() -> None:
                 semantic_query_text=semantic_text,
             )
 
-            db = l_path.last_debug_info
+            db = getattr(l_path, "last_debug_info", None) or {}
             print("\n" + "🔍 [深度诊断流水线]" + "-" * 98)
 
             domains = db.get("active_domains", [])

@@ -1515,6 +1515,7 @@ class LabelRecallPath:
         入参 domain_id 与向量路统一。返回 (author_id_list, duration_ms)。
         """
         if not self.graph:
+            self.last_debug_info = {"pipeline_checkpoints": [], "active_domains": [], "dominance": 0.0}
             return [], 0
         start_t = time.time()
 
@@ -1529,6 +1530,8 @@ class LabelRecallPath:
         checkpoints.append({"stage": "S1", "anchors": len(anchor_skills or {}), "active_domains": len(active_domain_set or set()), "ok": bool(anchor_skills)})
         if not anchor_skills:
             _emit_label_pipeline_checkpoints(checkpoints, None)
+            self.last_debug_info = dict(debug_1) if isinstance(debug_1, dict) else {}
+            self.last_debug_info["pipeline_checkpoints"] = checkpoints
             return [], (time.time() - start_t) * 1000
 
         # 阶段 2：学术词扩展（仅产出候选，不算权）；传入 jd_profile 供层级守卫
@@ -1544,6 +1547,8 @@ class LabelRecallPath:
         checkpoints.append({"stage": "S2", "raw_candidates": len(raw_candidates or []), "ok": bool(raw_candidates)})
         if not raw_candidates:
             _emit_label_pipeline_checkpoints(checkpoints, debug_1)
+            self.last_debug_info = dict(debug_1) if isinstance(debug_1, dict) else {}
+            self.last_debug_info["pipeline_checkpoints"] = checkpoints
             return [], (time.time() - start_t) * 1000
         debug_1["stage2_anchor_evidence_table"] = getattr(self.debug_info, "stage2_anchor_evidence_table", None) or []
         self.debug_info.raw_candidate_tids = sorted(
