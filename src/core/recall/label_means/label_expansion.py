@@ -63,6 +63,7 @@ STAGE2A_COLLECT_BASE_TOP_K = 8   # base 视角取 6～8，严判在后
 STAGE2A_COLLECT_CONDITIONED_TOP_K = 8
 SEED_MIN_IDENTITY = 0.65         # Stage2B seed 准入：唯一常量，不与其他阈值叠加
 DENSE_MAX_PER_PRIMARY = 4
+DENSE_PARENT_CAP = 0.85   # Stage2B：dense 扩展词 keep_score 不超过 parent primary 的此比例，避免 Motion controller > motion control
 CLUSTER_MAX_PER_PRIMARY = 3
 COOC_SUPPORT_MIN_FREQ = 2
 COOC_MAX_PER_PRIMARY = 2
@@ -3460,6 +3461,8 @@ def expand_from_vocab_dense_neighbors(
                 continue
             seen.add(tid)
             keep_score = float(keep_meta.get("keep_score", sim))
+            parent_primary_score = float(getattr(p, "primary_score", 1.0) or 1.0)
+            keep_score = min(keep_score, parent_primary_score * DENSE_PARENT_CAP)
             out.append(
                 ExpandedTermCandidate(
                     vid=tid,

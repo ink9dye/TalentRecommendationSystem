@@ -13,6 +13,11 @@ from src.core.recall.label_means.hierarchy_guard import (
 # 软排序 + 轻过滤：至少保留 top_k，不再用阈值淘汰为 0
 STAGE3_TOP_K = 20
 STAGE3_DETAIL_DEBUG = True  # 打印每个词的 base_score / hierarchy_score / penalties / final_score / reject_reason
+# Stage3 role 因子：mainline primary 稳一点，dense/conditioned_vec/side 略降，避免 Motion controller > motion control
+STAGE3_MAINLINE_BOOST = 1.06
+STAGE3_DENSE_PENALTY = 0.90
+STAGE3_CONDITIONED_PENALTY = 0.94
+STAGE3_SIDE_PENALTY = 0.95
 # 标签路追踪：是否打印 source_type / anchor / similar_to 原始候选 / 被过滤原因 / final primary 胜出原因
 LABEL_PATH_TRACE = True
 # family 保送式 paper 选词：每 family 最多 1 primary + 1 support，cluster 默认不进 paper recall
@@ -721,9 +726,24 @@ def _run_stage3_dual_gate(
         raw_final, explain = score_term_record(rec)
         identity_factor = term_scoring.compute_identity_factor(rec)
         risk_penalty = _compute_stage3_risk_penalty(rec)
-        rec["final_score"] = raw_final * identity_factor * risk_penalty
+        base_final = raw_final * identity_factor * risk_penalty
+        role_factor = 1.0
+        term_role = (rec.get("term_role") or "").strip().lower()
+        role_in_anchor = (rec.get("role_in_anchor") or "").strip().lower()
+        source_types = rec.get("source_types") or set()
+        source_type_single = (rec.get("source_type") or rec.get("source") or "").strip().lower()
+        if term_role == "primary" and role_in_anchor == "mainline":
+            role_factor = STAGE3_MAINLINE_BOOST
+        elif term_role == "dense_expansion" or "dense" in source_types or source_type_single == "dense":
+            role_factor = STAGE3_DENSE_PENALTY
+        elif "conditioned_vec" in source_types or source_type_single == "conditioned_vec":
+            role_factor = STAGE3_CONDITIONED_PENALTY
+        elif role_in_anchor == "side":
+            role_factor = STAGE3_SIDE_PENALTY
+        rec["final_score"] = base_final * role_factor
         explain["identity_factor"] = identity_factor
         explain["risk_penalty"] = risk_penalty
+        explain["role_factor"] = role_factor
         rec["stage3_explain"] = explain
         rec["reject_reason"] = ""
         rec["stage3_bucket"] = _assign_stage3_bucket(rec)
