@@ -76,6 +76,15 @@ GENERIC_RISK_MIN = 0.45           # 泛词风险高于此为 generic_like
 POLY_RISK_MIN = 0.55              # 多义风险高于此为 generic_like
 MAINLINE_IDENTITY_MIN = 0.50      # 主线准入 identity 下限
 RETAIN_MIN = 0.40                 # 仅保留（不扩）准入 retain_score 下限
+# Stage2A 终稿：三档分桶阈值（主线回 primary_expandable，歧义/弱词压住）
+STAGE2A_MAINLINE_PREF_MIN = 0.50   # 主线偏好下限 → primary_expandable
+STAGE2A_EXPANDABLE_IDENTITY_MIN = 0.52  # 锚点一致性下限 → 可扩散
+STAGE2A_WEAK_KEEP_MIN = 0.20       # 低于此且非 normal/weak_retain → reject
+# Stage2A pre-primary 明显错落点拦截（只拦大错词，不拦次优词）
+STAGE2A_REJECT_IDENTITY_FLOOR = 0.33   # 上下文不支持 + identity 低于此 → hard_reject
+STAGE2A_REJECT_MAINLINE_FLOOR = 0.40   # 上下文不支持 + mainline_pref 低于此 → hard_reject
+STAGE2A_POLY_HARD_RISK = 0.55         # 高歧义 + 无上下文 + identity<0.40 → hard_reject
+SEED_SCORE_MIN = 0.50              # Stage2B seed 门槛：仅消费 can_expand + primary_score≥此
 
 # ---------- Stage2A 准入：仅两个门槛 + source 折扣，不再按 source 分多套阈值 ----------
 PRIMARY_MIN_HIERARCHY_MATCH = 0.30   # hierarchy_match = 0.4*topic + 0.4*path + 0.2*subfield，effective = hierarchy_match * source_factor
@@ -1967,13 +1976,33 @@ def enrich_stage2a_candidates(
     return ranked
 
 
+def _should_hard_reject_stage2a_candidate(cand: Any) -> Tuple[bool, str]:
+    """
+    Stage2A 入 primary 前最后一道判定：只拦明显错义落点（歧义错支/上下文不支持/identity 太弱），
+    不拦可保留但不扩散的次优词；不依赖硬编码词表，仅用已有特征。
+    """
+    anchor_identity = float(getattr(cand, "anchor_identity_score", 0) or getattr(cand, "family_match", 0) or 0)
+    mainline_pref = float(getattr(cand, "mainline_pref_score", 0) or 0)
+    poly_risk = float(getattr(cand, "polysemy_risk", 0) or 0)
+    context_supported = bool(getattr(cand, "ctx_supported", getattr(cand, "context_supported", False)))
+
+    if (not context_supported) and anchor_identity < STAGE2A_REJECT_IDENTITY_FLOOR:
+        return True, "low_identity_no_context"
+    if (not context_supported) and mainline_pref < STAGE2A_REJECT_MAINLINE_FLOOR:
+        return True, "low_mainline_no_context"
+    if poly_risk >= STAGE2A_POLY_HARD_RISK and (not context_supported) and anchor_identity < 0.40:
+        return True, "polysemous_no_context"
+    return False, ""
+
+
 def select_primary_per_anchor(
     anchor: PreparedAnchor,
     candidates: List["Stage2ACandidate"],
 ) -> Dict[str, List["Stage2ACandidate"]]:
     """
-    Stage2A 终稿：三桶分配。按 mainline_pref_score 排序后，逐候选判定：
-    mainline_admissible -> primary_expandable；否则 retain_score>=RETAIN_MIN -> primary_keep_no_expand；否则 reject。
+    Stage2A 终稿：三档分桶。把真正的主线放回 primary_expandable，歧义/弱词压住。
+    obvious_bad -> reject；good_mainline -> primary_expandable；否则 -> primary_keep_no_expand。
+    不再用 mainline_admissible/suppress_seed 一票否决主线词。
     """
     if not candidates:
         return {"primary_expandable": [], "primary_keep_no_expand": [], "rejected": []}
@@ -1991,28 +2020,46 @@ def select_primary_per_anchor(
         c.can_expand = False
         c.primary_bucket = "reject"
         c.admission_reason = "below_retain_floor"
-        retain = getattr(c, "retain_score", 0) or 0
-        adm = getattr(c, "mainline_admissible", False)
+        retain_mode = getattr(c, "retain_mode", "normal") or "normal"
+        mainline_pref = getattr(c, "mainline_pref_score", 0) or 0
+        anchor_identity = getattr(c, "anchor_identity_score", 0) or 0
+        primary_score = getattr(c, "composite_rank_score", 0) or 0
 
-        if adm:
+        obvious_bad = (
+            retain_mode not in ("normal", "weak_retain")
+            or primary_score < STAGE2A_WEAK_KEEP_MIN
+        )
+        good_mainline = (
+            retain_mode == "normal"
+            and mainline_pref >= STAGE2A_MAINLINE_PREF_MIN
+            and anchor_identity >= STAGE2A_EXPANDABLE_IDENTITY_MIN
+        )
+        setattr(c, "is_good_mainline", good_mainline)
+
+        if obvious_bad:
+            c.primary_bucket = "reject"
+            c.can_expand = False
+            setattr(c, "bucket_reason", "obvious_bad")
+            c.reject_reason = "obvious_bad"
+            rejected.append(c)
+        elif good_mainline:
             c.primary_bucket = "primary_expandable"
             c.role_in_anchor = "mainline"
             c.role = "mainline"
             c.can_expand = True
             c.survive_primary = True
-            c.admission_reason = "mainline_like"
+            c.admission_reason = "good_mainline"
+            setattr(c, "bucket_reason", "good_mainline")
             primary_expandable.append(c)
-        elif retain >= RETAIN_MIN:
+        else:
             c.primary_bucket = "primary_keep_no_expand"
             c.role_in_anchor = "side"
             c.role = "side"
             c.can_expand = False
             c.survive_primary = True
-            c.admission_reason = "retain_only"
+            c.admission_reason = "weak_keep"
+            setattr(c, "bucket_reason", "weak_keep")
             primary_keep_no_expand.append(c)
-        else:
-            c.reject_reason = "below_retain_floor"
-            rejected.append(c)
 
     return {
         "primary_expandable": primary_expandable,
@@ -2936,6 +2983,8 @@ def score_stage2a_candidate(candidate: Any) -> None:
     if hasattr(candidate, "mainline_admissible"):
         candidate.mainline_admissible = adm
     setattr(candidate, "mainline_admissible", adm)
+    # 占位，组选主时在 select_primary_per_anchor 中按 good_mainline 填
+    setattr(candidate, "is_good_mainline", False)
 
 
 def collect_landing_candidates(
@@ -5133,6 +5182,7 @@ def stage2_generate_academic_terms(
                 "primary_expandable": [],
                 "primary_keep_no_expand": [],
                 "rejected": [],
+                "stage2a_hard_rejected": [],
             })
             continue
         enriched = enrich_stage2a_candidates(
@@ -5145,19 +5195,50 @@ def stage2_generate_academic_terms(
             jd_subfield_ids=jd_subfield_ids,
             jd_topic_ids=jd_topic_ids,
         )
-        selected = select_primary_per_anchor(anchor, enriched)
+        # Stage2A pre-primary 明显错落点拦截：只拦大错词，不拦次优词
+        stage2a_hard_rejected: List[Stage2ACandidate] = []
+        kept: List[Stage2ACandidate] = []
+        for c in enriched:
+            hard_reject, reject_reason = _should_hard_reject_stage2a_candidate(c)
+            setattr(c, "stage2a_hard_reject", hard_reject)
+            setattr(c, "stage2a_hard_reject_reason", reject_reason or "")
+            if hard_reject:
+                stage2a_hard_rejected.append(c)
+            else:
+                kept.append(c)
+        if not kept:
+            primary_landings_by_anchor[anchor.vid] = []
+            all_anchor_results.append({
+                "anchor": anchor,
+                "candidates": enriched,
+                "primary_expandable": [],
+                "primary_keep_no_expand": [],
+                "rejected": [],
+                "stage2a_hard_rejected": stage2a_hard_rejected,
+            })
+            if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and stage2a_hard_rejected:
+                anchor_term = getattr(anchor, "anchor", "") or ""
+                for c in stage2a_hard_rejected:
+                    print(f"[Stage2A hard reject] anchor={anchor_term!r} term={c.term!r} reason={getattr(c, 'stage2a_hard_reject_reason', '')}")
+            continue
+        selected = select_primary_per_anchor(anchor, kept)
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and stage2a_hard_rejected:
+            anchor_term = getattr(anchor, "anchor", "") or ""
+            for c in stage2a_hard_rejected:
+                print(f"[Stage2A hard reject] anchor={anchor_term!r} term={c.term!r} reason={getattr(c, 'stage2a_hard_reject_reason', '')}")
 
-        # Stage2A 候选定性表
+        # Stage2A 候选定性表（含 pre-primary hard_reject_reason）
         if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and enriched:
-            print("[Stage2A 候选定性表] anchor | term | semantic | jd_align | ctx_cont | anchor_id | hier | poly | object | generic | retain_mode | suppress_seed | mainline_pref")
+            print("[Stage2A 候选定性表] anchor | term | semantic | jd_align | ctx_cont | anchor_id | hier | poly | object | generic | retain_mode | suppress_seed | mainline_pref | hard_reject_reason")
             for c in enriched[:15]:
                 mp = c.mainline_preference
                 mp_val = float(mp) if isinstance(mp, (int, float)) else 0.0
+                hr = getattr(c, "stage2a_hard_reject_reason", "") or "-"
                 print(
                     f"  {getattr(anchor, 'anchor', '')!r} | {(c.term or '')[:20]:20s} | {c.semantic_score:.3f} | {c.jd_align:.3f} | "
                     f"{c.context_continuity:.3f} | {c.family_match:.3f} | {c.hierarchy_consistency:.3f} | "
                     f"{c.polysemy_risk:.3f} | {c.object_like_risk:.3f} | {c.generic_risk:.3f} | "
-                    f"{c.retain_mode} | {'Y' if c.suppress_seed else 'N'} | {mp_val:.3f}"
+                    f"{c.retain_mode} | {'Y' if c.suppress_seed else 'N'} | {mp_val:.3f} | {hr}"
                 )
             if len(enriched) > 15:
                 print(f"  ... 共 {len(enriched)} 条")
@@ -5234,22 +5315,25 @@ def stage2_generate_academic_terms(
             "primary_expandable": selected["primary_expandable"],
             "primary_keep_no_expand": selected["primary_keep_no_expand"],
             "rejected": selected["rejected"],
+            "stage2a_hard_rejected": stage2a_hard_rejected,
         })
 
     final_primary_merged = merge_stage2a_primary(all_anchor_results)
 
-    # Stage2A 选主结果表
+    # Stage2A 选主结果表（含 pre-primary hard_reject）
     if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
-        print("[Stage2A 选主结果表] anchor | primary_expandable | primary_keep_no_expand | rejected_top_reasons")
+        print("[Stage2A 选主结果表] anchor | primary_expandable | primary_keep_no_expand | rejected_top_reasons | hard_reject(term=reason)")
         for block in all_anchor_results:
             anc = getattr(block.get("anchor"), "anchor", "") or ""
             pe = block.get("primary_expandable", [])
             pk = block.get("primary_keep_no_expand", [])
             rej = block.get("rejected", [])
+            hard_rej = block.get("stage2a_hard_rejected", [])
             pe_terms = [c.term for c in pe] if pe else []
             pk_terms = [c.term for c in pk] if pk else []
             rej_reasons = list(getattr(rej[0], "admission_reasons", []))[:2] if rej else []
-            print(f"  {anc!r} | {pe_terms} | {pk_terms} | {rej_reasons}")
+            hard_rej_pairs = [f"{c.term!r}={getattr(c, 'stage2a_hard_reject_reason', '')}" for c in hard_rej[:5]] if hard_rej else []
+            print(f"  {anc!r} | {pe_terms} | {pk_terms} | {rej_reasons} | {hard_rej_pairs}")
         print("[Stage2A Merged Primary]")
         print("  term | support_count | mainline_hits | best_rank | can_expand | anchors | support_roles | retain_modes")
         for m in final_primary_merged[:20]:
@@ -5391,8 +5475,12 @@ def stage2_generate_academic_terms(
             continue
         if LABEL_EXPANSION_DEBUG:
             print(f"[Stage2] 锚点 anchor={anchor.anchor!r} primary 数={len(primary_landings)}")
-        # Stage2B：仅 primary_expandable 可进扩散（四分桶已决定，不再用 check_seed_eligibility 过滤）
-        diffusion_primaries = [p for p in primary_landings if getattr(p, "expandable", False)]
+        # Stage2B：仅 Stage2A 给出的 can_expand 且 primary_score≥SEED_SCORE_MIN 进扩散，不做第二轮主线审批
+        diffusion_primaries = [
+            p for p in primary_landings
+            if getattr(p, "expandable", False)
+            and (getattr(p, "primary_score", 0) or 0) >= SEED_SCORE_MIN
+        ]
         _seed_detail: List[Tuple[Any, bool, float]] = []
         for p in primary_landings:
             eligible = getattr(p, "expandable", False)
