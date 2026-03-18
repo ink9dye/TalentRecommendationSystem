@@ -1303,7 +1303,8 @@ def check_seed_eligibility(
     jd_profile: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, float, Optional[str]]:
     """
-    Stage2B 唯一 seed 决策入口：只有「适合扩散的 primary」才能扩；无 fallback 兜底。
+    Stage2B 唯一 seed 决策入口：只允许「2A 已认可可扩散」的 primary 进入扩散。
+    context_gain 不再硬拦截，仅作 seed_score 软加减分。
     返回 (eligible, seed_score, block_reason)。
     """
     identity = float(getattr(p, "identity_score", 0.0) or 0.0)
@@ -1318,144 +1319,103 @@ def check_seed_eligibility(
     support_count = int(getattr(p, "cross_anchor_support_count", 1) or 1)
     anchor_text = getattr(p, "anchor_term", "") or ""
     primary_term = getattr(p, "term", "") or ""
-    # 供 seed factors 打印
+    dual_support = bool(getattr(p, "dual_support", False))
     static_sim = float(getattr(p, "semantic_score", None) or primary_score or 0.0)
     ctx_sim_val = getattr(p, "conditioned_sim", None)
     if ctx_sim_val is not None:
         ctx_sim_val = float(ctx_sim_val)
     ctx_drop_str = f"{static_sim - ctx_sim_val:.3f}" if (ctx_sim_val is not None and static_sim is not None) else "N/A"
-    dual_support = bool(getattr(p, "dual_support", False))
     source_type_str = getattr(p, "source_type", None) or src or ""
 
-    # -1. 上下文不增益则不扩散：context_gain <= 0 不进 seed
-    if context_gain <= 0.0:
-        block_reason = "no_context_gain"
-        _print_stage2b_seed_factors(
-            anchor_text, primary_term, can_expand, source_type_str, dual_support,
-            static_sim, ctx_sim_val, ctx_drop_str, False, False, block_reason,
-        )
-        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
-            print(
-                f"[Stage2B final seed gate] anchor={anchor_text!r} term={primary_term!r} "
-                f"context_gain={context_gain:.3f} eligible=False block_reason={block_reason!r}"
-            )
-        return False, 0.0, block_reason
-
-    # 0. 2A 明确判成不可扩散的，2B 不得翻案
+    # 0. 先尊重 2A 的结论：2A 说不能扩，2B 不许翻案
     if not can_expand:
         block_reason = "stage2a_not_expandable"
         _print_stage2b_seed_factors(
             anchor_text, primary_term, can_expand, source_type_str, dual_support,
             static_sim, ctx_sim_val, ctx_drop_str, False, False, block_reason,
         )
-        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
-            print(
-                f"[Stage2B final seed gate] anchor={anchor_text!r} term={primary_term!r} "
-                f"context_gain={context_gain:.3f} can_expand={can_expand} retain_mode={retain_mode} suppress_seed={suppress_seed} "
-                f"identity={anchor_identity:.3f} primary={primary_score:.3f} jd={jd_align:.3f} "
-                f"eligible=False block_reason={block_reason!r}"
-            )
         return False, 0.0, block_reason
 
-    # 1. 仅 normal 且非 suppress_seed 才可能进入 seed
+    # 1. weak_retain / suppress_seed 一律不得扩散
     if retain_mode != "normal" or suppress_seed:
         block_reason = "weak_primary_no_expand"
         _print_stage2b_seed_factors(
             anchor_text, primary_term, can_expand, source_type_str, dual_support,
             static_sim, ctx_sim_val, ctx_drop_str, False, False, block_reason,
         )
-        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
-            print(
-                f"[Stage2B final seed gate] anchor={anchor_text!r} term={primary_term!r} "
-                f"context_gain={context_gain:.3f} can_expand={can_expand} retain_mode={retain_mode} suppress_seed={suppress_seed} "
-                f"identity={anchor_identity:.3f} primary={primary_score:.3f} jd={jd_align:.3f} "
-                f"eligible=False block_reason={block_reason!r}"
-            )
         return False, 0.0, block_reason
 
-    # 2. source 必须可信
-    trusted_set = {s.strip().lower() for s in (TRUSTED_SOURCE_TYPES_FOR_DIFFUSION or []) if s}
-    if trusted_set and src not in trusted_set:
-        block_reason = "source_not_trusted"
-        _print_stage2b_seed_factors(
-            anchor_text, primary_term, can_expand, source_type_str, dual_support,
-            static_sim, ctx_sim_val, ctx_drop_str, False, False, block_reason,
-        )
-        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
-            print(
-                f"[Stage2B final seed gate] anchor={anchor_text!r} term={primary_term!r} "
-                f"context_gain={context_gain:.3f} can_expand={can_expand} retain_mode={retain_mode} suppress_seed={suppress_seed} "
-                f"identity={anchor_identity:.3f} primary={primary_score:.3f} jd={jd_align:.3f} "
-                f"eligible=False block_reason={block_reason!r}"
-            )
-        return False, 0.0, block_reason
-
-    # 3. 语义错义 seed 直接禁
+    # 2. 明显错义种子不得扩散
     if is_semantic_mismatch_seed(anchor_text, primary_term):
         block_reason = "semantic_mismatch_seed"
         _print_stage2b_seed_factors(
             anchor_text, primary_term, can_expand, source_type_str, dual_support,
             static_sim, ctx_sim_val, ctx_drop_str, False, False, block_reason,
         )
-        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
-            print(
-                f"[Stage2B final seed gate] anchor={anchor_text!r} term={primary_term!r} "
-                f"context_gain={context_gain:.3f} can_expand={can_expand} retain_mode={retain_mode} suppress_seed={suppress_seed} "
-                f"identity={anchor_identity:.3f} primary={primary_score:.3f} jd={jd_align:.3f} "
-                f"eligible=False block_reason={block_reason!r}"
-            )
         return False, 0.0, block_reason
 
-    # 4. 最终唯一准入：is_primary_expandable
-    if not is_primary_expandable(
-        anchor_text=anchor_text,
-        primary_term=primary_term,
-        primary_score=primary_score,
-        anchor_identity=anchor_identity,
-        jd_align=jd_align,
-        support_count=support_count,
-        source_type=src,
-    ):
+    # 3. 真正的 seed 判定：不再要求 context_gain > 0
+    strong_static_seed = (
+        anchor_identity >= 0.52
+        and primary_score >= 0.50
+        and jd_align >= 0.74
+    )
+    dual_support_seed = (
+        dual_support
+        and anchor_identity >= 0.48
+        and primary_score >= 0.45
+        and jd_align >= 0.72
+    )
+    cross_anchor_seed = (
+        support_count >= 2
+        and anchor_identity >= 0.42
+        and primary_score >= 0.42
+        and jd_align >= 0.72
+    )
+    final_eligible = strong_static_seed or dual_support_seed or cross_anchor_seed
+
+    if not final_eligible:
         block_reason = "primary_not_expandable"
         _print_stage2b_seed_factors(
             anchor_text, primary_term, can_expand, source_type_str, dual_support,
-            static_sim, ctx_sim_val, ctx_drop_str, False, False, block_reason,
+            static_sim, ctx_sim_val, ctx_drop_str,
+            strong_static_seed, final_eligible, block_reason,
         )
-        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
-            print(
-                f"[Stage2B final seed gate] anchor={anchor_text!r} term={primary_term!r} "
-                f"context_gain={context_gain:.3f} can_expand={can_expand} retain_mode={retain_mode} suppress_seed={suppress_seed} "
-                f"identity={anchor_identity:.3f} primary={primary_score:.3f} jd={jd_align:.3f} "
-                f"eligible=False block_reason={block_reason!r}"
-            )
         return False, 0.0, block_reason
 
-    # 5. seed_score 只是排序/强弱，不参与翻案
-    seed_expand_factor = 1.0
-    if is_narrow_method_term(primary_term):
-        seed_expand_factor *= 0.75
-    if is_device_or_object_term(primary_term):
-        seed_expand_factor *= 0.65
-    if support_count == 1:
-        seed_expand_factor *= 0.85
+    # 4. context_gain 只做软修正，不再硬拦截
+    if context_gain >= 0.03:
+        ctx_bonus = 0.05
+    elif context_gain >= 0.00:
+        ctx_bonus = 0.02
+    elif context_gain >= -0.05:
+        ctx_bonus = -0.01
+    elif context_gain >= -0.10:
+        ctx_bonus = -0.03
+    else:
+        ctx_bonus = -0.06
 
-    path_match = float(getattr(p, "path_match", 0.0) or 0.0)
-    span_penalty = float(getattr(p, "topic_span_penalty", 1.0) or 1.0)
-    seed_score = primary_score * (0.7 + 0.3 * path_match) * span_penalty * seed_expand_factor
+    # 5. seed_score：用于 eligible 后排序/截断
+    seed_score = (
+        0.42 * primary_score
+        + 0.25 * anchor_identity
+        + 0.18 * jd_align
+        + 0.10 * min(1.0, support_count / 2.0)
+        + 0.05 * (1.0 if dual_support else 0.0)
+        + ctx_bonus
+    )
 
-    strong_static_seed = (src == "similar_to" and anchor_identity >= 0.58 and jd_align >= 0.74)
     _print_stage2b_seed_factors(
         anchor_text, primary_term, can_expand, source_type_str, dual_support,
-        static_sim, ctx_sim_val, ctx_drop_str, strong_static_seed, True, "expandable_primary",
+        static_sim, ctx_sim_val, ctx_drop_str,
+        strong_static_seed, final_eligible, None,
     )
     if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
         print(
             f"[Stage2B final seed gate] anchor={anchor_text!r} term={primary_term!r} "
-            f"context_gain={context_gain:.3f} can_expand={can_expand} retain_mode={retain_mode} suppress_seed={suppress_seed} "
-            f"identity={anchor_identity:.3f} primary={primary_score:.3f} jd={jd_align:.3f} "
-            f"eligible=True block_reason=None"
+            f"eligible=True seed_score={max(0.0, seed_score):.3f} block_reason=None"
         )
-    return True, seed_score, None
+    return True, max(0.0, seed_score), None
 
 
 def _anchor_skills_to_prepared_anchors(label, anchor_skills: Dict[str, Any]) -> List[PreparedAnchor]:
@@ -1641,7 +1601,7 @@ def retrieve_academic_term_by_similar_to(
             )
             if ok:
                 kept.append(c)
-                if reason and LABEL_EXPANSION_DEBUG:
+                if reason and LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
                     print(f"[Stage2A] 保留（层级未命中）vid={c.vid} term={c.term!r} sim={c.semantic_score:.3f} reason={reason}")
             elif reason == "domain_conflict_strong":
                 dropped_with_reason.append((c, reason))
@@ -1650,7 +1610,7 @@ def retrieve_academic_term_by_similar_to(
                 setattr(c, "soft_domain_retain", True)
                 setattr(c, "domain_fit", 0.85)
                 kept.append(c)
-                if LABEL_EXPANSION_DEBUG:
+                if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
                     print(f"[Stage2A] 软保留（domain_no_match）vid={c.vid} term={c.term!r} sim={c.semantic_score:.3f}")
         out = kept
         if LABEL_EXPANSION_DEBUG and n_before != len(out):
@@ -4113,11 +4073,8 @@ def expand_from_vocab_dense_neighbors(
                     f"score={sim:.3f} keep_score={keep_score:.3f}"
                 )
     if LABEL_EXPANSION_DEBUG:
-        print(f"[Stage2B] expand_from_vocab_dense_neighbors primary数={len(primary_landings)} -> dense_expansion {len(out)} 个")
-        for i, c in enumerate(out[:8]):
-            print(f"[stage2b_expanded] tid={c.vid} term={c.term!r} source_type={c.source} parent_anchor={c.anchor_term!r} parent_primary={getattr(c, 'parent_primary', '')!r} score={c.identity_score:.3f}")
-        if len(out) > 8:
-            print(f"[stage2b_expanded] ... dense 共 {len(out)} 条")
+        sample = [c.term for c in out[:3]]
+        print(f"[Stage2B] expand_from_vocab_dense_neighbors primary数={len(primary_landings)} -> dense_expansion {len(out)} 个 前3: {sample}")
     return out
 
 
@@ -4257,7 +4214,8 @@ def expand_from_cooccurrence_support(
             )
             kept += 1
     if LABEL_EXPANSION_DEBUG:
-        print(f"[Stage2B] expand_from_cooccurrence_support primary数={len(primary_landings)} -> cooc_expansion {len(out)} 个")
+        sample = [c.term for c in out[:3]] if out else []
+        print(f"[Stage2B] expand_from_cooccurrence_support primary数={len(primary_landings)} -> cooc_expansion {len(out)} 个 前3: {sample}")
     return out
 
 
@@ -5034,32 +4992,58 @@ def is_primary_expandable(
     source_type: str,
 ) -> bool:
     """
-    只有「适合扩散的 primary」才能扩。
-    允许：本体主词（motion control, robot control, medical robotics, robotic arm, reinforcement learning）、
-    多锚支持且上下文稳定的骨干词。
-    禁止：q-learning、digital control、automatic control、route planning 等窄支线；
-    任何 weak_retain + suppress_seed=True。
+    判断一个 primary 是否允许进入 Stage2B 扩散。
+    原则：主线强匹配/双证据/多锚一致允许扩；conditioned-only/窄支线/明显对象词禁止扩。
     """
     anchor = (anchor_text or "").strip().lower()
     term = (primary_term or "").strip().lower()
+    src = (source_type or "").strip().lower()
     if not term:
         return False
-    # 窄方法/支线词禁止扩散
+
+    # 0. 窄方法/明显支线，一律不扩
     if is_narrow_method_term(primary_term):
         return False
-    # 本体主词或骨干词：identity 或 多锚+jd 稳定
-    if support_count >= 2 and jd_align >= 0.78 and primary_score >= 0.35:
-        return True
-    if anchor_identity >= 0.40 and jd_align >= 0.75:
-        return True
-    # 主词白名单式放行
-    expandable_heads = (
-        "motion control", "robot control", "medical robotics", "robotic arm",
-        "reinforcement learning", "path planning", "simulation", "control engineering",
+
+    # 1. 明显设备/对象词默认不扩（除非锚点白名单放行）
+    if is_device_or_object_term(primary_term) and not anchor_allows_device_expansion(anchor_text):
+        return False
+
+    # 2. conditioned_only 候选默认更保守
+    conditioned_only = src == "conditioned_vec"
+
+    # 3. 三条放行主规则
+    strong_identity_ok = (
+        anchor_identity >= 0.55
+        and primary_score >= 0.50
+        and jd_align >= 0.74
     )
-    if any(h in term for h in expandable_heads) and anchor_identity >= 0.22:
-        return True
-    return False
+    dual_support_ok = (
+        anchor_identity >= 0.48
+        and primary_score >= 0.46
+        and jd_align >= 0.72
+        and not conditioned_only
+    )
+    multi_anchor_ok = (
+        support_count >= 2
+        and anchor_identity >= 0.42
+        and primary_score >= 0.42
+        and jd_align >= 0.72
+    )
+    allow = strong_identity_ok or dual_support_ok or multi_anchor_ok
+    if not allow:
+        return False
+
+    # 4. 对 conditioned_only 再补一道保守门
+    if conditioned_only:
+        if not (
+            anchor_identity >= 0.62
+            and primary_score >= 0.55
+            and jd_align >= 0.76
+            and support_count >= 2
+        ):
+            return False
+    return True
 
 
 def support_expandable_for_anchor(
@@ -5727,12 +5711,9 @@ def merge_primary_and_support_terms(
         out.append(c)
     if LABEL_EXPANSION_DEBUG:
         n_primary = len(primary_landings)
-        for i, c in enumerate(out[:15]):
-            print(f"[stage2_merged] tid={c.vid} term={c.term!r} source_type={getattr(c,'source','')} parent_anchor={c.anchor_term!r} parent_primary={getattr(c,'parent_primary', c.term)!r} score={getattr(c,'identity_score',0):.3f} domain_fit={getattr(c,'domain_fit',1):.3f}")
-        if len(out) > 15:
-            print(f"[stage2_merged] ... 共 {len(out)} 条")
         n_dense, n_cluster, n_cooc = len(dense_list), len(cluster_list), len(cooc_list)
-        print(f"[Stage2B] merge_primary_and_support_terms primary={n_primary} dense={n_dense} cluster={n_cluster} cooc={n_cooc} -> 合计 {len(out)} 项")
+        sample = [c.term for c in out[:3]]
+        print(f"[Stage2B] merge_primary_and_support_terms primary={n_primary} dense={n_dense} cluster={n_cluster} cooc={n_cooc} -> 合计 {len(out)} 项 前3: {sample}")
     return out
 
 
@@ -5958,35 +5939,17 @@ def stage2_generate_academic_terms(
                         f"[Stage2A merge evidence detail] term={(cand.term or '')[:28]!r} | anchor={anc!r} | "
                         f"local_bucket={local_bucket!r} mainline_candidate={mainline_cand} can_expand_local={can_expand_local} reason={local_reason!r}"
                     )
-        for m in final_primary_merged[:25]:
-            term = (m.get("term") or "")[:28]
-            sc = m.get("support_count", 0)
-            mh = m.get("mainline_hits", 0)
-            me = m.get("can_expand", False)
-            mb = "primary_expandable" if me else "primary_keep_no_expand"
-            print(
-                f"[Stage2A merged decision] term={term!r} | support_count={sc} mainline_hits={mh} "
-                f"merged_can_expand={me} merged_bucket={mb!r}"
-            )
-
-    # Stage2A 选主结果表（含 pre-primary hard_reject）
+    # Stage2A 选主/合并汇总：条数 + 前3，不打印全表
     if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
-        print("[Stage2A 选主结果表] anchor | primary_expandable | primary_keep_no_expand | rejected_top_reasons | hard_reject(term=reason)")
+        merged_sample = [m.get("term") for m in final_primary_merged[:3]]
+        print(f"[Stage2A] Merged Primary 共 {len(final_primary_merged)} 条 前3: {merged_sample}")
         for block in all_anchor_results:
             anc = getattr(block.get("anchor"), "anchor", "") or ""
             pe = block.get("primary_expandable", [])
             pk = block.get("primary_keep_no_expand", [])
-            rej = block.get("rejected", [])
-            hard_rej = block.get("stage2a_hard_rejected", [])
-            pe_terms = [c.term for c in pe] if pe else []
-            pk_terms = [c.term for c in pk] if pk else []
-            rej_reasons = list(getattr(rej[0], "admission_reasons", []))[:2] if rej else []
-            hard_rej_pairs = [f"{c.term!r}={getattr(c, 'stage2a_hard_reject_reason', '')}" for c in hard_rej[:5]] if hard_rej else []
-            print(f"  {anc!r} | {pe_terms} | {pk_terms} | {rej_reasons} | {hard_rej_pairs}")
-        print("[Stage2A Merged Primary]")
-        print("  term | support_count | mainline_hits | best_rank | can_expand | anchors | support_roles | retain_modes")
-        for m in final_primary_merged[:20]:
-            print(f"  {(m.get('term') or '')!r} | {m.get('support_count', 0)} | {m.get('mainline_hits', 0)} | {m.get('best_rank', 0)} | {m.get('can_expand', False)} | {m.get('anchors', [])} | {m.get('support_roles', [])} | {m.get('retain_modes', [])}")
+            pe_terms = [c.term for c in pe[:3]] if pe else []
+            pk_terms = [c.term for c in pk[:3]] if pk else []
+            print(f"  [Stage2A 选主] anchor={anc!r} expandable={pe_terms} keep_no_expand={pk_terms}")
 
     _stage2_header("Stage2A 每锚 primary（组内相对选主）", "-")
     if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
@@ -6005,23 +5968,8 @@ def stage2_generate_academic_terms(
             plist = primary_landings_by_anchor.get(a.vid, [])
             if not plist:
                 continue
-            print(f"  --- 锚点 {getattr(a, 'anchor', a)!r} primary 明细 ---")
-            _stage2_table(
-                [
-                    [
-                        str(p.vid),
-                        (p.term or "")[:16],
-                        f"{getattr(p, 'primary_score', 0):.3f}",
-                        getattr(p, "bucket", ""),
-                        "Y" if getattr(p, "expandable", False) else "N",
-                    ]
-                    for p in plist[:15]
-                ],
-                ["tid", "term", "primary_score", "bucket", "expandable"],
-                col_widths=[8, 18, 14, 22, 10],
-            )
-            if len(plist) > 15:
-                print(f"  ... 共 {len(plist)} 条 primary")
+            sample = [p.term for p in plist[:3]]
+            print(f"  锚点 {getattr(a, 'anchor', a)!r} primary 数={len(plist)} 前3: {sample}")
 
     if getattr(label, "debug_info", None) is not None:
         label.debug_info.stage2_anchor_evidence_table = evidence_table
@@ -6092,15 +6040,8 @@ def stage2_generate_academic_terms(
         seed_primaries = [p for p, _ in diffusion_primaries]
         _stage2_header(f"Stage2B seed 明细 [锚点 {getattr(anchor, 'anchor', anchor)!r}]", "-")
         if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and _seed_detail:
-            _stage2_table(
-                [
-                    [(p.term or "")[:20], "Y" if el else "N", f"{sc:.3f}" if el else "-", (br or "-")[:18]]
-                    for (p, el, sc, br) in _seed_detail[:20]
-                ],
-                ["term", "eligible", "seed_score", "block_reason"],
-                col_widths=[22, 10, 12, 20],
-            )
-            print(f"  diffusion_primaries({len(seed_primaries)}): {[p.term for p in seed_primaries[:10]]}")
+            sample = [p.term for (p, el, _, _) in _seed_detail[:3]]
+            print(f"  seed 数={len(seed_primaries)}/{len(primary_landings)} 前3: {sample} diffusion_primaries 前3: {[p.term for p in seed_primaries[:3]]}")
         debug_print(2, f"[Stage2B] anchor={anchor.anchor!r} primary 数={len(primary_landings)} seed 数={len(seed_primaries)}", label)
         debug_print(1, f"[Stage2B] seed 数={len(seed_primaries)}/{len(primary_landings)} 参与扩散（唯一入口 check_seed_eligibility）", label)
         if seed_primaries:
@@ -6137,13 +6078,10 @@ def stage2_generate_academic_terms(
         )
         _stage2_header("Stage2B 扩展汇总（dense / cluster / cooc）", "-")
         if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
-            print(f"  dense_kept={len(dense_list)}  |  cluster_kept={len(cluster_list)}  |  cooc_kept={len(cooc_list)}  |  primary={len(primary_landings)}")
-            if dense_list:
-                print(f"  dense 前5: {[getattr(c, 'term', c) for c in dense_list[:5]]}")
-            if cluster_list:
-                print(f"  cluster 前5: {[getattr(c, 'term', c) for c in cluster_list[:5]]}")
-            if cooc_list:
-                print(f"  cooc 前5: {[getattr(c, 'term', c) for c in cooc_list[:5]]}")
+            d3 = [getattr(c, "term", c) for c in dense_list[:3]]
+            c3 = [getattr(c, "term", c) for c in cluster_list[:3]]
+            o3 = [getattr(c, "term", c) for c in cooc_list[:3]]
+            print(f"  dense={len(dense_list)} cluster={len(cluster_list)} cooc={len(cooc_list)} primary={len(primary_landings)} 前3: dense={d3} cooc={o3}")
         debug_print(2, (
             f"[Stage2B Expansion Summary] dense_kept={len(dense_list)} | "
             f"cluster_kept={len(cluster_list)} | cooc_kept={len(cooc_list)} | "
@@ -6162,10 +6100,8 @@ def stage2_generate_academic_terms(
         )
         all_terms.extend(merged)
         _stage2_header("Stage2B 本锚合并", "-")
-        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
-            print(f"  primary={len(primary_landings)} + dense={len(dense_list)} + cluster={len(cluster_list)} + cooc={len(cooc_list)} -> merged={len(merged)}  |  累计 all_terms={len(all_terms)}")
         if LABEL_EXPANSION_DEBUG:
-            print(f"[Stage2] 锚点 anchor={anchor.anchor!r} 本锚合并后 +{len(merged)} 项，累计 {len(all_terms)} 项")
+            print(f"[Stage2] 锚点 anchor={anchor.anchor!r} 本锚合并 +{len(merged)} 项 累计 {len(all_terms)} 项")
     # 诊断：从 similar_to_raw_rows 聚合出 similar_to_agg；从最终 all_terms 中筛出 similar_to 来源的项写入 similar_to_pass
     if getattr(label, "debug_info", None) is not None:
         raw_rows = getattr(label.debug_info, "similar_to_raw_rows", None) or []
