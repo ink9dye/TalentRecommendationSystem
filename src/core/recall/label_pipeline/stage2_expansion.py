@@ -56,6 +56,14 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
             "topic_entropy": getattr(c, "topic_entropy", None),
             "main_subfield_match": getattr(c, "main_subfield_match", None),
             "landing_score": getattr(c, "landing_score", None),
+            "mainline_preference": getattr(c, "mainline_preference", None),
+            "mainline_rank": getattr(c, "mainline_rank", None),
+            "anchor_internal_rank": getattr(c, "anchor_internal_rank", None),
+            "survive_primary": getattr(c, "survive_primary", None),
+            "can_expand": getattr(c, "can_expand", None),
+            "sort_key_snapshot": getattr(c, "sort_key_snapshot", None),
+            "role_in_anchor": getattr(c, "role_in_anchor", None),
+            "cross_anchor_support": getattr(c, "cross_anchor_support", None),
         }
         rec["retrieval_role"] = get_retrieval_role_from_term_role(c.term_role)
         out.append(rec)
