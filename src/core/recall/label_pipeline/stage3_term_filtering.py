@@ -24,8 +24,9 @@ STAGE3_CROSS_ANCHOR_DEFAULT = 1.0
 
 def _merge_stage3_duplicates(raw_candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    按 tid 聚合同一词的多个候选，防止重复参与 rerank、cross-anchor 被重复 entry 污染。
-    输出聚合后的 term-level 候选列表，含 anchor_count、evidence_count、has_primary_role、has_support_role 等。
+    按 tid 聚合同一词的多个候选，保留多来源结构信息，供 Stage3 分层与准入使用。
+    合并后保留：anchor_count, evidence_count, family_keys, source_types, parent_anchors, parent_primaries,
+    mainline_hits, side_hits, best_stage2_score, best_anchor_identity, best_jd_align, best_context_continuity。
     """
     bucket: Dict[int, Dict[str, Any]] = {}
     for rec in raw_candidates:
@@ -42,25 +43,49 @@ def _merge_stage3_duplicates(raw_candidates: List[Dict[str, Any]]) -> List[Dict[
             "records": [],
             "best_identity_score": 0.0,
             "best_seed_score": 0.0,
+            "best_anchor_identity": 0.0,
+            "best_jd_align": 0.0,
+            "best_context_continuity": 0.0,
             "parent_anchors": set(),
             "parent_primaries": set(),
             "source_types": set(),
             "term_roles": set(),
+            "family_keys": set(),
             "anchor_count": 0,
             "evidence_count": 0,
+            "mainline_hits": 0,
+            "side_hits": 0,
             "has_primary_role": False,
             "has_support_role": False,
+            "role_in_anchor": "",
+            "can_expand": False,
+            "retain_mode": "normal",
+            "polysemy_risk": 0.0,
+            "object_like_risk": 0.0,
+            "generic_risk": 0.0,
         })
         obj["records"].append(rec)
-        obj["best_identity_score"] = max(
-            obj["best_identity_score"],
-            float(rec.get("identity_score") or rec.get("sim_score") or 0.0),
+        ident = float(rec.get("identity_score") or rec.get("sim_score") or 0.0)
+        obj["best_identity_score"] = max(obj["best_identity_score"], ident)
+        obj["best_anchor_identity"] = max(obj["best_anchor_identity"], ident)
+        seed_sc = float(rec.get("score") or 0.0)
+        obj["best_seed_score"] = max(obj["best_seed_score"], seed_sc)
+        obj["best_jd_align"] = max(
+            obj["best_jd_align"],
+            float(rec.get("jd_candidate_alignment") or rec.get("jd_align") or 0.0),
         )
-        obj["best_seed_score"] = max(obj["best_seed_score"], float(rec.get("score") or 0.0))
+        obj["best_context_continuity"] = max(
+            obj["best_context_continuity"],
+            float(rec.get("context_continuity") or 0.0),
+        )
+        obj["polysemy_risk"] = max(obj.get("polysemy_risk", 0), float(rec.get("polysemy_risk") or 0))
+        obj["object_like_risk"] = max(obj.get("object_like_risk", 0), float(rec.get("object_like_risk") or 0))
+        obj["generic_risk"] = max(obj.get("generic_risk", 0), float(rec.get("generic_risk") or 0))
         pa = (rec.get("parent_anchor") or "").strip()
         pp = (rec.get("parent_primary") or "").strip()
         st = (rec.get("source_type") or rec.get("source") or rec.get("origin") or "").strip()
         tr = (rec.get("term_role") or "").strip()
+        role_anchor = (rec.get("role_in_anchor") or "").strip().lower()
         if pa:
             obj["parent_anchors"].add(pa)
         if pp:
@@ -69,13 +94,26 @@ def _merge_stage3_duplicates(raw_candidates: List[Dict[str, Any]]) -> List[Dict[
             obj["source_types"].add(st)
         if tr:
             obj["term_roles"].add(tr)
+        if role_anchor == "mainline":
+            obj["mainline_hits"] = obj.get("mainline_hits", 0) + 1
+        elif role_anchor:
+            obj["side_hits"] = obj.get("side_hits", 0) + 1
         if tr == "primary" or st == "similar_to":
             obj["has_primary_role"] = True
         else:
             obj["has_support_role"] = True
-        if float(rec.get("score") or 0.0) >= obj.get("best_seed_score", -1.0):
+        if rec.get("can_expand"):
+            obj["can_expand"] = True
+        rm = (rec.get("retain_mode") or "normal").strip().lower()
+        if rm == "normal":
+            obj["retain_mode"] = "normal"
+        if role_anchor == "mainline":
+            obj["role_in_anchor"] = "mainline"
+        elif not obj.get("role_in_anchor"):
+            obj["role_in_anchor"] = role_anchor or "side"
+        if seed_sc >= obj.get("best_seed_score", -1.0):
             for k, v in rec.items():
-                if k not in ("records", "parent_anchors", "parent_primaries", "source_types", "term_roles"):
+                if k not in ("records", "parent_anchors", "parent_primaries", "source_types", "term_roles", "family_keys"):
                     obj[k] = v
     merged = []
     for tid, obj in bucket.items():
@@ -83,11 +121,119 @@ def _merge_stage3_duplicates(raw_candidates: List[Dict[str, Any]]) -> List[Dict[
         obj["parent_primaries"] = sorted(obj["parent_primaries"])
         obj["source_types"] = sorted(obj["source_types"])
         obj["term_roles"] = sorted(obj["term_roles"])
+        obj["family_keys"] = sorted(obj.get("family_keys") or [])
         obj["anchor_count"] = len(obj["parent_anchors"])
         obj["evidence_count"] = len(obj["records"])
+        obj["best_stage2_score"] = obj.get("best_stage2_score") or obj.get("best_seed_score") or 0.0
+        if not obj.get("role_in_anchor") and obj.get("mainline_hits", 0) > 0:
+            obj["role_in_anchor"] = "mainline"
+        if not obj.get("role_in_anchor"):
+            obj["role_in_anchor"] = "side" if obj.get("side_hits", 0) > 0 else ""
         merged.append(obj)
     merged.sort(key=lambda x: float(x.get("best_seed_score") or 0.0), reverse=True)
     return merged
+
+
+def _classify_stage3_entry_groups(terms: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    候选分层：trusted_primary / secondary_primary / support_expansion。
+    trusted_primary 不硬杀，只打 risk_flag；support_expansion 才重点审查。
+    """
+    for rec in terms:
+        term_role = (rec.get("term_role") or "").strip().lower()
+        if isinstance(rec.get("term_roles"), (list, set)):
+            term_roles_set = set(rec["term_roles"]) if rec["term_roles"] else set()
+            if "primary" in term_roles_set:
+                term_role = "primary"
+        role_in_anchor = (rec.get("role_in_anchor") or "").strip().lower()
+        can_expand = bool(rec.get("can_expand"))
+        retain_mode = (rec.get("retain_mode") or "normal").strip().lower()
+        if (
+            term_role == "primary"
+            and role_in_anchor == "mainline"
+            and can_expand
+        ):
+            rec["stage3_entry_group"] = "trusted_primary"
+        elif term_role == "primary":
+            rec["stage3_entry_group"] = "secondary_primary"
+        else:
+            rec["stage3_entry_group"] = "support_expansion"
+    return terms
+
+
+def _check_stage3_admission(
+    term: Dict[str, Any],
+    jd_profile: Any,
+    active_domains: Any,
+) -> Dict[str, Any]:
+    """
+    分层审查：trusted_primary 默认不 hard_drop；secondary 可降分不轻易杀；support_expansion 才严格。
+    返回 hard_drop, reason, risk_flags, admission_strength。
+    """
+    group = term.get("stage3_entry_group") or "support_expansion"
+    risk_flags: List[str] = []
+    poly = float(term.get("polysemy_risk") or 0.0)
+    obj = float(term.get("object_like_risk") or 0.0)
+    generic = float(term.get("generic_risk") or 0.0)
+    anchor_id = float(term.get("best_anchor_identity") or term.get("best_identity_score") or 0.0)
+    jd_align = float(term.get("best_jd_align") or 0.0)
+    ctx = float(term.get("best_context_continuity") or 0.0)
+    if poly > 0.75:
+        risk_flags.append("high_polysemy")
+    if obj > 0.55:
+        risk_flags.append("object_like")
+    if generic > 0.55:
+        risk_flags.append("too_generic")
+    term["risk_flags"] = risk_flags
+
+    if group == "trusted_primary":
+        return {
+            "hard_drop": False,
+            "reason": "",
+            "risk_flags": risk_flags,
+            "admission_strength": "trusted",
+        }
+    if group == "secondary_primary":
+        if anchor_id < 0.16 and jd_align < 0.72 and ctx < 0.48:
+            return {
+                "hard_drop": True,
+                "reason": "secondary_too_weak",
+                "risk_flags": risk_flags,
+                "admission_strength": "weak",
+            }
+        return {
+            "hard_drop": False,
+            "reason": "",
+            "risk_flags": risk_flags,
+            "admission_strength": "secondary",
+        }
+    if group == "support_expansion":
+        if anchor_id < 0.14 and ctx < 0.50:
+            return {
+                "hard_drop": True,
+                "reason": "weak_evidence_noise",
+                "risk_flags": risk_flags,
+                "admission_strength": "support",
+            }
+        if obj > 0.70 and generic > 0.60:
+            return {
+                "hard_drop": True,
+                "reason": "object_generic_noise",
+                "risk_flags": risk_flags,
+                "admission_strength": "support",
+            }
+        return {
+            "hard_drop": False,
+            "reason": "",
+            "risk_flags": risk_flags,
+            "admission_strength": "support",
+        }
+    return {
+        "hard_drop": False,
+        "reason": "",
+        "risk_flags": risk_flags,
+        "admission_strength": "support",
+    }
 
 
 def _compute_stage3_global_consensus(
@@ -208,11 +354,24 @@ def _collect_risky_reasons(rec: Dict[str, Any]) -> List[str]:
 
 
 def _bucket_stage3_terms(survivors: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """分为 core_terms、support_terms、risky_terms。core 两条路：强主干直通（primary 且 final>=0.66）或结构型主干（primary 且 final>=0.62、ptc>=0.55、cross>=0.94）。"""
+    """
+    分为 core_terms、support_terms、risky_terms。
+    若已有 stage3_bucket 则直接按桶分组；否则回退到原逻辑（强主干/结构型 core、support、risky）。
+    """
     core_terms: List[Dict[str, Any]] = []
     support_terms: List[Dict[str, Any]] = []
     risky_terms: List[Dict[str, Any]] = []
     for rec in survivors:
+        bucket = (rec.get("stage3_bucket") or "").strip().lower()
+        if bucket == "core":
+            core_terms.append(rec)
+            continue
+        if bucket == "support":
+            support_terms.append(rec)
+            continue
+        if bucket == "risky":
+            risky_terms.append(rec)
+            continue
         ex = rec.get("stage3_explain") or {}
         final_score = float(rec.get("final_score") or 0.0)
         ptc = float(ex.get("path_topic_consistency") or 0.0)
@@ -265,6 +424,40 @@ def _debug_print_stage3_bucket_details(
             )
 
 
+def _compute_stage3_risk_penalty(term: Dict[str, Any]) -> float:
+    """
+    风险仅降分不硬杀：trusted_primary 轻罚，support_expansion 重罚。
+    """
+    group = (term.get("stage3_entry_group") or "support_expansion")
+    poly = float(term.get("polysemy_risk") or 0.0)
+    obj = float(term.get("object_like_risk") or 0.0)
+    generic = float(term.get("generic_risk") or 0.0)
+    if group == "trusted_primary":
+        penalty = 1.0 - 0.10 * poly - 0.06 * obj - 0.05 * generic
+    elif group == "secondary_primary":
+        penalty = 1.0 - 0.16 * poly - 0.08 * obj - 0.08 * generic
+    else:
+        penalty = 1.0 - 0.22 * poly - 0.14 * obj - 0.12 * generic
+    return max(0.65, min(1.0, penalty))
+
+
+def _assign_stage3_bucket(term: Dict[str, Any]) -> str:
+    """
+    分桶结合 stage3_entry_group、final_score、risk_flags。
+    桶：core / support / risky。
+    """
+    score = float(term.get("final_score") or 0.0)
+    group = term.get("stage3_entry_group") or "support_expansion"
+    poly = float(term.get("polysemy_risk") or 0.0)
+    obj = float(term.get("object_like_risk") or 0.0)
+    generic = float(term.get("generic_risk") or 0.0)
+    if group == "trusted_primary" and score >= 0.55 and poly <= 0.55:
+        return "core"
+    if score >= 0.42 and obj <= 0.65 and generic <= 0.65:
+        return "support"
+    return "risky"
+
+
 def _is_primary_like(rec: Dict[str, Any]) -> bool:
     """primary-like 主落点：只做软惩罚，不走严格 topic gate。"""
     source_type = (rec.get("source_type") or rec.get("source") or rec.get("origin") or "").strip().lower()
@@ -275,6 +468,53 @@ def _is_primary_like(rec: Dict[str, Any]) -> bool:
         or source_type == "similar_to"
         or int(rec.get("anchor_count") or 0) >= 2
     )
+
+
+def _debug_print_stage3_tables(
+    layered_terms: List[Dict[str, Any]],
+    dropped_with_reason: List[Dict[str, Any]],
+    survivors: List[Dict[str, Any]],
+    recall: Any,
+) -> None:
+    """三张表：A. entry group；B. admission（含 hard_drop/reason/risk_flags）；C. scoring（final_score/identity_factor/.../bucket）。"""
+    stage3_debug = getattr(term_scoring, "STAGE3_DEBUG", False)
+    label_trace = LABEL_PATH_TRACE or stage3_debug
+    if not (label_trace or stage3_debug):
+        return
+    all_terms = layered_terms
+    debug_print(2, "[Stage3 Entry Group] term | stage3_entry_group | term_role | role_in_anchor | can_expand | source_type", recall)
+    for rec in all_terms[:40]:
+        term = (rec.get("term") or "")[:28]
+        grp = rec.get("stage3_entry_group") or ""
+        tr = rec.get("term_role") or ""
+        ria = rec.get("role_in_anchor") or ""
+        ce = rec.get("can_expand") or False
+        st = (rec.get("source_type") or rec.get("source") or "")[:12]
+        debug_print(2, f"  {term!r} | {grp} | {tr} | {ria} | {ce} | {st}", recall)
+    debug_print(2, "[Stage3 Admission] term | group | hard_drop | reason | risk_flags", recall)
+    for rec in dropped_with_reason[:30]:
+        term = (rec.get("term") or "")[:28]
+        grp = rec.get("stage3_entry_group") or ""
+        reason = rec.get("reject_reason") or ""
+        flags = rec.get("risk_flags") or []
+        debug_print(2, f"  {term!r} | {grp} | True | {reason} | {flags}", recall)
+    for rec in survivors[:30]:
+        term = (rec.get("term") or "")[:28]
+        grp = rec.get("stage3_entry_group") or ""
+        debug_print(2, f"  {term!r} | {grp} | False | | {rec.get('risk_flags', [])}", recall)
+    debug_print(2, "[Stage3 Scoring] term | final_score | identity_factor | family_centrality | path_topic_consistency | generic_penalty | object_like_penalty | bucket", recall)
+    for rec in survivors[:25]:
+        term = (rec.get("term") or "")[:28]
+        ex = rec.get("stage3_explain") or {}
+        final_score = float(rec.get("final_score") or 0.0)
+        id_f = ex.get("identity_factor")
+        fc = rec.get("family_centrality")
+        ptc = ex.get("path_topic_consistency")
+        gp = ex.get("generic_penalty")
+        olp = ex.get("object_like_penalty")
+        bucket = rec.get("stage3_bucket") or ""
+        _f = lambda x: f"{x:.3f}" if x is not None and isinstance(x, (int, float)) else str(x) if x is not None else "-"
+        debug_print(2, f"  {term!r} | {final_score:.4f} | {_f(id_f)} | {_f(fc)} | {_f(ptc)} | {_f(gp)} | {_f(olp)} | {bucket}", recall)
 
 
 def _debug_print_stage3_input(raw_candidates: List[Dict[str, Any]]) -> None:
@@ -378,33 +618,29 @@ def select_terms_for_paper_recall(
     max_terms: int = 12,
 ) -> List[Dict[str, Any]]:
     """
-    按 family 选词：每 family 保 1 个 primary，最多再保 1 个 support；support 只作补充，不系统性夺权。
+    优先 core，再补 support，最后不足再补 risky；按 final_score 排序，并为选中词设置 retrieval_role。
     """
     if not records:
         return []
-    family_buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for rec in records:
-        fk = rec.get("family_key") or build_family_key(rec)
-        rec["family_key"] = fk
-        rec["retrieval_role"] = rec.get("retrieval_role") or get_retrieval_role_from_term_role(rec.get("term_role"))
-        family_buckets[fk].append(rec)
-    selected: List[Dict[str, Any]] = []
-    for fk, members in family_buckets.items():
-        members = sorted(members, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
-        primaries = [m for m in members if (m.get("retrieval_role") or "").lower() == "paper_primary"]
-        supports = [m for m in members if (m.get("retrieval_role") or "").lower() == "paper_support"]
-        best_primary = None
-        if primaries:
-            best_primary = max(primaries, key=lambda x: float(x.get("final_score") or 0.0))
-            best_primary["win_reason"] = f"family {fk!r} 下 primary 中 final_score 最高"
-            selected.append(best_primary)
-        if supports:
-            best_support = max(supports, key=lambda x: float(x.get("final_score") or 0.0))
-            if best_primary is None:
-                best_support["win_reason"] = f"family {fk!r} 无 primary，仅保留最高 support"
-            else:
-                best_support["win_reason"] = f"family {fk!r} 下 support 中 final_score 最高"
-            selected.append(best_support)
+    core = [r for r in records if (r.get("stage3_bucket") or "").strip().lower() == "core"]
+    support = [r for r in records if (r.get("stage3_bucket") or "").strip().lower() == "support"]
+    risky = [r for r in records if (r.get("stage3_bucket") or "").strip().lower() == "risky"]
+    core = sorted(core, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
+    support = sorted(support, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
+    risky = sorted(risky, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
+    selected: List[Dict[str, Any]] = list(core[:max_terms])
+    if len(selected) < max_terms:
+        selected.extend(support[: max_terms - len(selected)])
+    if len(selected) < max_terms:
+        selected.extend(risky[: max_terms - len(selected)])
+    for r in selected:
+        b = (r.get("stage3_bucket") or "").strip().lower()
+        if b == "core":
+            r["retrieval_role"] = "paper_primary"
+        elif b == "support":
+            r["retrieval_role"] = "paper_support"
+        else:
+            r["retrieval_role"] = "paper_risky"
     selected.sort(key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
     return selected[:max_terms]
 
@@ -442,10 +678,19 @@ def _run_stage3_dual_gate(
     family_buckets = _build_family_buckets(merged_candidates)
     for rec in merged_candidates:
         rec["family_centrality"] = _compute_family_centrality(rec, family_buckets)
+    merged_candidates = _classify_stage3_entry_groups(merged_candidates)
+
+    jd_profile = getattr(recall, "jd_profile", None)
+    active_domains = getattr(recall, "active_domain_set", None)
 
     for rec in merged_candidates:
         rec["family_key"] = rec.get("family_key") or build_family_key(rec)
+        if not rec.get("term_role") and rec.get("term_roles"):
+            roles = list(rec["term_roles"]) if isinstance(rec["term_roles"], (list, set)) else [rec["term_roles"]]
+            rec["term_role"] = "primary" if "primary" in roles else (roles[0] if roles else "")
+        rec["term_role"] = rec.get("term_role") or ""
         rec["retrieval_role"] = rec.get("retrieval_role") or get_retrieval_role_from_term_role(rec.get("term_role"))
+
         drop, reject_reason = should_drop_term(rec)
         if drop:
             rec["reject_reason"] = reject_reason
@@ -453,28 +698,35 @@ def _run_stage3_dual_gate(
             if STAGE3_DETAIL_DEBUG or stage3_debug:
                 print(f"[Stage3 硬过滤] drop tid={rec.get('tid')} term={rec.get('term')!r} reason={reject_reason}")
             continue
-        if not term_scoring.passes_identity_gate(rec):
-            rec["reject_reason"] = "identity_gate"
+
+        gate = _check_stage3_admission(rec, jd_profile, active_domains)
+        if gate.get("hard_drop"):
+            rec["reject_reason"] = gate.get("reason") or "admission"
             dropped_with_reason.append(rec)
             if label_trace:
-                print(f"[Stage3 被过滤] tid={rec.get('tid')} term={rec.get('term')!r} reason=identity_gate")
+                print(f"[Stage3 准入拒绝] tid={rec.get('tid')} term={rec.get('term')!r} reason={rec['reject_reason']}")
             continue
+
         primary_like = _is_primary_like(rec)
-        if primary_like:
+        if primary_like and label_trace:
+            print(f"[Stage3 topic_gate] bypass primary-like tid={rec.get('tid')} term={rec.get('term')!r}")
+        if not primary_like and not term_scoring.passes_topic_consistency(rec, None):
+            rec["reject_reason"] = "topic_consistency"
+            dropped_with_reason.append(rec)
             if label_trace:
-                print(f"[Stage3 topic_gate] bypass primary-like tid={rec.get('tid')} term={rec.get('term')!r}")
-        else:
-            if not term_scoring.passes_topic_consistency(rec, None):
-                rec["reject_reason"] = "topic_consistency"
-                dropped_with_reason.append(rec)
-                if label_trace:
-                    print(f"[Stage3 topic_gate] drop support tid={rec.get('tid')} term={rec.get('term')!r} reason=topic_consistency")
-                continue
+                print(f"[Stage3 topic_gate] drop support tid={rec.get('tid')} term={rec.get('term')!r} reason=topic_consistency")
+            continue
+
         rec["quality_score"] = term_scoring.score_term_expansion_quality(recall, rec)
-        final_score, explain = score_term_record(rec)
-        rec["final_score"] = final_score
+        raw_final, explain = score_term_record(rec)
+        identity_factor = term_scoring.compute_identity_factor(rec)
+        risk_penalty = _compute_stage3_risk_penalty(rec)
+        rec["final_score"] = raw_final * identity_factor * risk_penalty
+        explain["identity_factor"] = identity_factor
+        explain["risk_penalty"] = risk_penalty
         rec["stage3_explain"] = explain
         rec["reject_reason"] = ""
+        rec["stage3_bucket"] = _assign_stage3_bucket(rec)
         survivors.append(rec)
 
     survivors.sort(key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
@@ -551,6 +803,7 @@ def _debug_print_stage3_output(
     """Stage3 调试输出：新列 anchor_count, evidence_count, family_centrality, path_topic_consistency, generic_penalty, cross_anchor_factor, retrieval_role；无 cluster 列。"""
     stage3_debug = getattr(term_scoring, "STAGE3_DEBUG", False)
     label_trace = LABEL_PATH_TRACE or stage3_debug
+    _debug_print_stage3_tables(raw_candidates, dropped_with_reason, survivors, recall)
     debug_print(1, f"[Stage3] 输入候选总数={len(raw_candidates)} 幸存={len(survivors)} top_k={len(top_survivors)}", recall)
     debug_print(2, "[Stage3 Final Score Breakdown] term | stage2_rank | anchor_count | evidence_count | family_centrality | path_topic_consistency | generic_penalty | cross_anchor_factor | backbone_boost | object_like_penalty | bonus_term_penalty | retrieval_role | final", recall)
     for rec in survivors[:15]:

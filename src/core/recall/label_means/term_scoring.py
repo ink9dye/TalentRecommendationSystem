@@ -591,13 +591,33 @@ EXPANSION_ROLES = frozenset({"dense_expansion", "cluster_expansion", "cooc_expan
 
 
 def passes_identity_gate(rec: Dict[str, Any]) -> bool:
-    """身份闸门：primary/similar_to 阈值略低(0.62)，support 阈值略高(0.68)。"""
+    """身份闸门：primary/similar_to 阈值略低(0.62)，support 阈值略高(0.68)。已弃用：Stage3 改用 check_stage3_admission + identity 软因子。"""
     identity = float(rec.get("identity_score") or rec.get("sim_score") or 0.0)
     role = (rec.get("term_role") or "").strip().lower()
     source = (rec.get("source_type") or rec.get("source") or rec.get("origin") or "").strip().lower()
     if role == "primary" or source == "similar_to":
         return identity >= 0.62
     return identity >= 0.68
+
+
+def compute_identity_factor(rec: Dict[str, Any]) -> float:
+    """
+    Stage3 软因子：identity 不再硬杀，只参与 final_score 乘性降权。
+    用于 compute_stage3_final_score，替代原 identity_gate 硬门。
+    """
+    identity = float(
+        rec.get("best_anchor_identity")
+        or rec.get("identity_score")
+        or rec.get("sim_score")
+        or 0.0
+    )
+    if identity >= 0.50:
+        return 1.00
+    if identity >= 0.35:
+        return 0.94
+    if identity >= 0.22:
+        return 0.88
+    return 0.78
 
 
 def passes_topic_consistency(rec: Dict[str, Any], active_domains: Optional[Any] = None) -> bool:

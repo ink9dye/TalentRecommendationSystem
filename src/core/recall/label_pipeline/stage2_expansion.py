@@ -66,6 +66,16 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
             "cross_anchor_support": getattr(c, "cross_anchor_support", None),
         }
         rec["retrieval_role"] = get_retrieval_role_from_term_role(c.term_role)
+        # Stage3 分层与准入所需字段（顶层透传，便于 classify_stage3_entry_groups / check_stage3_admission）
+        rec["can_expand"] = getattr(c, "can_expand", False)
+        rec["role_in_anchor"] = getattr(c, "role_in_anchor", "") or ""
+        rec["retain_mode"] = getattr(c, "retain_mode", "normal") or "normal"
+        rec["source_type"] = getattr(c, "source", "") or rec.get("source", "") or ""
+        rec["polysemy_risk"] = float(getattr(c, "polysemy_risk", 0) or 0)
+        rec["object_like_risk"] = float(getattr(c, "object_like_risk", 0) or 0)
+        rec["generic_risk"] = float(getattr(c, "generic_risk", 0) or 0)
+        rec["context_continuity"] = float(getattr(c, "context_continuity", 0) or 0)
+        rec["jd_candidate_alignment"] = float(getattr(c, "jd_candidate_alignment", 0.5) or getattr(c, "jd_align", 0.5) or 0.5)
         out.append(rec)
     return out
 
