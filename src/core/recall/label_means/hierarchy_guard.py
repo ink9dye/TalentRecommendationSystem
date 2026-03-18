@@ -509,10 +509,49 @@ def _get_topic_like_fit_eff(rec: Dict[str, Any]) -> float:
     return float(topic_fit or 0.5)
 
 
+def _compute_backbone_boost(rec: Dict[str, Any]) -> float:
+    """给 control 主轴词轻 boost：primary、多锚点、高 cross_anchor 优先。"""
+    boost = 1.0
+    if bool(rec.get("has_primary_role")):
+        boost *= 1.02
+    if int(rec.get("anchor_count") or 0) >= 2:
+        boost *= 1.03
+    if float(rec.get("cross_anchor_evidence") or 1.0) >= 0.98:
+        boost *= 1.02
+    return min(1.08, boost)
+
+
+def _compute_object_like_penalty(rec: Dict[str, Any]) -> float:
+    """轻压平台/对象/载体词（如 robotic arm、manipulator、hand），非硬编码词表。"""
+    term = (rec.get("term") or "").lower()
+    object_like = any(x in term for x in ["arm", "manipulator", "hand"])
+    if not object_like:
+        return 1.0
+    anchor_count = int(rec.get("anchor_count") or 0)
+    family_centrality = float(rec.get("family_centrality") or 0.0)
+    penalty = 1.0
+    if anchor_count <= 1:
+        penalty *= 0.96
+    if family_centrality < 0.60:
+        penalty *= 0.97
+    return max(0.92, penalty)
+
+
+def _compute_bonus_term_penalty(rec: Dict[str, Any]) -> float:
+    """轻压加分项/附加项类 broad 词：reinforcement learning、q-learning、medical robotics。"""
+    term = (rec.get("term") or "").lower()
+    penalty = 1.0
+    if "reinforcement learning" in term or "q-learning" in term:
+        penalty *= 0.95
+    if "medical robotics" in term:
+        penalty *= 0.93
+    return max(0.90, penalty)
+
+
 def score_term_record(record: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
     """
-    Stage3 唯一主分函数。path_topic_consistency 吸收 primary-like 身份；generic_penalty 只轻惩罚不杀穿主干。
-    final = base_score * gate * cross_anchor_factor，gate = 0.75 + 0.15*path_topic_consistency + 0.10*generic_penalty。
+    Stage3 唯一主分函数。path_topic_consistency 吸收 primary-like 身份；主干 boost、对象/加分项轻惩罚。
+    final = base_score * gate * cross_anchor_factor * backbone_boost * object_like_penalty * bonus_term_penalty。
     """
     semantic = float(record.get("identity_score") or record.get("sim_score") or 0.0)
     context = float(record.get("quality_score") or 0.0)
@@ -521,11 +560,11 @@ def score_term_record(record: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
     source_count = len(record.get("source_types") or [])
     multi_source_support = min(1.0, 0.5 + 0.25 * source_count)
     base_score = (
-        0.35 * semantic
-        + 0.20 * context
+        0.36 * semantic
+        + 0.18 * context
         + 0.20 * subfield_fit_eff
-        + 0.15 * topic_fit_eff
-        + 0.10 * multi_source_support
+        + 0.14 * topic_fit_eff
+        + 0.12 * multi_source_support
     )
     source_type = (record.get("source_type") or record.get("source") or record.get("origin") or "").strip().lower()
     is_primary_like = (
@@ -558,12 +597,25 @@ def score_term_record(record: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
     cross_anchor_factor = float(record.get("cross_anchor_evidence") or 1.0)
     cross_anchor_factor = min(1.10, max(0.90, cross_anchor_factor))
     gate = 0.75 + 0.15 * path_topic_consistency + 0.10 * generic_penalty
-    final_score = base_score * gate * cross_anchor_factor
+    backbone_boost = _compute_backbone_boost(record)
+    object_like_penalty = _compute_object_like_penalty(record)
+    bonus_term_penalty = _compute_bonus_term_penalty(record)
+    final_score = (
+        base_score
+        * gate
+        * cross_anchor_factor
+        * backbone_boost
+        * object_like_penalty
+        * bonus_term_penalty
+    )
     explain = {
         "base_score": base_score,
         "path_topic_consistency": path_topic_consistency,
         "generic_penalty": generic_penalty,
         "cross_anchor_factor": cross_anchor_factor,
+        "backbone_boost": backbone_boost,
+        "object_like_penalty": object_like_penalty,
+        "bonus_term_penalty": bonus_term_penalty,
         "final_score": final_score,
         "semantic_drift_risk": float(record.get("semantic_drift_risk") or 0.0),
         "outside_subfield_mass": outside,

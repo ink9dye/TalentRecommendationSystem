@@ -191,41 +191,42 @@ def _apply_family_role_constraints(survivors: List[Dict[str, Any]]) -> List[Dict
 
 
 def _collect_risky_reasons(rec: Dict[str, Any]) -> List[str]:
-    """基于弱证据、topic 偏移、family 边缘的 risky 理由，不再使用 cluster。"""
+    """Risky 理由：弱 family、高 drift+低 ptc、低分单锚点；不再因单锚点直接列 risky。"""
     reasons: List[str] = []
-    if int(rec.get("anchor_count") or 0) <= 1:
-        reasons.append("single_anchor_or_few")
-    if float(rec.get("family_centrality") or 0.0) < 0.35:
-        reasons.append("weak_family_centrality")
-    if float(rec.get("semantic_drift_risk") or 0.0) > 0.60:
-        reasons.append("high_drift_risk")
+    final_score = float(rec.get("final_score") or 0.0)
+    drift = float(rec.get("semantic_drift_risk") or 0.0)
     ex = rec.get("stage3_explain") or {}
     ptc = float(ex.get("path_topic_consistency") or 0.0)
-    if ptc < 0.20:
-        reasons.append("low_topic_consistency")
+    if float(rec.get("family_centrality") or 0.0) < 0.30:
+        reasons.append("weak_family_centrality")
+    if drift > 0.75 and ptc < 0.30:
+        reasons.append("high_drift_risk")
+    if final_score < 0.55 and int(rec.get("anchor_count") or 0) <= 1:
+        reasons.append("weak_single_anchor_term")
     return reasons
 
 
 def _bucket_stage3_terms(survivors: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """分为 core_terms、support_terms、risky_terms。"""
+    """分为 core_terms、support_terms、risky_terms；core 为真正主干 primary，不因单锚点直接打下去。"""
     core_terms: List[Dict[str, Any]] = []
     support_terms: List[Dict[str, Any]] = []
     risky_terms: List[Dict[str, Any]] = []
     for rec in survivors:
         final_score = float(rec.get("final_score") or 0.0)
-        cross_anchor = float(rec.get("cross_anchor_evidence") or 1.0)
-        family_centrality = float(rec.get("family_centrality") or 0.0)
+        ex = rec.get("stage3_explain") or {}
+        ptc = float(ex.get("path_topic_consistency") or 0.0)
         drift = float(rec.get("semantic_drift_risk") or 0.0)
         role = (rec.get("retrieval_role") or "").lower()
+        reasons = rec.get("risk_reasons") or []
         if (
             role == "paper_primary"
-            and final_score >= 0.18
-            and cross_anchor >= 0.95
-            and family_centrality >= 0.45
-            and drift <= 0.65
+            and final_score >= 0.64
+            and ptc >= 0.55
+            and drift <= 0.80
+            and "high_drift_risk" not in reasons
         ):
             core_terms.append(rec)
-        elif final_score >= 0.10 and family_centrality >= 0.25 and drift <= 0.80:
+        elif final_score >= 0.56 and "weak_family_centrality" not in reasons:
             support_terms.append(rec)
         else:
             risky_terms.append(rec)
@@ -519,7 +520,7 @@ def _debug_print_stage3_output(
     stage3_debug = getattr(term_scoring, "STAGE3_DEBUG", False)
     label_trace = LABEL_PATH_TRACE or stage3_debug
     debug_print(1, f"[Stage3] 输入候选总数={len(raw_candidates)} 幸存={len(survivors)} top_k={len(top_survivors)}", recall)
-    debug_print(2, "[Stage3 Final Score Breakdown] term | stage2_rank | anchor_count | evidence_count | family_centrality | path_topic_consistency | generic_penalty | cross_anchor_factor | retrieval_role | final", recall)
+    debug_print(2, "[Stage3 Final Score Breakdown] term | stage2_rank | anchor_count | evidence_count | family_centrality | path_topic_consistency | generic_penalty | cross_anchor_factor | backbone_boost | object_like_penalty | bonus_term_penalty | retrieval_role | final", recall)
     for rec in survivors[:15]:
         t = (rec.get("term") or "")[:28]
         ex = rec.get("stage3_explain") or {}
@@ -527,6 +528,7 @@ def _debug_print_stage3_output(
             f"  {t:<28} | s2={rec.get('stage2_rank', 0):>2} | anc={rec.get('anchor_count', 0)} ev={rec.get('evidence_count', 0)} | "
             f"fc={float(rec.get('family_centrality') or 0):.3f} | ptc={float(ex.get('path_topic_consistency') or 0):.3f} | "
             f"gen={float(ex.get('generic_penalty') or 0):.3f} | cross={float(ex.get('cross_anchor_factor') or 0):.3f} | "
+            f"bb={float(ex.get('backbone_boost') or 1):.3f} | obj={float(ex.get('object_like_penalty') or 1):.3f} | bonus={float(ex.get('bonus_term_penalty') or 1):.3f} | "
             f"{rec.get('retrieval_role', ''):14s} | final={float(rec.get('final_score') or 0):.3f}"
         ), recall)
     debug_print(2, "[Stage3 Rerank Delta] term | stage2_rank | stage3_rank | delta", recall)
@@ -548,7 +550,7 @@ def _debug_print_stage3_output(
         if len(paper_terms) > 30:
             print(f"  ... 共 {len(paper_terms)} 条")
         print(f"[Stage3] 去重后={len(raw_candidates)} 幸存={len(survivors)} top_k={len(top_survivors)} paper_terms={len(paper_terms)}")
-        print("[Stage3 final_score 明细] term | base_score | path_topic_consistency | generic_penalty | cross_anchor_factor | final_score | reject_reason")
+        print("[Stage3 final_score 明细] term | base_score | path_topic_consistency | generic_penalty | cross_anchor_factor | backbone_boost | object_like_penalty | bonus_term_penalty | final_score | reject_reason")
         for i, rec in enumerate(top_survivors[:20]):
             term = (rec.get("term") or "")[:28]
             ex = rec.get("stage3_explain") or {}
@@ -556,10 +558,13 @@ def _debug_print_stage3_output(
             path_topic = ex.get("path_topic_consistency")
             gen_pen = ex.get("generic_penalty")
             cross_anchor = ex.get("cross_anchor_factor")
+            backbone_boost = ex.get("backbone_boost")
+            object_like_penalty = ex.get("object_like_penalty")
+            bonus_term_penalty = ex.get("bonus_term_penalty")
             final_score = rec.get("final_score", 0) or 0.0
             reject = rec.get("reject_reason", "")
             _fmt = lambda x: f"{x:.3f}" if x is not None and isinstance(x, (int, float)) else str(x) if x is not None else "-"
-            print(f"  {i+1} {term!r} | base={_fmt(base_score)} | path_topic={_fmt(path_topic)} | gen={_fmt(gen_pen)} | cross={_fmt(cross_anchor)} | final={final_score:.4f} | {reject!r}")
+            print(f"  {i+1} {term!r} | base={_fmt(base_score)} | path_topic={_fmt(path_topic)} | gen={_fmt(gen_pen)} | cross={_fmt(cross_anchor)} | bb={_fmt(backbone_boost)} | obj={_fmt(object_like_penalty)} | bonus={_fmt(bonus_term_penalty)} | final={final_score:.4f} | {reject!r}")
         if len(top_survivors) > 20:
             print(f"  ... 共 {len(top_survivors)} 条")
     if stage3_debug and score_map:
