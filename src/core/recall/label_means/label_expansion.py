@@ -28,6 +28,31 @@ from src.core.recall.label_means.label_debug import debug_print
 
 # ---------- Stage2/3 保守常量：单一决策链，无冗余阈值（详见 README） ----------
 LABEL_EXPANSION_DEBUG = True  # 调试时打印 Stage2A/2B 流程
+STAGE2_VERBOSE_DEBUG = True   # True 时输出 Stage2 详细工整表格，便于调试
+
+
+def _stage2_header(title: str, char: str = "=") -> None:
+    """Stage2 调试：打印一节标题，工整分隔。"""
+    if not (LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG):
+        return
+    line = char * 72
+    print(f"\n{line}\n  [Stage2] {title}\n{line}")
+
+
+def _stage2_table(rows: List[List[str]], header: List[str], col_widths: Optional[List[int]] = None) -> None:
+    """Stage2 调试：打印一张对齐的表格。"""
+    if not (LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG) or not header:
+        return
+    if not col_widths:
+        col_widths = [max(len(str(h)), 4) for h in header]
+    fmt = "  ".join(f"{{:<{w}}}" for w in col_widths)
+    print(f"  {fmt.format(*header)}")
+    print("  " + "-" * (sum(col_widths) + 2 * (len(col_widths) - 1)))
+    for row in rows:
+        row_str = [str(x)[:w] for x, w in zip(row, col_widths)]
+        if len(row_str) < len(col_widths):
+            row_str.extend([""] * (len(col_widths) - len(row_str)))
+        print(f"  {fmt.format(*row_str[:len(col_widths)])}")
 PRIMARY_MIN_IDENTITY = 0.62       # Stage2A 准入：identity 下限（与 PRIMARY_MIN_PATH_MATCH 共同构成准入）
 PRIMARY_MAX_PER_ANCHOR = 2        # 每锚点最多 primary 数
 PRIMARY_TOP_M_PER_ANCHOR = 5      # 每锚先保留 top-m 候选再准入与冲突消解
@@ -973,25 +998,55 @@ def check_seed_eligibility(
     label,
     p: "PrimaryLanding",
     jd_profile: Optional[Dict[str, Any]] = None,
-) -> Tuple[bool, float]:
+) -> Tuple[bool, float, Optional[str]]:
     """
-    Stage2B 唯一 seed 决策入口：只保留一层。eligible = identity≥SEED_MIN_IDENTITY 且 source∈可信；
-    seed_score = primary_score * (0.7+0.3*path_match) * genericity_penalty。
-    不再调用 allow_primary_to_expand，无二次审批。
-    返回 (eligible, seed_score)。
+    Stage2B 唯一 seed 决策入口：identity/source 通过后，再判 weak_retain/错义/cooc 严格 bar。
+    返回 (eligible, seed_score, block_reason)；block_reason 仅在 eligible=False 时有值。
     """
     identity = getattr(p, "identity_score", 0.0) or 0.0
     src = (getattr(p, "source", "") or "").strip().lower()
     trusted_set = {s.strip().lower() for s in TRUSTED_SOURCE_TYPES_FOR_DIFFUSION if s}
     if identity < SEED_MIN_IDENTITY:
-        return False, 0.0
+        return False, 0.0, "seed_score_too_low"
     if trusted_set and src not in trusted_set:
-        return False, 0.0
+        return False, 0.0, "source_not_trusted"
+    retain_mode = getattr(p, "retain_mode", "normal") or "normal"
+    suppress_seed = getattr(p, "suppress_seed", True)
+    if retain_mode == "weak_retain" and suppress_seed:
+        return False, 0.0, "weak_primary_no_expand"
+    anchor_text = getattr(p, "anchor_term", "") or ""
+    if is_semantic_mismatch_seed(anchor_text, getattr(p, "term", "") or ""):
+        return False, 0.0, "semantic_mismatch_seed"
+    topic_source = getattr(p, "topic_source", "missing") or "missing"
+    if topic_source == "cooc":
+        sem = float(getattr(p, "semantic_score", 0) or 0)
+        jd_align = float(getattr(p, "jd_align", 0.5) or 0.5)
+        aid = float(getattr(p, "anchor_identity_score", identity) or identity)
+        if not (sem >= 0.84 and jd_align >= 0.82 and aid >= 0.35):
+            return False, 0.0, "cooc_seed_blocked"
     primary_score = getattr(p, "primary_score", identity) or identity
     path_match = float(getattr(p, "path_match", 0) or 0)
     genericity_penalty = float(getattr(p, "topic_span_penalty", 1.0) or 1.0)
     seed_score = primary_score * (0.7 + 0.3 * path_match) * genericity_penalty
-    return True, seed_score
+
+    jd_align = float(getattr(p, "jd_align", 0.5) or 0.5)
+    support_count = int(getattr(p, "cross_anchor_support_count", 1) or 1)
+    blocked, block_reason = should_block_seed_expansion(
+        anchor_text=anchor_text,
+        primary_term=getattr(p, "term", "") or "",
+        primary_score=primary_score,
+        anchor_identity=getattr(p, "anchor_identity_score", identity) or identity,
+        jd_align=jd_align,
+        source_type=src,
+        support_count=support_count,
+        retain_mode=retain_mode,
+        suppress_seed=suppress_seed,
+    )
+    if blocked:
+        if LABEL_EXPANSION_DEBUG:
+            print(f"[Stage2B] seed 禁扩 term={getattr(p, 'term', '')!r} anchor={anchor_text!r} reason={block_reason}")
+        return False, 0.0, block_reason
+    return True, seed_score, None
 
 
 def _anchor_skills_to_prepared_anchors(label, anchor_skills: Dict[str, Any]) -> List[PreparedAnchor]:
@@ -1647,8 +1702,9 @@ def expand_from_vocab_dense_neighbors(
     jd_field_ids: Optional[Set[str]] = None,
     jd_subfield_ids: Optional[Set[str]] = None,
     jd_topic_ids: Optional[Set[str]] = None,
+    jd_profile: Optional[Dict[str, Any]] = None,
 ) -> List[ExpandedTermCandidate]:
-    """从词汇向量索引取 primary 的学术近邻；仅保留与激活领域（及可选三级领域）一致的词。term_role=dense_expansion。"""
+    """从词汇向量索引取 primary 的学术近邻；入口先审 seed，支撑词再过滤语义偏航。term_role=dense_expansion。"""
     top_k_per_primary = top_k_per_primary or DENSE_MAX_PER_PRIMARY
     if not primary_landings or not getattr(label, "vocab_index", None) or not getattr(label, "vocab_to_idx", None):
         return []
@@ -1658,6 +1714,9 @@ def expand_from_vocab_dense_neighbors(
     seen = set(p.vid for p in primary_landings)
     out = []
     for p in primary_landings:
+        ok, _, _ = check_seed_eligibility(label, p, jd_profile)
+        if not ok:
+            continue
         idx = label.vocab_to_idx.get(str(p.vid))
         if idx is None:
             continue
@@ -1694,6 +1753,8 @@ def expand_from_vocab_dense_neighbors(
                 jd_topic_ids=jd_topic_ids,
             )
             if domain_fit < SUPPORT_MIN_DOMAIN_FIT:
+                continue
+            if _is_bad_support_for_anchor(getattr(p, "anchor_term", "") or "", meta[0] or ""):
                 continue
             domain_span = 0
             if getattr(label, "stats_conn", None):
@@ -1750,6 +1811,12 @@ def expand_from_cluster_members(
     seen = set(p.vid for p in primary_landings)
     out = []
     for p in primary_landings:
+        if getattr(p, "retain_mode", "normal") != "normal":
+            continue
+        if (getattr(p, "topic_source", "missing") or "missing") == "cooc":
+            continue
+        if (getattr(p, "primary_score", 0) or 0) < 0.40:
+            continue
         clusters = voc_to_clusters.get(p.vid)
         if not clusters:
             continue
@@ -1823,7 +1890,7 @@ def expand_from_cooccurrence_support(
     jd_subfield_ids: Optional[Set[str]] = None,
     jd_topic_ids: Optional[Set[str]] = None,
 ) -> List[ExpandedTermCandidate]:
-    """共现高支持度学术词；仅保留与激活领域（及可选三级领域）一致的词。term_role=cooc_expansion。"""
+    """共现高支持度学术词；仅允许 strong normal + direct 且 primary_score>=0.45 的 seed。term_role=cooc_expansion。"""
     if not primary_landings or not getattr(label, "stats_conn", None):
         return []
     load_vocab_meta(label)
@@ -1832,7 +1899,13 @@ def expand_from_cooccurrence_support(
         for v, (t, _) in label._vocab_meta.items():
             if t and t not in term_to_vid:
                 term_to_vid[t.strip()] = v
-    vid_to_term = {p.vid: (p.term, p.anchor_vid, p.anchor_term) for p in primary_landings}
+    strong_primaries = [
+        p for p in primary_landings
+        if getattr(p, "retain_mode", "normal") == "normal"
+        and (getattr(p, "topic_source", "missing") or "missing") == "direct"
+        and (getattr(p, "primary_score", 0) or 0) >= 0.45
+    ]
+    vid_to_term = {p.vid: (p.term, p.anchor_vid, p.anchor_term) for p in strong_primaries}
     out = []
     seen = set(p.vid for p in primary_landings)
     for vid, (term, anchor_vid, anchor_term) in vid_to_term.items():
@@ -2213,7 +2286,7 @@ def _compute_hierarchy_match_score(
     jd_subfield_ids: Set[str],
     jd_topic_ids: Set[str],
 ) -> Tuple[float, str]:
-    """层级命中分与档位。自上而下：topic → subfield → field → none。"""
+    """层级命中分与档位（仅用于 debug/explain）。准入以 compute_hierarchy_evidence 的连续 effective_* 为准，不做硬档位拒绝。"""
     if not jd_topic_ids and not jd_subfield_ids and not jd_field_ids:
         return 1.0, "missing"
     term_topic = _extract_ids_from_row(topic_row, "topic_id", "topic_dist")
@@ -2248,20 +2321,25 @@ def _compute_path_match(
     active_subfields: Set[str],
     active_topics: Set[str],
 ) -> float:
-    """三层路径一致性：有 active 的层级上 overlap 比率的几何平均（缺层用 1）。"""
-    vals = []
+    """
+    三层路径一致性：加权平均，避免几何平均强连坐导致 topic 不完整时 path 塌成 0.03。
+    权重 0.2*field + 0.3*subfield + 0.5*topic；某层 active 为空则跳过并重新归一化。
+    """
+    w_field, w_sub, w_topic = 0.2, 0.3, 0.5
+    total_w = 0.0
+    score = 0.0
     if active_fields:
-        vals.append(_overlap_ratio(cand_fields, active_fields) or 0.01)
+        score += w_field * (_overlap_ratio(cand_fields, active_fields) or 0.0)
+        total_w += w_field
     if active_subfields:
-        vals.append(_overlap_ratio(cand_subfields, active_subfields) or 0.01)
+        score += w_sub * (_overlap_ratio(cand_subfields, active_subfields) or 0.0)
+        total_w += w_sub
     if active_topics:
-        vals.append(_overlap_ratio(cand_topics, active_topics) or 0.01)
-    if not vals:
+        score += w_topic * (_overlap_ratio(cand_topics, active_topics) or 0.0)
+        total_w += w_topic
+    if total_w <= 0:
         return 0.0
-    prod = 1.0
-    for v in vals:
-        prod *= max(0.01, v)
-    return prod ** (1.0 / len(vals))
+    return score / total_w
 
 
 def compute_hierarchy_evidence(
@@ -2272,11 +2350,22 @@ def compute_hierarchy_evidence(
     active_topics: Set[str],
 ) -> Dict[str, Any]:
     """
-    三层领域特征：从“轻加分”升级为“准入/裁判”用证据。
-    返回 field_overlap, subfield_overlap, topic_overlap, path_match, topic_specificity, topic_span_penalty, hierarchy_level。
+    三层领域特征 + 来源可信度。准入/裁判使用 effective_*（overlap * hierarchy_reliability），
+    cooc 补出的三级领域不再与 direct 同权。
+    返回含 topic_source, hierarchy_reliability, effective_topic_overlap, effective_subfield_overlap, effective_path_match。
     """
     snap = get_vocab_hierarchy_snapshot(label, voc_id)
     topic_row = _load_vocabulary_topic_stats(label, voc_id) or {}
+    topic_source = (topic_row.get("source") or "missing").strip().lower()
+    if topic_source == "direct":
+        hierarchy_reliability = 1.0
+    elif topic_source == "direct+cooc":
+        hierarchy_reliability = 0.8
+    elif topic_source == "cooc":
+        hierarchy_reliability = 0.5
+    else:
+        hierarchy_reliability = 0.4
+
     cand_fields = _extract_ids_from_row(
         {"field_id": snap.get("field_id"), "field_dist": snap.get("field_dist") or {}},
         "field_id",
@@ -2299,6 +2388,10 @@ def compute_hierarchy_evidence(
         cand_fields, cand_subfields, cand_topics,
         active_fields, active_subfields, active_topics,
     )
+    effective_topic = topic_overlap * hierarchy_reliability
+    effective_subfield = subfield_overlap * hierarchy_reliability
+    effective_path = path_match * hierarchy_reliability
+
     topic_dist = _parse_dist(snap.get("topic_dist")) or _parse_dist(topic_row.get("topic_dist"))
     topic_specificity = compute_purity(topic_dist) if topic_dist else 0.0
     domain_span = int(snap.get("domain_span") or 0)
@@ -2319,6 +2412,11 @@ def compute_hierarchy_evidence(
         "topic_specificity": topic_specificity,
         "topic_span_penalty": topic_span_penalty,
         "hierarchy_level": hierarchy_level,
+        "topic_source": topic_source,
+        "hierarchy_reliability": hierarchy_reliability,
+        "effective_topic_overlap": effective_topic,
+        "effective_subfield_overlap": effective_subfield,
+        "effective_path_match": effective_path,
     }
 
 
@@ -2334,6 +2432,164 @@ def _lexical_term_sanity(term: str, meta: Any) -> bool:
     return True
 
 
+# ---------- 边界保留与禁扩（正确但 hierarchy/path 弱 → 保留降权；错误/窄义 → 禁扩或剔除） ----------
+
+# 工程主干锚点/术语关键词，用于 should_retain_borderline_candidate 的 engineering_core 判断
+_ENGINEERING_CORE_ANCHORS = frozenset({
+    "控制", "运动控制", "传统控制", "路径规划", "强化学习", "仿真", "机器人", "机器人运动控制",
+    "医疗机器人", "动力学", "动力学参数辨识", "抓取", "端到端", "机械臂", "robotics", "robot control",
+    "motion control", "reinforcement learning", "simulation", "pathfinding", "automatic control",
+})
+_ENGINEERING_CORE_TERM_SUBSTR = frozenset({
+    "control", "motion", "robot", "learning", "simulation", "path", "planning", "identification",
+    "dynamics", "manipulator", "robotics", "reinforcement", "digital control", "feedback control",
+})
+
+
+def _is_engineering_core_anchor(anchor_text: str) -> bool:
+    """锚点是否为控制/规划/学习/仿真/机器人等工程主干。"""
+    if not anchor_text:
+        return False
+    a = (anchor_text or "").strip().lower()
+    return any(k in a or a in k for k in _ENGINEERING_CORE_ANCHORS)
+
+
+def _is_engineering_core_term(term_text: str) -> bool:
+    """候选是否为明显工程术语（关键词子串）。"""
+    if not term_text:
+        return False
+    t = (term_text or "").strip().lower()
+    return any(k in t for k in _ENGINEERING_CORE_TERM_SUBSTR)
+
+
+def should_retain_borderline_candidate(
+    anchor_text: str,
+    candidate_text: str,
+    semantic_score: float,
+    jd_align: float,
+    anchor_identity: float,
+    hierarchy_level: str,
+    topic_overlap: float,
+    subfield_overlap: float,
+    path_match: float,
+    source_type: str,
+) -> Tuple[bool, Optional[str]]:
+    """
+    当 check_primary_admission 原本要 reject 时，判断是否属于“虽然 hierarchy/path 弱，但语义上该保留”的边界词。
+    返回 (retain, retain_reason)；retain_reason 为 "strong_*" 时 retain_mode=strong、不 suppress_seed，否则 weak、suppress_seed=True。
+    """
+    cand = (candidate_text or "").strip()
+    anchor = (anchor_text or "").strip().lower()
+    src = (source_type or "").strip().lower()
+
+    # 1. 主干语义强：semantic + jd_align 双高 → strong retain
+    if semantic_score >= 0.82 and jd_align >= 0.80:
+        return True, "strong_semantic_retain"
+
+    # 2. 工程主干锚点 + 明显工程术语，path 弱也先保留
+    if _is_engineering_core_anchor(anchor_text) and _is_engineering_core_term(cand):
+        if semantic_score >= 0.78 and jd_align >= 0.76:
+            return True, "engineering_core_retain"
+
+    # 3. similar_to 时，非明显错义则允许弱保留
+    if src == "similar_to":
+        if semantic_score >= 0.80 and jd_align >= 0.76:
+            return True, "similar_to_weak_retain"
+
+    # 4. hierarchy 只是弱（非 off_path 硬冲突）时也可弱保留
+    if hierarchy_level != HIERARCHY_LEVEL_OFF_PATH:
+        if semantic_score >= 0.78 and jd_align >= 0.78:
+            return True, "borderline_hierarchy_retain"
+
+    # 5. 即使 off_path，双高也弱保留（避免 simulation / reinforcement learning 等误杀）
+    if semantic_score >= 0.80 and jd_align >= 0.78:
+        return True, "weak_off_path_retain"
+
+    return False, None
+
+
+def _is_bad_support_for_anchor(anchor_text: str, support_term: str) -> bool:
+    """扩散支撑词是否明显偏义（与 is_semantic_mismatch_seed 同族逻辑，避免 抓取→retrieval、动力学→propulsion 等）。"""
+    return is_semantic_mismatch_seed(anchor_text, support_term)
+
+
+def is_semantic_mismatch_seed(anchor_text: str, primary_term: str) -> bool:
+    """
+    临时护栏：明显错义/偏义 seed 禁止扩散。
+    动力学→propulsion、抓取→retrieval/crawling、端到端→principle、强化学习→仅 q-learning 等。
+    """
+    anchor = (anchor_text or "").strip().lower()
+    term = (primary_term or "").strip().lower()
+    if not term:
+        return False
+
+    if "动力学" in anchor or "dynamics" in anchor:
+        if "propulsion" in term or "propulsor" in term:
+            return True
+    if "抓取" in anchor or "grasping" in anchor or "manipulation" in anchor:
+        if any(x in term for x in ["retrieval", "crawler", "crawling"]):
+            return True
+    if "端到端" in anchor or "end-to-end" in anchor:
+        if any(x in term for x in ["principle", "delay", "point-to-point", "end point"]):
+            return True
+    if "强化学习" in anchor or "reinforcement learning" in anchor:
+        if term == "q-learning":
+            return True
+    return False
+
+
+def _is_over_specific_subterm(anchor_text: str, primary_term: str) -> bool:
+    """是否仅为锚点的过窄子项（如 q-learning 对 强化学习、robot hand 对 机械臂），不宜单独当 seed。"""
+    anchor = (anchor_text or "").strip().lower()
+    term = (primary_term or "").strip().lower()
+    # 子项黑名单：锚点 -> 仅该词时禁扩
+    over_specific = (
+        ("机械臂", "robot hand"),
+        ("机械臂", "robotic hand"),
+        ("强化学习", "q-learning"),
+        ("robot control", "machine control"),
+        ("robot control", "servo control"),
+        ("robotics", "telerobotics"),
+    )
+    for a_key, t_key in over_specific:
+        if a_key in anchor or anchor in a_key:
+            if t_key in term or term in t_key:
+                return True
+    return False
+
+
+def should_block_seed_expansion(
+    anchor_text: str,
+    primary_term: str,
+    primary_score: float,
+    anchor_identity: float,
+    jd_align: float,
+    source_type: str,
+    support_count: int,
+    retain_mode: str,
+    suppress_seed: bool = True,
+) -> Tuple[bool, Optional[str]]:
+    """
+    surviving primary 是否应禁止扩散。
+    返回 (block, block_reason)；block=True 时不应作为 seed。
+    weak_retain 且 suppress_seed=True 时禁扩；suppress_seed=False 时可扩。
+    """
+    if retain_mode in ("weak", "weak_primary"):
+        return True, "weak_primary_no_expand"
+    if retain_mode == "weak_retain" and suppress_seed:
+        return True, "weak_primary_no_expand"
+    if anchor_identity < 0.20 and support_count < 2:
+        return True, "low_identity_single_support"
+    if is_semantic_mismatch_seed(anchor_text, primary_term):
+        return True, "semantic_mismatch_seed"
+    if _is_over_specific_subterm(anchor_text, primary_term):
+        return True, "over_specific_without_head_term"
+    src = (source_type or "").strip().lower()
+    if src == "conditioned_vec" and anchor_identity < 0.35 and support_count < 2:
+        return True, "weak_condvec_seed"
+    return False, None
+
+
 def check_primary_admission(
     anchor_text: str,
     anchor_meta: Any,
@@ -2344,50 +2600,50 @@ def check_primary_admission(
     jd_align: float,
     source_type: str,
     cross_anchor_support_count: int,
-) -> Tuple[bool, List[str], bool]:
+) -> Tuple[bool, List[str], bool, Dict[str, Any]]:
     """
-    Stage2A 主落点准入：仅两个量 hierarchy_match、path_match + source 折扣；rescue 用统一下限。
-    返回 (admitted, reasons, rescued)。
+    Stage2A 主落点准入：domain 强冲突才硬拒；topic/path 弱改为 weak_retain，不再误杀主干词。
+    返回 (admitted, reasons, rescued, meta)；meta 含 retain_mode（normal|weak_retain）、suppress_seed、retain_reason。
     """
-    reasons = []
+    src = (source_type or "").strip().lower()
+    reasons: List[str] = []
     if not _lexical_term_sanity(getattr(candidate, "term", "") or "", None):
-        return False, ["lexical_not_term"], False
-    if hierarchy_evidence.get("hierarchy_level") == HIERARCHY_LEVEL_OFF_PATH:
-        reasons.append("hierarchy_off_path")
-    topic = hierarchy_evidence.get("topic_overlap", 0)
-    subfield = hierarchy_evidence.get("subfield_overlap", 0)
-    path = hierarchy_evidence.get("path_match", 0)
-    has_jd_hierarchy = topic > 0 or subfield > 0 or path > 0
-    if has_jd_hierarchy:
-        hierarchy_match = 0.4 * topic + 0.4 * path + 0.2 * subfield
-        src = (source_type or "").strip().lower()
-        source_factor = CONDVEC_SOURCE_FACTOR if src == "conditioned_vec" else 1.0
-        effective_hierarchy = hierarchy_match * source_factor
-        if effective_hierarchy < PRIMARY_MIN_HIERARCHY_MATCH:
-            reasons.append("hierarchy_weak")
-        if path < PRIMARY_MIN_PATH_MATCH:
-            reasons.append("path_weak")
+        return False, ["lexical_not_term"], False, {"retain_mode": "reject"}
+
+    # 大领域强冲突：三层 overlap 全为 0 时硬拒
+    field_o = hierarchy_evidence.get("field_overlap", 0) or 0
+    sub_o = hierarchy_evidence.get("subfield_overlap", 0) or 0
+    topic_o = hierarchy_evidence.get("topic_overlap", 0) or 0
+    if field_o == 0 and sub_o == 0 and topic_o == 0:
+        # 无 JD 时也为 0，用 semantic/jd 救回；有 JD 时全 0 即强冲突
+        if semantic_score < 0.78 or jd_align < 0.76:
+            return False, ["domain_conflict_strong"], False, {"retain_mode": "reject"}
+
     if anchor_identity < 0.20:
-        if not (
-            jd_align >= PRIMARY_RESCUE_JD_ALIGN_MIN
-            and semantic_score >= PRIMARY_RESCUE_SEMANTIC_MIN
-        ):
+        if not (jd_align >= PRIMARY_RESCUE_JD_ALIGN_MIN and semantic_score >= PRIMARY_RESCUE_SEMANTIC_MIN):
             reasons.append("low_identity_not_rescued")
     is_generic = getattr(anchor_meta, "is_generic_anchor", False)
     if is_generic and src == "conditioned_vec" and cross_anchor_support_count < 2:
         reasons.append("generic_anchor_condvec_needs_multi_support")
-    rescued = False
     if reasons:
-        if (
-            cross_anchor_support_count >= PRIMARY_RESCUE_CROSS_ANCHOR_MIN
-            and path >= PRIMARY_RESCUE_PATH_MATCH_MIN
-            and jd_align >= PRIMARY_RESCUE_JD_ALIGN_MIN
-            and semantic_score >= PRIMARY_RESCUE_SEMANTIC_MIN
-        ):
-            rescued = True
-            reasons = []
-    admitted = len(reasons) == 0
-    return admitted, reasons, rescued
+        return False, reasons, False, {"retain_mode": "reject"}
+
+    ev_topic = hierarchy_evidence.get("effective_topic_overlap", hierarchy_evidence.get("topic_overlap", 0)) or 0
+    ev_path = hierarchy_evidence.get("effective_path_match", hierarchy_evidence.get("path_match", 0)) or 0
+
+    # 主干语义保护：双高直接弱保留且可做 seed
+    if semantic_score >= 0.82 and jd_align >= 0.80:
+        return True, [], False, {"retain_mode": "weak_retain", "suppress_seed": False, "retain_reason": "strong_semantic"}
+
+    # hierarchy 很强，正常通过
+    if ev_topic >= PRIMARY_MIN_HIERARCHY_MATCH and ev_path >= PRIMARY_MIN_PATH_MATCH:
+        return True, [], False, {"retain_mode": "normal", "suppress_seed": False}
+
+    # hierarchy 弱但 semantic/jd 足够，弱保留且默认不扩散
+    if semantic_score >= 0.78 and jd_align >= 0.76:
+        return True, ["hierarchy_weak"], False, {"retain_mode": "weak_retain", "suppress_seed": True, "retain_reason": "borderline_hierarchy"}
+
+    return False, ["hierarchy_weak", "path_weak"], False, {"retain_mode": "reject"}
 
 
 def _piecewise_identity_factor(anchor_identity: float) -> float:
@@ -2412,32 +2668,53 @@ def compute_primary_score(
     source_type: str,
 ) -> float:
     """
-    对已准入的候选排序；三层领域从“轻量项”升级为核心项，错义词下沉。
+    对已准入的候选排序；hierarchy 作强加分项，不做硬生杀；weak_retain 轻降权 0.85。
     """
     base = (
-        PRIMARY_SCORE_W_SEMANTIC * max(0, min(1, semantic_score))
-        + PRIMARY_SCORE_W_IDENTITY * max(0, min(1, anchor_identity))
-        + PRIMARY_SCORE_W_JD_ALIGN * max(0, min(1, jd_align))
-        + PRIMARY_SCORE_W_CROSS_ANCHOR * min(cross_anchor_support_count / 2.0, 1.0)
-        + PRIMARY_SCORE_W_NEIGHBOR * max(0, min(1, local_neighborhood_consistency))
+        0.35 * max(0, min(1, semantic_score))
+        + 0.25 * max(0, min(1, jd_align))
+        + 0.15 * max(0, min(1, anchor_identity))
+        + 0.10 * min(cross_anchor_support_count / 2.0, 1.0)
+        + 0.15 * max(0, min(1, local_neighborhood_consistency))
     )
-    hierarchy_core = (
-        PRIMARY_SCORE_W_FIELD * hierarchy_evidence.get("field_overlap", 0)
-        + PRIMARY_SCORE_W_SUBFIELD * hierarchy_evidence.get("subfield_overlap", 0)
-        + PRIMARY_SCORE_W_TOPIC * hierarchy_evidence.get("topic_overlap", 0)
-        + PRIMARY_SCORE_W_PATH * hierarchy_evidence.get("path_match", 0)
-        + PRIMARY_SCORE_W_SPECIFICITY * hierarchy_evidence.get("topic_specificity", 0)
-    )
-    src = (source_type or "").strip().lower()
-    if src == "similar_to":
-        source_factor = 1.00
-    elif cross_anchor_support_count >= 2:
-        source_factor = 0.90
-    else:
-        source_factor = 0.75
-    span_factor = hierarchy_evidence.get("topic_span_penalty", 1.0)
-    identity_factor = _piecewise_identity_factor(anchor_identity)
-    return (base + hierarchy_core) * source_factor * span_factor * identity_factor
+    eff_sub = hierarchy_evidence.get("effective_subfield_overlap", hierarchy_evidence.get("subfield_overlap", 0)) or 0
+    eff_topic = hierarchy_evidence.get("effective_topic_overlap", hierarchy_evidence.get("topic_overlap", 0)) or 0
+    eff_path = hierarchy_evidence.get("effective_path_match", hierarchy_evidence.get("path_match", 0)) or 0
+    spec = hierarchy_evidence.get("topic_specificity", 0) or 0
+    hierarchy_score = 0.20 * eff_sub + 0.30 * eff_topic + 0.30 * eff_path + 0.20 * spec
+    span_factor = hierarchy_evidence.get("topic_span_penalty", 1.0) or 1.0
+    final = (base + hierarchy_score) * span_factor
+    if getattr(candidate, "retain_mode", "normal") == "weak_retain":
+        final *= 0.85
+    return final
+
+
+# 主词优先：锚点->主干表达给小幅加分，避免 robot hand 长期压过 robotic arm
+_HEAD_TERM_BONUS_MAP = (
+    ("机械臂", ("robotic arm", "robot arm")),
+    ("运动控制", ("motion control",)),
+    ("机器人运动控制", ("robot control", "motion control")),
+    ("路径规划", ("path planning", "pathfinding")),
+    ("强化学习", ("reinforcement learning",)),
+    ("仿真", ("simulation",)),
+    ("医疗机器人", ("medical robotics",)),
+    ("传统控制", ("automatic control",)),
+)
+
+
+def _head_term_bonus(anchor_text: str, term: str) -> float:
+    """锚点主干词匹配时加小 bonus，便于 robotic arm 压过 robot hand。"""
+    if not anchor_text or not term:
+        return 0.0
+    anchor = (anchor_text or "").strip().lower()
+    t = (term or "").strip().lower()
+    for a_key, heads in _HEAD_TERM_BONUS_MAP:
+        if a_key not in anchor and anchor not in a_key:
+            continue
+        for h in heads:
+            if h in t or t in h:
+                return 0.08
+    return 0.0
 
 
 def choose_better_term_with_hierarchy(
@@ -2445,25 +2722,28 @@ def choose_better_term_with_hierarchy(
     b: LandingCandidate,
     anchor: PreparedAnchor,
 ) -> LandingCandidate:
-    """锚点内冲突裁判：三层领域主导，泛词自动吃亏。"""
+    """锚点内冲突裁判：三层领域 + 主词优先 bonus，避免子项压主项。"""
     ev_a = getattr(a, "hierarchy_evidence", {}) or {}
     ev_b = getattr(b, "hierarchy_evidence", {}) or {}
+    anchor_text = getattr(anchor, "anchor", "") or ""
     score_a = (
         0.30 * (getattr(a, "primary_score", 0) or 0)
-        + 0.20 * ev_a.get("topic_overlap", 0)
-        + 0.20 * ev_a.get("path_match", 0)
+        + 0.20 * (ev_a.get("effective_topic_overlap", ev_a.get("topic_overlap", 0)) or 0)
+        + 0.20 * (ev_a.get("effective_path_match", ev_a.get("path_match", 0)) or 0)
         + 0.10 * ev_a.get("topic_specificity", 0)
         + 0.10 * max(0, getattr(a, "jd_candidate_alignment", 0.5) or 0.5)
         + 0.10 * getattr(a, "anchor_identity_score", 0.5)
     ) * ev_a.get("topic_span_penalty", 1.0)
+    score_a += _head_term_bonus(anchor_text, getattr(a, "term", "") or "")
     score_b = (
         0.30 * (getattr(b, "primary_score", 0) or 0)
-        + 0.20 * ev_b.get("topic_overlap", 0)
-        + 0.20 * ev_b.get("path_match", 0)
+        + 0.20 * (ev_b.get("effective_topic_overlap", ev_b.get("topic_overlap", 0)) or 0)
+        + 0.20 * (ev_b.get("effective_path_match", ev_b.get("path_match", 0)) or 0)
         + 0.10 * ev_b.get("topic_specificity", 0)
         + 0.10 * max(0, getattr(b, "jd_candidate_alignment", 0.5) or 0.5)
         + 0.10 * getattr(b, "anchor_identity_score", 0.5)
     ) * ev_b.get("topic_span_penalty", 1.0)
+    score_b += _head_term_bonus(anchor_text, getattr(b, "term", "") or "")
     return a if score_a >= score_b else b
 
 
@@ -2629,6 +2909,10 @@ def merge_primary_and_support_terms(
         setattr(e, "field_fit", getattr(p, "field_fit", 0))
         setattr(e, "path_match", getattr(p, "path_match", 0))
         setattr(e, "genericity_penalty", getattr(p, "topic_span_penalty", 1.0))
+        setattr(e, "retain_mode", getattr(p, "retain_mode", "normal"))
+        setattr(e, "topic_source", getattr(p, "topic_source", "missing"))
+        setattr(e, "seed_blocked", getattr(p, "seed_blocked", False))
+        setattr(e, "seed_block_reason", getattr(p, "seed_block_reason", None))
         if getattr(p, "outside_subfield_mass", None) is not None:
             setattr(e, "outside_subfield_mass", p.outside_subfield_mass)
         if getattr(p, "outside_topic_mass", None) is not None:
@@ -2768,6 +3052,16 @@ def stage2_generate_academic_terms(
     debug_print(1, "\n" + "-" * 80 + "\n[Stage2A] Primary Landing\n" + "-" * 80, label)
     if LABEL_EXPANSION_DEBUG:
         print(f"[Stage2] stage2_generate_academic_terms 开始 锚点数={len(prepared_anchors)} active_domains={len(active_domains)}")
+    # ---------- Stage2 总览（详细调试） ----------
+    _stage2_header("总览")
+    if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+        has_jd = jd_profile is not None
+        jd_fields = len(jd_field_ids) if jd_field_ids else 0
+        jd_sub = len(jd_subfield_ids) if jd_subfield_ids else 0
+        jd_top = len(jd_topic_ids) if jd_topic_ids else 0
+        print(f"  锚点数: {len(prepared_anchors)}  |  active_domains: {len(active_domains)}  |  有 JD: {has_jd}")
+        print(f"  JD 维度: field={jd_fields}  subfield={jd_sub}  topic={jd_top}  |  PRIMARY_TOP_M_PER_ANCHOR={PRIMARY_TOP_M_PER_ANCHOR}")
+        print(f"  锚点列表: {[getattr(a, 'anchor', a) for a in prepared_anchors]}")
     # ---------- 数据驱动两阶段选主：先每锚 top-m 候选，再全局邻域/离群算 primary_score，最后每锚取 top primary ----------
     anchor_cands_list: List[Tuple[PreparedAnchor, List[LandingCandidate]]] = []
     for anchor in prepared_anchors:
@@ -2786,6 +3080,17 @@ def stage2_generate_academic_terms(
         top_m = sorted(candidates, key=sort_key, reverse=True)[: PRIMARY_TOP_M_PER_ANCHOR]
         if top_m:
             anchor_cands_list.append((anchor, top_m))
+    # ---------- Stage2A 每锚候选与 top-m ----------
+    _stage2_header("Stage2A 每锚候选与 top-m", "-")
+    if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+        _stage2_table(
+            [
+                [str(i + 1), getattr(a, "anchor", str(a))[:20], str(len(top_m)), ", ".join((c.term or "")[:12] for c in top_m[:6])]
+                for i, (a, top_m) in enumerate(anchor_cands_list)
+            ],
+            ["#", "锚点", "top_m数", "top 候选(前6)"],
+            col_widths=[4, 22, 10, 48],
+        )
     for idx, (anchor, top_m) in enumerate(anchor_cands_list[:5]):
         raw_top = [c.term for c in top_m[:5]]
         conditioned_top = _top_terms_by_vector(label, getattr(anchor, "conditioned_vec", None), 5) if getattr(anchor, "conditioned_vec", None) is not None else []
@@ -2799,6 +3104,10 @@ def stage2_generate_academic_terms(
     if flat_pool:
         _compute_neighborhood_and_isolation(label, flat_pool)
         _compute_conditioned_anchor_align_and_multi_anchor_support(label, flat_pool, prepared_anchors)
+
+    _stage2_header("Stage2A flat_pool（邻域/conditioned 已算）", "-")
+    if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+        print(f"  flat_pool 总条数: {len(flat_pool)}")
 
     jd_f = set(str(x) for x in (jd_field_ids or []))
     jd_s = set(str(x) for x in (jd_subfield_ids or []))
@@ -2824,7 +3133,7 @@ def stage2_generate_academic_terms(
             aid = getattr(c, "anchor_identity_score", 0.5) or 0.5
             jd_a = getattr(c, "jd_candidate_alignment", 0.5) or 0.5
             src = (getattr(c, "source", "") or "").strip()
-            admitted, reasons, rescued = check_primary_admission(
+            admitted, reasons, rescued, admission_meta = check_primary_admission(
                 getattr(anchor, "anchor", ""),
                 anchor,
                 c,
@@ -2835,12 +3144,17 @@ def stage2_generate_academic_terms(
                 src,
                 cross_count,
             )
-            if not admitted and not rescued:
+            if not admitted:
                 setattr(c, "_primary_rejected", True)
                 log_primary_reject(anchor, c, hier_ev, reasons)
             else:
                 setattr(c, "_primary_rejected", False)
+                setattr(c, "retain_mode", admission_meta.get("retain_mode", "normal"))
+                setattr(c, "suppress_seed", admission_meta.get("suppress_seed", False))
+                setattr(c, "retain_reason", admission_meta.get("retain_reason"))
+                setattr(c, "cross_anchor_support_count", cross_count)
                 setattr(c, "hierarchy_evidence", hier_ev)
+                setattr(c, "topic_source", hier_ev.get("topic_source", "missing"))
                 setattr(c, "identity_score", score_academic_identity(c))
                 ps = compute_primary_score(
                     c,
@@ -2853,7 +3167,12 @@ def stage2_generate_academic_terms(
                     src,
                 )
                 setattr(c, "primary_score", ps)
+        _n_before_admission = len(flat_pool)
         flat_pool = [(a, c) for (a, c) in flat_pool if not getattr(c, "_primary_rejected", False)]
+        _n_after_admission = len(flat_pool)
+        _stage2_header("Stage2A 准入结果", "-")
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+            print(f"  准入前: {_n_before_admission}  条  ->  准入后: {_n_after_admission}  条  (拒绝: {_n_before_admission - _n_after_admission})")
         for anchor in prepared_anchors:
             pool_for_anchor = [c for (a, c) in flat_pool if a.vid == anchor.vid]
             primary_candidates = resolve_anchor_local_conflicts(anchor, pool_for_anchor)
@@ -2871,6 +3190,13 @@ def stage2_generate_academic_terms(
                 setattr(p, "primary_score", getattr(c, "primary_score", 0))
                 setattr(p, "anchor_identity_score", getattr(c, "anchor_identity_score", 0.5))
                 setattr(p, "identity_gate", getattr(c, "identity_gate", 1.0))
+                setattr(p, "retain_mode", getattr(c, "retain_mode", "normal"))
+                setattr(p, "topic_source", getattr(c, "topic_source", "missing"))
+                setattr(p, "suppress_seed", getattr(c, "suppress_seed", False))
+                setattr(p, "retain_reason", getattr(c, "retain_reason"))
+                setattr(p, "cross_anchor_support_count", getattr(c, "cross_anchor_support_count", 1))
+                setattr(p, "jd_align", getattr(c, "jd_candidate_alignment", 0.5))
+                setattr(p, "semantic_score", getattr(c, "semantic_score", 0))
                 ev = getattr(c, "hierarchy_evidence", {}) or {}
                 setattr(p, "field_fit", ev.get("field_overlap", 0))
                 setattr(p, "path_match", ev.get("path_match", 0))
@@ -2884,6 +3210,40 @@ def stage2_generate_academic_terms(
                     setattr(p, "landing_score", getattr(c, "landing_score", 0))
                 primary_landings_list.append(p)
             primary_landings_by_anchor[anchor.vid] = primary_landings_list
+        _stage2_header("Stage2A 每锚 primary（冲突消解后）", "-")
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+            rows_summary = []
+            for anchor in prepared_anchors:
+                pool_for_anchor = [c for (a, c) in flat_pool if a.vid == anchor.vid]
+                plist = primary_landings_by_anchor.get(anchor.vid, [])
+                rows_summary.append([
+                    getattr(anchor, "anchor", str(anchor))[:18],
+                    str(len(pool_for_anchor)),
+                    str(len(plist)),
+                ])
+            if rows_summary:
+                _stage2_table(rows_summary, ["锚点", "准入候选数", "primary数"], col_widths=[20, 12, 12])
+            for anchor in prepared_anchors:
+                plist = primary_landings_by_anchor.get(anchor.vid, [])
+                if not plist:
+                    continue
+                print(f"  --- 锚点 {getattr(anchor, 'anchor', anchor)!r} primary 明细 ---")
+                _stage2_table(
+                    [
+                        [
+                            str(p.vid),
+                            (p.term or "")[:16],
+                            f"{getattr(p, 'primary_score', 0):.3f}",
+                            f"{getattr(p, 'path_match', 0):.2f}",
+                            f"{getattr(p, 'topic_span_penalty', 1.0):.2f}",
+                        ]
+                        for p in plist[:15]
+                    ],
+                    ["tid", "term", "primary_score", "path_match", "topic_span_penalty"],
+                    col_widths=[8, 18, 14, 12, 18],
+                )
+                if len(plist) > 15:
+                    print(f"  ... 共 {len(plist)} 条 primary")
         for anchor, c in flat_pool:
             ev = getattr(c, "hierarchy_evidence", {}) or {}
             hierarchy_n = ev.get("topic_overlap", 0) * 0.4 + ev.get("path_match", 0) * 0.4 + ev.get("subfield_overlap", 0) * 0.2
@@ -3021,15 +3381,30 @@ def stage2_generate_academic_terms(
             continue
         if LABEL_EXPANSION_DEBUG:
             print(f"[Stage2] 锚点 anchor={anchor.anchor!r} primary 数={len(primary_landings)}")
-        # Stage2B：唯一 seed 决策入口 check_seed_eligibility(primary, jd_profile) -> (eligible, seed_score)
+        # Stage2B：唯一 seed 决策入口 check_seed_eligibility -> (eligible, seed_score, block_reason)
         diffusion_primaries = []
+        _seed_detail: List[Tuple[Any, bool, float]] = []
         for p in primary_landings:
-            eligible, seed_score = check_seed_eligibility(label, p, jd_profile)
+            eligible, seed_score, block_reason = check_seed_eligibility(label, p, jd_profile)
+            setattr(p, "seed_blocked", not eligible)
+            setattr(p, "seed_block_reason", block_reason if not eligible else None)
+            _seed_detail.append((p, eligible, seed_score))
             if eligible:
                 setattr(p, "seed_score", seed_score)
                 diffusion_primaries.append(p)
         if not diffusion_primaries and primary_landings:
             diffusion_primaries = sorted(primary_landings, key=lambda x: getattr(x, "primary_score", x.identity_score), reverse=True)[: max(1, len(primary_landings) // 2)]
+        _stage2_header(f"Stage2B seed 明细 [锚点 {getattr(anchor, 'anchor', anchor)!r}]", "-")
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and _seed_detail:
+            _stage2_table(
+                [
+                    [(p.term or "")[:20], "Y" if el else "N", f"{sc:.3f}" if el else "-"]
+                    for (p, el, sc) in _seed_detail[:20]
+                ],
+                ["term", "eligible", "seed_score"],
+                col_widths=[22, 10, 12],
+            )
+            print(f"  diffusion_primaries({len(diffusion_primaries)}): {[p.term for p in diffusion_primaries[:10]]}")
         debug_print(2, f"[Stage2B] anchor={anchor.anchor!r} primary 数={len(primary_landings)} seed 数={len(diffusion_primaries)}", label)
         debug_print(1, f"[Stage2B] seed 数={len(diffusion_primaries)}/{len(primary_landings)} 参与扩散（SEED_MIN_IDENTITY={SEED_MIN_IDENTITY}）", label)
         if diffusion_primaries:
@@ -3042,6 +3417,7 @@ def stage2_generate_academic_terms(
             jd_field_ids=jd_field_ids,
             jd_subfield_ids=jd_subfield_ids,
             jd_topic_ids=jd_topic_ids,
+            jd_profile=jd_profile,
         )
         cluster_list = expand_from_cluster_members(
             label, diffusion_primaries,
@@ -3057,6 +3433,15 @@ def stage2_generate_academic_terms(
             jd_subfield_ids=jd_subfield_ids,
             jd_topic_ids=jd_topic_ids,
         )
+        _stage2_header("Stage2B 扩展汇总（dense / cluster / cooc）", "-")
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+            print(f"  dense_kept={len(dense_list)}  |  cluster_kept={len(cluster_list)}  |  cooc_kept={len(cooc_list)}  |  primary={len(primary_landings)}")
+            if dense_list:
+                print(f"  dense 前5: {[getattr(c, 'term', c) for c in dense_list[:5]]}")
+            if cluster_list:
+                print(f"  cluster 前5: {[getattr(c, 'term', c) for c in cluster_list[:5]]}")
+            if cooc_list:
+                print(f"  cooc 前5: {[getattr(c, 'term', c) for c in cooc_list[:5]]}")
         debug_print(2, (
             f"[Stage2B Expansion Summary] dense_kept={len(dense_list)} | "
             f"cluster_kept={len(cluster_list)} | cooc_kept={len(cooc_list)} | "
@@ -3074,6 +3459,9 @@ def stage2_generate_academic_terms(
             jd_topic_ids=jd_topic_ids,
         )
         all_terms.extend(merged)
+        _stage2_header("Stage2B 本锚合并", "-")
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+            print(f"  primary={len(primary_landings)} + dense={len(dense_list)} + cluster={len(cluster_list)} + cooc={len(cooc_list)} -> merged={len(merged)}  |  累计 all_terms={len(all_terms)}")
         if LABEL_EXPANSION_DEBUG:
             print(f"[Stage2] 锚点 anchor={anchor.anchor!r} 本锚合并后 +{len(merged)} 项，累计 {len(all_terms)} 项")
     # 诊断：从 similar_to_raw_rows 聚合出 similar_to_agg；从最终 all_terms 中筛出 similar_to 来源的项写入 similar_to_pass
@@ -3112,6 +3500,11 @@ def stage2_generate_academic_terms(
                 "domain_span": 0,
             })
         label.debug_info.similar_to_pass = pass_list
+    _stage2_header("Stage2 结束汇总", "=")
+    if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+        by_role: Dict[str, int] = collections.Counter(getattr(t, "term_role", "?") for t in all_terms)
+        print(f"  总学术词数: {len(all_terms)}")
+        print(f"  按 term_role: {dict(by_role)}")
     if LABEL_EXPANSION_DEBUG:
         print(f"[Stage2] stage2_generate_academic_terms 结束 总学术词数={len(all_terms)}")
     return all_terms
