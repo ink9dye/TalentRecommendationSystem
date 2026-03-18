@@ -1407,8 +1407,8 @@ def compute_anchor_identity_score(
     anchor_type: Optional[str] = None,
 ) -> float:
     """
-    候选与锚点是否“本义同一概念家族”的 0~1 分。
-    用于压制：动力学->propulsion、运动学->kinesics、仿真->simula、抓取->Data retrieval、机械臂->Robot control 等错义。
+    候选与锚点是否「本义同一概念家族」的 0~1 分。
+    这里的 identity 只用于「软区分本义/偏义」，不再当成中英映射任务里的硬门。
     """
     a = normalize_identity_surface(anchor_term)
     c = normalize_identity_surface(candidate_term)
@@ -1431,13 +1431,15 @@ def compute_anchor_identity_score(
     inter = atok & ctok
     union = atok | ctok
     token_overlap_score = len(inter) / len(union) if union else 0.0
+    alias_hit = False
     for _anchor, aliases in ANCHOR_IDENTITY_ALIASES.items():
         an_norm = normalize_identity_surface(_anchor)["norm"]
         if an_norm and a_norm and (an_norm == a_norm or normalize_identity_surface(_anchor)["token_set"] == atok):
             for al in aliases:
                 al_norm = normalize_identity_surface(al)["norm"]
                 if al_norm and (al_norm == c_norm or al_norm in c_norm or c_norm in al_norm):
-                    token_overlap_score = max(token_overlap_score, 0.7)
+                    token_overlap_score = max(token_overlap_score, 0.72)
+                    alias_hit = True
                     break
             break
     if exact_or_substring >= 0.85:
@@ -1452,26 +1454,36 @@ def compute_anchor_identity_score(
     if exact_or_substring >= 0.85:
         head_consistency_score = max(head_consistency_score, 0.85)
 
-    score = (
-        0.45 * exact_or_substring
+    # 中英映射 / 锚点别名命中时，给一个较高的基础分，避免全体被压成 low identity
+    base_floor = 0.0
+    if alias_hit:
+        base_floor = max(base_floor, 0.34)
+    if a_norm and c_norm and any(t in c_norm for t in a_norm.split()):
+        base_floor = max(base_floor, 0.26)
+    if token_overlap_score >= 0.45 and head_consistency_score >= 0.6:
+        base_floor = max(base_floor, 0.30)
+
+    score = max(
+        base_floor,
+        0.40 * exact_or_substring
         + 0.35 * token_overlap_score
-        + 0.20 * head_consistency_score
+        + 0.25 * head_consistency_score
     )
 
-    # 泛词/歧义惩罚
+    # 泛词/歧义惩罚：保留，但不再把正常中英映射一刀砍死
     generic_penalty = 1.0
     if ctok and len(ctok) <= 2:
         low_tokens = {t.lower() for t in c["tokens"]}
         if low_tokens & IDENTITY_AMBIGUITY_TERMS and not (atok & ctok):
-            generic_penalty = 0.5
+            generic_penalty = 0.72
     ambiguity_penalty = 1.0
     c_head_lower = c["head"].lower() if c["head"] else ""
     if c_head_lower in IDENTITY_AMBIGUITY_TERMS and c_head_lower not in atok:
-        ambiguity_penalty = 0.6
+        ambiguity_penalty = 0.78
     if (c_norm in ("control (management)", "control flow", "data retrieval", "crawling",
                    "point-to-point", "end-to-end principle", "simula", "kinesics", "propulsion") and
             not (atok & ctok)):
-        ambiguity_penalty = min(ambiguity_penalty, 0.35)
+        ambiguity_penalty = min(ambiguity_penalty, 0.45)
 
     score *= generic_penalty * ambiguity_penalty
     return max(0.0, min(1.0, score))
@@ -2692,29 +2704,28 @@ def check_primary_eligibility(
     c: LandingCandidate,
     hier_ev: Dict[str, Any],
 ) -> Tuple[bool, List[str]]:
-    """资格赛：该候选是否有资格争 primary。返回 (eligible, reasons)。"""
+    """资格赛：只拦特别危险的，边界情况留给 admission 做 weak_retain。返回 (eligible, reasons)。"""
     reasons: List[str] = []
     aid = float(getattr(c, "anchor_identity_score", 0.0) or 0.0)
     ctx_sim = float(getattr(c, "context_sim", 0.0) or 0.0)
-    ctx_supported = bool(getattr(c, "context_supported", False))
     source_role = (getattr(c, "source_role", "") or "").strip()
 
-    if aid < 0.30:
+    # identity 不再作为普遍硬门；只有非常低且上下文也不支持时才拦
+    if aid < 0.20 and ctx_sim < 0.80:
         reasons.append("identity_too_low")
-    if c.source == "similar_to":
-        if ctx_sim < 0.74:
-            reasons.append("context_not_supporting_similar_to")
+    # similar_to 候选：上下文明显反对时再拦；边界情况留给 admission 做 weak_retain
+    if c.source == "similar_to" and ctx_sim > 0.0 and ctx_sim < 0.70:
+        reasons.append("context_not_supporting_similar_to")
+    # context fallback：仍保守，但降低 identity 门槛
     if source_role == "context_fallback":
         if ctx_sim < 0.82:
             reasons.append("context_fallback_not_strong_enough")
-        if aid < 0.50:
+        if aid < 0.32 and ctx_sim < 0.88:
             reasons.append("context_fallback_identity_weak")
     domain_reason = getattr(c, "domain_reason", "") or ""
     if domain_reason == "domain_conflict_strong":
         reasons.append("domain_conflict_strong")
-
-    eligible = len(reasons) == 0
-    return eligible, reasons
+    return len(reasons) == 0, reasons
 
 
 def check_primary_admission(
@@ -2728,21 +2739,20 @@ def check_primary_admission(
     source_type: str,
     cross_anchor_support_count: int,
 ) -> Tuple[bool, List[str], bool, Dict[str, Any]]:
-    """
-    返回 (admitted, reasons, rescued, admission_meta)。
-    准入纳入「上下文是否仍然支持」：双空间一致 + rescue/context_fallback 通道。
-    """
+    """Stage2A 主落点准入：上下文稳定性优先，identity 只做软约束。"""
     reasons: List[str] = []
     rescued = False
-    meta: Dict[str, Any] = {"retain_mode": "reject", "suppress_seed": False, "retain_reason": None}
-
+    meta: Dict[str, Any] = {
+        "retain_mode": "reject",
+        "suppress_seed": False,
+        "retain_reason": None,
+    }
     if not _lexical_term_sanity(getattr(candidate, "term", "") or "", None):
         return False, ["lexical_not_term"], rescued, meta
 
     eligible, eligibility_reasons = check_primary_eligibility(anchor_meta, candidate, hierarchy_evidence)
     if not eligible:
-        reasons.extend(eligibility_reasons)
-        return False, reasons, rescued, meta
+        return False, eligibility_reasons, rescued, meta
 
     path_match = float(hierarchy_evidence.get("path_match", 0.0) or 0.0)
     topic_overlap = float(hierarchy_evidence.get("topic_overlap", 0.0) or 0.0)
@@ -2751,25 +2761,25 @@ def check_primary_admission(
     ctx_sim = float(getattr(candidate, "context_sim", 0.0) or 0.0)
     source_role = (getattr(candidate, "source_role", "") or "").strip()
 
-    # 主通道：双空间都站得住
+    # 主通道：优先看上下文稳定性，其次才看 identity
     if (
         semantic_score >= 0.80
-        and jd_align >= 0.80
-        and anchor_identity >= 0.35
-        and context_consistency >= 0.78
+        and jd_align >= 0.78
+        and context_consistency >= 0.76
+        and (anchor_identity >= 0.22 or ctx_sim >= 0.82)
     ):
-        meta["retain_mode"] = "normal"
-        meta["suppress_seed"] = False
+        meta["retain_mode"] = "normal" if anchor_identity >= 0.30 else "weak_retain"
+        meta["suppress_seed"] = anchor_identity < 0.30
         meta["retain_reason"] = "dual_space_supported"
         return True, reasons, rescued, meta
 
-    # rescue：多锚支持 + 上下文不差 + 层级不差
+    # rescue：多锚 + path/jd/semantic 不差 + context 至少不反对
     if (
         cross_anchor_support_count >= PRIMARY_RESCUE_CROSS_ANCHOR_MIN
         and path_match >= PRIMARY_RESCUE_PATH_MATCH_MIN
-        and jd_align >= PRIMARY_RESCUE_JD_ALIGN_MIN
+        and jd_align >= max(0.76, PRIMARY_RESCUE_JD_ALIGN_MIN - 0.02)
         and semantic_score >= PRIMARY_RESCUE_SEMANTIC_MIN
-        and context_consistency >= 0.74
+        and context_consistency >= 0.72
     ):
         rescued = True
         meta["retain_mode"] = "weak_retain"
@@ -2777,13 +2787,20 @@ def check_primary_admission(
         meta["retain_reason"] = "cross_anchor_context_rescue"
         return True, reasons, rescued, meta
 
-    # conditioned_vec 弱补位通道：必须非常强
+    # context fallback：仍保守，但允许更低 identity 通过
     if source_role == "context_fallback":
-        if ctx_sim >= 0.84 and jd_align >= 0.82 and anchor_identity >= 0.55:
+        if ctx_sim >= 0.84 and jd_align >= 0.80 and anchor_identity >= 0.32:
             meta["retain_mode"] = "weak_retain"
             meta["suppress_seed"] = True
             meta["retain_reason"] = "context_fallback_supported"
             return True, reasons, rescued, meta
+
+    # hierarchy 尚可 + context 边界可接受：弱保留，不直接全砍
+    if topic_overlap >= PRIMARY_MIN_HIERARCHY_MATCH and subfield_overlap >= 0.25 and context_consistency >= 0.70:
+        meta["retain_mode"] = "weak_retain"
+        meta["suppress_seed"] = True
+        meta["retain_reason"] = "hierarchy_supported_but_context_borderline"
+        return True, ["context_borderline"], rescued, meta
 
     reasons.append("dual_space_not_stable")
     return False, reasons, rescued, meta
