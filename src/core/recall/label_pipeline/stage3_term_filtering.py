@@ -33,6 +33,18 @@ STAGE3_SUPPORT_DEMOTE_POLY_PTC_MAX = 0.50
 PAPER_RECALL_MAX_TERMS = 12
 # 与 select_terms_for_paper_recall 对齐的入稿闸门说明（逐项 term）
 STAGE3_PAPER_GATE_DEBUG = True
+# Stage3 窄表审计：final adjust / cross-anchor / support·risky / paper bridge（与 bucket reason 互补）
+STAGE3_AUDIT_DEBUG = True
+# 非空时：下列审计只打印 term 字面完全匹配（strip 后）的行，避免刷屏；置空 set() 则按 top_k 全表
+STAGE3_DEBUG_FOCUS_TERMS: Set[str] = {
+    "Motion control",
+    "motion control",
+    "robot control",
+    "digital control",
+    "Robot manipulator",
+    "Educational robotics",
+    "route planning",
+}
 
 # 全局共识因子默认值（无硬编码）；Stage3 已彻底移除 cluster 依赖
 STAGE3_CROSS_ANCHOR_DEFAULT = 1.0
@@ -752,6 +764,184 @@ def _write_term_maps_if_missing(
     )
 
 
+def _stage3_audit_filter_rows(rows: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+    """审计表行裁剪：若 STAGE3_DEBUG_FOCUS_TERMS 非空则只保留 term 命中集合的行。"""
+    if not rows:
+        return []
+    if STAGE3_DEBUG_FOCUS_TERMS:
+        rows = [r for r in rows if (r.get("term") or "").strip() in STAGE3_DEBUG_FOCUS_TERMS]
+    return rows[:top_k]
+
+
+def _print_stage3_final_adjust_audit(cands: List[Dict[str, Any]], top_k: int = 12) -> None:
+    """
+    [Stage3 final adjust audit]
+    对照 stage3_build_score_map：pre_adjust（进入第二段乘子前）→ risk_mult × cross_bonus → post_adjust（当前 final_score）。
+    依赖 rec['_stage3_pre_adjust_score']（由 stage3_build_score_map 写入）；缺失时用 post/(risk×cross) 反推。
+    """
+    if not STAGE3_AUDIT_DEBUG or not cands:
+        return
+    ranked = sorted(cands, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
+    ranked = _stage3_audit_filter_rows(ranked, top_k)
+    if not ranked:
+        print("\n" + "-" * 80 + "\n[Stage3 final adjust audit] (no rows after focus filter)\n" + "-" * 80)
+        return
+
+    print("\n" + "-" * 80)
+    print("[Stage3 final adjust audit]")
+    print("-" * 80)
+    print(
+        "term                         | bucket   | pre_adj  | risk_mlt | cross_bn | post_adj | "
+        "anchor_count | mainline_hits | can_exp | cond_only | flags"
+    )
+    for rec in ranked:
+        term = (rec.get("term") or "")[:28]
+        bucket = (rec.get("stage3_bucket") or "")[:8]
+        ex = rec.get("stage3_explain") or {}
+        risk_mult = float(ex.get("mainline_risk_penalty") or 1.0)
+        cross_bonus = float(ex.get("cross_anchor_score_bonus") or 1.0)
+        post_adjust = float(rec.get("final_score") or 0.0)
+        pre_adjust = rec.get("_stage3_pre_adjust_score")
+        if pre_adjust is None:
+            denom = risk_mult * cross_bonus
+            pre_adjust = post_adjust / denom if denom else post_adjust
+        else:
+            pre_adjust = float(pre_adjust or 0.0)
+        anchor_count = int(rec.get("anchor_count") or 0)
+        mainline_hits = int(rec.get("mainline_hits") or 0)
+        can_expand = bool(rec.get("can_expand", False) or rec.get("can_expand_from_2a", False))
+        conditioned_only = _stage3_is_conditioned_only(rec)
+        flags = list(rec.get("bucket_reason_flags") or [])
+        print(
+            f"{term:28} | {bucket:8} | {pre_adjust:8.4f} | {risk_mult:8.4f} | {cross_bonus:8.4f} | {post_adjust:8.4f} | "
+            f"{anchor_count:^12d} | {mainline_hits:^13d} | {str(can_expand):^7} | {str(conditioned_only):^9} | {flags}"
+        )
+
+
+def _print_stage3_cross_anchor_audit(cands: List[Dict[str, Any]], top_k: int = 40) -> None:
+    """
+    [Stage3 cross-anchor audit]
+    只列 anchor_count>=2：看跨锚词拿到的 cross_anchor_score_bonus 与桶、主线证据是否一致。
+    """
+    if not STAGE3_AUDIT_DEBUG or not cands:
+        return
+    focus = [c for c in cands if int(c.get("anchor_count") or 0) >= 2]
+    focus = sorted(
+        focus,
+        key=lambda x: (int(x.get("anchor_count") or 0), float(x.get("final_score") or 0.0)),
+        reverse=True,
+    )
+    focus = _stage3_audit_filter_rows(focus, top_k)
+    if not focus:
+        print("\n" + "-" * 80 + "\n[Stage3 cross-anchor audit] (no multi-anchor rows / focus empty)\n" + "-" * 80)
+        return
+
+    print("\n" + "-" * 80)
+    print("[Stage3 cross-anchor audit]")
+    print("-" * 80)
+    print(
+        "term                     | anchor_count | anchors                  | evidence_cnt | "
+        "mainline_hits | can_exp | bucket   | cross_bn   | flags"
+    )
+    for rec in focus:
+        term = (rec.get("term") or "")[:24]
+        anchor_count = int(rec.get("anchor_count") or 0)
+        anchors = rec.get("parent_anchors") or []
+        if isinstance(anchors, (list, tuple, set)):
+            anchors_show = ",".join(str(a) for a in list(anchors)[:4])
+        else:
+            anchors_show = str(anchors)[:24]
+        evidence_count = int(rec.get("evidence_count") or 0)
+        mainline_hits = int(rec.get("mainline_hits") or 0)
+        can_expand = bool(rec.get("can_expand", False) or rec.get("can_expand_from_2a", False))
+        bucket = (rec.get("stage3_bucket") or "")[:8]
+        ex = rec.get("stage3_explain") or {}
+        cross_bonus = float(ex.get("cross_anchor_score_bonus") or 1.0)
+        flags = list(rec.get("bucket_reason_flags") or [])
+        print(
+            f"{term:24} | {anchor_count:^12d} | {anchors_show[:24]:24} | {evidence_count:^12d} | "
+            f"{mainline_hits:^13d} | {str(can_expand):^7} | {bucket:8} | {cross_bonus:10.4f} | {flags}"
+        )
+
+
+def _print_stage3_support_risky_concise(cands: List[Dict[str, Any]], top_k: int = 20) -> None:
+    """[Stage3 support/risky concise] 只列 support / risky，快速扫可疑项。"""
+    if not STAGE3_AUDIT_DEBUG or not cands:
+        return
+    focus = [
+        c for c in cands
+        if (c.get("stage3_bucket") or "").strip().lower() in ("support", "risky")
+    ]
+    focus = sorted(focus, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
+    focus = _stage3_audit_filter_rows(focus, top_k)
+    if not focus:
+        print("\n" + "-" * 80 + "\n[Stage3 support/risky concise] (no rows / focus empty)\n" + "-" * 80)
+        return
+
+    print("\n" + "-" * 80)
+    print("[Stage3 support/risky concise]")
+    print("-" * 80)
+    print(
+        "term                     | bucket   | final_score | mainline_hits | can_exp | "
+        "cond_only | weak_keep | xa>=2"
+    )
+    for rec in focus:
+        term = (rec.get("term") or "")[:24]
+        bucket = (rec.get("stage3_bucket") or "")[:8]
+        final_score = float(rec.get("final_score") or 0.0)
+        mainline_hits = int(rec.get("mainline_hits") or 0)
+        can_expand = bool(rec.get("can_expand", False) or rec.get("can_expand_from_2a", False))
+        conditioned_only = _stage3_is_conditioned_only(rec)
+        reason_flags = set(rec.get("bucket_reason_flags") or [])
+        weak_keep_only = "only_weak_keep_sources" in reason_flags
+        cross_anchor = int(rec.get("anchor_count") or 0) >= 2
+        print(
+            f"{term:24} | {bucket:8} | {final_score:11.4f} | {mainline_hits:^13d} | {str(can_expand):^7} | "
+            f"{str(conditioned_only):^9} | {str(weak_keep_only):^9} | {str(cross_anchor):^5}"
+        )
+
+
+def _print_stage3_to_paper_bridge(cands: List[Dict[str, Any]], top_k: int = 20) -> None:
+    """
+    [Stage3->Paper bridge]
+    在 select_terms_for_paper_recall 为每条写好 selected / reject 之后调用：
+    bucket 与 paper 去留同一行对照。
+    """
+    if not STAGE3_AUDIT_DEBUG or not cands:
+        return
+    ranked = sorted(cands, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
+    ranked = _stage3_audit_filter_rows(ranked, top_k)
+    if not ranked:
+        print("\n" + "-" * 80 + "\n[Stage3->Paper bridge] (no rows after focus filter)\n" + "-" * 80)
+        return
+
+    print("\n" + "-" * 80)
+    print("[Stage3->Paper bridge]")
+    print("-" * 80)
+    print(
+        "term                     | bucket   | final_score | selected_for_paper | select_reason          | "
+        "reject_reason            | ml_hits | can_exp | source_type    | parent_anchor"
+    )
+    for rec in ranked:
+        term = (rec.get("term") or "")[:24]
+        bucket = (rec.get("stage3_bucket") or "")[:8]
+        final_score = float(rec.get("final_score") or 0.0)
+        selected = bool(rec.get("selected_for_paper", False))
+        select_reason = str(rec.get("select_reason") or "")
+        reject_reason = str(rec.get("paper_reject_reason") or "")
+        mainline_hits = int(rec.get("mainline_hits") or 0)
+        can_expand = bool(rec.get("can_expand", False) or rec.get("can_expand_from_2a", False))
+        st = rec.get("source_type") or rec.get("source") or ""
+        if not st and rec.get("source_types"):
+            st = ",".join(sorted(str(x) for x in list(rec.get("source_types"))[:3]))
+        source_type = str(st)[:14]
+        parent_anchor = str(rec.get("parent_anchor") or "")[:18]
+        print(
+            f"{term:24} | {bucket:8} | {final_score:11.4f} | {str(selected):^18} | {select_reason[:22]:22} | "
+            f"{reject_reason[:24]:24} | {mainline_hits:^7d} | {str(can_expand):^7} | {source_type:14} | {parent_anchor:18}"
+        )
+
+
 def _print_paper_term_selection_audit(ordered: List[Dict[str, Any]], limit: int = 45) -> None:
     """按 core→support→risky、同桶内 final_score 顺序，打印每条 paper 门结果（含未入选）。"""
     if not STAGE3_PAPER_GATE_DEBUG or not ordered:
@@ -884,6 +1074,85 @@ def select_terms_for_paper_recall(
     return selected
 
 
+def stage3_build_score_map(survivors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Stage3 最终分数乘法修正（在 identity×risk×role 与 _assign_stage3_bucket 之后执行）：
+    用 score_mult 压制 weak keep / conditioned_only / 无主线等；cross_bonus 仅在 core 或「强证据 support」上给条件跨锚加分；
+    risky 永不拿跨锚正奖励；locked_mainline_no_expand 不参与跨锚正奖励，避免 keep_no_expand 仅靠多锚顶到前排。
+    重排后重刷 bucket_reason_flags，使 [Stage3 bucket reason] / dominant factors 与最终序一致。
+    """
+    for rec in survivors:
+        reason_flags = set(rec.get("bucket_reason_flags") or [])
+        bucket = (rec.get("stage3_bucket") or "").strip().lower()
+        group = (rec.get("stage3_entry_group") or "").strip().lower()
+
+        anchor_count = int(rec.get("anchor_count") or 1)
+        mainline_hits = int(rec.get("mainline_hits") or 0)
+        can_expand = bool(rec.get("can_expand", False))
+
+        conditioned_only = _stage3_is_conditioned_only(rec)
+
+        score_mult = 1.0
+
+        # A. 风险压制（强于旧版 mainline_risk_penalty 链）
+        if "no_mainline_support" in reason_flags:
+            score_mult *= 0.72
+        # 无主线证据且不可扩：在 A 基础上再压一档（「能进桶」≠「排位冲前」）
+        if "no_mainline_support" in reason_flags and not can_expand:
+            score_mult *= 0.82
+        if "only_weak_keep_sources" in reason_flags:
+            score_mult *= 0.72
+        if "locked_mainline_no_expand" in reason_flags:
+            score_mult *= 0.86
+        if bucket == "risky":
+            score_mult *= 0.82
+        if group == "secondary_primary" and bucket != "core":
+            score_mult *= 0.88
+
+        # B. conditioned_only：在 paper gate 之前就从排序上压低（单锚 / 无主线无扩 / 其余轻压）
+        if conditioned_only:
+            if anchor_count <= 1:
+                score_mult *= 0.68
+            elif mainline_hits == 0 and not can_expand:
+                score_mult *= 0.80
+            else:
+                score_mult *= 0.90
+
+        # C. 单锚、无主线命中、不可扩：与 weak 侧翼一致再压一档
+        if anchor_count <= 1 and mainline_hits == 0 and not can_expand:
+            score_mult *= 0.74
+
+        # D. 跨锚奖励：按桶 + 主线证据条件发放（取代无条件 1.18×1.10）
+        cross_bonus = 1.0
+        locked_no_xa_bonus = "locked_mainline_no_expand" in reason_flags
+        if not locked_no_xa_bonus:
+            if bucket == "core":
+                if anchor_count >= 2:
+                    cross_bonus *= 1.08
+            elif bucket == "support":
+                if anchor_count >= 2 and (mainline_hits >= 1 or can_expand):
+                    cross_bonus *= 1.03
+            # risky：保持 1.0
+
+        # E. 跨锚出现但非强主线（无 mainline_hits、不可扩）：回收虚高
+        if anchor_count >= 2 and mainline_hits == 0 and not can_expand:
+            cross_bonus *= 0.92
+
+        rec["final_score"] = float(rec.get("final_score") or 0.0) * score_mult * cross_bonus
+
+        ex = rec.get("stage3_explain") or {}
+        ex["mainline_risk_penalty"] = score_mult
+        ex["cross_anchor_score_bonus"] = cross_bonus
+        rec["stage3_explain"] = ex
+
+    survivors.sort(key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
+    for i, rec in enumerate(survivors):
+        rec["stage3_rank"] = i
+        rec["bucket_reason_flags"] = _collect_stage3_bucket_reason_flags(rec)
+
+    return survivors
+
+
 def _run_stage3_dual_gate(
     recall,
     raw_candidates: List[Dict[str, Any]],
@@ -995,45 +1264,7 @@ def _run_stage3_dual_gate(
         rec["risk_reasons"] = _collect_risky_reasons(rec)
         rec["bucket_reason_flags"] = _collect_stage3_bucket_reason_flags(rec)
 
-    # Stage3 风险修正：压 conditioned-only / weak-only / no-mainline
-    for rec in survivors:
-        reason_flags = set(rec.get("bucket_reason_flags") or [])
-        bucket = (rec.get("stage3_bucket") or "").strip().lower()
-        stage3_entry_group = (rec.get("stage3_entry_group") or "").strip().lower()
-        anchor_count = int(rec.get("anchor_count") or 1)
-        mainline_hits = int(rec.get("mainline_hits") or 0)
-        can_expand = bool(rec.get("can_expand", False))
-        risk_penalty = 1.0
-        if "no_mainline_support" in reason_flags:
-            risk_penalty *= 0.72
-        if "only_weak_keep_sources" in reason_flags:
-            risk_penalty *= 0.78
-        if _stage3_is_conditioned_only(rec):
-            if anchor_count <= 1:
-                risk_penalty *= 0.72
-            else:
-                risk_penalty *= 0.88
-        if _stage3_is_conditioned_only(rec) and anchor_count <= 1 and mainline_hits <= 1:
-            risk_penalty *= 0.82
-        if anchor_count <= 1 and mainline_hits == 0 and not can_expand:
-            risk_penalty *= 0.75
-        if stage3_entry_group == "secondary_primary" and bucket != "core":
-            risk_penalty *= 0.88
-        if bucket == "risky":
-            risk_penalty *= 0.88
-        xa_bonus = 1.0
-        if anchor_count >= 2:
-            xa_bonus *= 1.18
-        if anchor_count >= 2 and mainline_hits == 0:
-            xa_bonus *= 1.10
-        rec["final_score"] = float(rec.get("final_score") or 0.0) * risk_penalty * xa_bonus
-        ex = rec.get("stage3_explain") or {}
-        ex["mainline_risk_penalty"] = risk_penalty
-        ex["cross_anchor_score_bonus"] = xa_bonus
-        rec["stage3_explain"] = ex
-    survivors.sort(key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
-    for i, rec in enumerate(survivors):
-        rec["stage3_rank"] = i
+    survivors = stage3_build_score_map(survivors)
 
     core_terms_list, support_terms_list, risky_terms_list = _bucket_stage3_terms(survivors)
     if LABEL_PATH_TRACE or getattr(term_scoring, "STAGE3_DEBUG", False):
