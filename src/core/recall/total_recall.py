@@ -5,7 +5,6 @@
 import time
 import faiss
 import os
-import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -18,9 +17,23 @@ from src.core.recall.candidate_pool import (
     CandidatePool,
     PoolDebugSummary,
 )
+from src.core.recall.candidate_features import (
+    extract_terms_from_label_evidence,
+    infer_dominant_path,
+    batch_load_author_stats_from_sqlite,
+    batch_load_recent_author_stats,
+    batch_load_top_works,
+    calc_query_author_topic_similarity,
+    calc_domain_consistency,
+    calc_recent_activity_match,
+    calc_skill_coverage_ratio,
+    calc_paper_hit_strength,
+    calc_top_work_quality,
+    bucket_quota_truncate,
+    build_kgatax_feature_row,
+)
 from src.utils.domain_detector import DomainDetector
 from src.utils.domain_utils import DomainProcessor
-from config import DB_PATH
 
 # 限制底层模型并行，防止多线程冲突
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -31,6 +44,8 @@ RRF_K = 60
 PATH_WEIGHTS = {"v": 2.0, "l": 3.0, "c": 1.0}
 ALPHA_MULTI_PATH = 0.05
 FINAL_POOL_TOP_N = 200
+# 分桶配额（多路一致优先）
+BUCKET_QUOTAS = {"A": 80, "B": 30, "C": 60, "D": 20, "E": 20, "F": 10}
 
 
 def _ensure_meta_list(result: Any, path_tag: str) -> List[Dict[str, Any]]:
@@ -123,10 +138,17 @@ class TotalRecallSystem:
             aid = str(m.get("author_id"))
             if aid not in by_id:
                 by_id[aid] = CandidateRecord(author_id=aid)
-            by_id[aid].from_label = True
-            by_id[aid].label_rank = m.get("label_rank") or rank + 1
-            by_id[aid].label_score_raw = m.get("label_score_raw")
-            by_id[aid].label_evidence = m.get("label_evidence")
+            rec = by_id[aid]
+            rec.from_label = True
+            rec.label_rank = m.get("label_rank") or rank + 1
+            rec.label_score_raw = m.get("label_score_raw")
+            rec.label_evidence = m.get("label_evidence")
+            terms = extract_terms_from_label_evidence(rec.label_evidence)
+            rec.label_term_count = len(terms)
+            rec.label_core_term_count = sum(1 for t in terms if (t.get("bucket") or "").lower() == "core")
+            rec.label_support_term_count = sum(1 for t in terms if (t.get("bucket") or "").lower() == "support")
+            rec.label_risky_term_count = sum(1 for t in terms if (t.get("bucket") or "").lower() == "risky")
+            rec.label_best_term_score = max((t.get("score") or 0.0) for t in terms) if terms else 0.0
         for rank, m in enumerate(c_meta):
             aid = str(m.get("author_id"))
             if aid not in by_id:
@@ -143,43 +165,31 @@ class TotalRecallSystem:
         return list(by_id.values())
 
     def score_candidate_pool(self, records: List[CandidateRecord]) -> List[CandidateRecord]:
-        """RRF、multi_path_bonus、candidate_pool_score，排序。"""
-        scores = {}
+        """RRF、multi_path_bonus、pair_path_bonus、label_hint、candidate_pool_score，排序；多路一致优先。"""
         for r in records:
-            s = 0.0
+            rrf = 0.0
             if r.vector_rank is not None:
-                s += PATH_WEIGHTS["v"] * (1.0 / (RRF_K + r.vector_rank))
+                rrf += PATH_WEIGHTS["v"] * (1.0 / (RRF_K + r.vector_rank))
             if r.label_rank is not None:
-                s += PATH_WEIGHTS["l"] * (1.0 / (RRF_K + r.label_rank))
+                rrf += PATH_WEIGHTS["l"] * (1.0 / (RRF_K + r.label_rank))
             if r.collab_rank is not None:
-                s += PATH_WEIGHTS["c"] * (1.0 / (RRF_K + r.collab_rank))
-            r.rrf_score = s
-            bonus = ALPHA_MULTI_PATH * (r.path_count - 1) if r.path_count >= 1 else 0.0
-            r.multi_path_bonus = bonus
-            r.candidate_pool_score = r.rrf_score + bonus
-            scores[r.author_id] = r.candidate_pool_score
-
-        # dominant_recall_path
-        for r in records:
-            if r.path_count >= 3:
-                r.dominant_recall_path = "multi"
-            elif r.path_count == 2:
-                if r.from_label and r.from_vector:
-                    r.dominant_recall_path = "label+vector"
-                elif r.from_label and r.from_collab:
-                    r.dominant_recall_path = "label+collab"
-                elif r.from_vector and r.from_collab:
-                    r.dominant_recall_path = "vector+collab"
-                else:
-                    r.dominant_recall_path = "multi"
-            else:
-                if r.from_label:
-                    r.dominant_recall_path = "label"
-                elif r.from_vector:
-                    r.dominant_recall_path = "vector"
-                else:
-                    r.dominant_recall_path = "collab"
-
+                rrf += PATH_WEIGHTS["c"] * (1.0 / (RRF_K + r.collab_rank))
+            r.rrf_score = rrf
+            r.multi_path_bonus = ALPHA_MULTI_PATH * max(0, r.path_count - 1)
+            pair_bonus = 0.0
+            if r.from_vector and r.from_label:
+                pair_bonus += 0.20
+            elif r.from_vector and r.from_collab:
+                pair_bonus += 0.10
+            elif r.from_label and r.from_collab:
+                pair_bonus += 0.08
+            r.pair_path_bonus = pair_bonus
+            label_hint = 0.0
+            if r.from_label:
+                label_hint += min(0.05, 0.01 * r.label_core_term_count)
+                label_hint -= min(0.05, 0.01 * r.label_risky_term_count)
+            r.candidate_pool_score = r.rrf_score + r.multi_path_bonus + r.pair_path_bonus + label_hint
+            r.dominant_recall_path = infer_dominant_path(r)
         records.sort(key=lambda x: x.candidate_pool_score, reverse=True)
         return records
 
@@ -189,52 +199,44 @@ class TotalRecallSystem:
         active_domains: Optional[Any],
         query_text: str,
     ) -> None:
-        """补全作者静态指标与 query-author 交叉特征（第一版粗算，缺的填 None）。"""
+        """补全作者静态指标与 query-author 交叉特征，供精排与硬过滤使用。"""
         if not records:
             return
         aids = [r.author_id for r in records]
-        author_stats: Dict[str, Dict[str, Any]] = {}
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            conn.row_factory = sqlite3.Row
-            ph = ",".join("?" * len(aids))
-            rows = conn.execute(
-                f"SELECT author_id, name, h_index, works_count, cited_by_count FROM authors WHERE author_id IN ({ph})",
-                aids,
-            ).fetchall()
-            for row in rows:
-                author_stats[str(row["author_id"])] = {
-                    "name": row["name"],
-                    "h_index": row["h_index"],
-                    "works_count": row["works_count"],
-                    "cited_by_count": row["cited_by_count"],
-                }
-            conn.close()
-        except Exception:
-            pass
+        author_stats = batch_load_author_stats_from_sqlite(aids)
+        author_recent_stats = batch_load_recent_author_stats(aids)
+        author_top_works = batch_load_top_works(aids)
+        query_vec, _ = self.encoder.encode(query_text)
+        active_domain_set = None
+        if active_domains:
+            active_domain_set = set(str(d) for d in active_domains) if not isinstance(active_domains, set) else active_domains
 
         for r in records:
             st = author_stats.get(r.author_id) or {}
+            rt = author_recent_stats.get(r.author_id) or {}
+            tw = author_top_works.get(r.author_id) or []
             r.author_name = st.get("name")
             r.h_index = float(st["h_index"]) if st.get("h_index") is not None else None
             r.works_count = int(st["works_count"]) if st.get("works_count") is not None else None
             r.cited_by_count = int(st["cited_by_count"]) if st.get("cited_by_count") is not None else None
-            r.recent_works_count = None
-            r.recent_citations = None
-            r.institution_level = None
-            r.top_work_quality = None
-            r.topic_similarity = None
-            r.skill_coverage_ratio = None
-            r.domain_consistency = None
-            r.paper_hit_strength = None
-            r.recent_activity_match = None
+            r.recent_works_count = rt.get("recent_works_count")
+            r.recent_citations = rt.get("recent_citations")
+            r.institution_level = rt.get("institution_level_score")
+            r.top_work_quality = calc_top_work_quality(tw)
+            r.topic_similarity = calc_query_author_topic_similarity(query_vec, tw)
+            r.domain_consistency = calc_domain_consistency(active_domain_set, tw)
+            r.recent_activity_match = calc_recent_activity_match(rt, tw)
+            r.skill_coverage_ratio = calc_skill_coverage_ratio(
+                r.label_term_count, r.label_core_term_count, r.label_support_term_count,
+            )
+            r.paper_hit_strength = calc_paper_hit_strength(r.label_evidence, r.vector_evidence, tw)
 
     def _apply_hard_filters(
         self,
         records: List[CandidateRecord],
         summary: PoolDebugSummary,
     ) -> List[CandidateRecord]:
-        """第一层轻硬过滤：仅协同无主题、无论文无指标。"""
+        """硬过滤：协同无主题、无论文无指标、label_only 弱命中。"""
         out = []
         for r in records:
             reasons = []
@@ -242,6 +244,15 @@ class TotalRecallSystem:
                 reasons.append("collab_only_no_topic")
             if (r.works_count is None or r.works_count == 0) and not r.from_label and not r.from_vector:
                 reasons.append("no_paper_no_metrics")
+            if r.from_label and r.path_count == 1:
+                if r.domain_consistency is not None and r.domain_consistency < 0.25:
+                    reasons.append("label_only_low_domain_consistency")
+                if r.paper_hit_strength is not None and r.paper_hit_strength < 0.15:
+                    reasons.append("label_only_weak_paper_hit")
+                if r.recent_activity_match is not None and r.recent_activity_match < 0.20:
+                    reasons.append("label_only_stale_activity")
+                if r.label_risky_term_count >= 2 and r.label_core_term_count == 0:
+                    reasons.append("label_only_risky_terms")
             if reasons:
                 r.passed_hard_filter = False
                 r.hard_filter_reasons = reasons
@@ -252,28 +263,35 @@ class TotalRecallSystem:
         return out
 
     def _assign_buckets(self, records: List[CandidateRecord], summary: PoolDebugSummary) -> None:
-        """第一版分桶：A/B/C/D 仅按 from_label、from_vector、from_collab、path_count。"""
+        """分桶 A～F：便于截断与精排；A=vector+label, B=vector+collab, C=vector_only, D=label+collab, E=label_only, F=collab_only。"""
         for r in records:
-            if r.from_label and (r.path_count >= 2 or r.from_vector):
+            if r.from_vector and r.from_label:
                 r.bucket_type = "A"
-                r.bucket_reasons = "label_multi_path_or_label_vector"
+                r.bucket_reasons = "vector+label"
                 summary.bucket_a_count += 1
-            elif r.from_label:
+            elif r.from_vector and r.from_collab:
                 r.bucket_type = "B"
-                r.bucket_reasons = "label_only"
+                r.bucket_reasons = "vector+collab"
                 summary.bucket_b_count += 1
             elif r.from_vector:
                 r.bucket_type = "C"
                 r.bucket_reasons = "vector_only"
                 summary.bucket_c_count += 1
+            elif r.from_label and r.from_collab:
+                r.bucket_type = "D"
+                r.bucket_reasons = "label+collab"
+                summary.bucket_d_count += 1
+            elif r.from_label:
+                r.bucket_type = "E"
+                r.bucket_reasons = "label_only"
+                summary.bucket_e_count += 1
             elif r.from_collab:
-                r.bucket_type = "D"
+                r.bucket_type = "F"
                 r.bucket_reasons = "collab_only"
-                summary.bucket_d_count += 1
+                summary.bucket_f_count += 1
             else:
-                r.bucket_type = "D"
+                r.bucket_type = "Z"
                 r.bucket_reasons = "unknown"
-                summary.bucket_d_count += 1
         summary.final_pool_size = len(records)
 
     def execute(self, query_text, domain_id=None, is_training=False):
@@ -338,7 +356,9 @@ class TotalRecallSystem:
         self._enrich_candidate_features(records, active_domains, query_text)
         records = self._apply_hard_filters(records, summary)
         self._assign_buckets(records, summary)
+        records = bucket_quota_truncate(records, BUCKET_QUOTAS, FINAL_POOL_TOP_N)
 
+        kgatax_rows = [build_kgatax_feature_row(r) for r in records]
         evidence_rows = []
         for r in records:
             if r.vector_evidence:
@@ -369,6 +389,7 @@ class TotalRecallSystem:
 
         return {
             "candidate_pool": pool,
+            "kgatax_sidecar_rows": kgatax_rows,
             "final_top_200": final_list,
             "final_top_500": final_list,
             "rank_map": rank_map,

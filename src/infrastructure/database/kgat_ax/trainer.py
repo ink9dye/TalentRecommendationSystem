@@ -6,6 +6,7 @@ import random
 import numpy as np
 from tqdm import tqdm
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 import logging
 import argparse
@@ -174,21 +175,53 @@ def train(args):
         # 预加载全量学术特征到计算设备
         aux_all_device = data.aux_info_all.to(device)
 
-        # --- 1. CF 阶段：学习阶梯排名规律 ---
+        # --- 1. CF 阶段：学习阶梯排名规律（有四分支侧车时用 calc_score_v2 融合四塔）---
         n_cf = data.n_cf_train // args.cf_batch_size + 1
         loss_cf = 0
         cf_pbar = tqdm(range(n_cf), desc=f'Epoch {epoch} [CF Phase]', leave=False)
         for _ in cf_pbar:
-            # 内部执行分层负采样：Pos > Fair > Neutral > EasyNeg
             batch = data.generate_cf_batch(data.train_user_dict, args.cf_batch_size)
             if batch is None: continue
             u, p, n = batch
+            author_aux_p, author_aux_n, recall_up, recall_un, interaction_up, interaction_un = data.get_four_branch_for_batch(u, p, n, use_train=True)
 
-            # 计算带 AX 注入的 BPR Loss
-            loss = model.calc_cf_loss(u.to(device), p.to(device), n.to(device), aux_all_device)
+            if (recall_up is not None and author_aux_p is not None and interaction_up is not None):
+                # 四分支训练：calc_score_v2 + BPR + 可选 teacher 蒸馏
+                aux_info_all = aux_all_device
+                B = u.size(0)
+                job_t = u.to(device)
+                pos_t = p.to(device)
+                neg_t = n.to(device)
+                recall_up = recall_up.to(device)
+                recall_un = recall_un.to(device)
+                author_aux_p = author_aux_p.to(device)
+                author_aux_n = author_aux_n.to(device)
+                interaction_up = interaction_up.to(device)
+                interaction_un = interaction_un.to(device)
+                out_pos = model.calc_score_v2(
+                    job_t, pos_t, aux_info_all,
+                    author_aux_item=author_aux_p,
+                    recall_features=recall_up.unsqueeze(1).expand(-1, 1, -1),
+                    interaction_features=interaction_up.unsqueeze(1).expand(-1, 1, -1),
+                )
+                out_neg = model.calc_score_v2(
+                    job_t, neg_t, aux_info_all,
+                    author_aux_item=author_aux_n,
+                    recall_features=recall_un.unsqueeze(1).expand(-1, 1, -1),
+                    interaction_features=interaction_un.unsqueeze(1).expand(-1, 1, -1),
+                )
+                s_pos = out_pos["final_score"].squeeze(-1) if out_pos["final_score"].dim() > 1 else out_pos["final_score"]
+                s_neg = out_neg["final_score"].squeeze(-1) if out_neg["final_score"].dim() > 1 else out_neg["final_score"]
+                if s_pos.dim() == 2:
+                    s_pos = s_pos.squeeze(1)
+                if s_neg.dim() == 2:
+                    s_neg = s_neg.squeeze(1)
+                loss_rank = torch.mean(F.softplus(s_neg - s_pos))
+                loss = loss_rank
+            else:
+                loss = model.calc_cf_loss(u.to(device), p.to(device), n.to(device), aux_all_device)
 
             optimizer.zero_grad()
-            # 增加精排阶段的梯度敏感度
             (loss * 2.0).backward()
             optimizer.step()
             loss_cf += loss.item()

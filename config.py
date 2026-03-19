@@ -155,6 +155,11 @@ CYPHER_TEMPLATES = {
         "CREATE INDEX IF NOT EXISTS FOR (w:Work) ON (w.domain_ids)",
         "CREATE INDEX IF NOT EXISTS FOR (j:Job) ON (j.domain_ids)",
         "CREATE INDEX IF NOT EXISTS FOR (v:Vocabulary) ON (v.term)",
+        # 标签路召回：按 id 查找节点（与 UNIQUE 约束等价，显式列出便于与手动建库一致）
+        "CREATE INDEX IF NOT EXISTS FOR (v:Vocabulary) ON (v.id)",
+        "CREATE INDEX IF NOT EXISTS FOR (j:Job) ON (j.id)",
+        "CREATE INDEX IF NOT EXISTS FOR (w:Work) ON (w.id)",
+        "CREATE INDEX IF NOT EXISTS FOR (a:Author) ON (a.id)",
         "CREATE INDEX IF NOT EXISTS FOR (a:Author) ON (a.h_index)",
         # [新增] 为共现关系建立索引，加速后续路径计算
         "CREATE INDEX IF NOT EXISTS FOR ()-[r:CO_OCCURRED_WITH]-() ON (r.weight)"

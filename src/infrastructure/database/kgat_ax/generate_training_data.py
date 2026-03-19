@@ -190,20 +190,39 @@ class KGATAXTrainingGenerator:
         return line, None
 
     def _classify_record(self, r, rank_by_score):
-        """将一条 CandidateRecord 分为 Strong Positive / Weak Positive / HardNeg / CollabNeg / FieldNeg（README 5.5）。"""
+        """
+        训练标签分配：多特征一致性优先，不再默认信标签路。
+        vector+label 高质量 -> strong_pos；label only 且 topic/domain/activity 弱 -> hard_neg；
+        vector only 但整体强 -> weak_pos。
+        """
         if not getattr(r, "passed_hard_filter", True):
             return LABEL_FIELD_NEG
         bucket = (getattr(r, "bucket_type") or "").strip().upper()
         from_label = getattr(r, "from_label", False)
         from_collab = getattr(r, "from_collab", False)
+        from_vector = getattr(r, "from_vector", False)
         path_count = getattr(r, "path_count", 0) or 0
+        domain_consistency = getattr(r, "domain_consistency", None)
+        paper_hit_strength = getattr(r, "paper_hit_strength", None)
+        recent_activity_match = getattr(r, "recent_activity_match", None)
+        label_risky = getattr(r, "label_risky_term_count", 0) or 0
+        label_core = getattr(r, "label_core_term_count", 0) or 0
 
-        if (bucket == "A" and (from_label or path_count >= 2)):
+        if from_vector and from_label and (domain_consistency is None or domain_consistency >= 0.25):
             return LABEL_STRONG_POS
-        if bucket in ("A", "B") and (from_label or path_count >= 2 or getattr(r, "from_vector", False)):
+        if from_vector and (from_label or path_count >= 2) or (bucket in ("A", "B", "C") and from_vector):
             return LABEL_WEAK_POS
-        if from_collab and path_count == 1 and not getattr(r, "from_label", False) and not getattr(r, "from_vector", False):
+        if from_collab and path_count == 1 and not from_label and not from_vector:
             return LABEL_COLLAB_NEG
+        if from_label and path_count == 1:
+            if domain_consistency is not None and domain_consistency < 0.25:
+                return LABEL_HARD_NEG
+            if paper_hit_strength is not None and paper_hit_strength < 0.15:
+                return LABEL_HARD_NEG
+            if recent_activity_match is not None and recent_activity_match < 0.20:
+                return LABEL_HARD_NEG
+            if label_risky >= 2 and label_core == 0:
+                return LABEL_HARD_NEG
         if (from_label or path_count >= 2) and rank_by_score.get(r.author_id, 999) > 100:
             return LABEL_HARD_NEG
         return LABEL_FIELD_NEG
@@ -274,8 +293,13 @@ class KGATAXTrainingGenerator:
         line = f"{u_id};{','.join(pos_ids)};{','.join(fair_ids)};{','.join(neutral_ids)};{','.join(easy_neg_ids)}"
         return line, four_branch
 
+    def _encode_bucket(self, bucket_type):
+        m = {"A": 0.25, "B": 0.35, "C": 0.5, "D": 0.6, "E": 0.75, "F": 0.9, "Z": 1.0}
+        bt = (bucket_type or "D").strip().upper() if bucket_type else "D"
+        return m.get(bt, 0.5)
+
     def _export_four_branch_row(self, record, max_pool_score):
-        """导出一条 (job, author) 的四分支特征列表：recall 13 维、author_aux 12 维、interaction 8 维。"""
+        """导出一条 (job, author) 的四分支特征：recall 13 维、author_aux 12 维、interaction 8 维（含标签路摘要）。"""
         if record is None:
             return {"recall": [0.0] * 13, "author_aux": [0.0] * 12, "interaction": [0.0] * 8}
         max_rank = 500.0
@@ -292,7 +316,7 @@ class KGATAXTrainingGenerator:
             1.0 - min(l_rank / max_rank, 1.0) if l_rank else 0.0,
             1.0 - min(c_rank / max_rank, 1.0) if c_rank else 0.0,
             (float(r.candidate_pool_score or 0.0) / max_pool_score) if max_pool_score else 0.0,
-            {"A": 0.25, "B": 0.5, "C": 0.75, "D": 1.0}.get((getattr(r, "bucket_type") or "D").strip().upper(), 0.5),
+            self._encode_bucket(getattr(r, "bucket_type", None)),
             1.0 if getattr(r, "is_multi_path_hit", False) else 0.0,
             float(getattr(r, "vector_score_raw") or 0.0),
             float(getattr(r, "label_score_raw") or 0.0),
@@ -301,20 +325,28 @@ class KGATAXTrainingGenerator:
         h = getattr(r, "h_index", None)
         w = getattr(r, "works_count", None)
         c = getattr(r, "cited_by_count", None)
+        rw = getattr(r, "recent_works_count", None)
+        rc = getattr(r, "recent_citations", None)
+        inst = getattr(r, "institution_level", None)
+        tq = getattr(r, "top_work_quality", None)
         author_aux = [
             np.log1p(h) if h is not None else 0.0,
             np.log1p(c) if c is not None else 0.0,
             np.log1p(w) if w is not None else 0.0,
-        ] + [0.0] * 9
+            np.log1p(rw) if rw is not None else 0.0,
+            np.log1p(rc) if rc is not None else 0.0,
+            float(inst) if inst is not None else 0.0,
+            float(tq) if tq is not None else 0.0,
+        ] + [0.0] * 5
         interaction = [
             float(getattr(r, "topic_similarity") or 0.0),
             float(getattr(r, "skill_coverage_ratio") or 0.0),
             float(getattr(r, "domain_consistency") or 0.0),
             float(getattr(r, "paper_hit_strength") or 0.0),
             float(getattr(r, "recent_activity_match") or 0.0),
-            0.0,
-            0.0,
-            0.0,
+            (getattr(r, "label_term_count", 0) or 0) / 10.0,
+            (getattr(r, "label_core_term_count", 0) or 0) / 10.0,
+            float(getattr(r, "label_best_term_score") or 0.0),
         ]
         return {"recall": recall, "author_aux": author_aux, "interaction": interaction}
 

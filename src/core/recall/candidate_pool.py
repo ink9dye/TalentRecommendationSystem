@@ -36,6 +36,7 @@ class CandidateRecord:
     # --- 融合分 ---
     rrf_score: float = 0.0
     multi_path_bonus: float = 0.0
+    pair_path_bonus: float = 0.0
     candidate_pool_score: float = 0.0
     is_multi_path_hit: bool = False
 
@@ -54,6 +55,13 @@ class CandidateRecord:
     domain_consistency: Optional[float] = None
     paper_hit_strength: Optional[float] = None
     recent_activity_match: Optional[float] = None
+
+    # --- 标签路摘要特征（供硬过滤与精排）---
+    label_term_count: int = 0
+    label_core_term_count: int = 0
+    label_support_term_count: int = 0
+    label_risky_term_count: int = 0
+    label_best_term_score: float = 0.0
 
     # --- 候选池辅助标记 ---
     bucket_type: str = ""
@@ -84,7 +92,13 @@ class CandidateRecord:
             "collab_score_raw": self.collab_score_raw,
             "rrf_score": self.rrf_score,
             "multi_path_bonus": self.multi_path_bonus,
+            "pair_path_bonus": self.pair_path_bonus,
             "candidate_pool_score": self.candidate_pool_score,
+            "label_term_count": self.label_term_count,
+            "label_core_term_count": self.label_core_term_count,
+            "label_support_term_count": self.label_support_term_count,
+            "label_risky_term_count": self.label_risky_term_count,
+            "label_best_term_score": self.label_best_term_score,
             "is_multi_path_hit": self.is_multi_path_hit,
             "h_index": self.h_index,
             "works_count": self.works_count,
@@ -125,6 +139,8 @@ class PoolDebugSummary:
     bucket_b_count: int = 0
     bucket_c_count: int = 0
     bucket_d_count: int = 0
+    bucket_e_count: int = 0
+    bucket_f_count: int = 0
     final_pool_size: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -142,6 +158,8 @@ class PoolDebugSummary:
             "bucket_b_count": self.bucket_b_count,
             "bucket_c_count": self.bucket_c_count,
             "bucket_d_count": self.bucket_d_count,
+            "bucket_e_count": self.bucket_e_count,
+            "bucket_f_count": self.bucket_f_count,
             "final_pool_size": self.final_pool_size,
         }
 

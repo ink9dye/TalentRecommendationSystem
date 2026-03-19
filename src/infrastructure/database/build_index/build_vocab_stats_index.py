@@ -126,6 +126,7 @@ class VocabStatsIndexer:
             PRIMARY KEY (voc_id, domain_id)
         );
         CREATE INDEX IF NOT EXISTS idx_vcodr_domain ON vocabulary_cooc_domain_ratio(domain_id, voc_id);
+        CREATE INDEX IF NOT EXISTS idx_vcodr_voc_domain ON vocabulary_cooc_domain_ratio(voc_id, domain_id);
 
         -- 表4-中间累加表：存共现领域占比的分子分母，避免一次性巨型 SQL
         CREATE TABLE IF NOT EXISTS vocabulary_cooc_domain_accum (
