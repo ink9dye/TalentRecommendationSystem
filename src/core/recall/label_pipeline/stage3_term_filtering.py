@@ -68,6 +68,8 @@ def _merge_stage3_duplicates(raw_candidates: List[Dict[str, Any]]) -> List[Dict[
     按 tid 聚合同一词的多个候选，保留多来源结构信息，供 Stage3 分层与准入使用。
     合并后保留：anchor_count, evidence_count, family_keys, source_types, parent_anchors, parent_primaries,
     mainline_hits, side_hits, best_stage2_score, best_anchor_identity, best_jd_align, best_context_continuity。
+    最佳 seed 条目的整表字段会随 `obj[k]=v` 写入（含 Stage2A 的 primary_bucket、primary_reason、
+    fallback_primary、mainline_candidate、can_expand_local 等），供 `_assign_stage3_bucket` / paper 门使用。
     """
     bucket: Dict[int, Dict[str, Any]] = {}
     for rec in raw_candidates:
@@ -403,10 +405,34 @@ def _collect_stage3_bucket_reason_flags(rec: Dict[str, Any]) -> List[str]:
     identity_factor = float((rec.get("stage3_explain") or {}).get("identity_factor", 1.0) or 1.0)
     obj = float(rec.get("object_like_risk") or 0.0)
     generic = float(rec.get("generic_risk") or 0.0)
-    if mainline_hits == 0 and anchor_count > 0:
+    primary_bucket = (rec.get("primary_bucket") or "").strip().lower()
+    primary_reason = (rec.get("primary_reason") or "").strip().lower()
+    fallback_primary = bool(rec.get("fallback_primary", False))
+    mainline_candidate = bool(rec.get("mainline_candidate", False))
+    can_expand_local = bool(rec.get("can_expand_local", can_expand))
+
+    is_fallback_primary = (
+        fallback_primary
+        or primary_bucket == "primary_fallback_keep_no_expand"
+        or primary_reason == "anchor_core_fallback"
+    )
+
+    is_locked_mainline = (
+        primary_bucket == "primary_keep_no_expand"
+        or primary_reason == "usable_mainline_no_expand"
+        or (mainline_candidate and (not can_expand_local))
+    )
+
+    has_mainline_support = (mainline_hits >= 1) or can_expand or is_locked_mainline
+
+    if not has_mainline_support and anchor_count > 0:
         flags.append("no_mainline_support")
-    if mainline_hits == 0 and can_expand is False:
+    if (not has_mainline_support) and (not is_fallback_primary):
         flags.append("only_weak_keep_sources")
+    if is_locked_mainline:
+        flags.append("locked_mainline_no_expand")
+    if is_fallback_primary:
+        flags.append("fallback_primary")
     if anchor_count >= 2 and mainline_hits == 0:
         flags.append("cross_anchor_but_side_only")
     if _stage3_is_conditioned_only(rec):
@@ -542,11 +568,10 @@ def _compute_stage3_risk_penalty(term: Dict[str, Any]) -> float:
 
 def _assign_stage3_bucket(term: Dict[str, Any]) -> str:
     """
-    Stage3 分桶（两函数硬门之一）：彻底封死 conditioned_only 进 core。
-    - conditioned_only：有 conditioned_vec，且无 similar_to、无 family_landing（与 _stage3_is_conditioned_only 一致）。
-    - 单锚 conditioned_only：仅 support（mainline_hits≥1 或 can_expand）或 risky；永不为 core。
-    - 多锚 conditioned_only：最高 support，不为 core。
-    - 非 conditioned：core 须 mainline_hits≥1 ∧ can_expand ∧ identity_factor≥0.95；否则按 support_ok / risky。
+    Stage3 分桶（两函数硬门之一）：conditioned_only 永不得 core；并消费 Stage2A 透传语义。
+    - is_fallback_primary：fallback 保线词，默认 risky（与正常 primary 区分）。
+    - is_locked_mainline：primary_keep_no_expand / usable_mainline_no_expand 等「主线但不可扩」→ support，避免误伤 risky。
+    - has_mainline_support：强主线（mainline_hits≥1 或 can_expand）或 locked mainline。
     """
     term.pop("stage3_support_demote_reason", None)
     anchor_count = int(term.get("anchor_count") or 0)
@@ -557,36 +582,53 @@ def _assign_stage3_bucket(term: Dict[str, Any]) -> str:
     ex = term.get("stage3_explain") or {}
     identity_factor = float(ex.get("identity_factor", 1.0) or 1.0)
 
+    primary_bucket = (term.get("primary_bucket") or "").strip().lower()
+    primary_reason = (term.get("primary_reason") or "").strip().lower()
+    fallback_primary = bool(term.get("fallback_primary", False))
+    mainline_candidate = bool(term.get("mainline_candidate", False))
+    can_expand_local = bool(term.get("can_expand_local", can_expand))
+
+    is_fallback_primary = (
+        fallback_primary
+        or primary_bucket == "primary_fallback_keep_no_expand"
+        or primary_reason == "anchor_core_fallback"
+    )
+
+    is_locked_mainline = (
+        primary_bucket == "primary_keep_no_expand"
+        or primary_reason == "usable_mainline_no_expand"
+        or (mainline_candidate and (not can_expand_local))
+    )
+
+    strong_mainline_support = mainline_hits >= 1 or can_expand
+    has_mainline_support = strong_mainline_support or is_locked_mainline
+
     st = _stage3_normalized_source_types(term)
     has_similar = "similar_to" in st
     has_family = "family_landing" in st
     has_conditioned = "conditioned_vec" in st
     conditioned_only = bool(has_conditioned and (not has_similar) and (not has_family))
 
-    if conditioned_only and anchor_count <= 1:
-        if mainline_hits >= 1 or can_expand:
-            return "support"
+    if is_fallback_primary:
         return "risky"
 
+    if conditioned_only and anchor_count <= 1:
+        return "support" if has_mainline_support else "risky"
     if conditioned_only and anchor_count >= 2:
         return "support"
 
-    cross_side_only = anchor_count >= 2 and mainline_hits == 0
+    if is_locked_mainline:
+        return "support"
+
     core_ok = (
         mainline_hits >= 1
         and can_expand
-        and anchor_count >= 1
         and identity_factor >= 0.95
     )
     if core_ok:
-        bucket = "core"
-    else:
-        support_ok = (
-            (mainline_hits >= 1)
-            or can_expand
-            or (anchor_count >= 2 and (not cross_side_only))
-        )
-        bucket = "support" if support_ok else "risky"
+        return "core"
+
+    bucket = "support" if has_mainline_support else "risky"
 
     if bucket == "support" and _stage3_single_anchor_expand_branch_demote(term):
         term["stage3_support_demote_reason"] = "single_anchor_expand_branch"
@@ -734,9 +776,10 @@ def select_terms_for_paper_recall(
 ) -> List[Dict[str, Any]]:
     """
     Paper 召回选词（两函数硬门之二）：
-    - conditioned_only 且 anchor_count<=1 → 一律不进 final_term_ids_for_paper（paper_reject_reason=conditioned_only_single_anchor_block）。
-    - 其余：core 可入选；support 须 mainline_hits≥1 或 can_expand 或 anchor_count≥2；risky 不进。
-    - 同 family_key 去重；按桶优先 core→support→risky，同桶内按 final_score 降序，直至 max_terms。
+    - conditioned_only 且单锚 → 不进 paper（conditioned_only_single_anchor_block）。
+    - fallback_primary（含 Stage2A primary_fallback / anchor_core_fallback）→ fallback_primary_block。
+    - core 直接入选；support 须 has_mainline_support（含 locked mainline）或 anchor_count≥2；risky 不进。
+    - 同 family_key 去重；遍历顺序 core→support→risky，同桶内按 final_score 降序。
     """
     if not records:
         return []
@@ -756,6 +799,30 @@ def select_terms_for_paper_recall(
         can_expand = bool(rec.get("can_expand", False))
         bucket = (rec.get("stage3_bucket") or "").strip().lower()
 
+        primary_bucket = (rec.get("primary_bucket") or "").strip().lower()
+        primary_reason = (rec.get("primary_reason") or "").strip().lower()
+        fallback_primary = bool(rec.get("fallback_primary", False))
+        mainline_candidate = bool(rec.get("mainline_candidate", False))
+        can_expand_local = bool(rec.get("can_expand_local", can_expand))
+
+        is_fallback_primary = (
+            fallback_primary
+            or primary_bucket == "primary_fallback_keep_no_expand"
+            or primary_reason == "anchor_core_fallback"
+        )
+
+        is_locked_mainline = (
+            primary_bucket == "primary_keep_no_expand"
+            or primary_reason == "usable_mainline_no_expand"
+            or (mainline_candidate and (not can_expand_local))
+        )
+
+        has_mainline_support = (
+            (mainline_hits >= 1)
+            or can_expand
+            or is_locked_mainline
+        )
+
         st = _stage3_normalized_source_types(rec)
         has_similar = "similar_to" in st
         has_family = "family_landing" in st
@@ -770,6 +837,10 @@ def select_terms_for_paper_recall(
             rec["paper_reject_reason"] = "conditioned_only_single_anchor_block"
             continue
 
+        if is_fallback_primary:
+            rec["paper_reject_reason"] = "fallback_primary_block"
+            continue
+
         fk = rec.get("family_key") or build_family_key(rec)
         rec["family_key"] = fk
 
@@ -781,14 +852,16 @@ def select_terms_for_paper_recall(
             sel = True
             reason = "bucket_core_direct"
             rrole = "paper_primary"
+
         elif bucket == "support":
-            support_ok = mainline_hits >= 1 or can_expand or anchor_count >= 2
+            support_ok = has_mainline_support or anchor_count >= 2
             if support_ok:
                 sel = True
                 reason = "support_mainline_or_expand_ok"
                 rrole = "paper_support"
             else:
                 rec["paper_reject_reason"] = "support_but_not_grounded"
+
         else:
             rec["paper_reject_reason"] = "risky_bucket_block"
 
