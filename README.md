@@ -727,7 +727,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 
 4. **允许保底，不允许失控**  
    对于某些岗位核心锚点，候选集合可能暂时没有足够强的主线词，但这并不意味着整条任务支线应被直接丢弃。为此，标签路允许对「高质量核心锚点」设置保底主词（fallback primary）：当组内不存在足够强的 expandable primary 时，可从候选中选择最像主线的一项暂时保留，供 Stage3 继续判断。但这类保底词默认不参与扩展，且会带有明确的 fallback 标记。该原则的核心是：宁可保守保留一条潜在主线，也不让关键锚点在早期阶段整体失活；但保底仅用于保线，不用于放大噪声。
-   此外，当 `select_primary_per_anchor` 在组内仍然找不到任何 primary 时，会启用“高质量锚点空组保线”：从非硬坏分支里按组内相对信号救回 1 条 `primary_keep_no_expand`，并同样标记 `fallback_primary`，禁止 Stage2B seed（不扩散）且在 paper 阶段不抢配额。
+   此外，当 `select_primary_per_anchor` 在组内仍然找不到任何 primary 时，会启用“高质量锚点空组保线”：从非硬坏分支里按组内相对信号救回 1 条 `primary_keep_no_expand`，并同样标记 `fallback_primary`，同时将 `role_in_anchor` 置为 `mainline` 并标记 `is_grounded_fallback/weak_mainline_support`，让 Stage3 把它统计为有交叉证据的弱主线救线词；禁止 Stage2B seed（不扩散）且在 paper 阶段不抢配额。
 
 5. **软约束优先于硬过滤**  
    标签路尽量避免依赖黑白名单、领域硬裁剪或固定规则表来决定候选去留，而是采用「软奖励 + 软惩罚 + 分桶重排」的方式处理歧义。领域路径一致性、上下文支持、多锚点共振、家族中心性等因素主要用于排序和分层，而不是直接作为一票否决条件。这样设计的原因在于：科技岗位往往天然存在跨学科特征，知识图谱中的领域标注也可能不完整。如果采用过强硬过滤，很容易误杀真实相关但标注不足的概念；而软约束更适合在保证召回的同时稳步提升排序质量。
@@ -756,7 +756,7 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 | 阶段 | 输入 | 输出 | 依赖的 label_means / 外部 |
 |------|------|------|---------------------------|
 | **Stage1** | query_vector, query_text, domain_id | active_domains, domain_regex, anchor_skills, Stage1Result | DomainDetector；label_anchors.extract_anchor_skills、supplement_anchors_from_jd_vector；tools.extract_skills |
-| **Stage2A** | prepared_anchors, active_domain_set, query_vector, query_text, 可选 jd_*_ids | primary_landings（含 **can_expand_from_2a**、**fallback_primary**、**can_expand**（与前者同步）、**bucket**（含 primary_fallback_keep_no_expand）、primary_score 等；_debug 透传至 Stage3） | **最小收尾四点**：① `judge_primary_and_expandability` 将 **primary 资格（宽）** 与 **expand 资格（严）** 解耦，并对 **branch_blocked 误伤的控制主线词** 设 **窄逃生口**（见 README「三函数最小收尾」表）；→ `select_primary_per_anchor`；无 expandable 时 keep **最多 1 条**；② `select_primary_per_anchor` 在“高质量锚点空组”场景会救回 1 条 `primary_keep_no_expand`（标记 `fallback_primary`，不扩散且不参与 paper）；③ 仍 0-primary 且锚点允许时 **`pick_fallback_primary_for_anchor`** 保线（不扩、交 Stage3）；④ `merge_stage2a_primary` |
+| **Stage2A** | prepared_anchors, active_domain_set, query_vector, query_text, 可选 jd_*_ids | primary_landings（含 **can_expand_from_2a**、**fallback_primary**、**can_expand**（与前者同步）、**bucket**（含 primary_fallback_keep_no_expand）、primary_score 等；_debug 透传至 Stage3） | **最小收尾四点**：① `judge_primary_and_expandability` 将 **primary 资格（宽）** 与 **expand 资格（严）** 解耦，并对 **branch_blocked 误伤的控制主线词** 设 **窄逃生口**（见 README「三函数最小收尾」表）；→ `select_primary_per_anchor`；无 expandable 时 keep **最多 1 条**；② `select_primary_per_anchor` 在“高质量锚点空组”场景会救回 1 条 `primary_keep_no_expand`（标记 `fallback_primary` 并将 role_in_anchor 置为 mainline，传递 grounded fallback 身份；不扩散且不参与 paper）；③ 仍 0-primary 且锚点允许时 **`pick_fallback_primary_for_anchor`** 保线（不扩、交 Stage3）；④ `merge_stage2a_primary` |
 | **Stage2B** | primary_landings（经 **`can_expand_from_2a=True`** 且 primary_score≥SEED_SCORE_MIN 得 diffusion_primaries）, active_domain_set, jd_*_ids | raw_candidates（retain_mode、topic_source、seed_blocked 等下传 Stage3） | **`check_seed_eligibility` 仅认 `can_expand_from_2a`**；`fallback_primary` / `primary_keep_no_expand` 不扩；diffusion_primaries = 上述 eligible ∧ primary_score≥SEED_SCORE_MIN；**expand_from_vocab_dense_neighbors**（默认四门 + **强 seed 弱放行**，见 README「三函数最小收尾」）；**DENSE_PARENT_CAP=0.85**；expand_from_cluster_members 全关；expand_from_cooccurrence_support；merge_primary_and_support_terms |
 | **Stage3** | raw_candidates（含 term_role、role_in_anchor、source_types、retain_mode、**primary_bucket / fallback_primary / mainline_candidate** 等）, query_vector, anchor_vids | score_map, term_map, idf_map, **paper_terms** | 去重聚合 → classify_stage3_entry_groups → check_stage3_admission；**唯一主分** × role_factor；**`_assign_stage3_bucket`**（conditioned_only **永不得 core**；**fallback vs locked mainline**）；**`stage3_build_score_map`**（core/support 条件跨锚；**conditioned_only 不吃 support 跨锚正奖励**；单锚 conditioned_only 与 weak keep 加压，重刷 `bucket_reason_flags`）；**`select_terms_for_paper_recall`**（单锚 conditioned_only、**fallback_primary** 不进 paper；**locked mainline** 计入主线条目）；**`_print_paper_term_selection_audit`** |
 | **Stage4** | vocab_ids, regex_str, term_scores, term_retrieval_roles | author_papers_list（按作者聚合的论文及 hits） | 二层召回；**role_weight**（paper_primary=1.0、paper_support=0.7）；MELT_RATIO、domain 软奖励、per-term 限流；paper_scoring 在 Stage5 用 |
@@ -998,7 +998,7 @@ Stage2A 从「候选平均打分器」改为「主线优先的组内选主器」
 - **enrich_stage2a_candidates**：为候选补 `context_gain`、`has_dynamic_support`、`has_static_support`、`dual_support`。
 - **_stage2a_rule_flags**：新增 `context_gain_ok`（context_gain ≥ 0.03）、`dynamic_support_ok`、`dual_support_ok`。
 - **select_primary_per_anchor**（最小收尾）：① **前置仅** `retain_mode=="reject"`；**obviously_bad_branch、drift_bad、polysemous_no_context** 仍硬拒绝；**低 primary_score 不前置 reject**，交给 **`judge_primary_and_expandability`**；② **`judge_primary_and_expandability`**：`primary_ok`（宽）与 **`can_expand`（严）** 解耦；③ **family_fallback_only** 强制不可扩；④ 无 expandable 时 keep **截断为 1**；⑤ 仍 0-primary 时 **`pick_fallback_primary_for_anchor`**。
-- **check_seed_eligibility**：**仅 `can_expand_from_2a=True`** 可 seed；`fallback_primary` 挡扩；context_gain 仅影响 **seed_score**；保留 semantic_mismatch 硬挡。
+- **check_seed_eligibility**：**仅 `can_expand_from_2a=True`** 可 seed；`fallback_primary` 挡扩；context_gain 仅影响 **seed_score**；同时写入 `seed_grounded` 标记（仅打标不改 eligible）；保留 semantic_mismatch 硬挡。
 - **调试打印**：`[Stage2A primary/expand split]`、`[Stage2A select]`、`[Stage2A fallback]`、`[Stage2B seed gate]`、`[Stage2B final seed gate]`。
 - **预期现象**：动力学/运动学/仿真/路径规划等锚点下，conditioned_sim > static_sim、context_gain > 0 的候选有机会 primary_expandable；kinesiology 等 static 尚可但 context_gain 不佳则降级；family_landing 仅在两路都很弱时补池且不扩散。
 
@@ -1091,7 +1091,7 @@ Stage2A 从「候选平均打分器」改为「主线优先的组内选主器」
   - 窄方法词、设备/对象词（且未在锚点白名单）一律不扩；conditioned_only 再补一道门（identity≥0.62、primary≥0.55、jd≥0.76、support_count≥2 才放行）。
 - **3）Stage3 最终分数修正 + paper 选词**  
   - **风险修正**（算完 final_score、设好 bucket_reason_flags 后）：对 `no_mainline_support` 乘 0.72、`only_weak_keep_sources` 乘 0.78、`conditioned_only` 乘 0.80、单锚且无 mainline 且不可扩乘 0.75、secondary_primary 且非 core 乘 0.88、risky 桶乘 0.88；再按 final_score 重排。  
-  - **select_terms_for_paper_recall**（当前实现）：core 直接放行；单锚 conditioned_only 不进；**fallback_primary**（含 Stage2A fallback 语义）不进；support 需要“主线 grounding”（mainline_hits/can_expand/locked mainline/多锚支撑）且满足语义质量门槛（`jd_align`、`context_continuity`、`generic/poly/object` 风险阈值）；**risky 桶一律不进** paper。  
+  - **select_terms_for_paper_recall**（当前实现）：core 直接放行；单锚 conditioned_only 不进；**fallback_primary**（含 Stage2A fallback 语义）不进；support 需要“grounded cross-anchor 支撑”：`final_score>=0.46` 且 `(anchor_count>=2 & mainline_hits>=1)` 或 `mainline_hits>=2`，并满足风险阈值（`generic<=0.75`、`poly<=0.65`、`object<=0.50`）；**risky 桶一律不进** paper。
   - **数量截断**：core 不限，support 最多 8，risky 最多 2，总上限 12（PAPER_RECALL_MAX_TERMS）。
 - **预期现象**：  
   - 2B 被救活：motion control、reinforcement learning、robotic arm、route planning 等重新变为可扩散 seed；dense/cluster/cooc 不再全 0。  

@@ -990,52 +990,47 @@ def select_terms_for_paper_recall(
 
     def _support_grounded_enough(rec: Dict[str, Any]) -> bool:
         """
-        支撑词 paper 优先级约束：
-        - 結构上：必须被主线命中/扩散资格/锚定（locked mainline）或多锚支撑所“托住”
-        - 语义上：避免泛方法/弱链条词抢 paper 配额
+        支撑词 paper 允许准入的“grounded support”门：
+        - 避免 conditioned_only 抢占 paper 配额
+        - 需要交叉锚证据（anchor_count & mainline_hits）托住
+        - 用风险项做保守兜底（不再强依赖 context_continuity）
         """
+        st = _stage3_normalized_source_types(rec)
+        has_similar = "similar_to" in st
+        has_family = "family_landing" in st
+        has_conditioned = "conditioned_vec" in st
+        conditioned_only = bool(has_conditioned and (not has_similar) and (not has_family))
+
+        # fallback 只保留，不进 paper
+        if bool(rec.get("fallback_primary", False)):
+            return False
+
+        if conditioned_only:
+            return False
+
+        final_score = float(rec.get("final_score") or 0.0)
+        if final_score < 0.46:
+            return False
+
         mainline_hits = int(rec.get("mainline_hits", 0) or 0)
-        can_expand = bool(rec.get("can_expand", False))
         anchor_count = int(rec.get("anchor_count", 1) or 1)
-        fallback_primary = bool(rec.get("fallback_primary", False))
-        primary_bucket = (rec.get("primary_bucket") or "").strip().lower()
-        primary_reason = (rec.get("primary_reason") or "").strip().lower()
+
+        grounded_support_ok = (
+            (anchor_count >= 2 and mainline_hits >= 1)
+            or (mainline_hits >= 2)
+        )
+        if not grounded_support_ok:
+            return False
 
         generic_risk = float(rec.get("generic_risk", 0.0) or 0.0)
         polysemy_risk = float(rec.get("polysemy_risk", 0.0) or 0.0)
         object_like_risk = float(rec.get("object_like_risk", 0.0) or 0.0)
-        jd_align = float(
-            rec.get("jd_candidate_alignment") or rec.get("jd_align") or 0.5
+
+        return (
+            generic_risk <= 0.75
+            and object_like_risk <= 0.50
+            and polysemy_risk <= 0.65
         )
-        context_cont = float(rec.get("context_continuity", 0.0) or 0.0)
-
-        locked_mainline = (
-            primary_bucket == "primary_keep_no_expand"
-            or primary_reason == "usable_mainline_no_expand"
-        )
-
-        # fallback 只保留，不进 paper
-        if fallback_primary:
-            return False
-
-        # 主线 grounding：有主线命中 / 可扩 / 锁定主线 / 多锚支撑
-        structural_ok = (
-            mainline_hits >= 1
-            or can_expand
-            or locked_mainline
-            or anchor_count >= 2
-        )
-
-        # 语义质量：更像主线，不像泛方法/高歧义漂移
-        semantic_ok = (
-            jd_align >= 0.72
-            and context_cont >= 0.38
-            and generic_risk <= 0.58
-            and polysemy_risk <= 0.55
-            and object_like_risk <= 0.35
-        )
-
-        return structural_ok and semantic_ok
 
     for rec in ordered:
         anchor_count = int(rec.get("anchor_count") or 1) or 1

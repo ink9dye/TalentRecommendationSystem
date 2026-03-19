@@ -1446,6 +1446,7 @@ def check_seed_eligibility(
         )
         setattr(p, "seed_eligible", False)
         setattr(p, "seed_block_reason", block_reason)
+        setattr(p, "seed_grounded", False)
         return False, 0.0, block_reason
 
     if not can_expand_from_2a:
@@ -1456,6 +1457,7 @@ def check_seed_eligibility(
         )
         setattr(p, "seed_eligible", False)
         setattr(p, "seed_block_reason", block_reason)
+        setattr(p, "seed_grounded", False)
         return False, 0.0, block_reason
 
     if is_semantic_mismatch_seed(anchor_text, primary_term):
@@ -1466,6 +1468,7 @@ def check_seed_eligibility(
         )
         setattr(p, "seed_eligible", False)
         setattr(p, "seed_block_reason", block_reason)
+        setattr(p, "seed_grounded", False)
         return False, 0.0, block_reason
 
     # --------------------------------------------------
@@ -1504,7 +1507,24 @@ def check_seed_eligibility(
         )
         setattr(p, "seed_eligible", False)
         setattr(p, "seed_block_reason", block_reason)
+        setattr(p, "seed_grounded", False)
         return False, 0.0, block_reason
+
+    # --------------------------------------------------
+    # 0.6 grounded seed 标记（仅打标，不改 eligible/seed_score 结果）
+    # --------------------------------------------------
+    trusted_set = {s.strip().lower() for s in (TRUSTED_SOURCE_TYPES_FOR_DIFFUSION or []) if s}
+    trusted_source = (source_type_str or "").strip().lower() in trusted_set if trusted_set else False
+
+    ctx_present = ctx_sim_val is not None and float(ctx_sim_val or 0.0) > 0.0
+    ctx_sim_val_f = float(ctx_sim_val or 0.0)
+
+    seed_grounded = (
+        dual_support
+        or (ctx_present and ctx_sim_val_f >= 0.78)
+        or (float(static_sim or 0.0) >= 0.88 and trusted_source)
+    )
+    setattr(p, "seed_grounded", bool(seed_grounded))
 
     # --------------------------------------------------
     # 1. context_gain 软修正（仅影响 seed_score）
@@ -3072,10 +3092,18 @@ def select_primary_per_anchor(
             best.can_expand_from_2a = False
             best.fallback_primary = True
             best.admission_reason = "anchor_core_fallback"
-            best.role_in_anchor = "side"
-            best.role = "side"
+            # 让 Stage3 统计到 mainline_hits：fallback 词在“身份上像主线救线”，但仍禁止扩散
+            best.role_in_anchor = "mainline"
+            best.role = "mainline"
             setattr(best, "bucket_reason", "anchor_core_fallback")
             setattr(best, "mainline_block_reason", "anchor_core_fallback")
+            # --- Stage3 / 审计对齐字段：不依赖词表，只用于传递“弱主线救线身份” ---
+            setattr(best, "is_grounded_fallback", True)
+            setattr(best, "weak_mainline_support", True)
+            setattr(best, "mainline_candidate", True)
+            setattr(best, "mainline_support_hits", max(1, int(getattr(best, "mainline_support_hits", 0) or 0)))
+            # fallback 可保留，但永不作为可扩散 seed
+            setattr(best, "can_expand_from_2a", False)
 
             primary_keep_no_expand.append(best)
 
