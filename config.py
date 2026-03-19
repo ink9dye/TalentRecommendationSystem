@@ -38,6 +38,9 @@ FEATURE_INDEX_PATH = os.path.join(INDEX_DIR, "feature_index.json")
 COLLAB_DB_PATH = os.path.join(INDEX_DIR, "scholar_collaboration.db")
 VOCAB_STATS_DB_PATH = os.path.join(INDEX_DIR, 'vocab_stats.db')
 
+# 论文标题向量离线索引（与 QueryEncoder 同空间，供 Stage5 JD 门控查表，缺失则在线 encode）
+WORK_TITLE_EMB_DB_PATH = os.path.join(INDEX_DIR, "work_title_embeddings.db")
+
 # --- 6.1 标签路召回参数（学术词过滤与 SIMILAR_TO 约束）---
 VOCAB_P95_PAPER_COUNT = 800   # 学术词 paper_count 上限，过滤泛词（如 machine learning / algorithm）
 SIMILAR_TO_TOP_K = 3         # 每个锚点词最多扩展的学术词数量
@@ -217,7 +220,8 @@ CONFIG_DICT = {
     "NEO4J_DATABASE": NEO4J_DATABASE,
     "BATCH_SIZE": 1000,
     "SBERT_DIR": SBERT_DIR,
-    "SBERT_MODEL_NAME": SBERT_MODEL_NAME
+    "SBERT_MODEL_NAME": SBERT_MODEL_NAME,
+    "WORK_TITLE_EMB_DB_PATH": WORK_TITLE_EMB_DB_PATH,
 }
 
 # --- 11. SQLite 索引初始化脚本 ---

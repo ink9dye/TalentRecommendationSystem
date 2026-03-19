@@ -1,5 +1,6 @@
 import math
-from typing import Any, Dict, List, Tuple
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -67,12 +68,15 @@ def compute_contribution(
       - supporting_count: 命中的 supporting term 数（无 term_role_map 时为 -1）
     """
     raw_title = (paper.get("title") or "")
+    _prof = context.get("_paper_contrib_prof")
 
     # 1. 撤稿拦截
     if _is_retracted(raw_title):
         return 0.0, [], 0.0, {}, -1, -1
 
     # 2. 领域纯度降权
+    if _prof is not None:
+        _t0 = time.perf_counter()
     domain_coeff = _get_domain_purity_factor(
         paper.get("domains"),
         context["active_domain_set"],
@@ -80,8 +84,12 @@ def compute_contribution(
     )
     if domain_coeff <= 0:
         return 0.0, [], 0.0, {}, -1, -1
+    if _prof is not None:
+        _prof["domain"] = _prof.get("domain", 0.0) + (time.perf_counter() - _t0) * 1000.0
 
     # 3. 标签匹配与动态权重累加（按 term_role 加权：primary 权重大、expansion 适中/更低）
+    if _prof is not None:
+        _t1 = time.perf_counter()
     score_map: Dict[str, float] = context["score_map"]
     term_map: Dict[str, str] = context["term_map"]
     term_role_map: Dict[str, str] = context.get("term_role_map") or {}
@@ -110,6 +118,9 @@ def compute_contribution(
         valid_hids.append(hit["vid"])
         hit_terms.append(term_map.get(vid_s, ""))
 
+    if _prof is not None:
+        _prof["rank_loop"] = _prof.get("rank_loop", 0.0) + (time.perf_counter() - _t1) * 1000.0
+
     if rank_score == 0:
         return 0.0, [], 0.0, {}, -1, -1
 
@@ -122,17 +133,29 @@ def compute_contribution(
     survey_decay = survey_decay_factor(hit_count, raw_title)
 
     # 5. 语义紧密度加成
+    if _prof is not None:
+        _t2 = time.perf_counter()
+    prox_cache = context.get("_proximity_cache")
     proximity = _calculate_proximity(
         recall.vocab_to_idx,
         recall.all_vocab_vectors,
         valid_hids,
+        cache=prox_cache,
     )
     proximity_bonus = math.pow(1.0 + proximity, hit_count)
+    if _prof is not None:
+        _prof["proximity"] = _prof.get("proximity", 0.0) + (time.perf_counter() - _t2) * 1000.0
 
     # 6. 时间衰减
+    if _prof is not None:
+        _t3 = time.perf_counter()
     time_decay = compute_paper_recency(paper.get("year", 2000), context["active_domain_set"])
+    if _prof is not None:
+        _prof["time_decay"] = _prof.get("time_decay", 0.0) + (time.perf_counter() - _t3) * 1000.0
 
     # 6.5 跨簇奖励
+    if _prof is not None:
+        _t4 = time.perf_counter()
     cluster_ids = set()
     for vid in valid_hids:
         try:
@@ -143,11 +166,15 @@ def compute_contribution(
             cid, _ = max(clusters, key=lambda x: x[1])
             cluster_ids.add(cid)
     cluster_bonus = paper_cluster_bonus(cluster_ids)
+    if _prof is not None:
+        _prof["cluster"] = _prof.get("cluster", 0.0) + (time.perf_counter() - _t4) * 1000.0
 
     # 7. 命中标签数量归一化
     coverage_norm = coverage_norm_factor(hit_count)
 
     # 7.1 组合主干因子
+    if _prof is not None:
+        _t5 = time.perf_counter()
     score = (
         rank_score
         * coverage_norm
@@ -157,11 +184,19 @@ def compute_contribution(
         * time_decay
         * survey_decay
     )
+    if _prof is not None:
+        _prof["combine"] = _prof.get("combine", 0.0) + (time.perf_counter() - _t5) * 1000.0
 
     # 7.5 paper-level JD semantic gate
+    if _prof is not None:
+        _t6 = time.perf_counter()
     jd_vec = context.get("query_vector")
-    title_vecs = context.get("paper_title_vec_by_title") or {}
-    paper_vec_pre = title_vecs.get(raw_title) if raw_title else None
+    by_wid = context.get("paper_title_vec_by_wid") or {}
+    by_title = context.get("paper_title_vec_by_title") or {}
+    wid_s = str(paper.get("wid") or "")
+    paper_vec_pre = by_wid.get(wid_s)
+    if paper_vec_pre is None and raw_title:
+        paper_vec_pre = by_title.get(raw_title)
     gate_factor = paper_jd_semantic_gate_factor(
         raw_title,
         jd_vec,
@@ -169,6 +204,8 @@ def compute_contribution(
         paper_vec_precomputed=paper_vec_pre,
     )
     score *= gate_factor
+    if _prof is not None:
+        _prof["gate"] = _prof.get("gate", 0.0) + (time.perf_counter() - _t6) * 1000.0
 
     return float(score), hit_terms, float(rank_score), term_weights, primary_count, supporting_count
 
@@ -199,18 +236,37 @@ def _get_domain_purity_factor(paper_domains_raw, active_set, dominance: float) -
     return base_score * math.pow(purity_ratio, 6)
 
 
-def _calculate_proximity(vocab_to_idx: Dict[str, int], all_vocab_vectors, hit_ids: List[int]) -> float:
+def _calculate_proximity(
+    vocab_to_idx: Dict[str, int],
+    all_vocab_vectors,
+    hit_ids: List[int],
+    cache: Optional[Dict[Tuple[int, ...], float]] = None,
+) -> float:
     """
     计算命中标签在向量空间中的平均余弦相似度（语义紧密度），从 LabelRecallPath._calculate_proximity 迁移。
+    cache: 可选，按 sorted(vid) 元组缓存，同一命中集合结果与顺序无关。
     """
     if len(hit_ids) < 2:
         return 0.5
+    try:
+        key_ints = tuple(sorted(int(vid) for vid in hit_ids))
+    except (TypeError, ValueError):
+        key_ints = tuple(sorted(int(str(vid)) for vid in hit_ids))
+    if cache is not None and key_ints in cache:
+        return cache[key_ints]
+
     idxs = [vocab_to_idx.get(str(vid)) for vid in hit_ids if str(vid) in vocab_to_idx]
     idxs = [i for i in idxs if i is not None]
     if len(idxs) < 2:
-        return 0.5
+        out = 0.5
+        if cache is not None:
+            cache[key_ints] = out
+        return out
 
     vecs = all_vocab_vectors[idxs]
     sim_matrix = np.dot(vecs, vecs.T)
-    return float(np.mean(sim_matrix[np.triu_indices(sim_matrix.shape[0], k=1)]))
+    out = float(np.mean(sim_matrix[np.triu_indices(sim_matrix.shape[0], k=1)]))
+    if cache is not None:
+        cache[key_ints] = out
+    return out
 
