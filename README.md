@@ -16,6 +16,8 @@
 - **[知识图谱构建详解](#知识图谱构建详解)**
   - [6. 数据表与图模型速查](#6-数据表与图模型速查)
 - **[三路召回与文本转向量详解](#三路召回与文本转向量详解)**
+  - [标签路设计定位](#标签路设计定位以任务主线为中心的学术概念落地与证据聚合)
+  - [标签路核心设计原则](#标签路核心设计原则)
 - **[索引构建详解](#索引构建详解)**
 - **[KGAT-AX 模型详解](#kgat-ax-模型详解)**
 - **[精排与解释详解](#精排与解释详解)**
@@ -71,7 +73,7 @@ TalentRecommendationSystem-master/
     │   │   ├── candidate_features.py # 候选池特征：extract_terms_from_label_evidence、6 个 calc_*、bucket_quota_truncate、build_kgatax_feature_row
     │   │   ├── total_recall.py     # 多路召回总控（向量 / 标签 / 协同）+ 候选池构建 / 打分 / enrich / 硬过滤 / 分桶 / 分桶截断 / kgatax_sidecar
     │   │   ├── vector_path.py      # 向量路：Faiss + 向量索引召回作者
-    │   │   ├── label_path.py       # 标签路入口：编排五阶段流水线（label_pipeline + label_means）；Stage1Result 含 jd_profile 传 Stage2
+    │   │   ├── label_path.py       # 标签路入口：编排五阶段流水线（label_pipeline + label_means）；从 stage1_domain_anchors 再导出 Stage1Result
     │   │   ├── label_path_pre.py   # 标签路旧版/备用实现（内部或历史参考）
     │   │   ├── works_to_authors.py # 论文级得分聚合为作者级，供标签路 Stage5 使用
     │   │   ├── diagnose_embedding_neighbors.py # 嵌入邻居诊断工具（开发与调试用）
@@ -88,7 +90,7 @@ TalentRecommendationSystem-master/
     │   │   │   ├── advanced_metrics.py
     │   │   │   └── label_debug_cli.py
     │   │   └── label_pipeline/      # 标签路五阶段流水线实现
-    │   │       ├── stage1_domain_anchors.py   # 领域与锚点；attach_anchor_contexts、build_jd_hierarchy_profile，产出 jd_profile 与锚点 local_context/phrase_context
+    │   │       ├── stage1_domain_anchors.py   # 领域与锚点；Stage1Result、attach_anchor_contexts、build_jd_hierarchy_profile，产出 jd_profile 与锚点 local_context/phrase_context
     │   │       ├── stage2_expansion.py       # 学术落点+扩展；接收 jd_profile，raw_candidates 带 subfield_fit/topic_fit/landing_score/cluster_id 等
     │   │       ├── stage3_term_filtering.py  # 全局复审层：按 tid 去重聚合（保留多来源）→ classify_stage3_entry_groups（trusted_primary/secondary_primary/support_expansion）→ check_stage3_admission（trusted 不硬杀）→ score_term_record×identity_factor×risk_penalty → assign_stage3_bucket（core/support/risky）→ select_terms_for_paper（core 优先→support→risky）→ 三张调试表
     │   │       ├── stage4_paper_recall.py    # 论文二层召回、领域软奖励、TERM_MAX_PAPERS/per-term 限流、MELT_RATIO
@@ -697,6 +699,45 @@ Neo4j 中还会建立索引：`Work.domain_ids`、`Job.domain_ids`、`Vocabulary
 ---
 
 ### 3. 标签路召回（label_path.py — LabelRecallPath）
+
+#### 标签路设计定位：以任务主线为中心的学术概念落地与证据聚合
+
+标签路（Label Path）的目标，并不是为岗位描述中的每个技能短语寻找「字面上最相近」的学术词，也不是单纯依赖向量近邻做术语翻译；其核心任务是：在完整 JD 的任务语境下，将工业侧技能表达稳定地落到一组能够代表岗位主线需求的学术概念上，并进一步通过论文与作者证据完成闭环验证。因此，标签路本质上是一个面向科技人才发现的、由任务主线驱动的多阶段概念落地与证据聚合系统。
+
+从系统定位上看，标签路结合了多种成熟信息检索与知识图谱系统的设计思想：一方面，它继承了 Expert Finding（专家发现）系统中「需求解析 → 概念映射 → 证据聚合 → 专家排序」的基本链路；另一方面，它也借鉴了 Candidate Generation + Rerank（二段式候选生成与重排）的经典架构，将「高召回的候选生成」与「强调主线一致性的全局重审」分开处理。此外，Stage2A 的学术落点过程与 Concept Normalization / Entity Linking（概念标准化 / 实体消歧）高度相似，但又进一步引入了多锚点、多候选共同竞争的 collective disambiguation（集体消歧）思想：一个候选学术词是否正确，不仅取决于它与单个锚点的局部相似度，更取决于它能否与其它锚点、上下文和后续论文证据共同构成一条稳定的任务主线。
+
+基于这一定位，标签路坚持如下核心原则：局部语义负责候选准入，主线一致性负责主词裁决。也就是说，SIMILAR_TO、conditioned_vec、alias/exact matching 等信号的作用，是为每个工业锚点提供一组「可能的学术落点」；但最终谁能够成为 primary、谁只应作为 keep_no_expand、谁应被视为 risky term，并不由单点相似度直接决定，而是由候选词是否与当前 JD 的任务主线一致、是否与其它锚点形成共振、是否能在论文层与作者层形成稳定证据链共同决定。这一设计可以有效降低短词、泛词、跨学科同形词带来的语义漂移风险，避免系统被「局部很像、整体不对」的近邻词误导。
+
+从工程结构看，标签路采用五阶段流水线：Stage1 负责从 JD 中抽取工业锚点与上下文；Stage2A 负责将锚点落到候选学术主词，并进行「主线优先」的组内选主；Stage2B 仅围绕少量高置信主词做保守扩展，而不是重新翻译锚点；Stage3 跨锚点、跨来源、跨家族地对学术词进行统一重审，完成全局去歧义、风险分桶与论文召回用词选择；Stage4 负责论文召回；Stage5 再将论文证据聚合为作者级排序。这样的分层设计使系统具备清晰边界：Stage2A 关注「落点是否正确」，Stage2B 关注「扩展是否保守」，Stage3 关注「全局主线是否稳定」，Stage4/5 则负责「最终证据是否闭环」。
+
+因此，标签路的关键不在于「为每个词找到最近邻」，而在于：为整份 JD 找到一组最能解释该岗位核心能力结构的学术概念族群。一个学术词是否真正优质，不应只看它与锚点的局部相似度，还应看它能否召回主题集中、方向正确的论文，能否在作者层形成稳定、可解释的专家排序结果。换言之，标签路中的「学术词」不是最终目标，而是连接 JD、论文与作者的桥梁；其设计目标是最大限度地提升这座桥梁在任务语境中的稳定性、可解释性与检索效能。
+
+#### 标签路核心设计原则
+
+为保证岗位需求能够稳定、准确地映射到学术概念空间，标签路在设计上遵循以下原则。
+
+1. **主线一致性优先于局部近邻相似**  
+   标签路不将「与某个锚点最相似」直接等同于「最适合作为该岗位的学术主词」。对于岗位检索任务而言，真正重要的不是某个候选词与单个锚点的局部相似度，而是它能否在完整 JD 语境下，与其它锚点共同构成一条稳定的任务主线。因此，局部语义相似度只承担「候选准入」的作用，而「能否成为 primary、能否进入论文召回主词集合」则主要由主线一致性决定。这样可以有效抑制跨学科同形词、泛义词和局部近邻误召回带来的偏移。
+
+2. **候选生成与全局裁决分层进行**  
+   标签路采用「先生成、后裁决」的两段式设计。Stage2A/Stage2B 负责为锚点提供尽可能完整但仍受控的学术候选集合，Stage3 再对这些候选进行跨锚点、跨来源、跨家族的统一重审。这样做的好处在于：前段不需要过早承担最终决策责任，后段则可以利用更完整的上下文证据进行全局判断，避免在候选尚不充分时过早剪枝，也避免仅凭局部证据直接确定最终学术词。
+
+3. **强主词少量扩展，弱主词保守保留**  
+   扩展并不是越多越好。标签路坚持「高置信主词少量扩展、低置信主词只保留不扩散」的策略：只有在 Stage2A 中被判为主线明确、上下文稳定、来源可靠的 primary term，才允许进入 Stage2B 做 dense / cluster / co-occurrence 扩展；而那些虽可作为主线代理、但主线证据不足的候选，只作为 keep_no_expand 进入后续 Stage3 重审，不直接触发扩散。这样可以在不丢失主线信息的前提下，尽量控制语义漂移。
+
+4. **允许保底，不允许失控**  
+   对于某些岗位核心锚点，候选集合可能暂时没有足够强的主线词，但这并不意味着整条任务支线应被直接丢弃。为此，标签路允许对「高质量核心锚点」设置保底主词（fallback primary）：当组内不存在足够强的 expandable primary 时，可从候选中选择最像主线的一项暂时保留，供 Stage3 继续判断。但这类保底词默认不参与扩展，且会带有明确的 fallback 标记。该原则的核心是：宁可保守保留一条潜在主线，也不让关键锚点在早期阶段整体失活；但保底仅用于保线，不用于放大噪声。
+
+5. **软约束优先于硬过滤**  
+   标签路尽量避免依赖黑白名单、领域硬裁剪或固定规则表来决定候选去留，而是采用「软奖励 + 软惩罚 + 分桶重排」的方式处理歧义。领域路径一致性、上下文支持、多锚点共振、家族中心性等因素主要用于排序和分层，而不是直接作为一票否决条件。这样设计的原因在于：科技岗位往往天然存在跨学科特征，知识图谱中的领域标注也可能不完整。如果采用过强硬过滤，很容易误杀真实相关但标注不足的概念；而软约束更适合在保证召回的同时稳步提升排序质量。
+
+6. **概念质量最终由论文与作者证据闭环验证**  
+   标签路中的学术词不是终点，而是连接 JD、论文与作者的中间桥梁。因此，一个学术词是否真正「好」，不能只看它在 Stage2/Stage3 中的分数，还必须看它在 Stage4/Stage5 中是否能够召回主题集中、方向正确的论文，并进一步聚合出符合岗位要求的作者候选。若某个词虽然在局部语义上看似合理，但在论文层与作者层持续带来噪声，那么它就不应被视为高质量主词。换言之，标签路采用的是「概念层生成 + 对象层验证」的闭环设计。
+
+7. **可解释性与工程可控性并重**  
+   标签路不仅追求效果，也强调每一步的可解释性。锚点如何产生、候选从何而来、为何成为 primary、为何只能 keep_no_expand、为何在 Stage3 被打入 risky bucket、最终哪些词进入论文召回，这些决策应尽量能够通过日志与特征面板回溯。这样的设计既有利于调试和迭代，也有利于在毕业设计、项目答辩和后续工程优化中清晰说明系统行为，避免形成「只能看结果、无法解释过程」的黑盒链路。
+
+---
 
 **核心目的**  
 走「**岗位技能 → 学术词 → 论文 → 作者**」的图谱路径，用知识图谱 + 多维度打分，找出与 JD 技能要求在语义和共现上都对齐的学术词，再只保留领域垂直、论文质量高的论文与作者；强调硬技能/概念对齐，并抑制泛词、万金油论文和弱相关论文。实现上采用**五阶段流水线**（`label_pipeline`）与**标签子模块**（`label_means`），基础设施与索引（Neo4j、Faiss、vocab_stats.db、簇中心等）由 `label_means.infra` 统一加载与管理。
@@ -3207,7 +3248,7 @@ def stage3_filter_and_score_terms(term_candidates, active_domains):
     以下四条契约确保 Stage 2/3 与底层数据库及上层总控逻辑的物理对齐，编码阶段须严格遵循以实现「零误差」衔接。
 
     **1. 状态传递契约（Stage 1 → Stage 2）**  
-    Stage 1 输出须从简单字符串列表升级为对象列表。`stage1_domain_anchors.py` 返回的 `Stage1Result` 必须包含如下精确结构的 `PreparedAnchor`（定义于 `src/core/recall/label_path.py` 或专用 types 文件）：
+    Stage 1 输出须从简单字符串列表升级为对象列表。`stage1_domain_anchors.py` 返回的 `Stage1Result` 必须包含如下精确结构的 `PreparedAnchor`（`Stage1Result` 定义于同文件 `stage1_domain_anchors.py`）：
 
     ```python
     @dataclass

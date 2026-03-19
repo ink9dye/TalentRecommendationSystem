@@ -265,7 +265,6 @@ class VectorPath:
         return meta_list, duration
 
 
-# 修改 vector_path.py 最后的 if __name__ == "__main__": 部分
 if __name__ == "__main__":
     from src.core.recall.input_to_vector import QueryEncoder  # 确保路径正确
     from src.core.recall.label_path import LabelRecallPath
@@ -331,15 +330,17 @@ if __name__ == "__main__":
             target_domains = "|".join(sorted(active_domains)) if active_domains else None
 
             # 3. 执行召回（根据 target_domains 做领域硬过滤）
-            author_ids, duration = v_path.recall(query_vec, target_domains=target_domains, verbose=True)
+            # recall 返回与 total_recall 一致的 meta 列表：每项含 author_id / vector_score_raw / vector_rank 等
+            v_meta, duration = v_path.recall(query_vec, target_domains=target_domains, verbose=True)
 
             # 3. 打印报告
-            print(f"\n[召回报告] 耗时: {duration:.2f}ms | 命中人数: {len(author_ids)} | 应用领域: {applied_domains_str}")
+            print(f"\n[召回报告] 耗时: {duration:.2f}ms | 命中人数: {len(v_meta)} | 应用领域: {applied_domains_str}")
             print("-" * 115)
             print(f"{'排名':<6} | {'作者 ID':<12} | {'检索路径':<15} | {'代表作标题 (数据源: SQLite)'}")
             print("-" * 115)
 
-            for rank, aid in enumerate(author_ids[:20], 1):
+            for rank, item in enumerate(v_meta[:20], 1):
+                aid = item["author_id"]
                 title = get_work_title(aid)
                 if len(title) > 70: title = title[:67] + "..."
                 print(f"#{rank:<5} | {aid:<12} | {'Vector (V)':<15} | {title}")

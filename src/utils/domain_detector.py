@@ -22,6 +22,7 @@ class DomainDetector:
         detect_jobs_top_k: int = 20,
         candidate_domains_top_k: int = 5,
         active_domains_top_k: int = 3,
+        total_job_count: Optional[float] = None,
     ):
         """
         :param label_path: 可选 LabelRecallPath 实例（具备 _stage1_domain_and_anchors 方法），
@@ -32,6 +33,8 @@ class DomainDetector:
         :param detect_jobs_top_k: 领域探测时在 Job 空间检索的 Top-K。
         :param candidate_domains_top_k: 候选领域数（基于 Job 统计）。
         :param active_domains_top_k: 最终激活领域上限（用于简单裁剪）。
+        :param total_job_count: 可选，图中 Job 总数（与 LabelRecallPath.total_job_count 一致），
+                               用于 anchor_debug 中 cov_j 分母；不传时回退为 len(job_id_map)（旧行为，可能偏差）。
         """
         self._label_path = label_path
         self._graph = graph
@@ -40,6 +43,9 @@ class DomainDetector:
         self._detect_jobs_top_k = int(detect_jobs_top_k)
         self._candidate_domains_top_k = int(candidate_domains_top_k)
         self._active_domains_top_k = int(active_domains_top_k)
+        self._total_job_count = (
+            float(total_job_count) if total_job_count is not None and float(total_job_count) > 0 else None
+        )
 
     # ------------------------------------------------------------------
     # Job 空间领域探测与调试工具
@@ -47,17 +53,26 @@ class DomainDetector:
 
     def detect_from_jobs(
         self, query_vector
-    ) -> Tuple[Sequence, Sequence[str], float]:
+    ) -> Tuple[Sequence, Sequence[str], float, Sequence[Dict[str, Any]]]:
         """
-        通过 Job 向量空间与 Neo4j 统计领域分布。
+        通过 Job 向量空间与 Neo4j 统计领域分布，并生成 job_previews（少一次 Neo4j 往返）。
 
-        逻辑对应 Label 路中的 `_detect_domain_context`：
-          - 在 Job 索引中检索 Top-K 相似岗位；
-          - 根据这些岗位的 domain_ids 频次统计候选领域；
-          - 返回候选 Job ID 列表、候选领域 ID 列表以及主导领域占比。
+        逻辑对应 Label 路中的 `_detect_domain_context` + `get_job_previews` 合并：
+          - Faiss 检索 Top-K 岗位 id；
+          - **单次** MATCH Job 取 domain_ids + name + description；
+          - domain_counter 按 **Faiss 返回的 candidate_ids 顺序**逐 id 聚合（与「先 Counter 再 most_common」在集合上同构，因 Counter 与遍历顺序无关）；
+          - job_previews 仅前 20 个 id，字段/截断与 `get_job_previews` 一致；列表顺序改为 **Faiss 序**（原实现为 Neo4j 返回序，仅影响诊断展示，不改变领域计数/inferred/dominance）。
+
+        返回: (candidate_ids, inferred_domain_ids, dominance, job_previews)
         """
+        empty_prev: Tuple[Sequence, Sequence[str], float, Sequence[Dict[str, Any]]] = (
+            [],
+            [],
+            0.0,
+            [],
+        )
         if self._job_index is None or not self._job_id_map or self._graph is None:
-            return [], [], 0.0
+            return empty_prev
 
         k = self._detect_jobs_top_k
         _, indices = self._job_index.search(query_vector, k)
@@ -66,14 +81,27 @@ class DomainDetector:
             for idx in indices[0]
             if 0 <= idx < len(self._job_id_map)
         ]
+        if not candidate_ids:
+            return empty_prev
+
+        # -----------------------------------------------------------------
+        # Neo4j 单次往返（谨慎合并，见上 docstring）：原 2 次「MATCH Job WHERE id IN」
+        # 合并为 1 次；RETURN 列并集 = 原两次查询所需字段。
+        # Faiss 侧：仍 1 次 search，行为不变。
+        # -----------------------------------------------------------------
+        rows = list(
+            self._graph.run(
+                "MATCH (j:Job) WHERE j.id IN $j_ids "
+                "RETURN j.id AS id, j.domain_ids AS d_ids, j.name AS name, j.description AS desc",
+                j_ids=list(candidate_ids),
+            )
+        )
+        row_by_id = {r["id"]: r for r in rows}
 
         domain_counter = collections.Counter()
-        cursor = self._graph.run(
-            "MATCH (j:Job) WHERE j.id IN $j_ids RETURN j.domain_ids AS d_ids",
-            j_ids=candidate_ids,
-        )
-        for row in cursor:
-            if row["d_ids"]:
+        for jid in candidate_ids:
+            row = row_by_id.get(jid)
+            if row and row.get("d_ids"):
                 for d in DomainProcessor.to_set(row["d_ids"]):
                     domain_counter[d] += 1
 
@@ -82,7 +110,25 @@ class DomainDetector:
         dominance = (
             domain_counter.most_common(1)[0][1] / float(k) if domain_counter else 0.0
         )
-        return candidate_ids, inferred, dominance
+
+        max_snippet = 200
+        job_previews: list[Dict[str, Any]] = []
+        for jid in list(candidate_ids)[:20]:
+            row = row_by_id.get(jid)
+            if not row:
+                continue
+            desc = (row.get("desc") or "") or ""
+            if isinstance(desc, str) and len(desc) > max_snippet:
+                desc = desc[:max_snippet] + "..."
+            job_previews.append(
+                {
+                    "id": row.get("id"),
+                    "name": (row.get("name") or "")[:80],
+                    "description_snippet": desc,
+                }
+            )
+
+        return candidate_ids, inferred, dominance, job_previews
 
     def get_job_previews(
         self, job_ids: Sequence, max_snippet: int = 200
@@ -130,6 +176,8 @@ class DomainDetector:
         if not job_ids or self._graph is None or total_j <= 0:
             return {}
         try:
+            # 仍为 2 次 Neo4j：per_job 与全局 cov_j 的聚合粒度不同，合并为单条 Cypher
+            # 易误合并子查询结果集；此处仅保留注释供后续审计。
             cursor = self._graph.run(
                 """
                 MATCH (j:Job) WHERE j.id IN $j_ids
@@ -207,13 +255,17 @@ class DomainDetector:
         # 2.1 优先使用独立 Job 探测模式（graph + job_index 可用时）
         if self._job_index is not None and self._graph is not None and self._job_id_map:
             try:
-                job_ids, inferred, dominance = self.detect_from_jobs(query_vector)
+                job_ids, inferred, dominance, job_previews = self.detect_from_jobs(
+                    query_vector
+                )
                 # 激活领域集合：简单地裁剪到 active_domains_top_k
                 active = set(list(inferred)[: self._active_domains_top_k])
-                job_previews = self.get_job_previews(job_ids)
-                anchor_debug = self.get_anchor_debug_stats(
-                    job_ids, total_j=float(len(self._job_id_map) or 1.0)
+                tj = (
+                    self._total_job_count
+                    if self._total_job_count is not None
+                    else float(len(self._job_id_map) or 1.0)
                 )
+                anchor_debug = self.get_anchor_debug_stats(job_ids, total_j=float(tj))
                 stage1_debug = {
                     "source": "auto_job_space",
                     "job_ids": job_ids,

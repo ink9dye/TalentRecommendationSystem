@@ -533,6 +533,11 @@ def encode_text_with_optional_cache(
     return v
 
 
+# S1 anchor_ctx：单次 encode_batch 过大时按块切分；每行仍走 QueryEncoder.encode_batch 路径，
+# 与「把 unique_raws 一次性传入 encode_batch」在 SentenceTransformer 下逐样本一致（无跨样本交互）。
+_ANCHOR_CTX_PREFILL_ENCODE_CHUNK = 64
+
+
 def prefill_encode_cache_for_anchor_ctx(
     encoder: Any,
     anchor_skills: Dict[str, Any],
@@ -541,10 +546,13 @@ def prefill_encode_cache_for_anchor_ctx(
 ) -> None:
     """
     在 build_conditioned_anchor_representation 循环前，收集本 JD 下所有待编码短文本，
-    按「共振后字符串」去重后 encode_batch 一次并写入 encode_cache（键与 lookup_or_encode 一致）。
-    数值与逐条 encode 等价，显著减少 S1 anchor_ctx 的模型前向次数。
+    按「共振后字符串」去重后 encode_batch 写入 encode_cache（键与 lookup_or_encode 一致）。
+    数值与逐条 encode/lookup_or_encode 等价，显著减少 S1 anchor_ctx 的模型前向次数。
+
+    注意：encode_cache 允许为空 dict（例如 JD 片段编码失败时）；仍会预填锚点/局部/共现串，
+    不得因「缓存尚空」整段跳过，否则退化为每锚点多次 forward。
     """
-    if not raw_text or not anchor_skills or encoder is None or not encode_cache:
+    if encode_cache is None or not raw_text or not anchor_skills or encoder is None:
         return
     if not hasattr(encoder, "encode_batch") or not hasattr(encoder, "_apply_dynamic_resonance"):
         return
@@ -591,13 +599,16 @@ def prefill_encode_cache_for_anchor_ctx(
     if not unique_raws:
         return
 
-    batch = encoder.encode_batch(unique_raws)
-    if batch.shape[0] != len(unique_raws):
-        return
-    for i, raw in enumerate(unique_raws):
-        enh = encoder._apply_dynamic_resonance(raw)
-        row = np.asarray(batch[i], dtype=np.float32).reshape(1, -1).copy()
-        encode_cache[enh] = row
+    chunk_sz = max(1, int(_ANCHOR_CTX_PREFILL_ENCODE_CHUNK))
+    for off in range(0, len(unique_raws), chunk_sz):
+        chunk = unique_raws[off : off + chunk_sz]
+        batch = encoder.encode_batch(chunk)
+        if batch.shape[0] != len(chunk):
+            return
+        for i, raw in enumerate(chunk):
+            enh = encoder._apply_dynamic_resonance(raw)
+            row = np.asarray(batch[i], dtype=np.float32).reshape(1, -1).copy()
+            encode_cache[enh] = row
 
 
 def build_conditioned_anchor_representation(

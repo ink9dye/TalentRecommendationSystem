@@ -58,6 +58,7 @@ from src.core.recall.label_means.simple_factors import (
 from src.core.recall.label_means import advanced_metrics as label_means_adv, label_anchors, label_expansion
 from src.core.recall.label_means.infra import LabelMeansInfra
 from src.core.recall.label_means import term_scoring
+from src.core.recall.label_pipeline.stage1_domain_anchors import Stage1Result
 from src.core.recall.label_pipeline import (
     stage1_domain_anchors,
     stage2_expansion,
@@ -65,22 +66,6 @@ from src.core.recall.label_pipeline import (
     stage4_paper_recall,
     stage5_author_rank,
 )
-
-
-@dataclass
-class Stage1Result:
-    """
-    阶段 1 结构化结果壳，用于逐步解耦领域与锚点阶段的中间状态。
-    含 jd_profile（四层领域画像）供 Stage2 层级守卫使用。
-    """
-    active_domains: Set[int]
-    domain_regex: str
-    anchor_skills: Dict[Any, Any]
-    job_ids: List[int]
-    job_previews: List[Dict[str, Any]]
-    dominance: float
-    anchor_debug: Dict[str, Any]
-    jd_profile: Optional[Dict[str, Any]] = None  # domain/field/subfield/topic_weights, active_*, main_*
 
 
 @dataclass
@@ -253,6 +238,7 @@ class LabelRecallPath:
                 detect_jobs_top_k=self.DETECT_JOBS_TOP_K,
                 candidate_domains_top_k=self.CANDIDATE_DOMAINS_TOP_K,
                 active_domains_top_k=self.ACTIVE_DOMAINS_TOP_K,
+                total_job_count=float(self.total_job_count),
             )
         except Exception:
             self.domain_detector = None

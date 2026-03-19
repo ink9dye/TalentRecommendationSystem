@@ -1,6 +1,7 @@
 import re
 import time
-from typing import Any, Dict, List, Set, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -12,7 +13,23 @@ from src.core.recall.label_means.hierarchy_guard import parse_json_dist
 from src.core.recall.label_means.label_debug import debug_print
 from src.utils.domain_utils import DomainProcessor
 from src.utils.tools import extract_skills
-from src.core.recall.label_path import Stage1Result
+
+
+@dataclass
+class Stage1Result:
+    """
+    阶段 1 结构化结果壳，用于逐步解耦领域与锚点阶段的中间状态。
+    含 jd_profile（四层领域画像）供 Stage2 层级守卫使用。
+    """
+
+    active_domains: Set[int]
+    domain_regex: str
+    anchor_skills: Dict[Any, Any]
+    job_ids: List[int]
+    job_previews: List[Dict[str, Any]]
+    dominance: float
+    anchor_debug: Dict[str, Any]
+    jd_profile: Optional[Dict[str, Any]] = None  # domain/field/subfield/topic_weights, active_*, main_*
 
 
 def attach_anchor_contexts(
@@ -126,37 +143,55 @@ def build_jd_hierarchy_profile(
     all_subfield: Dict[str, float] = {}
     all_topic: Dict[str, float] = {}
     total_weight = 0.0
-    # (tid, weight) 保留锚点×相似词的多重贡献，与原先逐条 SQL 语义一致
+    # (tid, weight) 保留锚点×相似词的多重贡献
     tid_weight_pairs: List[Tuple[int, float]] = []
-    for vid_str, info in (anchor_skills or {}).items():
+
+    anchor_vids: List[int] = []
+    for vid_str in (anchor_skills or {}):
         try:
-            anchor_vid = int(vid_str)
+            anchor_vids.append(int(vid_str))
         except (TypeError, ValueError):
             continue
+    # -------------------------------------------------------------------------
+    # Neo4j：由「每锚点 1 次 MATCH + LIMIT k」改为「全锚点 1 次 IN + Python 侧每 src 取 top-k」
+    # 等价性（指标/语义/数据）：
+    #   - 过滤：与原 Cypher 相同 — v.id 锚定、r.score>=0.5、v2.type in concept/keyword。
+    #   - 每锚点的 top-k：按 r.score DESC 取前 k 条；与 per-anchor ORDER BY score DESC LIMIT k
+    #     一致，除非多条边 score  bitwise 完全相等（Neo4j 未保证并列次序），对加权聚合影响可忽略。
+    #   - 返回的 (tid, w) 多重集合与原 N 次查询的并集一致（含同一 tid 被多锚点命中）。
+    # -------------------------------------------------------------------------
+    if anchor_vids:
         try:
-            rows = recall.graph.run(
+            from itertools import groupby
+
+            sim_rows = recall.graph.run(
                 """
-                MATCH (v:Vocabulary {id: $vid})-[r:SIMILAR_TO]->(v2:Vocabulary)
-                WHERE r.score >= 0.5 AND coalesce(v2.type, 'concept') IN ['concept', 'keyword']
-                RETURN v2.id AS tid, r.score AS s
-                ORDER BY r.score DESC
-                LIMIT $k
+                MATCH (v:Vocabulary)-[r:SIMILAR_TO]->(v2:Vocabulary)
+                WHERE v.id IN $vids AND r.score >= 0.5
+                  AND coalesce(v2.type, 'concept') IN ['concept', 'keyword']
+                RETURN v.id AS src_vid, v2.id AS tid, r.score AS s
+                ORDER BY src_vid, s DESC
                 """,
-                vid=anchor_vid,
-                k=SIMILAR_TOP_K,
+                vids=anchor_vids,
             ).data()
+            for _src_key, group in groupby(
+                sim_rows or [],
+                key=lambda x: x.get("src_vid"),
+            ):
+                for i, r in enumerate(group):
+                    if i >= SIMILAR_TOP_K:
+                        break
+                    tid = r.get("tid")
+                    if tid is None:
+                        continue
+                    try:
+                        tid_i = int(tid)
+                    except (TypeError, ValueError):
+                        continue
+                    w = float(r.get("s") or 0.5)
+                    tid_weight_pairs.append((tid_i, w))
         except Exception:
-            continue
-        for r in rows:
-            tid = r.get("tid")
-            if tid is None:
-                continue
-            try:
-                tid = int(tid)
-            except (TypeError, ValueError):
-                continue
-            w = float(r.get("s") or 0.5)
-            tid_weight_pairs.append((tid, w))
+            tid_weight_pairs = []
 
     unique_tids = {t for t, _ in tid_weight_pairs}
     topic_map, domain_dist_map = _batch_load_vocabulary_stats_for_tids(recall, unique_tids)
