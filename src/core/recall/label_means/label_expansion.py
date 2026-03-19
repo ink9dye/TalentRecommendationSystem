@@ -30,6 +30,8 @@ from src.core.recall.label_means.label_debug import debug_print
 # ---------- Stage2/3 保守常量：单一决策链，无冗余阈值（详见 README） ----------
 LABEL_EXPANSION_DEBUG = True  # 调试时打印 Stage2A/2B 流程
 STAGE2_VERBOSE_DEBUG = True   # True 时输出 Stage2 详细工整表格，便于调试
+# 关键裁决点：primary 因子 / dense·cooc 漏斗（可与 STAGE2_VERBOSE_DEBUG 独立开关）
+STAGE2_RULING_DEBUG = True
 
 
 def _stage2_header(title: str, char: str = "=") -> None:
@@ -124,7 +126,32 @@ STAGE2A_JD_OK = 0.74             # 与 STAGE2A_WEAK_TECH_JD_MIN 一致，主线 
 STAGE2A_CTX_FLOOR = 0.42         # 双路/静态时 context_sim 最低可用线
 STAGE2A_CTX_DROP_TOL = 0.08      # 静态强匹配允许 context_sim 略低于 semantic_score 的容差
 STAGE2A_PRIMARY_KEEP_MIN = 0.20  # 保守留存门槛（= WEAK_KEEP_MIN），低于则 reject
-SEED_SCORE_MIN = 0.50              # Stage2B seed 门槛：仅消费 can_expand + primary_score≥此
+SEED_SCORE_MIN = 0.50              # Stage2B：check_seed 通过后按 seed_score≥此裁剪（仅 can_expand_from_2a 可过 check）
+
+# ---------- Stage2 最小收尾：primary（宽）与 expand（严）解耦 + 空锚 fallback ----------
+# primary：禁止「仅 static 高相似 + 无 conditioned_sim」冒充主线（ctx_drop=0 不算支持）
+STAGE2A_CONDITIONED_SIM_EPS = 1e-6  # conditioned_sim 存在且 > 此视为「真实上下文纠偏分」
+STAGE2A_PRIMARY_MIN_SIM = 0.38
+STAGE2A_PRIMARY_MAX_CTX_DROP = 0.14
+STAGE2A_PRIMARY_MIN_CTX_SIM = 0.36  # 真实 conditioned 路径下 ctx 下限
+STAGE2A_PRIMARY_DUAL_MIN_CTX = 0.34  # dual_support 且已有 conditioned 时略宽
+STAGE2A_PRIMARY_MULTI_MIN_FAMILY = 0.46  # 多锚救援：仅 similar_to 无 ctx 时，须更高 family 一致性
+# expand：无 conditioned_sim → 默认不可扩；且挡 object/generic/poly 旁枝
+STAGE2A_EXPAND_MIN_CTX_SIM = 0.46
+STAGE2A_EXPAND_DUAL_MIN_CTX = 0.46
+STAGE2A_EXPAND_MULTI_MIN_CTX = 0.47
+STAGE2A_EXPAND_MAX_CTX_DROP = 0.10
+STAGE2A_EXPAND_MAX_OBJECT_LIKE = 0.38
+STAGE2A_EXPAND_MAX_GENERIC_RISK = 0.46
+STAGE2A_EXPAND_MAX_POLY_RISK = 0.54
+# 单锚无 multi、dual 标志异常时：仅当 conditioned 极强 + family 够稳才给 expandable
+STAGE2A_EXPAND_SOLO_STRONG_CTX = 0.52
+STAGE2A_EXPAND_SOLO_MIN_FAMILY = 0.50
+# 仅当本锚点 0-primary 时，对高质量 canonical 锚点做一条「保线」fallback（不扩、交 Stage3）
+STAGE2A_FALLBACK_ANCHOR_MIN_SCORE = 0.35
+STAGE2A_FALLBACK_MIN_LOCAL_HITS = 1
+STAGE2A_FALLBACK_MIN_CO_HITS = 1
+STAGE2A_FALLBACK_MIN_SIM = 0.32
 
 # ---------- Stage2A 准入：仅两个门槛 + source 折扣，不再按 source 分多套阈值 ----------
 PRIMARY_MIN_HIERARCHY_MATCH = 0.30   # hierarchy_match = 0.4*topic + 0.4*path + 0.2*subfield，effective = hierarchy_match * source_factor
@@ -358,7 +385,9 @@ class Stage2ACandidate:
 
     # 最终标签（由 select_primary_per_anchor 设置）
     survive_primary: bool = False
-    can_expand: bool = False
+    can_expand: bool = False  # 与 can_expand_from_2a 同步：仅 primary_expandable 为 True
+    can_expand_from_2a: bool = False  # 唯一 Stage2B 扩散权标记（强主线）
+    fallback_primary: bool = False  # anchor_core_fallback：保线不交 2B 扩
     reject_reason: Optional[str] = None
     role: Optional[str] = None  # mainline | side | off | unknown
     role_in_anchor: Optional[str] = None  # mainline | side | dropped（与 role 同步）
@@ -1303,10 +1332,10 @@ def check_seed_eligibility(
     jd_profile: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, float, Optional[str]]:
     """
-    Stage2B 唯一 seed 决策入口：
-    - 2A 已认定 can_expand=True 的高质量 primary，优先放行
-    - context_gain 只做软修正
-    返回 (eligible, seed_score, block_reason)。
+    Stage2B 唯一 seed 决策入口（最小收尾版）：
+    - 仅当 Stage2A 标记 can_expand_from_2a=True（primary_expandable）时可扩散
+    - fallback_primary / keep_no_expand 一律不扩
+    - 仍做语义错配硬挡；seed_score 用于 eligible 后的排序裁剪（SEED_SCORE_MIN）
     """
     identity = float(getattr(p, "identity_score", 0.0) or 0.0)
     anchor_identity = float(getattr(p, "anchor_identity_score", identity) or identity)
@@ -1315,10 +1344,12 @@ def check_seed_eligibility(
     context_gain = float(getattr(p, "context_gain", 0.0) or 0.0)
 
     src = (getattr(p, "source", "") or getattr(p, "source_type", "") or "").strip().lower()
-    retain_mode = getattr(p, "retain_mode", "normal") or "normal"
-    suppress_seed = bool(getattr(p, "suppress_seed", True))
     can_expand = bool(getattr(p, "can_expand", getattr(p, "expandable", False)))
-    support_count = int(getattr(p, "cross_anchor_support_count", 1) or 1)
+    _cec_raw = getattr(p, "can_expand_from_2a", None)
+    if _cec_raw is None:
+        can_expand_from_2a = can_expand
+    else:
+        can_expand_from_2a = bool(_cec_raw)
 
     anchor_text = getattr(p, "anchor_term", "") or ""
     primary_term = getattr(p, "term", "") or ""
@@ -1330,87 +1361,42 @@ def check_seed_eligibility(
         ctx_sim_val = float(ctx_sim_val)
     ctx_drop_str = f"{static_sim - ctx_sim_val:.3f}" if (ctx_sim_val is not None and static_sim is not None) else "N/A"
     source_type_str = getattr(p, "source_type", None) or src or ""
-    source_has_similar_to = "similar_to" in source_type_str
 
     # --------------------------------------------------
-    # 0. 先尊重 2A
+    # 0. 仅强主线可 seed
     # --------------------------------------------------
-    if not can_expand:
-        block_reason = "stage2a_not_expandable"
+    if getattr(p, "fallback_primary", False):
+        block_reason = "fallback_primary_no_expand"
         _print_stage2b_seed_factors(
-            anchor_text, primary_term, can_expand, source_type_str, dual_support,
+            anchor_text, primary_term, can_expand_from_2a, source_type_str, dual_support,
             static_sim, ctx_sim_val, ctx_drop_str, False, False, block_reason,
         )
+        setattr(p, "seed_eligible", False)
+        setattr(p, "seed_block_reason", block_reason)
         return False, 0.0, block_reason
 
-    if retain_mode != "normal" or suppress_seed:
-        block_reason = "weak_primary_no_expand"
+    if not can_expand_from_2a:
+        block_reason = "stage2a_not_expandable"
         _print_stage2b_seed_factors(
-            anchor_text, primary_term, can_expand, source_type_str, dual_support,
+            anchor_text, primary_term, can_expand_from_2a, source_type_str, dual_support,
             static_sim, ctx_sim_val, ctx_drop_str, False, False, block_reason,
         )
+        setattr(p, "seed_eligible", False)
+        setattr(p, "seed_block_reason", block_reason)
         return False, 0.0, block_reason
 
     if is_semantic_mismatch_seed(anchor_text, primary_term):
         block_reason = "semantic_mismatch_seed"
         _print_stage2b_seed_factors(
-            anchor_text, primary_term, can_expand, source_type_str, dual_support,
+            anchor_text, primary_term, can_expand_from_2a, source_type_str, dual_support,
             static_sim, ctx_sim_val, ctx_drop_str, False, False, block_reason,
         )
+        setattr(p, "seed_eligible", False)
+        setattr(p, "seed_block_reason", block_reason)
         return False, 0.0, block_reason
 
     # --------------------------------------------------
-    # 1. 新的 seed 判定：对 2A 高质量主线词更顺畅放行
-    # --------------------------------------------------
-    direct_seed_ok = (
-        can_expand
-        and primary_score >= SEED_SCORE_MIN
-        and anchor_identity >= 0.50
-        and jd_align >= 0.72
-    )
-
-    dual_support_seed = (
-        dual_support
-        and can_expand
-        and primary_score >= 0.45
-        and anchor_identity >= 0.48
-        and jd_align >= 0.72
-    )
-
-    strong_static_seed = (
-        source_has_similar_to
-        and can_expand
-        and anchor_identity >= 0.52
-        and primary_score >= 0.48
-        and jd_align >= 0.72
-    )
-
-    cross_anchor_seed = (
-        support_count >= 2
-        and can_expand
-        and anchor_identity >= 0.45
-        and primary_score >= 0.44
-        and jd_align >= 0.70
-    )
-
-    final_eligible = (
-        direct_seed_ok
-        or dual_support_seed
-        or strong_static_seed
-        or cross_anchor_seed
-    )
-
-    if not final_eligible:
-        block_reason = "primary_not_expandable"
-        _print_stage2b_seed_factors(
-            anchor_text, primary_term, can_expand, source_type_str, dual_support,
-            static_sim, ctx_sim_val, ctx_drop_str,
-            strong_static_seed, final_eligible, block_reason,
-        )
-        return False, 0.0, block_reason
-
-    # --------------------------------------------------
-    # 2. context_gain 只做软修正
+    # 1. context_gain 软修正（仅影响 seed_score）
     # --------------------------------------------------
     if context_gain >= 0.03:
         ctx_bonus = 0.05
@@ -1423,9 +1409,6 @@ def check_seed_eligibility(
     else:
         ctx_bonus = -0.06
 
-    # --------------------------------------------------
-    # 3. seed_score：尽量保持现有风格
-    # --------------------------------------------------
     seed_score = (
         0.45 * primary_score
         + 0.25 * anchor_identity
@@ -1436,15 +1419,17 @@ def check_seed_eligibility(
     seed_score = max(0.0, min(1.0, seed_score))
 
     _print_stage2b_seed_factors(
-        anchor_text, primary_term, can_expand, source_type_str, dual_support,
+        anchor_text, primary_term, can_expand_from_2a, source_type_str, dual_support,
         static_sim, ctx_sim_val, ctx_drop_str,
-        strong_static_seed, final_eligible, None,
+        False, True, None,
     )
     if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
         print(
             f"[Stage2B final seed gate] anchor={anchor_text!r} term={primary_term!r} "
             f"eligible=True seed_score={seed_score:.3f} block_reason=None"
         )
+    setattr(p, "seed_eligible", True)
+    setattr(p, "seed_block_reason", None)
     return True, seed_score, None
 
 
@@ -1486,6 +1471,11 @@ def _anchor_skills_to_prepared_anchors(label, anchor_skills: Dict[str, Any]) -> 
             jd_snippet=jd_snippet,
             surface_vec=surface_vec,
         )
+        if info.get("final_anchor_score") is not None:
+            try:
+                setattr(pa, "final_anchor_score", float(info.get("final_anchor_score")))
+            except (TypeError, ValueError):
+                setattr(pa, "final_anchor_score", 0.0)
         out.append(pa)
     return out
 
@@ -2373,16 +2363,275 @@ def _should_hard_reject_stage2a_candidate(cand: Any) -> Tuple[bool, str]:
     return False, ""
 
 
+def _stage2a_static_ctx_for_primary_expand_split(c: "Stage2ACandidate") -> Tuple[float, float, float, float]:
+    """双路相似度：static=semantic_score，ctx 优先 conditioned_sim，否则 context_sim / context_continuity。"""
+    static_sim = float(getattr(c, "semantic_score", 0.0) or 0.0)
+    cs = getattr(c, "conditioned_sim", None)
+    if cs is not None:
+        ctx_sim = float(cs)
+    else:
+        ctx_raw = getattr(c, "context_sim", None)
+        if ctx_raw is None:
+            ctx_raw = getattr(c, "context_continuity", 0)
+        ctx_sim = float(ctx_raw) if ctx_raw is not None else 0.0
+    if static_sim > 0 and ctx_sim > 0:
+        ctx_drop = max(0.0, static_sim - ctx_sim)
+    else:
+        ctx_drop = 0.0
+    best_sim = max(static_sim, ctx_sim)
+    return static_sim, ctx_sim, ctx_drop, best_sim
+
+
+def _stage2a_has_real_conditioned_sim(c: "Stage2ACandidate") -> bool:
+    """仅图/合并产出的 conditioned_sim 算「真实上下文纠偏」；无则不得靠 ctx_drop=0 当支持。"""
+    cs = getattr(c, "conditioned_sim", None)
+    if cs is None:
+        return False
+    try:
+        return float(cs) > STAGE2A_CONDITIONED_SIM_EPS
+    except (TypeError, ValueError):
+        return False
+
+
+def judge_primary_and_expandability(c: "Stage2ACandidate") -> Tuple[str, str, Dict[str, Any]]:
+    """
+    单候选：primary 资格与 expand 资格解耦。
+    primary：须（真实 conditioned 上下文合格）或（多锚 + 高 family）或（双路 + conditioned 合格）；
+    禁止仅凭 static 相似 + 无 conditioned 进主线。
+    expand：必须有真实 conditioned_sim，且 ctx 阈值更高，且非 object/generic/poly 旁枝型。
+    返回 (bucket, reason, snapshot) 供 [Stage2A primary factors] 与 expand 调试打印。
+    """
+    rr = getattr(c, "reject_reason", None) or getattr(c, "stage2a_hard_reject_reason", None) or ""
+    if rr in ("obviously_bad_branch", "object_or_poly_bad_branch", "semantic_drift_branch"):
+        return "reject", "bad_branch", {"prior_reject_reason": rr, "bad_branch": True}
+
+    static_sim = float(getattr(c, "semantic_score", 0.0) or 0.0)
+    has_real_ctx = _stage2a_has_real_conditioned_sim(c)
+    ctx_sim = float(getattr(c, "conditioned_sim", 0.0) or 0.0) if has_real_ctx else 0.0
+    if static_sim > 0 and ctx_sim > 0:
+        ctx_drop = max(0.0, static_sim - ctx_sim)
+    else:
+        ctx_drop = 0.0
+    best_sim = max(static_sim, ctx_sim) if has_real_ctx else static_sim
+
+    dual_support = bool(getattr(c, "dual_support", False))
+    support_count = int(getattr(c, "cross_anchor_support_count", 1) or 1)
+    multi_anchor_ok = support_count >= 2
+    family_match = float(getattr(c, "family_match", 0) or getattr(c, "anchor_identity_score", 0) or 0.0)
+
+    semantic_ok = best_sim >= STAGE2A_PRIMARY_MIN_SIM
+    drop_ok_primary = (static_sim <= STAGE2A_CONDITIONED_SIM_EPS) or (ctx_drop <= STAGE2A_PRIMARY_MAX_CTX_DROP)
+
+    ctx_path_ok = (
+        has_real_ctx
+        and ctx_sim >= STAGE2A_PRIMARY_MIN_CTX_SIM
+        and drop_ok_primary
+    )
+    structural_multi = (
+        multi_anchor_ok
+        and (not has_real_ctx)
+        and family_match >= STAGE2A_PRIMARY_MULTI_MIN_FAMILY
+        and static_sim >= STAGE2A_PRIMARY_MIN_SIM
+    )
+    structural_dual = (
+        dual_support
+        and has_real_ctx
+        and ctx_sim >= STAGE2A_PRIMARY_DUAL_MIN_CTX
+        and drop_ok_primary
+    )
+
+    primary_ok = semantic_ok and (ctx_path_ok or structural_multi or structural_dual)
+    snap0: Dict[str, Any] = {
+        "static_sim": static_sim,
+        "ctx_sim": ctx_sim,
+        "ctx_drop": ctx_drop,
+        "ctx_present": has_real_ctx,
+        "best_sim": best_sim,
+        "dual_support": dual_support,
+        "multi_anchor_ok": multi_anchor_ok,
+        "family_match": family_match,
+        "semantic_ok": semantic_ok,
+        "context_path_ok": ctx_path_ok,
+        "structural_multi": structural_multi,
+        "structural_dual": structural_dual,
+        "primary_ok": primary_ok,
+        "drop_ok_primary": drop_ok_primary,
+    }
+    if not primary_ok:
+        return "reject", "not_primary_enough", snap0
+
+    # ---------- expand：强上下文主线；无真实 conditioned → 不扩 ----------
+    if getattr(c, "family_fallback_only", False) or not has_real_ctx:
+        snap0["expand_block"] = "no_real_conditioned_or_family_fallback"
+        return "primary_keep_no_expand", "usable_mainline_no_expand", snap0
+
+    drop_ok_exp = (static_sim <= STAGE2A_CONDITIONED_SIM_EPS) or (ctx_drop <= STAGE2A_EXPAND_MAX_CTX_DROP)
+    obj = float(getattr(c, "object_like_risk", 0) or 0)
+    gen = float(getattr(c, "generic_risk", 0) or 0)
+    poly = float(getattr(c, "polysemy_risk", 0) or 0)
+    branch_blocked = (
+        obj >= STAGE2A_EXPAND_MAX_OBJECT_LIKE
+        or gen >= STAGE2A_EXPAND_MAX_GENERIC_RISK
+        or poly >= STAGE2A_EXPAND_MAX_POLY_RISK
+    )
+    dual_expand_ok = dual_support and ctx_sim >= STAGE2A_EXPAND_DUAL_MIN_CTX
+    multi_expand_ok = multi_anchor_ok and ctx_sim >= STAGE2A_EXPAND_MULTI_MIN_CTX
+    solo_ctx_expand = (
+        ctx_sim >= STAGE2A_EXPAND_SOLO_STRONG_CTX
+        and family_match >= STAGE2A_EXPAND_SOLO_MIN_FAMILY
+    )
+    base_ctx_ok = ctx_sim >= STAGE2A_EXPAND_MIN_CTX_SIM
+    can_expand = base_ctx_ok and (dual_expand_ok or multi_expand_ok or solo_ctx_expand)
+    snap0.update({
+        "drop_ok_exp": drop_ok_exp,
+        "branch_blocked": branch_blocked,
+        "object_like_risk": obj,
+        "generic_risk": gen,
+        "polysemy_risk": poly,
+        "dual_expand_ok": dual_expand_ok,
+        "multi_expand_ok": multi_expand_ok,
+        "solo_ctx_expand": solo_ctx_expand,
+        "base_ctx_ok": base_ctx_ok,
+        "can_expand_from_2a": can_expand,
+        "strong_static_ok": static_sim >= STAGE2A_PRIMARY_MIN_SIM,
+        "strong_ctx_ok": has_real_ctx and ctx_sim >= STAGE2A_EXPAND_MIN_CTX_SIM,
+    })
+    if not drop_ok_exp or branch_blocked:
+        snap0["expand_block"] = "ctx_drop_or_branch_risk"
+        return "primary_keep_no_expand", "usable_mainline_no_expand", snap0
+
+    if can_expand:
+        return "primary_expandable", "good_mainline", snap0
+    snap0["expand_block"] = "ctx_thresholds_not_met"
+    return "primary_keep_no_expand", "usable_mainline_no_expand", snap0
+
+
+def _print_stage2a_primary_factors(
+    anchor: PreparedAnchor,
+    c: "Stage2ACandidate",
+    bucket: str,
+    reason: str,
+    snap: Dict[str, Any],
+) -> None:
+    """[Stage2A primary factors]：锚点下该候选为何能/不能当 primary（与 judge_primary_and_expandability 同源）。"""
+    if not (LABEL_EXPANSION_DEBUG and STAGE2_RULING_DEBUG):
+        return
+    anchor_term = getattr(anchor, "anchor", "") or ""
+    term = (getattr(c, "term", None) or "")[:48]
+    print(f"\n{'-' * 80}\n[Stage2A] Primary factors\n{'-' * 80}")
+    print(f"[Stage2A primary factors] anchor={anchor_term!r} term={term!r}")
+    if snap.get("bad_branch"):
+        print(f"  pre_gate_reject={snap.get('prior_reject_reason')!r}")
+        print(f"  primary_ok=False primary_reason={reason!r}")
+        return
+    src = getattr(c, "source_type", "") or ""
+    static_sim = snap.get("static_sim")
+    ctx_present = bool(snap.get("ctx_present"))
+    ctx_sim = snap.get("ctx_sim")
+    ctx_drop = snap.get("ctx_drop")
+    _ss = f"{float(static_sim):.3f}" if static_sim is not None else "N/A"
+    _cs = f"{float(ctx_sim):.3f}" if ctx_present and ctx_sim is not None else "N/A"
+    _cd = f"{float(ctx_drop):.3f}" if ctx_drop is not None else "N/A"
+    ctx_path_ok = bool(snap.get("context_path_ok"))
+    primary_survived = bucket != "reject"
+    print(f"  source_type={src!r}")
+    print(f"  static_sim={_ss}")
+    print(f"  ctx_sim={_cs}")
+    print(f"  ctx_present={ctx_present}")
+    print(f"  ctx_drop={_cd}")
+    print(f"  semantic_ok={snap.get('semantic_ok')}")
+    print(f"  context_ok={ctx_path_ok}")
+    print(f"  multi_anchor_ok={snap.get('multi_anchor_ok')}")
+    print(f"  local_context_hit={getattr(c, 'local_context_hit', 0)}")
+    print(f"  family_centrality={float(getattr(c, 'family_centrality', 0.0) or 0.0):.3f}")
+    print(f"  mainline_support_ok={bool(getattr(c, 'mainline_admissible', False))}")
+    print(f"  primary_ok={primary_survived}")
+    print(f"  primary_reason={reason!r}")
+    # expand 侧快照（同一候选、同源 snap）
+    ce = bool(snap.get("can_expand_from_2a", False))
+    print(f"[Stage2A expand factors] anchor={anchor_term!r} term={term!r}")
+    print(f"  can_expand_from_2a={ce}")
+    print(f"  dual_support={snap.get('dual_support')}")
+    print(f"  multi_anchor_ok={snap.get('multi_anchor_ok')}")
+    print(f"  static_sim={_ss}")
+    print(f"  ctx_sim={_cs}")
+    print(f"  ctx_drop={_cd}")
+    print(f"  strong_static_ok={snap.get('strong_static_ok', False)}")
+    print(f"  strong_ctx_ok={snap.get('strong_ctx_ok', False)}")
+    print(f"  final_expandable={ce}")
+    eb = snap.get("expand_block")
+    print(f"  expand_reason={reason!r}" + (f" | expand_block={eb!r}" if eb else ""))
+
+
+def anchor_allows_fallback_primary(anchor: PreparedAnchor) -> bool:
+    """仅对 canonical 学术锚点开放；缩写/高歧义型不允许 fallback。"""
+    at = (anchor.anchor_type or "").strip().lower()
+    if at == "acronym":
+        return False
+    if at in HIGH_AMBIGUITY_ANCHOR_TYPES:
+        return False
+    if not _is_canonical_academic_like_anchor(anchor):
+        return False
+    fa = float(getattr(anchor, "final_anchor_score", 0.0) or 0.0)
+    n_local = len(getattr(anchor, "local_phrases", None) or [])
+    n_co = len(getattr(anchor, "co_anchor_terms", None) or [])
+    strong_anchor = fa >= STAGE2A_FALLBACK_ANCHOR_MIN_SCORE
+    strong_context = (n_local >= STAGE2A_FALLBACK_MIN_LOCAL_HITS) or (n_co >= STAGE2A_FALLBACK_MIN_CO_HITS)
+    return strong_anchor or strong_context
+
+
+def pick_fallback_primary_for_anchor(
+    anchor: PreparedAnchor,
+    candidates: List["Stage2ACandidate"],
+) -> Optional["Stage2ACandidate"]:
+    """
+    本锚点在正常选主后 0-primary 时调用：从组内挑一条「最不像坏分支」的保线词，不扩、交 Stage3。
+    """
+    if not anchor_allows_fallback_primary(anchor):
+        return None
+    fallback_pool: List["Stage2ACandidate"] = []
+    for cand in candidates:
+        feat = _get_stage2a_feat(cand)
+        if _is_obviously_bad_branch_stage2a(cand, feat):
+            continue
+        static_sim, ctx_sim, ctx_drop, best_sim = _stage2a_static_ctx_for_primary_expand_split(cand)
+        if best_sim < STAGE2A_FALLBACK_MIN_SIM:
+            continue
+        fallback_score = (
+            0.50 * best_sim
+            + 0.30 * ctx_sim
+            + 0.20 * (1.0 - min(ctx_drop, 1.0))
+        )
+        setattr(cand, "fallback_score", fallback_score)
+        fallback_pool.append(cand)
+    if not fallback_pool:
+        return None
+    fallback_pool.sort(key=lambda x: float(getattr(x, "fallback_score", 0.0)), reverse=True)
+    best = fallback_pool[0]
+    best.survive_primary = True
+    best.can_expand = False
+    best.can_expand_from_2a = False
+    best.fallback_primary = True
+    best.primary_bucket = "primary_fallback_keep_no_expand"
+    best.role_in_anchor = "side"
+    best.role = "side"
+    best.admission_reason = "anchor_core_fallback"
+    best.reject_reason = None
+    setattr(best, "bucket_reason", "anchor_core_fallback")
+    setattr(best, "mainline_block_reason", "anchor_core_fallback")
+    return best
+
+
 def select_primary_per_anchor(
     anchor: PreparedAnchor,
     candidates: List["Stage2ACandidate"],
 ) -> Dict[str, List["Stage2ACandidate"]]:
     """
-    Stage2A 组内选主：
-    - primary_expandable：主线且允许扩散
-    - primary_keep_no_expand：技术上可留，但不应扩散
-    - rejected：直接拒绝
-    修正：坏组不被迫选主；仅 primary_score>=阈值且满足技术性弱保留且非 conditioned-only 漂移词才弱保留。
+    Stage2A 组内选主（最小收尾版）：
+    - primary_expandable：通过 expand 严格门，可进 Stage2B seed
+    - primary_keep_no_expand：可做 primary，但 can_expand_from_2a=False
+    - rejected：拒绝
+    primary 资格与 expand 资格在 judge_primary_and_expandability 中解耦。
     """
     if not candidates:
         return {"primary_expandable": [], "primary_keep_no_expand": [], "rejected": []}
@@ -2393,25 +2642,6 @@ def select_primary_per_anchor(
 
     for c in candidates:
         primary_score = float(getattr(c, "primary_score", 0.0) or getattr(c, "composite_rank_score", 0) or 0.0)
-        anchor_identity = float(getattr(c, "anchor_identity_score", 0) or getattr(c, "family_match", 0) or 0.0)
-        jd_align = float(getattr(c, "jd_align", 0) or getattr(c, "jd_candidate_alignment", 0.5) or 0.5)
-        context_sim_raw = getattr(c, "context_continuity", 0) or getattr(c, "context_sim", 0)
-        if context_sim_raw is None:
-            context_sim_raw = getattr(c, "conditioned_sim", None)
-        context_sim = float(context_sim_raw) if context_sim_raw is not None else 0.0
-        semantic_score = float(getattr(c, "semantic_score", 0.0) or 0.0)
-
-        dual_support = bool(getattr(c, "dual_support", False))
-        context_supported = bool(getattr(c, "ctx_supported", getattr(c, "context_supported", False)))
-        support_count = int(getattr(c, "cross_anchor_support_count", 1) or 1)
-
-        source_set = getattr(c, "source_set", None) or set()
-        source_type = (getattr(c, "source_type", None) or getattr(c, "source", "") or "").strip().lower()
-        source_has_similar_to = (
-            "similar_to" in source_type
-            or (isinstance(source_set, (set, list)) and "similar_to" in (source_set if isinstance(source_set, set) else set(source_set)))
-        )
-
         retain_mode = getattr(c, "retain_mode", "normal") or "normal"
 
         feat = _get_stage2a_feat(c)
@@ -2421,15 +2651,16 @@ def select_primary_per_anchor(
         poly_bad = flags["poly_bad"]
         object_bad = flags["object_bad"]
         ctx_ok = flags["ctx_ok"]
-        identity_ok = flags["identity_ok"]
 
         # --------------------------------------------------
-        # 0. 先处理硬拒绝
+        # 0. 先处理硬拒绝（与 pre-primary 一致）
         # --------------------------------------------------
         obvious_bad = retain_mode == "reject" or primary_score < STAGE2A_WEAK_KEEP_MIN
         if obvious_bad:
             c.primary_bucket = "reject"
             c.can_expand = False
+            c.can_expand_from_2a = False
+            c.fallback_primary = False
             c.reject_reason = "obvious_bad"
             setattr(c, "bucket_reason", "obvious_bad")
             setattr(c, "mainline_block_reason", "retain_mode_reject" if retain_mode == "reject" else "primary_score_below_weak_keep")
@@ -2439,6 +2670,8 @@ def select_primary_per_anchor(
         if obviously_bad_branch or drift_bad:
             c.primary_bucket = "reject"
             c.can_expand = False
+            c.can_expand_from_2a = False
+            c.fallback_primary = False
             c.reject_reason = "obviously_bad_branch" if obviously_bad_branch else "semantic_drift_branch"
             setattr(c, "bucket_reason", c.reject_reason)
             setattr(c, "mainline_block_reason", c.reject_reason)
@@ -2448,6 +2681,8 @@ def select_primary_per_anchor(
         if poly_bad and not ctx_ok:
             c.primary_bucket = "reject"
             c.can_expand = False
+            c.can_expand_from_2a = False
+            c.fallback_primary = False
             c.reject_reason = "polysemous_no_context"
             setattr(c, "bucket_reason", "polysemous_no_context")
             setattr(c, "mainline_block_reason", "polysemous_no_context")
@@ -2455,139 +2690,80 @@ def select_primary_per_anchor(
             continue
 
         # --------------------------------------------------
-        # 1. mainline_candidate：保持原本的「放宽主线判定」
+        # 1. primary / expand 解耦判定
         # --------------------------------------------------
-        mainline_candidate = (
-            identity_ok
-            or (anchor_identity >= STAGE2A_ID_WEAK and jd_align >= STAGE2A_JD_OK)
-            or (dual_support and ctx_ok)
-        )
-        setattr(c, "is_good_mainline", mainline_candidate)
+        bucket, reason, p_snap = judge_primary_and_expandability(c)
+        static_sim, ctx_sim, ctx_drop, _best = _stage2a_static_ctx_for_primary_expand_split(c)
+        setattr(c, "is_good_mainline", bucket != "reject")
+        setattr(c, "_stage2a_primary_snap", p_snap)
 
-        # --------------------------------------------------
-        # 2. 可扩散判定：保留原本主干
-        # --------------------------------------------------
-        ctx_floor = max(STAGE2A_CTX_FLOOR, semantic_score - STAGE2A_CTX_DROP_TOL) if semantic_score else STAGE2A_CTX_FLOOR
-
-        strong_static_ok = (
-            source_has_similar_to
-            and anchor_identity >= STAGE2A_ID_STRONG
-            and jd_align >= STAGE2A_JD_OK
-            and context_sim >= ctx_floor
-        )
-
-        dual_route_ok = (
-            dual_support
-            and anchor_identity >= STAGE2A_ID_MAIN
-            and context_supported
-            and context_sim >= STAGE2A_CTX_FLOOR
-        )
-
-        multi_anchor_ok = (
-            support_count >= 2
-            and anchor_identity >= STAGE2A_ID_MULTI
-            and jd_align >= STAGE2A_JD_OK
-            and not poly_bad
-            and not object_bad
-        )
-
-        can_expand = (
-            mainline_candidate
-            and (dual_route_ok or strong_static_ok or multi_anchor_ok)
-        )
-
-        if getattr(c, "family_fallback_only", False):
-            can_expand = False
-
-        # --------------------------------------------------
-        # 3. 弱保留白名单（技术性弱保留，非硬编码名单）
-        # --------------------------------------------------
-        weak_but_technical_keep = (
-            (not can_expand)
-            and (not poly_bad)
-            and (not object_bad)
-            and (
-                mainline_candidate
-                or (
-                    source_has_similar_to
-                    and anchor_identity >= 0.40
-                    and jd_align >= STAGE2A_JD_OK
-                )
-            )
-        )
-
-        # conditioned-only 又无主线支撑时，不允许靠分数硬留
-        conditioned_only_no_mainline = (
-            (not source_has_similar_to)
-            and (not dual_support)
-            and (support_count <= 1)
-            and (not mainline_candidate)
-        )
+        if LABEL_EXPANSION_DEBUG and STAGE2_RULING_DEBUG:
+            _print_stage2a_primary_factors(anchor, c, bucket, reason, p_snap)
 
         if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
             anchor_term = getattr(anchor, "anchor", "") or ""
             term_short = (getattr(c, "term", None) or "")[:28]
-            ctx_drop_val = (semantic_score - context_sim) if (semantic_score and context_sim is not None) else None
-            ctx_drop_str = f"{ctx_drop_val:.3f}" if ctx_drop_val is not None else "N/A"
-            expandable_block_reason = "" if can_expand else (
-                "expand_rule_too_strict" if mainline_candidate else "not_mainline_candidate"
-            )
             print(
-                f"[Stage2A expandable gate] anchor={anchor_term!r} term={term_short!r}\n"
-                f"  dual_support={dual_support} static={semantic_score:.3f} ctx={context_sim:.3f} ctx_drop={ctx_drop_str}\n"
-                f"  dual_route_ok={dual_route_ok} strong_static_ok={strong_static_ok} multi_anchor_ok={multi_anchor_ok} final_expandable={can_expand}\n"
-                f"  block_reason={expandable_block_reason!r}"
+                f"[Stage2A primary/expand split] anchor={anchor_term!r} term={term_short!r} "
+                f"bucket={bucket!r} reason={reason!r} static={static_sim:.3f} ctx={ctx_sim:.3f} ctx_drop={ctx_drop:.3f}"
             )
 
-        # --------------------------------------------------
-        # 4. 分桶：关键修正点
-        # --------------------------------------------------
-        if can_expand:
+        if bucket == "reject":
+            c.primary_bucket = "reject"
+            c.survive_primary = False
+            c.can_expand = False
+            c.can_expand_from_2a = False
+            c.fallback_primary = False
+            c.reject_reason = reason
+            setattr(c, "bucket_reason", reason)
+            setattr(c, "mainline_block_reason", reason)
+            rejected.append(c)
+            continue
+
+        if bucket == "primary_expandable":
             c.survive_primary = True
             c.can_expand = True
+            c.can_expand_from_2a = True
+            c.fallback_primary = False
             c.primary_bucket = "primary_expandable"
             c.role_in_anchor = "mainline"
             c.role = "mainline"
-            c.admission_reason = "good_mainline"
-            setattr(c, "bucket_reason", "good_mainline")
+            c.admission_reason = reason
+            setattr(c, "bucket_reason", reason)
             primary_expandable.append(c)
             continue
 
-        if mainline_candidate:
-            c.survive_primary = True
-            c.can_expand = False
-            c.primary_bucket = "primary_keep_no_expand"
-            c.role_in_anchor = "side"
-            c.role = "side"
-            c.admission_reason = "weak_keep"
-            setattr(c, "bucket_reason", "no_expand_context_gate")
-            primary_keep_no_expand.append(c)
-            continue
-
-        # 原逻辑：只要 primary_score >= STAGE2A_PRIMARY_KEEP_MIN 就保留
-        # 现修正：必须同时满足「技术性弱保留」且不是 conditioned-only 漂移词
-        if (
-            primary_score >= STAGE2A_PRIMARY_KEEP_MIN
-            and weak_but_technical_keep
-            and not conditioned_only_no_mainline
-        ):
-            c.survive_primary = True
-            c.can_expand = False
-            c.primary_bucket = "primary_keep_no_expand"
-            c.role_in_anchor = "side"
-            c.role = "side"
-            c.admission_reason = "weak_keep"
-            setattr(c, "bucket_reason", "weak_technical_keep")
-            primary_keep_no_expand.append(c)
-            continue
-
-        # 否则直接 reject，允许该锚点 0 primary
-        c.primary_bucket = "reject"
+        # primary_keep_no_expand
+        c.survive_primary = True
         c.can_expand = False
-        c.reject_reason = "below_primary_keep_min_or_not_technical_keep"
-        setattr(c, "bucket_reason", "below_primary_keep_min_or_not_technical_keep")
-        setattr(c, "mainline_block_reason", "not_mainline_and_not_technical_keep")
-        rejected.append(c)
+        c.can_expand_from_2a = False
+        c.fallback_primary = False
+        c.primary_bucket = "primary_keep_no_expand"
+        c.role_in_anchor = "side"
+        c.role = "side"
+        c.admission_reason = reason
+        setattr(c, "bucket_reason", reason)
+        primary_keep_no_expand.append(c)
+
+    primary_expandable.sort(
+        key=lambda x: float(getattr(x, "composite_rank_score", 0) or getattr(x, "primary_score", 0) or 0.0),
+        reverse=True,
+    )
+    primary_keep_no_expand.sort(
+        key=lambda x: float(getattr(x, "composite_rank_score", 0) or getattr(x, "primary_score", 0) or 0.0),
+        reverse=True,
+    )
+    # 无 expandable 时最多保留 1 条 keep，避免弱词堆叠
+    if not primary_expandable and primary_keep_no_expand:
+        primary_keep_no_expand = primary_keep_no_expand[:1]
+
+    if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+        anchor_term = getattr(anchor, "anchor", "") or ""
+        print(
+            f"[Stage2A select] anchor={anchor_term!r} "
+            f"expandable={[x.term for x in primary_expandable]} "
+            f"keep_no_expand={[x.term for x in primary_keep_no_expand]}"
+        )
 
     return {
         "primary_expandable": primary_expandable,
@@ -2631,7 +2807,7 @@ def _init_merged_primary(cand: "Stage2ACandidate", anchor_term: str) -> Dict[str
         "support_count": 1,
         "best_rank": cand.anchor_internal_rank if getattr(cand, "anchor_internal_rank", None) is not None else 10**9,
         "mainline_hits": 1 if role == "mainline" else 0,
-        "can_expand": bool(getattr(cand, "can_expand", False)),
+        "can_expand": bool(getattr(cand, "can_expand_from_2a", getattr(cand, "can_expand", False))),
         "support_roles": [role],
         "retain_modes": [retain],
         "family_type": ft,
@@ -2665,7 +2841,9 @@ def merge_stage2a_primary(all_anchor_results: List[Dict[str, Any]]) -> List[Dict
                     if rank is not None:
                         merged[tid]["best_rank"] = min(merged[tid]["best_rank"], rank)
                     merged[tid]["mainline_hits"] += 1 if role == "mainline" else 0
-                    merged[tid]["can_expand"] = merged[tid]["can_expand"] or bool(getattr(cand, "can_expand", False))
+                    merged[tid]["can_expand"] = merged[tid]["can_expand"] or bool(
+                        getattr(cand, "can_expand_from_2a", getattr(cand, "can_expand", False))
+                    )
                     merged[tid]["support_roles"].append(role)
                     merged[tid]["retain_modes"].append(retain)
                     _update_merged_best_scores(merged[tid], cand)
@@ -2686,7 +2864,9 @@ def merge_stage2a_primary(all_anchor_results: List[Dict[str, Any]]) -> List[Dict
                 if rank is not None:
                     merged[tid]["best_rank"] = min(merged[tid]["best_rank"], rank)
                 merged[tid]["mainline_hits"] += 1 if role == "mainline" else 0
-                merged[tid]["can_expand"] = merged[tid]["can_expand"] or bool(getattr(cand, "can_expand", False))
+                merged[tid]["can_expand"] = merged[tid]["can_expand"] or bool(
+                    getattr(cand, "can_expand_from_2a", getattr(cand, "can_expand", False))
+                )
                 merged[tid]["support_roles"].append(role)
                 merged[tid]["retain_modes"].append(retain)
                 _update_merged_best_scores(merged[tid], cand)
@@ -4055,20 +4235,29 @@ def expand_from_vocab_dense_neighbors(
             _stage2b_anchor_primaries=anchor_to_primaries.get(getattr(p, "anchor_vid", 0), []),
         )
 
+        n_raw = n_src = n_sim = n_dom = n_dom_fit = n_supp = n_post_mainline = 0
+        top_raw: List[str] = []
+        top_kept: List[str] = []
+
         for score, tid in zip(scores[0], ids[0]):
-            if kept >= max_keep:
-                break
             tid = int(tid)
-            if tid <= 0 or tid in seen:
+            if tid <= 0:
+                continue
+            n_raw += 1
+            if tid in seen:
                 continue
             meta = label._vocab_meta.get(tid, ("", ""))
             term = (meta[0] or "").strip() or str(tid)
             vocab_type = meta[1] or ""
+            if len(top_raw) < 5:
+                top_raw.append(term)
             if vocab_type not in ("concept", "keyword", "") and vocab_type:
                 continue
+            n_src += 1
             sim = max(0.0, min(1.0, float(score)))
             if sim < 0.55:
                 continue
+            n_sim += 1
             if active_domain_set is not None or jd_field_ids or jd_subfield_ids or jd_topic_ids:
                 if not _term_in_active_domains(
                     label, tid,
@@ -4078,6 +4267,7 @@ def expand_from_vocab_dense_neighbors(
                     jd_topic_ids=jd_topic_ids,
                 ):
                     continue
+            n_dom += 1
             domain_fit = _compute_domain_fit(
                 label, tid,
                 active_domain_set=active_domain_set,
@@ -4087,6 +4277,7 @@ def expand_from_vocab_dense_neighbors(
             )
             if domain_fit < support_domain_min:
                 continue
+            n_dom_fit += 1
 
             keep, keep_meta = support_expandable_for_anchor(
                 label=label,
@@ -4107,6 +4298,7 @@ def expand_from_vocab_dense_neighbors(
                         f"cand_sim={sim:.3f} anchor_consistency={ac_val:.3f} family_support={fs_val:.3f} family_ok={family_ok} reason={keep_meta.get('reason')!r}"
                     )
                 continue
+            n_supp += 1
 
             if is_device_or_object_term(term) and not anchor_allows_device_expansion(anchor_term):
                 continue
@@ -4119,6 +4311,10 @@ def expand_from_vocab_dense_neighbors(
                 if row:
                     domain_span = int(row[0] or 0)
             if domain_span > DOMAIN_SPAN_EXTREME:
+                continue
+            n_post_mainline += 1
+
+            if kept >= max_keep:
                 continue
             seen.add(tid)
             keep_score = float(keep_meta.get("keep_score", sim))
@@ -4140,12 +4336,29 @@ def expand_from_vocab_dense_neighbors(
                 )
             )
             kept += 1
+            if len(top_kept) < 5:
+                top_kept.append(term)
             if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
                 print(
                     f"[stage2b_expanded] tid={tid} term={term!r} source_type=dense "
                     f"parent_anchor={p.anchor_term!r} parent_primary={p.term!r} "
                     f"score={sim:.3f} keep_score={keep_score:.3f}"
                 )
+
+        if LABEL_EXPANSION_DEBUG and STAGE2_RULING_DEBUG:
+            seed_term = getattr(p, "term", "") or ""
+            print(f"\n{'-' * 80}\n[Stage2B] Dense expansion funnel\n{'-' * 80}")
+            print(f"[Stage2B dense debug] seed={seed_term!r}")
+            print(f"  raw_neighbors={n_raw}")
+            print(f"  after_source_filter={n_src}")
+            print(f"  after_similarity_filter={n_sim}")
+            print(f"  after_domain_filter={n_dom}")
+            print(f"  after_domain_fit={n_dom_fit}")
+            print(f"  after_mainline_filter={n_supp}")
+            print(f"  after_device_domain_span={n_post_mainline}")
+            print(f"  final_kept={kept}")
+            print(f"  top_raw={top_raw}")
+            print(f"  top_kept={top_kept}")
     if LABEL_EXPANSION_DEBUG:
         sample = [c.term for c in out[:3]]
         print(f"[Stage2B] expand_from_vocab_dense_neighbors primary数={len(primary_landings)} -> dense_expansion {len(out)} 个 前3: {sample}")
@@ -4217,13 +4430,17 @@ def expand_from_cooccurrence_support(
             _stage2b_anchor_primaries=anchor_to_primaries.get(getattr(p, "anchor_vid", 0), []),
         )
         kept = 0
+        raw_cooc = len(rows)
+        n_freq3 = n_dom = n_dom_fit = n_supp = n_span_ok = 0
+        top_raw_co: List[str] = []
+        top_kept_co: List[str] = []
         for row in rows:
-            if kept >= 2:
-                break
             ta, tb, freq = row[0], row[1], row[2]
             other = (tb if ta == term else ta) or ""
             if other == term or not other:
                 continue
+            if len(top_raw_co) < 5:
+                top_raw_co.append((other.strip() or "")[:48])
             vid_other = term_to_vid.get(other.strip())
             if vid_other is None:
                 continue
@@ -4231,6 +4448,7 @@ def expand_from_cooccurrence_support(
                 continue
             if (freq or 0) < 3:
                 continue
+            n_freq3 += 1
             cooc_strength = min(1.0, float(freq or 0) / 5.0)
             if active_domain_set is not None or jd_field_ids or jd_subfield_ids or jd_topic_ids:
                 if not _term_in_active_domains(
@@ -4241,6 +4459,7 @@ def expand_from_cooccurrence_support(
                     jd_topic_ids=jd_topic_ids,
                 ):
                     continue
+            n_dom += 1
             domain_fit = _compute_domain_fit(
                 label, vid_other,
                 active_domain_set=active_domain_set,
@@ -4250,6 +4469,7 @@ def expand_from_cooccurrence_support(
             )
             if domain_fit < 0.75:
                 continue
+            n_dom_fit += 1
             keep, _ = support_expandable_for_anchor(
                 label=label,
                 anchor=anchor_stub,
@@ -4259,6 +4479,7 @@ def expand_from_cooccurrence_support(
             )
             if not keep:
                 continue
+            n_supp += 1
             domain_span = 0
             if getattr(label, "stats_conn", None):
                 r = label.stats_conn.execute(
@@ -4269,8 +4490,12 @@ def expand_from_cooccurrence_support(
                     domain_span = int(r[0] or 0)
             if domain_span > DOMAIN_SPAN_EXTREME:
                 continue
+            n_span_ok += 1
+            if kept >= 2:
+                continue
             seen.add(vid_other)
             meta = label._vocab_meta.get(vid_other, ("", ""))
+            kt = (meta[0] or other or "")[:48]
             out.append(
                 ExpandedTermCandidate(
                     vid=vid_other,
@@ -4287,6 +4512,21 @@ def expand_from_cooccurrence_support(
                 )
             )
             kept += 1
+            if len(top_kept_co) < 5:
+                top_kept_co.append(kt)
+
+        if LABEL_EXPANSION_DEBUG and STAGE2_RULING_DEBUG:
+            print(f"\n{'-' * 80}\n[Stage2B] Co-occurrence funnel\n{'-' * 80}")
+            print(f"[Stage2B cooc debug] seed={term!r}")
+            print(f"  raw_cooc={raw_cooc}")
+            print(f"  after_purity_filter={n_freq3}")
+            print(f"  after_domain_filter={n_dom}")
+            print(f"  after_score_filter={n_dom_fit}")
+            print(f"  after_support_gate={n_supp}")
+            print(f"  after_domain_span={n_span_ok}")
+            print(f"  final_kept={kept}")
+            print(f"  top_raw={top_raw_co}")
+            print(f"  top_kept={top_kept_co}")
     if LABEL_EXPANSION_DEBUG:
         sample = [c.term for c in out[:3]] if out else []
         print(f"[Stage2B] expand_from_cooccurrence_support primary数={len(primary_landings)} -> cooc_expansion {len(out)} 个 前3: {sample}")
@@ -5936,6 +6176,17 @@ def stage2_generate_academic_terms(
             sample = [f"{c.term!r}={getattr(c, 'stage2a_hard_reject_reason', '')}" for c in stage2a_hard_rejected[:3]]
             print(f"[Stage2A hard reject] anchor={anchor_term!r} 共 {len(stage2a_hard_rejected)} 条 前3: {sample}")
 
+        # 本锚点 0-primary：canonical 核心锚点尝试 fallback 保线（不扩）
+        if not selected["primary_expandable"] and not selected["primary_keep_no_expand"]:
+            fb = pick_fallback_primary_for_anchor(anchor, kept)
+            if fb is not None:
+                selected["primary_keep_no_expand"] = [fb]
+                if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+                    print(
+                        f"[Stage2A fallback] anchor={anchor_term!r} "
+                        f"selected={fb.term!r} reason=anchor_core_fallback"
+                    )
+
         # 为选中的候选挂 parent_anchor，供 merge / Stage2B 使用
         anchor_term = getattr(anchor, "anchor", "") or ""
         for cand in selected["primary_expandable"] + selected["primary_keep_no_expand"]:
@@ -5955,12 +6206,16 @@ def stage2_generate_academic_terms(
             )
             setattr(p, "primary_score", cand.composite_rank_score)
             setattr(p, "anchor_identity_score", cand.family_match)
-            setattr(p, "retain_mode", "normal" if cand.can_expand else "weak_retain")
-            setattr(p, "suppress_seed", not cand.can_expand)
+            _cec = bool(getattr(cand, "can_expand_from_2a", cand.can_expand))
+            setattr(p, "can_expand_from_2a", _cec)
+            setattr(p, "fallback_primary", bool(getattr(cand, "fallback_primary", False)))
+            setattr(p, "retain_mode", "normal" if _cec else "weak_retain")
+            setattr(p, "suppress_seed", not _cec)
             setattr(p, "topic_source", "missing")
             setattr(p, "jd_align", cand.jd_align)
-            setattr(p, "bucket", "primary_expandable" if cand.can_expand else "primary_keep_no_expand")
-            setattr(p, "expandable", cand.can_expand)
+            _pb = getattr(cand, "primary_bucket", None) or ("primary_expandable" if _cec else "primary_keep_no_expand")
+            setattr(p, "bucket", _pb)
+            setattr(p, "expandable", _cec)
             setattr(p, "field_fit", 0.0)
             setattr(p, "path_match", 0.0)
             setattr(p, "topic_span_penalty", 1.0)
@@ -5972,7 +6227,7 @@ def stage2_generate_academic_terms(
             setattr(p, "mainline_rank", getattr(cand, "mainline_rank", None))
             setattr(p, "anchor_internal_rank", getattr(cand, "anchor_internal_rank", None))
             setattr(p, "survive_primary", getattr(cand, "survive_primary", None))
-            setattr(p, "can_expand", getattr(cand, "can_expand", None))
+            setattr(p, "can_expand", _cec)
             setattr(p, "sort_key_snapshot", getattr(cand, "sort_key_snapshot", None))
             setattr(p, "role_in_anchor", getattr(cand, "role_in_anchor", None))
             setattr(p, "cross_anchor_support", getattr(cand, "cross_anchor_support", None))
@@ -5989,10 +6244,10 @@ def stage2_generate_academic_terms(
                 "anchor_vid": anchor.vid,
                 "candidate": cand.term,
                 "tid": cand.tid,
-                "bucket": "primary_expandable" if cand.can_expand else "primary_keep_no_expand",
+                "bucket": _pb,
                 "primary_score": cand.composite_rank_score,
                 "mainline_alignment": _mainline_num,
-                "expandable": cand.can_expand,
+                "expandable": _cec,
                 "source": cand.source,
                 "semantic_score": cand.semantic_score,
                 "jd_align": cand.jd_align,
@@ -6027,7 +6282,7 @@ def stage2_generate_academic_terms(
                 for cand in block.get(group_name, []):
                     local_bucket = getattr(cand, "primary_bucket", "") or group_name
                     mainline_cand = getattr(cand, "is_good_mainline", False)
-                    can_expand_local = bool(getattr(cand, "can_expand", False))
+                    can_expand_local = bool(getattr(cand, "can_expand_from_2a", getattr(cand, "can_expand", False)))
                     local_reason = getattr(cand, "mainline_block_reason", "") or getattr(cand, "bucket_reason", "")
                     print(
                         f"[Stage2A merge evidence detail] term={(cand.term or '')[:28]!r} | anchor={anc!r} | "
@@ -6127,6 +6382,11 @@ def stage2_generate_academic_terms(
             setattr(p, "seed_score", seed_score)
             setattr(p, "seed_blocked", not eligible)
             setattr(p, "seed_block_reason", block_reason)
+            if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+                print(
+                    f"[Stage2B seed gate] term={getattr(p, 'term', '')!r} "
+                    f"eligible={eligible} block_reason={block_reason!r}"
+                )
             _seed_detail.append((p, eligible, seed_score, block_reason))
             if eligible and seed_score >= SEED_SCORE_MIN:
                 diffusion_primaries.append((p, seed_score))

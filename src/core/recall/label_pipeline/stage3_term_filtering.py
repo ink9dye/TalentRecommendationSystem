@@ -20,11 +20,47 @@ STAGE3_CONDITIONED_PENALTY = 0.94
 STAGE3_SIDE_PENALTY = 0.95
 # 标签路追踪：是否打印 source_type / anchor / similar_to 原始候选 / 被过滤原因 / final primary 胜出原因
 LABEL_PATH_TRACE = True
+# 单锚 + mainline_hits=1 + can_expand 的旁枝：从 support 降级 risky（结构信号，非词表）
+STAGE3_SUPPORT_DEMOTE_FC_MAX = 0.38
+STAGE3_SUPPORT_DEMOTE_PTC_MAX = 0.52
+STAGE3_SUPPORT_DEMOTE_OBJ_MIN = 0.38
+STAGE3_SUPPORT_DEMOTE_DRIFT_MIN = 0.62
+STAGE3_SUPPORT_DEMOTE_DRIFT_PTC_MAX = 0.48
+STAGE3_SUPPORT_DEMOTE_GENERIC_MIN = 0.52
+STAGE3_SUPPORT_DEMOTE_POLY_MIN = 0.58
+STAGE3_SUPPORT_DEMOTE_POLY_PTC_MAX = 0.50
 # family 保送式 paper 选词：每 family 最多 1 primary + 1 support，cluster 默认不进 paper recall
 PAPER_RECALL_MAX_TERMS = 12
+# 与 select_terms_for_paper_recall 对齐的入稿闸门说明（逐项 term）
+STAGE3_PAPER_GATE_DEBUG = True
 
 # 全局共识因子默认值（无硬编码）；Stage3 已彻底移除 cluster 依赖
 STAGE3_CROSS_ANCHOR_DEFAULT = 1.0
+
+
+def _stage3_normalized_source_types(rec: Dict[str, Any]) -> Set[str]:
+    """合并 source_types 与 source_type / source 单值，供 conditioned_only 与 paper 门统一使用。"""
+    source_types = rec.get("source_types") or set()
+    if isinstance(source_types, (list, tuple)):
+        source_types = set(source_types)
+    else:
+        source_types = set(source_types)
+    st = (rec.get("source_type") or rec.get("source") or rec.get("origin") or "").strip().lower()
+    if st:
+        source_types.add(st)
+    return source_types
+
+
+def _stage3_is_conditioned_only(rec: Dict[str, Any]) -> bool:
+    """
+    conditioned_only（严格）：仅有 conditioned_vec，且无 similar_to、无 family_landing。
+    与分桶 / bucket_reason_flags / paper 硬门同源。
+    """
+    st = _stage3_normalized_source_types(rec)
+    has_similar = "similar_to" in st
+    has_family = "family_landing" in st
+    has_conditioned = "conditioned_vec" in st
+    return bool(has_conditioned and (not has_similar) and (not has_family))
 
 
 def _merge_stage3_duplicates(raw_candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -364,9 +400,6 @@ def _collect_stage3_bucket_reason_flags(rec: Dict[str, Any]) -> List[str]:
     mainline_hits = int(rec.get("mainline_hits") or 0)
     anchor_count = int(rec.get("anchor_count") or 0)
     can_expand = bool(rec.get("can_expand", False))
-    source_types = rec.get("source_types") or set()
-    if isinstance(source_types, (list, tuple)):
-        source_types = set(source_types)
     identity_factor = float((rec.get("stage3_explain") or {}).get("identity_factor", 1.0) or 1.0)
     obj = float(rec.get("object_like_risk") or 0.0)
     generic = float(rec.get("generic_risk") or 0.0)
@@ -376,7 +409,7 @@ def _collect_stage3_bucket_reason_flags(rec: Dict[str, Any]) -> List[str]:
         flags.append("only_weak_keep_sources")
     if anchor_count >= 2 and mainline_hits == 0:
         flags.append("cross_anchor_but_side_only")
-    if "conditioned_vec" in source_types and ("similar_to" not in source_types or len(source_types) == 1):
+    if _stage3_is_conditioned_only(rec):
         flags.append("conditioned_only")
     if identity_factor < 0.60:
         flags.append("identity_low_family")
@@ -384,6 +417,8 @@ def _collect_stage3_bucket_reason_flags(rec: Dict[str, Any]) -> List[str]:
         flags.append("object_like")
     if generic >= 0.50:
         flags.append("generic_like")
+    if rec.get("stage3_support_demote_reason") == "single_anchor_expand_branch":
+        flags.append("single_anchor_expand_branch_demote")
     return flags
 
 
@@ -458,6 +493,36 @@ def _debug_print_stage3_bucket_details(
             )
 
 
+def _stage3_single_anchor_expand_branch_demote(term: Dict[str, Any]) -> bool:
+    """
+    单锚、仅 1 次 mainline 命中且 Stage2 可扩：若 family/topic 不在控制-规划主线中心，
+    或 object/drift/generic/poly 结构偏支，则不应轻松进 support（压到 risky）。
+    """
+    anchor_count = int(term.get("anchor_count") or 0)
+    mainline_hits = int(term.get("mainline_hits") or 0)
+    can_expand = bool(term.get("can_expand", False))
+    if anchor_count != 1 or mainline_hits < 1 or not can_expand:
+        return False
+    ex = term.get("stage3_explain") or {}
+    fc = float(term.get("family_centrality") or ex.get("family_centrality") or 0.0)
+    ptc = float(ex.get("path_topic_consistency") or 0.0)
+    obj = float(term.get("object_like_risk") or 0.0)
+    drift = float(term.get("semantic_drift_risk") or 0.0)
+    generic = float(term.get("generic_risk") or 0.0)
+    poly = float(term.get("polysemy_risk") or 0.0)
+    if fc < STAGE3_SUPPORT_DEMOTE_FC_MAX and ptc < STAGE3_SUPPORT_DEMOTE_PTC_MAX:
+        return True
+    if obj >= STAGE3_SUPPORT_DEMOTE_OBJ_MIN:
+        return True
+    if drift >= STAGE3_SUPPORT_DEMOTE_DRIFT_MIN and ptc < STAGE3_SUPPORT_DEMOTE_DRIFT_PTC_MAX:
+        return True
+    if generic >= STAGE3_SUPPORT_DEMOTE_GENERIC_MIN:
+        return True
+    if poly >= STAGE3_SUPPORT_DEMOTE_POLY_MIN and ptc < STAGE3_SUPPORT_DEMOTE_POLY_PTC_MAX:
+        return True
+    return False
+
+
 def _compute_stage3_risk_penalty(term: Dict[str, Any]) -> float:
     """
     风险仅降分不硬杀：trusted_primary 轻罚，support_expansion 重罚。
@@ -477,19 +542,56 @@ def _compute_stage3_risk_penalty(term: Dict[str, Any]) -> float:
 
 def _assign_stage3_bucket(term: Dict[str, Any]) -> str:
     """
-    分桶结合 stage3_entry_group、final_score、risk_flags。
-    桶：core / support / risky。
+    Stage3 分桶（两函数硬门之一）：彻底封死 conditioned_only 进 core。
+    - conditioned_only：有 conditioned_vec，且无 similar_to、无 family_landing（与 _stage3_is_conditioned_only 一致）。
+    - 单锚 conditioned_only：仅 support（mainline_hits≥1 或 can_expand）或 risky；永不为 core。
+    - 多锚 conditioned_only：最高 support，不为 core。
+    - 非 conditioned：core 须 mainline_hits≥1 ∧ can_expand ∧ identity_factor≥0.95；否则按 support_ok / risky。
     """
-    score = float(term.get("final_score") or 0.0)
-    group = term.get("stage3_entry_group") or "support_expansion"
-    poly = float(term.get("polysemy_risk") or 0.0)
-    obj = float(term.get("object_like_risk") or 0.0)
-    generic = float(term.get("generic_risk") or 0.0)
-    if group == "trusted_primary" and score >= 0.55 and poly <= 0.55:
-        return "core"
-    if score >= 0.42 and obj <= 0.65 and generic <= 0.65:
+    term.pop("stage3_support_demote_reason", None)
+    anchor_count = int(term.get("anchor_count") or 0)
+    if anchor_count < 1:
+        anchor_count = 1
+    mainline_hits = int(term.get("mainline_hits") or 0)
+    can_expand = bool(term.get("can_expand", False))
+    ex = term.get("stage3_explain") or {}
+    identity_factor = float(ex.get("identity_factor", 1.0) or 1.0)
+
+    st = _stage3_normalized_source_types(term)
+    has_similar = "similar_to" in st
+    has_family = "family_landing" in st
+    has_conditioned = "conditioned_vec" in st
+    conditioned_only = bool(has_conditioned and (not has_similar) and (not has_family))
+
+    if conditioned_only and anchor_count <= 1:
+        if mainline_hits >= 1 or can_expand:
+            return "support"
+        return "risky"
+
+    if conditioned_only and anchor_count >= 2:
         return "support"
-    return "risky"
+
+    cross_side_only = anchor_count >= 2 and mainline_hits == 0
+    core_ok = (
+        mainline_hits >= 1
+        and can_expand
+        and anchor_count >= 1
+        and identity_factor >= 0.95
+    )
+    if core_ok:
+        bucket = "core"
+    else:
+        support_ok = (
+            (mainline_hits >= 1)
+            or can_expand
+            or (anchor_count >= 2 and (not cross_side_only))
+        )
+        bucket = "support" if support_ok else "risky"
+
+    if bucket == "support" and _stage3_single_anchor_expand_branch_demote(term):
+        term["stage3_support_demote_reason"] = "single_anchor_expand_branch"
+        return "risky"
+    return bucket
 
 
 def _is_primary_like(rec: Dict[str, Any]) -> bool:
@@ -608,66 +710,105 @@ def _write_term_maps_if_missing(
     )
 
 
+def _print_paper_term_selection_audit(ordered: List[Dict[str, Any]], limit: int = 45) -> None:
+    """按 core→support→risky、同桶内 final_score 顺序，打印每条 paper 门结果（含未入选）。"""
+    if not STAGE3_PAPER_GATE_DEBUG or not ordered:
+        return
+    print(f"\n{'-' * 80}\n[Stage3] Paper term selection gate (audit)\n{'-' * 80}")
+    for rec in ordered[:limit]:
+        term = (rec.get("term") or "")[:48]
+        fs = float(rec.get("final_score") or 0.0)
+        print(f"[paper_term_selection gate] term={term!r}")
+        print(f"  bucket={rec.get('stage3_bucket')!r}")
+        print(f"  final_score={fs:.4f}")
+        print(f"  selected_for_paper={rec.get('selected_for_paper', False)}")
+        print(f"  select_reason={rec.get('select_reason')!r}")
+        print(f"  paper_reject_reason={repr(rec.get('paper_reject_reason') or '')}")
+        print(f"  retrieval_role={rec.get('retrieval_role')!r}")
+        print(f"  reason_flags={rec.get('bucket_reason_flags') or []}")
+
+
 def select_terms_for_paper_recall(
     records: List[Dict[str, Any]],
     max_terms: int = 12,
 ) -> List[Dict[str, Any]]:
     """
-    Paper 召回选词：core 直接放行；support 需有主线支撑；risky 默认不进，仅在有主线证据时可放行。
-    数量截断：core 不限，support 最多 8，risky 最多 2，总上限 max_terms。
+    Paper 召回选词（两函数硬门之二）：
+    - conditioned_only 且 anchor_count<=1 → 一律不进 final_term_ids_for_paper（paper_reject_reason=conditioned_only_single_anchor_block）。
+    - 其余：core 可入选；support 须 mainline_hits≥1 或 can_expand 或 anchor_count≥2；risky 不进。
+    - 同 family_key 去重；按桶优先 core→support→risky，同桶内按 final_score 降序，直至 max_terms。
     """
     if not records:
         return []
-    selected_terms: List[Dict[str, Any]] = []
-    for rec in records:
-        term = rec.get("term") or ""
-        final_score = float(rec.get("final_score", 0.0) or 0.0)
-        bucket = (rec.get("stage3_bucket") or "").strip().lower()
-        retrieval_role = (rec.get("retrieval_role") or "").strip().lower()
-        reason_flags = set(rec.get("bucket_reason_flags") or [])
-        anchor_count = int(rec.get("anchor_count") or 1)
+
+    def _bucket_sort_key(r: Dict[str, Any]) -> Tuple[int, float]:
+        b = (r.get("stage3_bucket") or "").strip().lower()
+        pri = 0 if b == "core" else (1 if b == "support" else 2)
+        return pri, -float(r.get("final_score") or 0.0)
+
+    ordered = sorted(records, key=_bucket_sort_key)
+    used_family: Set[str] = set()
+    selected: List[Dict[str, Any]] = []
+
+    for rec in ordered:
+        anchor_count = int(rec.get("anchor_count") or 1) or 1
         mainline_hits = int(rec.get("mainline_hits") or 0)
         can_expand = bool(rec.get("can_expand", False))
-        source_type = (rec.get("source_type") or rec.get("source") or "").strip().lower()
-        conditioned_only = ("conditioned_only" in reason_flags) or (source_type == "conditioned_vec")
+        bucket = (rec.get("stage3_bucket") or "").strip().lower()
+
+        st = _stage3_normalized_source_types(rec)
+        has_similar = "similar_to" in st
+        has_family = "family_landing" in st
+        has_conditioned = "conditioned_vec" in st
+        conditioned_only = bool(has_conditioned and (not has_similar) and (not has_family))
+
+        rec["selected_for_paper"] = False
+        rec["select_reason"] = ""
+        rec["paper_reject_reason"] = ""
+
+        if conditioned_only and anchor_count <= 1:
+            rec["paper_reject_reason"] = "conditioned_only_single_anchor_block"
+            continue
+
+        fk = rec.get("family_key") or build_family_key(rec)
+        rec["family_key"] = fk
+
+        sel = False
+        reason = ""
+        rrole = ""
 
         if bucket == "core":
-            selected_terms.append(rec)
-            continue
-        if bucket == "support":
-            if mainline_hits >= 1 or can_expand:
-                if conditioned_only and anchor_count <= 1 and mainline_hits == 0:
-                    continue
-                selected_terms.append(rec)
-            continue
-        if bucket == "risky":
-            risky_override_ok = (
-                final_score >= 0.48
-                and (mainline_hits >= 1 or can_expand or anchor_count >= 2)
-                and "only_weak_keep_sources" not in reason_flags
-            )
-            if risky_override_ok:
-                selected_terms.append(rec)
-            continue
-
-    core_terms = [x for x in selected_terms if (x.get("stage3_bucket") or "").strip().lower() == "core"]
-    support_terms = [x for x in selected_terms if (x.get("stage3_bucket") or "").strip().lower() == "support"]
-    risky_terms = [x for x in selected_terms if (x.get("stage3_bucket") or "").strip().lower() == "risky"]
-    core_terms = sorted(core_terms, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
-    support_terms = sorted(support_terms, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
-    risky_terms = sorted(risky_terms, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
-    final_term_ids_for_paper = core_terms + support_terms[:8] + risky_terms[:2]
-    final_term_ids_for_paper = final_term_ids_for_paper[:max_terms]
-
-    for r in final_term_ids_for_paper:
-        b = (r.get("stage3_bucket") or "").strip().lower()
-        if b == "core":
-            r["retrieval_role"] = "paper_primary"
-        elif b == "support":
-            r["retrieval_role"] = "paper_support"
+            sel = True
+            reason = "bucket_core_direct"
+            rrole = "paper_primary"
+        elif bucket == "support":
+            support_ok = mainline_hits >= 1 or can_expand or anchor_count >= 2
+            if support_ok:
+                sel = True
+                reason = "support_mainline_or_expand_ok"
+                rrole = "paper_support"
+            else:
+                rec["paper_reject_reason"] = "support_but_not_grounded"
         else:
-            r["retrieval_role"] = "paper_risky"
-    return final_term_ids_for_paper
+            rec["paper_reject_reason"] = "risky_bucket_block"
+
+        if not sel:
+            continue
+
+        if fk in used_family:
+            rec["paper_reject_reason"] = "family_duplicate_block"
+            continue
+
+        rec["selected_for_paper"] = True
+        rec["select_reason"] = reason
+        rec["retrieval_role"] = rrole
+        used_family.add(fk)
+        selected.append(rec)
+        if len(selected) >= max_terms:
+            break
+
+    _print_paper_term_selection_audit(ordered)
+    return selected
 
 
 def _run_stage3_dual_gate(
@@ -794,17 +935,28 @@ def _run_stage3_dual_gate(
             risk_penalty *= 0.72
         if "only_weak_keep_sources" in reason_flags:
             risk_penalty *= 0.78
-        if "conditioned_only" in reason_flags:
-            risk_penalty *= 0.80
+        if _stage3_is_conditioned_only(rec):
+            if anchor_count <= 1:
+                risk_penalty *= 0.72
+            else:
+                risk_penalty *= 0.88
+        if _stage3_is_conditioned_only(rec) and anchor_count <= 1 and mainline_hits <= 1:
+            risk_penalty *= 0.82
         if anchor_count <= 1 and mainline_hits == 0 and not can_expand:
             risk_penalty *= 0.75
         if stage3_entry_group == "secondary_primary" and bucket != "core":
             risk_penalty *= 0.88
         if bucket == "risky":
             risk_penalty *= 0.88
-        rec["final_score"] = float(rec.get("final_score") or 0.0) * risk_penalty
+        xa_bonus = 1.0
+        if anchor_count >= 2:
+            xa_bonus *= 1.18
+        if anchor_count >= 2 and mainline_hits == 0:
+            xa_bonus *= 1.10
+        rec["final_score"] = float(rec.get("final_score") or 0.0) * risk_penalty * xa_bonus
         ex = rec.get("stage3_explain") or {}
         ex["mainline_risk_penalty"] = risk_penalty
+        ex["cross_anchor_score_bonus"] = xa_bonus
         rec["stage3_explain"] = ex
     survivors.sort(key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
     for i, rec in enumerate(survivors):
