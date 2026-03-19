@@ -12,14 +12,14 @@ from src.core.recall.label_means.hierarchy_guard import (
 
 # 软排序 + 轻过滤：至少保留 top_k，不再用阈值淘汰为 0
 STAGE3_TOP_K = 20
-STAGE3_DETAIL_DEBUG = True  # 打印每个词的 base_score / hierarchy_score / penalties / final_score / reject_reason
+STAGE3_DETAIL_DEBUG = False  # 默认关闭重型逐词细表（可按需打开）
 # Stage3 role 因子：mainline primary 稳一点，dense/conditioned_vec/side 略降，避免 Motion controller > motion control
 STAGE3_MAINLINE_BOOST = 1.06
 STAGE3_DENSE_PENALTY = 0.90
 STAGE3_CONDITIONED_PENALTY = 0.94
 STAGE3_SIDE_PENALTY = 0.95
 # 标签路追踪：是否打印 source_type / anchor / similar_to 原始候选 / 被过滤原因 / final primary 胜出原因
-LABEL_PATH_TRACE = True
+LABEL_PATH_TRACE = False
 # 单锚 + mainline_hits=1 + can_expand 的旁枝：从 support 降级 risky（结构信号，非词表）
 STAGE3_SUPPORT_DEMOTE_FC_MAX = 0.38
 STAGE3_SUPPORT_DEMOTE_PTC_MAX = 0.52
@@ -37,6 +37,9 @@ STAGE3_PAPER_GATE_DEBUG = True
 STAGE3_AUDIT_DEBUG = True
 # Stage3 score_mult 单词明细 / 重点词 watch / rerank TopN（仅 stage3_build_score_map）
 DEBUG_LABEL_PATH = True
+STAGE3_BUCKET_FACTOR_DEBUG = False   # [Stage3 bucket reason] / [Stage3 dominant factors]
+STAGE3_OUTPUT_BREAKDOWN_DEBUG = False  # Final Score Breakdown / Bucket Details / Risky Reasons / final_score 明细
+STAGE3_OBSERVABILITY_PANEL_DEBUG = False  # 观测面板 Stage3 / 汇总
 # 非空时：下列审计只打印 term 字面完全匹配（strip 后）的行，避免刷屏；置空 set() 则按 top_k 全表
 STAGE3_DEBUG_FOCUS_TERMS: Set[str] = {
     "Motion control",
@@ -1415,7 +1418,7 @@ def _run_stage3_dual_gate(
         _print_stage3_support_risky_concise(survivors, top_k=20)
 
     core_terms_list, support_terms_list, risky_terms_list = _bucket_stage3_terms(survivors)
-    if LABEL_PATH_TRACE or getattr(term_scoring, "STAGE3_DEBUG", False):
+    if STAGE3_BUCKET_FACTOR_DEBUG and (LABEL_PATH_TRACE or getattr(term_scoring, "STAGE3_DEBUG", False)):
         for rec in (core_terms_list + support_terms_list + risky_terms_list)[:15]:
             term = (rec.get("term") or "")[:28]
             bucket = rec.get("stage3_bucket") or ""
@@ -1512,31 +1515,32 @@ def _debug_print_stage3_output(
     label_trace = LABEL_PATH_TRACE or stage3_debug
     _debug_print_stage3_tables(raw_candidates, dropped_with_reason, survivors, recall)
     debug_print(1, f"[Stage3] 输入候选总数={len(raw_candidates)} 幸存={len(survivors)} top_k={len(top_survivors)}", recall)
-    debug_print(2, "[Stage3 Final Score Breakdown] term | stage2_rank | anchor_count | evidence_count | family_centrality | path_topic_consistency | generic_penalty | cross_anchor_factor | backbone_boost | object_like_penalty | bonus_term_penalty | retrieval_role | final", recall)
-    for rec in survivors[:15]:
-        t = (rec.get("term") or "")[:28]
-        ex = rec.get("stage3_explain") or {}
-        debug_print(2, (
-            f"  {t:<28} | s2={rec.get('stage2_rank', 0):>2} | anc={rec.get('anchor_count', 0)} ev={rec.get('evidence_count', 0)} | "
-            f"fc={float(rec.get('family_centrality') or 0):.3f} | ptc={float(ex.get('path_topic_consistency') or 0):.3f} | "
-            f"gen={float(ex.get('generic_penalty') or 0):.3f} | cross={float(ex.get('cross_anchor_factor') or 0):.3f} | "
-            f"bb={float(ex.get('backbone_boost') or 1):.3f} | obj={float(ex.get('object_like_penalty') or 1):.3f} | bonus={float(ex.get('bonus_term_penalty') or 1):.3f} | "
-            f"{rec.get('retrieval_role', ''):14s} | final={float(rec.get('final_score') or 0):.3f}"
-        ), recall)
-    debug_print(2, "[Stage3 Rerank Delta] term | stage2_rank | stage3_rank | delta", recall)
-    for row in rerank_delta_rows[:15]:
-        t = (row.get("term") or "")[:28]
-        debug_print(2, f"  {t:<28} | {row.get('stage2_rank', 0):>3} | {row.get('stage3_rank', 0):>3} | {row.get('delta', 0):+d}", recall)
-    debug_print(2, "[Stage3 Buckets]", recall)
-    debug_print(2, f"  core_terms={[r.get('term') for r in core_terms[:15]]}", recall)
-    debug_print(2, f"  support_terms={[r.get('term') for r in support_terms[:15]]}", recall)
-    debug_print(2, f"  risky_terms={[r.get('term') for r in risky_terms[:15]]}", recall)
-    _debug_print_stage3_bucket_details(core_terms, support_terms, risky_terms, recall)
-    debug_print(3, "[Stage3 Risky Term Reasons] term | reasons | final", recall)
-    for r in risky_terms[:10]:
-        t = (r.get("term") or "")[:28]
-        debug_print(3, f"  {t:<28} | {r.get('risk_reasons', [])} | {r.get('final_score', 0):.3f}", recall)
-    if STAGE3_DETAIL_DEBUG or stage3_debug:
+    if STAGE3_OUTPUT_BREAKDOWN_DEBUG:
+        debug_print(2, "[Stage3 Final Score Breakdown] term | stage2_rank | anchor_count | evidence_count | family_centrality | path_topic_consistency | generic_penalty | cross_anchor_factor | backbone_boost | object_like_penalty | bonus_term_penalty | retrieval_role | final", recall)
+        for rec in survivors[:15]:
+            t = (rec.get("term") or "")[:28]
+            ex = rec.get("stage3_explain") or {}
+            debug_print(2, (
+                f"  {t:<28} | s2={rec.get('stage2_rank', 0):>2} | anc={rec.get('anchor_count', 0)} ev={rec.get('evidence_count', 0)} | "
+                f"fc={float(rec.get('family_centrality') or 0):.3f} | ptc={float(ex.get('path_topic_consistency') or 0):.3f} | "
+                f"gen={float(ex.get('generic_penalty') or 0):.3f} | cross={float(ex.get('cross_anchor_factor') or 0):.3f} | "
+                f"bb={float(ex.get('backbone_boost') or 1):.3f} | obj={float(ex.get('object_like_penalty') or 1):.3f} | bonus={float(ex.get('bonus_term_penalty') or 1):.3f} | "
+                f"{rec.get('retrieval_role', ''):14s} | final={float(rec.get('final_score') or 0):.3f}"
+            ), recall)
+        debug_print(2, "[Stage3 Rerank Delta] term | stage2_rank | stage3_rank | delta", recall)
+        for row in rerank_delta_rows[:15]:
+            t = (row.get("term") or "")[:28]
+            debug_print(2, f"  {t:<28} | {row.get('stage2_rank', 0):>3} | {row.get('stage3_rank', 0):>3} | {row.get('delta', 0):+d}", recall)
+        debug_print(2, "[Stage3 Buckets]", recall)
+        debug_print(2, f"  core_terms={[r.get('term') for r in core_terms[:15]]}", recall)
+        debug_print(2, f"  support_terms={[r.get('term') for r in support_terms[:15]]}", recall)
+        debug_print(2, f"  risky_terms={[r.get('term') for r in risky_terms[:15]]}", recall)
+        _debug_print_stage3_bucket_details(core_terms, support_terms, risky_terms, recall)
+        debug_print(3, "[Stage3 Risky Term Reasons] term | reasons | final", recall)
+        for r in risky_terms[:10]:
+            t = (r.get("term") or "")[:28]
+            debug_print(3, f"  {t:<28} | {r.get('risk_reasons', [])} | {r.get('final_score', 0):.3f}", recall)
+    if STAGE3_OUTPUT_BREAKDOWN_DEBUG and (STAGE3_DETAIL_DEBUG or stage3_debug):
         print(f"[paper_term_selection] family 保送式 选词数={len(paper_terms)} 明细: family_key | term | term_role | retrieval_role | final_score")
         for r in paper_terms[:30]:
             print(f"  {r.get('family_key','')} | {r.get('term','')!r} | {r.get('term_role','')} | {r.get('retrieval_role','')} | {r.get('final_score',0):.4f}")
@@ -1560,17 +1564,17 @@ def _debug_print_stage3_output(
             print(f"  {i+1} {term!r} | base={_fmt(base_score)} | path_topic={_fmt(path_topic)} | gen={_fmt(gen_pen)} | cross={_fmt(cross_anchor)} | bb={_fmt(backbone_boost)} | obj={_fmt(object_like_penalty)} | bonus={_fmt(bonus_term_penalty)} | final={final_score:.4f} | {reject!r}")
         if len(top_survivors) > 20:
             print(f"  ... 共 {len(top_survivors)} 条")
-    if stage3_debug and score_map:
+    if STAGE3_OUTPUT_BREAKDOWN_DEBUG and stage3_debug and score_map:
         print("[stage3_output] tid | term | source_type | parent_anchor | parent_primary | score")
         for i, (tid_str, sc) in enumerate(sorted(score_map.items(), key=lambda x: -x[1])[:25]):
             print(f"  {i+1} {tid_str} | {term_map.get(tid_str, '')!r} | {term_source_map.get(tid_str, '')} | {parent_anchor_map.get(tid_str, '')!r} | {parent_primary_map.get(tid_str, '')!r} | {sc:.3f}")
-    if label_trace and dropped_with_reason:
+    if STAGE3_OUTPUT_BREAKDOWN_DEBUG and label_trace and dropped_with_reason:
         print("[标签路-被过滤原因] tid | term | source_type | parent_anchor | 原因")
         for r in dropped_with_reason[:50]:
             print(f"  {r.get('tid')} | {r.get('term','')!r} | {r.get('source') or r.get('origin','')} | {r.get('parent_anchor','')!r} | {r.get('reject_reason','')}")
         if len(dropped_with_reason) > 50:
             print(f"  ... 共 {len(dropped_with_reason)} 条被过滤")
-    if label_trace and paper_terms:
+    if STAGE3_OUTPUT_BREAKDOWN_DEBUG and label_trace and paper_terms:
         print("[标签路-final primary 为什么胜出] tid | term | source_type | parent_anchor | retrieval_role | 胜出原因")
         for r in paper_terms[:30]:
             print(f"  {r.get('tid')} | {r.get('term','')!r} | {r.get('source') or r.get('origin','')} | {r.get('parent_anchor','')!r} | {r.get('retrieval_role','')} | {r.get('win_reason','')}")
@@ -1611,7 +1615,7 @@ def run_stage3(
         parent_primary_map = {}
 
     # verbose 调试：Stage3 已移除 cluster 列，改用 anchor_count / evidence_count / family_centrality / path_topic_consistency / generic_penalty / cross_anchor_factor / retrieval_role
-    if recall.verbose and score_map and getattr(recall, "_last_tag_purity_debug", None):
+    if STAGE3_OBSERVABILITY_PANEL_DEBUG and recall.verbose and score_map and getattr(recall, "_last_tag_purity_debug", None):
         debug_by_tid = {str(d["tid"]): d for d in recall.debug_info.tag_purity_debug if d.get("tid") is not None}
         top_tids = sorted(score_map.keys(), key=lambda t: score_map.get(t, 0.0), reverse=True)
 

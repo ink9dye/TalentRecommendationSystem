@@ -6,6 +6,8 @@ import faiss
 from src.core.recall.label_path import LabelRecallPath
 from src.utils.tools import extract_skills, SKILL_SPLIT_PATTERN, normalize_skill, split_space_terms, is_bad_skill
 
+LABEL_DEBUG_CLI_EXTRA_TABLES = False  # 学术词命运表/Stage3 来源回溯表：默认关闭
+
 
 def run_label_debug_cli() -> None:
     try:
@@ -169,21 +171,22 @@ def run_label_debug_cli() -> None:
                     raw_tids = _to_int_set(fcl_inner.get("similar_to_raw_tids"))
                     pass_tids = _to_int_set(fcl_inner.get("similar_to_pass_tids"))
                     final_tids = _to_int_set(fcl_inner.get("final_term_ids_for_paper"))
-                    print("【学术词命运表】tid | term | in_similar_raw | in_similar_pass | in_final_paper")
-                    for r in top_contrib[:20]:
-                        tid = r.get("tid")
-                        term = (r.get("term") or "")[:28]
-                        tid_int = int(tid) if tid is not None else None
-                        in_raw = tid_int in raw_tids if tid_int is not None else False
-                        in_pass = tid_int in pass_tids if tid_int is not None else False
-                        in_final = tid_int in final_tids if tid_int is not None else False
-                        print(
-                            f"  {tid:<6} | {term:28s} | {str(in_raw):>13} | {str(in_pass):>15} | {str(in_final):>13}"
-                        )
+                    if LABEL_DEBUG_CLI_EXTRA_TABLES:
+                        print("【学术词命运表】tid | term | in_similar_raw | in_similar_pass | in_final_paper")
+                        for r in top_contrib[:20]:
+                            tid = r.get("tid")
+                            term = (r.get("term") or "")[:28]
+                            tid_int = int(tid) if tid is not None else None
+                            in_raw = tid_int in raw_tids if tid_int is not None else False
+                            in_pass = tid_int in pass_tids if tid_int is not None else False
+                            in_final = tid_int in final_tids if tid_int is not None else False
+                            print(
+                                f"  {tid:<6} | {term:28s} | {str(in_raw):>13} | {str(in_pass):>15} | {str(in_final):>13}"
+                            )
 
                     # Stage3 来源回溯表：Top 学术词的 source + tag_purity / cos_sim / anchor_sim，便于判断坏词来自 edge 还是 ctx
                     di2 = getattr(l_path, "debug_info", None)
-                    if di2:
+                    if di2 and LABEL_DEBUG_CLI_EXTRA_TABLES:
                         exp_raw = getattr(di2, "expansion_raw_results", None) or []
                         tag_debug = getattr(di2, "tag_purity_debug", None) or []
                         source_by_tid = {}
