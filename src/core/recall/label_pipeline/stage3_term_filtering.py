@@ -35,15 +35,20 @@ PAPER_RECALL_MAX_TERMS = 12
 STAGE3_PAPER_GATE_DEBUG = True
 # Stage3 窄表审计：final adjust / cross-anchor / support·risky / paper bridge（与 bucket reason 互补）
 STAGE3_AUDIT_DEBUG = True
+# Stage3 score_mult 单词明细 / 重点词 watch / rerank TopN（仅 stage3_build_score_map）
+DEBUG_LABEL_PATH = True
 # 非空时：下列审计只打印 term 字面完全匹配（strip 后）的行，避免刷屏；置空 set() 则按 top_k 全表
 STAGE3_DEBUG_FOCUS_TERMS: Set[str] = {
     "Motion control",
     "motion control",
     "robot control",
+    "Robot control",
     "digital control",
+    "Digital control",
     "Robot manipulator",
     "Educational robotics",
     "route planning",
+    "Route planning",
 }
 
 # 全局共识因子默认值（无硬编码）；Stage3 已彻底移除 cluster 依赖
@@ -1070,6 +1075,9 @@ def select_terms_for_paper_recall(
         if len(selected) >= max_terms:
             break
 
+    # 与 bucket / final_score 同一批对象，在逐项写好 paper 字段后打横向对照表
+    if STAGE3_AUDIT_DEBUG:
+        _print_stage3_to_paper_bridge(ordered, top_k=20)
     _print_paper_term_selection_audit(ordered)
     return selected
 
@@ -1079,9 +1087,18 @@ def stage3_build_score_map(survivors: List[Dict[str, Any]]) -> List[Dict[str, An
     Stage3 最终分数乘法修正（在 identity×risk×role 与 _assign_stage3_bucket 之后执行）：
     用 score_mult 压制 weak keep / conditioned_only / 无主线等；cross_bonus 仅在 core 或「强证据 support」上给条件跨锚加分；
     risky 永不拿跨锚正奖励；locked_mainline_no_expand 不参与跨锚正奖励，避免 keep_no_expand 仅靠多锚顶到前排。
+
+    本次最小修正目标：
+    1. 压低 conditioned_only + single_anchor 的 support 词
+    2. conditioned_only 不再吃 support 的跨锚奖励
+    3. 不改 Stage2，不改 paper gate，只改 Stage3 一个函数
+
     重排后重刷 bucket_reason_flags，使 [Stage3 bucket reason] / dominant factors 与最终序一致。
     """
     for rec in survivors:
+        # 供 [Stage3 final adjust audit]：第二段乘子前的 final_score（identity×risk×role 后、×score_mult 前）
+        rec["_stage3_pre_adjust_score"] = float(rec.get("final_score") or 0.0)
+
         reason_flags = set(rec.get("bucket_reason_flags") or [])
         bucket = (rec.get("stage3_bucket") or "").strip().lower()
         group = (rec.get("stage3_entry_group") or "").strip().lower()
@@ -1109,10 +1126,21 @@ def stage3_build_score_map(survivors: List[Dict[str, Any]]) -> List[Dict[str, An
         if group == "secondary_primary" and bucket != "core":
             score_mult *= 0.88
 
-        # B. conditioned_only：在 paper gate 之前就从排序上压低（单锚 / 无主线无扩 / 其余轻压）
+        # B. conditioned_only：本次唯一重点加强
+        # 单锚 conditioned_only 在排序阶段就要明显压低，避免 Robotics / Robot control 的侧翼词顶到前排
         if conditioned_only:
             if anchor_count <= 1:
+                # 原始基础压制
                 score_mult *= 0.68
+
+                # 单锚且主线命中弱，再压一档
+                if mainline_hits <= 1:
+                    score_mult *= 0.86
+
+                # 单锚 conditioned_only 且位于 support，再压一档
+                if bucket == "support":
+                    score_mult *= 0.88
+
             elif mainline_hits == 0 and not can_expand:
                 score_mult *= 0.80
             else:
@@ -1122,7 +1150,8 @@ def stage3_build_score_map(survivors: List[Dict[str, Any]]) -> List[Dict[str, An
         if anchor_count <= 1 and mainline_hits == 0 and not can_expand:
             score_mult *= 0.74
 
-        # D. 跨锚奖励：按桶 + 主线证据条件发放（取代无条件 1.18×1.10）
+        # D. 跨锚奖励：按桶 + 主线证据条件发放
+        # 本次修正：conditioned_only 不再拿 support 的跨锚正奖励
         cross_bonus = 1.0
         locked_no_xa_bonus = "locked_mainline_no_expand" in reason_flags
         if not locked_no_xa_bonus:
@@ -1130,7 +1159,7 @@ def stage3_build_score_map(survivors: List[Dict[str, Any]]) -> List[Dict[str, An
                 if anchor_count >= 2:
                     cross_bonus *= 1.08
             elif bucket == "support":
-                if anchor_count >= 2 and (mainline_hits >= 1 or can_expand):
+                if (not conditioned_only) and anchor_count >= 2 and (mainline_hits >= 1 or can_expand):
                     cross_bonus *= 1.03
             # risky：保持 1.0
 
@@ -1140,15 +1169,84 @@ def stage3_build_score_map(survivors: List[Dict[str, Any]]) -> List[Dict[str, An
 
         rec["final_score"] = float(rec.get("final_score") or 0.0) * score_mult * cross_bonus
 
+        # --- DEBUG 1: Stage3 单词修正明细 ---
+        if DEBUG_LABEL_PATH and (
+            conditioned_only
+            or bucket in ("support", "risky")
+            or anchor_count >= 2
+        ):
+            term = rec.get("term", "")
+            print(
+                "[Stage3 score adjust] "
+                f"term={term!r} | "
+                f"bucket={bucket!r} group={group!r} | "
+                f"anchors={anchor_count} mainline_hits={mainline_hits} can_expand={can_expand} | "
+                f"conditioned_only={conditioned_only} | "
+                f"score_mult={score_mult:.3f} cross_bonus={cross_bonus:.3f} | "
+                f"final={float(rec.get('final_score') or 0.0):.4f}"
+            )
+
+        # --- DEBUG 2: 重点风险词专项 ---
+        if DEBUG_LABEL_PATH:
+            watch_terms = {
+                "Educational robotics",
+                "Telerobotics",
+                "Robot manipulator",
+                "robot control",
+                "digital control",
+                "Motion control",
+            }
+            term = rec.get("term", "")
+            if term in watch_terms:
+                print(
+                    "[Stage3 watch] "
+                    f"term={term!r} | "
+                    f"bucket={bucket!r} | "
+                    f"reason_flags={sorted(list(reason_flags))} | "
+                    f"anchor_count={anchor_count} | "
+                    f"mainline_hits={mainline_hits} | "
+                    f"can_expand={can_expand} | "
+                    f"conditioned_only={conditioned_only} | "
+                    f"score_mult={score_mult:.3f} | "
+                    f"cross_bonus={cross_bonus:.3f} | "
+                    f"final={float(rec.get('final_score') or 0.0):.4f}"
+                )
+
         ex = rec.get("stage3_explain") or {}
         ex["mainline_risk_penalty"] = score_mult
         ex["cross_anchor_score_bonus"] = cross_bonus
+        ex["conditioned_only"] = conditioned_only
         rec["stage3_explain"] = ex
 
     survivors.sort(key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
     for i, rec in enumerate(survivors):
         rec["stage3_rank"] = i
         rec["bucket_reason_flags"] = _collect_stage3_bucket_reason_flags(rec)
+
+    # --- DEBUG 3: Stage3 排序后 TopN 总览 ---
+    if DEBUG_LABEL_PATH:
+        print("\n" + "-" * 80)
+        print("[Stage3 rerank summary]")
+        print("-" * 80)
+        print("rank | term | bucket | conditioned_only | anchors | mainline_hits | can_expand | final")
+        for i, rec in enumerate(survivors[:12], start=1):
+            term = rec.get("term", "")
+            bucket = rec.get("stage3_bucket", "")
+            conditioned_only_row = _stage3_is_conditioned_only(rec)
+            anchor_count_row = int(rec.get("anchor_count") or 1)
+            mainline_hits_row = int(rec.get("mainline_hits") or 0)
+            can_expand_row = bool(rec.get("can_expand", False))
+            final_score = float(rec.get("final_score") or 0.0)
+            print(
+                f"{i:>4} | "
+                f"{term[:28]:<28} | "
+                f"{str(bucket):<7} | "
+                f"{str(conditioned_only_row):<16} | "
+                f"{anchor_count_row:^7} | "
+                f"{mainline_hits_row:^13} | "
+                f"{str(can_expand_row):<10} | "
+                f"{final_score:.4f}"
+            )
 
     return survivors
 
@@ -1265,6 +1363,12 @@ def _run_stage3_dual_gate(
         rec["bucket_reason_flags"] = _collect_stage3_bucket_reason_flags(rec)
 
     survivors = stage3_build_score_map(survivors)
+
+    # 窄表审计：final adjust → cross-anchor → support/risky（与 STAGE3_DEBUG_FOCUS_TERMS 配合可只看定点词）
+    if STAGE3_AUDIT_DEBUG:
+        _print_stage3_final_adjust_audit(survivors, top_k=12)
+        _print_stage3_cross_anchor_audit(survivors, top_k=40)
+        _print_stage3_support_risky_concise(survivors, top_k=20)
 
     core_terms_list, support_terms_list, risky_terms_list = _bucket_stage3_terms(survivors)
     if LABEL_PATH_TRACE or getattr(term_scoring, "STAGE3_DEBUG", False):
