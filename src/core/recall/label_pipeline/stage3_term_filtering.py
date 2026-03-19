@@ -973,7 +973,7 @@ def select_terms_for_paper_recall(
     Paper 召回选词（两函数硬门之二）：
     - conditioned_only 且单锚 → 不进 paper（conditioned_only_single_anchor_block）。
     - fallback_primary（含 Stage2A primary_fallback / anchor_core_fallback）→ fallback_primary_block。
-    - core 直接入选；support 须 has_mainline_support（含 locked mainline）或 anchor_count≥2；risky 不进。
+    - core 直接入选；support 需要“主线 grounding + 语义质量”；risky 不进。
     - 同 family_key 去重；遍历顺序 core→support→risky，同桶内按 final_score 降序。
     """
     if not records:
@@ -987,6 +987,55 @@ def select_terms_for_paper_recall(
     ordered = sorted(records, key=_bucket_sort_key)
     used_family: Set[str] = set()
     selected: List[Dict[str, Any]] = []
+
+    def _support_grounded_enough(rec: Dict[str, Any]) -> bool:
+        """
+        支撑词 paper 优先级约束：
+        - 結构上：必须被主线命中/扩散资格/锚定（locked mainline）或多锚支撑所“托住”
+        - 语义上：避免泛方法/弱链条词抢 paper 配额
+        """
+        mainline_hits = int(rec.get("mainline_hits", 0) or 0)
+        can_expand = bool(rec.get("can_expand", False))
+        anchor_count = int(rec.get("anchor_count", 1) or 1)
+        fallback_primary = bool(rec.get("fallback_primary", False))
+        primary_bucket = (rec.get("primary_bucket") or "").strip().lower()
+        primary_reason = (rec.get("primary_reason") or "").strip().lower()
+
+        generic_risk = float(rec.get("generic_risk", 0.0) or 0.0)
+        polysemy_risk = float(rec.get("polysemy_risk", 0.0) or 0.0)
+        object_like_risk = float(rec.get("object_like_risk", 0.0) or 0.0)
+        jd_align = float(
+            rec.get("jd_candidate_alignment") or rec.get("jd_align") or 0.5
+        )
+        context_cont = float(rec.get("context_continuity", 0.0) or 0.0)
+
+        locked_mainline = (
+            primary_bucket == "primary_keep_no_expand"
+            or primary_reason == "usable_mainline_no_expand"
+        )
+
+        # fallback 只保留，不进 paper
+        if fallback_primary:
+            return False
+
+        # 主线 grounding：有主线命中 / 可扩 / 锁定主线 / 多锚支撑
+        structural_ok = (
+            mainline_hits >= 1
+            or can_expand
+            or locked_mainline
+            or anchor_count >= 2
+        )
+
+        # 语义质量：更像主线，不像泛方法/高歧义漂移
+        semantic_ok = (
+            jd_align >= 0.72
+            and context_cont >= 0.38
+            and generic_risk <= 0.58
+            and polysemy_risk <= 0.55
+            and object_like_risk <= 0.35
+        )
+
+        return structural_ok and semantic_ok
 
     for rec in ordered:
         anchor_count = int(rec.get("anchor_count") or 1) or 1
@@ -1049,7 +1098,7 @@ def select_terms_for_paper_recall(
             rrole = "paper_primary"
 
         elif bucket == "support":
-            support_ok = has_mainline_support or anchor_count >= 2
+            support_ok = _support_grounded_enough(rec)
             if support_ok:
                 sel = True
                 reason = "support_mainline_or_expand_ok"

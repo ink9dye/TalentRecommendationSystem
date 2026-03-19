@@ -1469,6 +1469,44 @@ def check_seed_eligibility(
         return False, 0.0, block_reason
 
     # --------------------------------------------------
+    # 0.5 泛方法词 seed 收紧：不靠词表，只看结构信号
+    #    目标：把“能保留（primary）”与“能扩散（seed）”进一步拉开。
+    # --------------------------------------------------
+    generic_risk = float(getattr(p, "generic_risk", 0.0) or 0.0)
+    polysemy_risk = float(getattr(p, "polysemy_risk", 0.0) or 0.0)
+    object_like_risk = float(getattr(p, "object_like_risk", 0.0) or 0.0)
+    cross_anchor_support = int(getattr(p, "cross_anchor_support_count", 1) or 1)
+    has_family_evidence = bool(getattr(p, "has_family_evidence", False))
+    retain_mode = (getattr(p, "retain_mode", "") or "").strip().lower()
+    role_in_anchor = (getattr(p, "role_in_anchor", "") or "").strip().lower()
+
+    # method-like seed risk：更像泛方法/侧翼词时，才需要额外 grounding
+    method_like_seed_risk = (
+        generic_risk >= 0.48
+        or polysemy_risk >= 0.45
+        or role_in_anchor == "side"
+    )
+
+    # grounding：有足够“主线上下文/多锚证据”，才允许扩散 seed
+    grounding_ok = (
+        dual_support
+        or cross_anchor_support >= 2
+        or has_family_evidence
+        or anchor_identity >= 0.60
+        or jd_align >= 0.76
+    )
+
+    if method_like_seed_risk and not grounding_ok:
+        block_reason = "method_like_without_grounding"
+        _print_stage2b_seed_factors(
+            anchor_text, primary_term, can_expand_from_2a, source_type_str, dual_support,
+            static_sim, ctx_sim_val, ctx_drop_str, False, False, block_reason,
+        )
+        setattr(p, "seed_eligible", False)
+        setattr(p, "seed_block_reason", block_reason)
+        return False, 0.0, block_reason
+
+    # --------------------------------------------------
     # 1. context_gain 软修正（仅影响 seed_score）
     # --------------------------------------------------
     if context_gain >= 0.03:
@@ -2945,6 +2983,101 @@ def select_primary_per_anchor(
     # 无 expandable 时最多保留 1 条 keep，避免弱词堆叠
     if not primary_expandable and primary_keep_no_expand:
         primary_keep_no_expand = primary_keep_no_expand[:1]
+
+    # --------------------------------------------------
+    # 2. 高质量锚点空组保线：只保 keep_no_expand，不允许扩散
+    #    目的：当一个强锚点本组（primary_expandable / primary_keep_no_expand）为空，
+    #    从“非硬坏分支”里按组内相对信号救回 1 条 primary_keep_no_expand，
+    #    但不会拿到 Stage2B seed（can_expand_from_2a=False，fallback_primary=True）。
+    # --------------------------------------------------
+    if not primary_expandable and not primary_keep_no_expand:
+        anchor_strength = float(getattr(anchor, "source_weight", 1.0) or 1.0)
+
+        fallback_pool: List[Tuple[float, Stage2ACandidate]] = []
+        for c in candidates:
+            feat = _get_stage2a_feat(c)
+            flags = _stage2a_rule_flags(c, feat)
+            obviously_bad_branch = _is_obviously_bad_branch_stage2a(c, feat)
+            drift_bad = flags["drift_bad"]
+            poly_bad = flags["poly_bad"]
+            ctx_ok = flags["ctx_ok"]
+
+            # 不能从真正 hard reject / obviously bad 里救
+            retain_mode = (getattr(c, "retain_mode", "") or "").strip().lower()
+            if retain_mode == "reject":
+                continue
+            if obviously_bad_branch:
+                continue
+            if drift_bad:
+                continue
+            if poly_bad and not ctx_ok:
+                continue
+
+            # 只允许“弱但还像主线”的技术词：用结构/证据信号救线，而不是词表
+            family_match = float(getattr(c, "family_match", 0.0) or 0.0)
+            jd_align = float(getattr(c, "jd_align", 0.0) or 0.0)
+            context_cont = float(getattr(c, "context_continuity", 0.0) or 0.0)
+            generic_risk = float(getattr(c, "generic_risk", 0.0) or 0.0)
+            object_risk = float(getattr(c, "object_like_risk", 0.0) or 0.0)
+            poly_risk = float(getattr(c, "polysemy_risk", 0.0) or 0.0)
+
+            weak_mainline_ok = (
+                family_match >= 0.28
+                and jd_align >= 0.62
+                and context_cont >= 0.35
+                and generic_risk <= 0.65
+                and object_risk <= 0.35
+                and poly_risk <= 0.60
+            )
+
+            # --- fallback debug: 每个候选为何通过/不通过（仅在 verbose debug 打开时）---
+            if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+                print(
+                    f"[Stage2A fallback cand] anchor={anchor_term_sel!r} term={getattr(c, 'term', '')!r} "
+                    f"family={family_match:.3f} jd={jd_align:.3f} context={context_cont:.3f} "
+                    f"gen={generic_risk:.3f} obj={object_risk:.3f} poly={poly_risk:.3f} "
+                    f"weak_ok={weak_mainline_ok}"
+                )
+            if not weak_mainline_ok:
+                continue
+
+            # 组内相对排序：更像主线、更少风险、更贴 JD 的优先
+            rescue_score = (
+                0.42 * family_match
+                + 0.28 * jd_align
+                + 0.20 * context_cont
+                + 0.10 * float(getattr(c, "semantic_score", 0.0) or 0.0)
+                - 0.08 * generic_risk
+                - 0.06 * object_risk
+                - 0.06 * poly_risk
+            )
+            fallback_pool.append((rescue_score, c))
+
+        # 只对“强锚点”启用（防止弱锚点用救线把噪声抬上来）
+        trigger = anchor_strength >= 0.90 and bool(fallback_pool)
+        # --- fallback debug: 是否触发落地 append ---
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+            print(
+                f"[Stage2A fallback debug] anchor={getattr(anchor, 'anchor', '')!r} "
+                f"source_weight={anchor_strength:.3f} pool_size={len(fallback_pool)} "
+                f"trigger={trigger}"
+            )
+        if trigger:
+            fallback_pool.sort(key=lambda x: x[0], reverse=True)
+            best = fallback_pool[0][1]
+
+            best.primary_bucket = "primary_keep_no_expand"
+            best.survive_primary = True
+            best.can_expand = False
+            best.can_expand_from_2a = False
+            best.fallback_primary = True
+            best.admission_reason = "anchor_core_fallback"
+            best.role_in_anchor = "side"
+            best.role = "side"
+            setattr(best, "bucket_reason", "anchor_core_fallback")
+            setattr(best, "mainline_block_reason", "anchor_core_fallback")
+
+            primary_keep_no_expand.append(best)
 
     if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
         anchor_term = getattr(anchor, "anchor", "") or ""
@@ -6422,6 +6555,14 @@ def stage2_generate_academic_terms(
                 stage2a_hard_rejected.append(c)
             else:
                 kept.append(c)
+
+        # --- fallback debug: keep 是否为空（用于定位是否触发 select_primary_per_anchor）---
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+            anchor_term = getattr(anchor, "anchor", "") or ""
+            print(
+                f"[Stage2A kept debug] anchor={anchor_term!r} "
+                f"enriched={len(enriched)} kept={len(kept)}"
+            )
         if not kept:
             primary_landings_by_anchor[anchor.vid] = []
             all_anchor_results.append({
