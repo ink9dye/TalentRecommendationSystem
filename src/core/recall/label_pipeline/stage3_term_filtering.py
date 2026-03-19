@@ -613,22 +613,53 @@ def select_terms_for_paper_recall(
     max_terms: int = 12,
 ) -> List[Dict[str, Any]]:
     """
-    优先 core，再补 support，最后不足再补 risky；按 final_score 排序，并为选中词设置 retrieval_role。
+    Paper 召回选词：core 直接放行；support 需有主线支撑；risky 默认不进，仅在有主线证据时可放行。
+    数量截断：core 不限，support 最多 8，risky 最多 2，总上限 max_terms。
     """
     if not records:
         return []
-    core = [r for r in records if (r.get("stage3_bucket") or "").strip().lower() == "core"]
-    support = [r for r in records if (r.get("stage3_bucket") or "").strip().lower() == "support"]
-    risky = [r for r in records if (r.get("stage3_bucket") or "").strip().lower() == "risky"]
-    core = sorted(core, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
-    support = sorted(support, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
-    risky = sorted(risky, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
-    selected: List[Dict[str, Any]] = list(core[:max_terms])
-    if len(selected) < max_terms:
-        selected.extend(support[: max_terms - len(selected)])
-    if len(selected) < max_terms:
-        selected.extend(risky[: max_terms - len(selected)])
-    for r in selected:
+    selected_terms: List[Dict[str, Any]] = []
+    for rec in records:
+        term = rec.get("term") or ""
+        final_score = float(rec.get("final_score", 0.0) or 0.0)
+        bucket = (rec.get("stage3_bucket") or "").strip().lower()
+        retrieval_role = (rec.get("retrieval_role") or "").strip().lower()
+        reason_flags = set(rec.get("bucket_reason_flags") or [])
+        anchor_count = int(rec.get("anchor_count") or 1)
+        mainline_hits = int(rec.get("mainline_hits") or 0)
+        can_expand = bool(rec.get("can_expand", False))
+        source_type = (rec.get("source_type") or rec.get("source") or "").strip().lower()
+        conditioned_only = ("conditioned_only" in reason_flags) or (source_type == "conditioned_vec")
+
+        if bucket == "core":
+            selected_terms.append(rec)
+            continue
+        if bucket == "support":
+            if mainline_hits >= 1 or can_expand:
+                if conditioned_only and anchor_count <= 1 and mainline_hits == 0:
+                    continue
+                selected_terms.append(rec)
+            continue
+        if bucket == "risky":
+            risky_override_ok = (
+                final_score >= 0.48
+                and (mainline_hits >= 1 or can_expand or anchor_count >= 2)
+                and "only_weak_keep_sources" not in reason_flags
+            )
+            if risky_override_ok:
+                selected_terms.append(rec)
+            continue
+
+    core_terms = [x for x in selected_terms if (x.get("stage3_bucket") or "").strip().lower() == "core"]
+    support_terms = [x for x in selected_terms if (x.get("stage3_bucket") or "").strip().lower() == "support"]
+    risky_terms = [x for x in selected_terms if (x.get("stage3_bucket") or "").strip().lower() == "risky"]
+    core_terms = sorted(core_terms, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
+    support_terms = sorted(support_terms, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
+    risky_terms = sorted(risky_terms, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
+    final_term_ids_for_paper = core_terms + support_terms[:8] + risky_terms[:2]
+    final_term_ids_for_paper = final_term_ids_for_paper[:max_terms]
+
+    for r in final_term_ids_for_paper:
         b = (r.get("stage3_bucket") or "").strip().lower()
         if b == "core":
             r["retrieval_role"] = "paper_primary"
@@ -636,8 +667,7 @@ def select_terms_for_paper_recall(
             r["retrieval_role"] = "paper_support"
         else:
             r["retrieval_role"] = "paper_risky"
-    selected.sort(key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
-    return selected[:max_terms]
+    return final_term_ids_for_paper
 
 
 def _run_stage3_dual_gate(
@@ -750,9 +780,39 @@ def _run_stage3_dual_gate(
     for rec in survivors:
         rec["risk_reasons"] = _collect_risky_reasons(rec)
         rec["bucket_reason_flags"] = _collect_stage3_bucket_reason_flags(rec)
+
+    # Stage3 风险修正：压 conditioned-only / weak-only / no-mainline
+    for rec in survivors:
+        reason_flags = set(rec.get("bucket_reason_flags") or [])
+        bucket = (rec.get("stage3_bucket") or "").strip().lower()
+        stage3_entry_group = (rec.get("stage3_entry_group") or "").strip().lower()
+        anchor_count = int(rec.get("anchor_count") or 1)
+        mainline_hits = int(rec.get("mainline_hits") or 0)
+        can_expand = bool(rec.get("can_expand", False))
+        risk_penalty = 1.0
+        if "no_mainline_support" in reason_flags:
+            risk_penalty *= 0.72
+        if "only_weak_keep_sources" in reason_flags:
+            risk_penalty *= 0.78
+        if "conditioned_only" in reason_flags:
+            risk_penalty *= 0.80
+        if anchor_count <= 1 and mainline_hits == 0 and not can_expand:
+            risk_penalty *= 0.75
+        if stage3_entry_group == "secondary_primary" and bucket != "core":
+            risk_penalty *= 0.88
+        if bucket == "risky":
+            risk_penalty *= 0.88
+        rec["final_score"] = float(rec.get("final_score") or 0.0) * risk_penalty
+        ex = rec.get("stage3_explain") or {}
+        ex["mainline_risk_penalty"] = risk_penalty
+        rec["stage3_explain"] = ex
+    survivors.sort(key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
+    for i, rec in enumerate(survivors):
+        rec["stage3_rank"] = i
+
     core_terms_list, support_terms_list, risky_terms_list = _bucket_stage3_terms(survivors)
     if LABEL_PATH_TRACE or getattr(term_scoring, "STAGE3_DEBUG", False):
-        for rec in (core_terms_list + support_terms_list + risky_terms_list)[:40]:
+        for rec in (core_terms_list + support_terms_list + risky_terms_list)[:15]:
             term = (rec.get("term") or "")[:28]
             bucket = rec.get("stage3_bucket") or ""
             identity_factor = float((rec.get("stage3_explain") or {}).get("identity_factor", 1.0) or 1.0)
@@ -765,7 +825,7 @@ def _run_stage3_dual_gate(
                 f"anchor_count={anchor_count} mainline_hits={mainline_hits} can_expand={can_expand} | reason_flags={reason_flags}"
             )
         # 排序上升/下降主导因子：便于验证 mainline_support_factor 是否罚对
-        for rec in survivors[:30]:
+        for rec in survivors[:15]:
             term = (rec.get("term") or "")[:28]
             prev_rank = rec.get("stage2_rank")
             new_rank = rec.get("stage3_rank")
