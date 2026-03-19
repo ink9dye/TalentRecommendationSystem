@@ -2417,6 +2417,7 @@ KGAT-AX 不单独工作，而是放在总召回之后：
     - **分层正负样本**：Strong/Weak Positive、EasyNeg/FieldNeg/HardNeg/CollabNeg（README 5.5）；产出 `train.txt / test.txt`，每行 `user_id;pos;fair;neutral;easyNeg`。
     - **四分支侧车**：可选导出 `train_four_branch.json` / `test_four_branch.json`（recall/author_aux/interaction 特征），供 DataLoader 与四分支模型使用。
     - 从 Neo4j 导出加权关系并映射到统一 ID 空间，生成 `kg_final.txt` 与 `id_map.json`。
+    - **训练加速**：`generate_refined_train_data(..., recall_workers=N)`（`N≥2`）时多进程并行 `TotalRecallSystem.execute(is_training=True)`，主进程再顺序做 `get_user_id/get_ent_id` 与行组装；环境变量 `KGATAX_RECALL_WORKERS` 可在直接运行脚本时指定。`TotalRecallSystem.execute` 在 `is_training=True` 时跳过领域 prompt 二次编码，与线上默认 `is_training=False` 行为区分。
 
 - **`build_kg_index.py`**  
   - `KGIndexBuilder`：将 `kg_final.txt` 导入到 `kg_index.db` 中的 `kg_triplets` 表，并建立双向覆盖索引，提升子图采样效率。
@@ -2753,7 +2754,8 @@ python build_collaborative_index.py
 ```bash
 cd src/infrastructure/database/kgat_ax
 
-# 1) 生成训练样本与加权 KG 文本
+# 1) 生成训练样本与加权 KG 文本（可选多进程召回，例如 4 个 worker）
+# set KGATAX_RECALL_WORKERS=4   # Windows CMD: set KGATAX_RECALL_WORKERS=4
 python generate_training_data.py
 
 # 2) 将 kg_final.txt 导入 SQLite 并建立索引

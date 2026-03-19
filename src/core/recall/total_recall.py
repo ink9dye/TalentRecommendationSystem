@@ -310,7 +310,7 @@ class TotalRecallSystem:
         active_domains, applied_domain_str, domain_debug = self.domain_detector.detect(
             raw_vec,
             query_text=query_text,
-            user_domain=user_domain if not is_training else user_domain,
+            user_domain=user_domain,
         )
 
         vector_domains = None
@@ -326,8 +326,12 @@ class TotalRecallSystem:
                     bias = self.DOMAIN_PROMPTS[primary_domain]
                     final_query = f"{query_text} | Area: {bias}"
 
-        query_vec, _ = self.encoder.encode(final_query)
-        faiss.normalize_L2(query_vec)
+        # 训练模式跳过领域 prompt，且多数情况下 final_query==query_text：复用已归一化的 raw_vec，避免二次 encode
+        if final_query == query_text:
+            query_vec = raw_vec
+        else:
+            query_vec, _ = self.encoder.encode(final_query)
+            faiss.normalize_L2(query_vec)
 
         future_v = self.executor.submit(self.v_path.recall, query_vec, target_domains=vector_domains)
         future_l = self.executor.submit(

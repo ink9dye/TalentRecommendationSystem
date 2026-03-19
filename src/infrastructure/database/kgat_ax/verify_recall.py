@@ -106,13 +106,13 @@ def run_offline_verification():
         query_text = f"{job['job_name']} {job['description']} {job['skills']}"
         pos_ids = set(dataloader.test_user_dict[u_int])
 
-        # 模拟 75% 场景：带 Domain 过滤
-        res_d = recall_system.execute(query_text, domain_id=job['domain_ids'])
+        # 模拟 75% 场景：带 Domain 过滤（批评估与训练数据一致：is_training=True，跳过领域 prompt 二次编码）
+        res_d = recall_system.execute(query_text, domain_id=job["domain_ids"], is_training=True)
         cand_d = [dataloader.entity_to_int.get(f"a_{aid}") for aid in res_d['final_top_500'] if
                   f"a_{aid}" in dataloader.entity_to_int]
 
-        # 模拟 25% 场景：全库搜索 (domain_id=None)
-        res_g = recall_system.execute(query_text, domain_id=None)
+        # 模拟 25% 场景：全库搜索 (domain_id=None)；domain 策略不同须单独召回，无法与 res_d 共用
+        res_g = recall_system.execute(query_text, domain_id=None, is_training=True)
         cand_g = [dataloader.entity_to_int.get(f"a_{aid}") for aid in res_g['final_top_500'] if
                   f"a_{aid}" in dataloader.entity_to_int]
 

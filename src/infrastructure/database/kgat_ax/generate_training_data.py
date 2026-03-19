@@ -5,6 +5,7 @@ KGAT-AX 训练数据生成器。
 - 训练样本入口优先基于 candidate_pool.candidate_records；final_top_500 仅作兼容回退。
 - 分层正负样本：Strong/Weak Positive，EasyNeg/FieldNeg/HardNeg/CollabNeg。
 - 可选导出四分支字段到 train_four_branch.json / test_four_branch.json，供 DataLoader 与四分支模型使用。
+- 多进程：子进程各持一套 TotalRecallSystem，仅并行 execute(is_training=True)；主进程顺序做 ID 映射与样本行组装。
 """
 import os
 import re
@@ -14,6 +15,9 @@ import faiss
 import numpy as np
 import pandas as pd
 import random
+from multiprocessing import Pool, cpu_count
+from typing import Any, Dict, List, Optional, Tuple
+
 from tqdm import tqdm
 from py2neo import Graph
 from config import (
@@ -22,6 +26,58 @@ from config import (
     NEO4J_PASSWORD, NEO4J_DATABASE
 )
 from src.core.recall.total_recall import TotalRecallSystem
+
+# ---------------------------------------------------------------------------
+# 多进程召回 worker（Windows spawn 下需在模块顶层可 pickle）
+# ---------------------------------------------------------------------------
+_MP_RECALL_SYSTEM: Optional[TotalRecallSystem] = None
+_MP_JOB_IDX: Optional[Dict[str, int]] = None
+
+
+def _kgat_mp_worker_init() -> None:
+    global _MP_RECALL_SYSTEM, _MP_JOB_IDX
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    with open(JOB_MAP_PATH, "r", encoding="utf-8") as f:
+        sid_list = json.load(f)
+    _MP_JOB_IDX = {str(sid): i for i, sid in enumerate(sid_list)}
+    _MP_RECALL_SYSTEM = TotalRecallSystem()
+    _MP_RECALL_SYSTEM.v_path.verbose = False
+    _MP_RECALL_SYSTEM.l_path.verbose = False
+
+
+def _kgat_mp_worker_task(spec: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """返回 (securityId, execute 结果)；无索引的岗位返回 (id, None)。"""
+    global _MP_RECALL_SYSTEM, _MP_JOB_IDX
+    assert _MP_RECALL_SYSTEM is not None and _MP_JOB_IDX is not None
+    job = spec["job"]
+    jid = str(job["securityId"])
+    if jid not in _MP_JOB_IDX:
+        return jid, None
+    query_text = f"{job.get('job_name') or ''} {job.get('description') or ''} {job.get('skills') or ''}"
+    target_domain = spec.get("target_domain")
+    res = _MP_RECALL_SYSTEM.execute(query_text, domain_id=target_domain, is_training=True)
+    return jid, res
+
+
+def parallel_total_recall_for_specs(
+    specs: List[Dict[str, Any]],
+    workers: int,
+) -> Dict[str, Optional[Dict[str, Any]]]:
+    """
+    对 specs 并行执行 TotalRecallSystem.execute(is_training=True)。
+    specs 每项: {"job": dict, "target_domain": Optional[str]}
+    """
+    if not specs:
+        return {}
+    n = max(1, int(workers))
+    n = min(n, cpu_count() or 1)
+    if n < 2:
+        raise ValueError("parallel_total_recall_for_specs requires workers >= 2")
+    chunksize = max(1, len(specs) // (n * 4))
+    with Pool(processes=n, initializer=_kgat_mp_worker_init) as pool:
+        pairs = pool.map(_kgat_mp_worker_task, specs, chunksize=chunksize)
+    return {jid: res for jid, res in pairs}
+
 
 # 分层正负样本标签（README 5.5）
 LABEL_STRONG_POS = "strong_pos"
@@ -47,10 +103,8 @@ class KGATAXTrainingGenerator:
         with open(JOB_MAP_PATH, 'r', encoding='utf-8') as f:
             self.job_id_to_idx = {sid: i for i, sid in enumerate(json.load(f))}
 
-        # 3. 召回系统
-        self.recall_system = TotalRecallSystem()
-        self.recall_system.v_path.verbose = False
-        self.recall_system.l_path.verbose = False
+        # 3. 召回系统（顺序模式懒加载；多进程模式下每 worker 自建）
+        self.recall_system: Optional[TotalRecallSystem] = None
 
         # 4. 载入学术质量映射
         self.author_quality_map = {}
@@ -75,6 +129,13 @@ class KGATAXTrainingGenerator:
             w_norm = feats.get('works_count', 0.0)
             self.author_quality_map[str(aid)] = 0.4 * h_norm + 0.4 * c_norm + 0.2 * w_norm
 
+    def _ensure_recall_system(self) -> TotalRecallSystem:
+        if self.recall_system is None:
+            self.recall_system = TotalRecallSystem()
+            self.recall_system.v_path.verbose = False
+            self.recall_system.l_path.verbose = False
+        return self.recall_system
+
     def get_user_id(self, raw_id):
         raw_id = str(raw_id)
         if raw_id not in self.user_to_int:
@@ -89,11 +150,14 @@ class KGATAXTrainingGenerator:
             self.entity_counter += 1
         return self.entity_to_int[raw_id] + self.ENTITY_OFFSET
 
-    def generate_refined_train_data(self, train_size=3000, test_size=300):
+    def generate_refined_train_data(self, train_size=3000, test_size=300, recall_workers: int = 0):
         """
         任务 1：生成精排训练样本（优先基于 candidate_pool.candidate_records，分层正负样本，README 5.5）。
         同时写入 train_four_branch.json / test_four_branch.json（四分支字段），供 DataLoader 与四分支模型使用。
         返回：被抽样用于训练的岗位 ID 列表 (锚点)。
+
+        :param recall_workers: 0=顺序执行；>=2 时用多进程并行 execute（每进程一套 TotalRecallSystem），
+               主进程顺序做 ID 映射；与顺序模式一致地传 is_training=True。
         """
         print(f"\n>>> 任务 1: 生成混合排名精排数据（候选池入口 + 分层正负样本 + 四分支导出）...")
         conn = sqlite3.connect(DB_PATH)
@@ -106,19 +170,64 @@ class KGATAXTrainingGenerator:
         train_lines, test_lines = [], []
         train_four_branch, test_four_branch = {}, {}
 
-        for job in tqdm(sampled[:train_size], desc="Generating Train"):
-            line, aux = self._process_single_job(job)
-            if line:
-                train_lines.append(line)
-                if aux:
-                    train_four_branch.update(aux)
+        train_slice = sampled[:train_size]
+        test_slice = sampled[train_size:]
+        rng = random.Random(42)
 
-        for job in tqdm(sampled[train_size:], desc="Generating Test"):
-            line, aux = self._process_single_job(job)
-            if line:
-                test_lines.append(line)
-                if aux:
-                    test_four_branch.update(aux)
+        if recall_workers and recall_workers >= 2:
+            def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+                return {k: row[k] for k in row.keys()}
+
+            train_specs = [
+                {
+                    "job": _row_to_dict(job),
+                    "target_domain": job["domain_ids"] if rng.random() < 0.75 else None,
+                }
+                for job in train_slice
+            ]
+            test_rng = random.Random(43)
+            test_specs = [
+                {
+                    "job": _row_to_dict(job),
+                    "target_domain": job["domain_ids"] if test_rng.random() < 0.75 else None,
+                }
+                for job in test_slice
+            ]
+            print(
+                f"[*] 多进程召回: workers={min(recall_workers, cpu_count() or 1)} "
+                f"(train={len(train_specs)} test={len(test_specs)})，is_training=True",
+                flush=True,
+            )
+            train_by = parallel_total_recall_for_specs(train_specs, recall_workers)
+            test_by = parallel_total_recall_for_specs(test_specs, recall_workers)
+
+            for job in tqdm(train_slice, desc="Generating Train (finalize)"):
+                line, aux = self._finalize_job_from_recall(job, train_by.get(str(job["securityId"])))
+                if line:
+                    train_lines.append(line)
+                    if aux:
+                        train_four_branch.update(aux)
+
+            for job in tqdm(test_slice, desc="Generating Test (finalize)"):
+                line, aux = self._finalize_job_from_recall(job, test_by.get(str(job["securityId"])))
+                if line:
+                    test_lines.append(line)
+                    if aux:
+                        test_four_branch.update(aux)
+        else:
+            for job in tqdm(train_slice, desc="Generating Train"):
+                line, aux = self._process_single_job(job)
+                if line:
+                    train_lines.append(line)
+                    if aux:
+                        train_four_branch.update(aux)
+
+            for job in tqdm(test_slice, desc="Generating Test"):
+                line, aux = self._process_single_job(job)
+                if line:
+                    test_lines.append(line)
+                    if aux:
+                        test_four_branch.update(aux)
 
         train_path = os.path.join(self.output_dir, "train.txt")
         test_path = os.path.join(self.output_dir, "test.txt")
@@ -138,19 +247,35 @@ class KGATAXTrainingGenerator:
         print(f"[OK] 任务 1 完成，共生成 {len(train_lines) + len(test_lines)} 条阶梯样本；四分支条目 train={len(train_four_branch)} test={len(test_four_branch)}。")
         return sampled_job_ids
 
-    def _process_single_job(self, job):
+    def _process_single_job(self, job, use_domain: Optional[bool] = None):
         """
-        处理单个岗位：优先使用 candidate_pool.candidate_records，分层正负样本（README 5.5）；
-        不足时回退到 final_top_500 + 原四级梯度。返回 (train_line, four_branch_aux_dict 或 None)。
+        顺序模式：单次召回 + 组装训练行。use_domain=None 时按 75% 概率使用岗位 domain_ids。
         """
-        job_raw_id = str(job['securityId'])
+        job_raw_id = str(job["securityId"])
         if job_raw_id not in self.job_id_to_idx:
             return None, None
-
         query_text = f"{job['job_name'] or ''} {job['description'] or ''} {job['skills'] or ''}"
-        use_domain = random.random() < 0.75
-        target_domain = job['domain_ids'] if use_domain else None
-        recall_results = self.recall_system.execute(query_text, domain_id=target_domain)
+        if use_domain is None:
+            use_domain = random.random() < 0.75
+        target_domain = job["domain_ids"] if use_domain else None
+        recall_results = self._ensure_recall_system().execute(
+            query_text, domain_id=target_domain, is_training=True
+        )
+        return self._finalize_job_from_recall(job, recall_results)
+
+    def _finalize_job_from_recall(
+        self,
+        job,
+        recall_results: Optional[Dict[str, Any]],
+    ):
+        """
+        在已有 execute 结果上组装训练行（供多进程召回后主进程顺序调用，保证 get_user_id/get_ent_id 一致）。
+        """
+        if not recall_results:
+            return None, None
+        job_raw_id = str(job["securityId"])
+        if job_raw_id not in self.job_id_to_idx:
+            return None, None
 
         pool = recall_results.get("candidate_pool")
         records = getattr(pool, "candidate_records", None) if pool else None
@@ -435,6 +560,8 @@ class KGATAXTrainingGenerator:
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     gen = KGATAXTrainingGenerator()
+    # 多进程召回：设置环境变量 KGATAX_RECALL_WORKERS=4（或传参扩展）；0=顺序
+    _rw = int(os.environ.get("KGATAX_RECALL_WORKERS", "0") or "0")
 
     # 第一步：锁定全局 ID 偏移量 (从 Neo4j 读取全量岗位)
     print("\n[*] 正在从 Neo4j 锁定全局 ID 偏移量 (执行人口普查)...")
@@ -450,7 +577,9 @@ if __name__ == "__main__":
     print(f"[OK] ENTITY_OFFSET 已锁定为: {gen.ENTITY_OFFSET}")
 
     # 第二步：生成精排样本 (此时使用已锁定的 OFFSET)
-    trained_anchors = gen.generate_refined_train_data(train_size=3000, test_size=300)
+    trained_anchors = gen.generate_refined_train_data(
+        train_size=3000, test_size=300, recall_workers=_rw
+    )
 
     # 第三步：执行全量拓扑收割
     gen.generate_kg_topology(sampled_job_ids=trained_anchors)
