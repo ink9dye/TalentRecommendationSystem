@@ -125,6 +125,9 @@ def run_label_debug_cli() -> None:
                         ("raw_merged Top20", "stage2_raw_merged_top20"),
                     ]:
                         rows = getattr(di, attr, None) or []
+                        # 降噪：空表不再打印表头，避免重复“空块”干扰诊断主线
+                        if not rows:
+                            continue
                         print(f"【Stage2 {name}】tid | term | sim_score | source/origin | degree_w | domain_span")
                         for r in rows[:20]:
                             term = (r.get("term") or "")[:28]
@@ -138,8 +141,7 @@ def run_label_debug_cli() -> None:
                 print(f"  similar_to_raw_tids 数量: {len(raw_tids)}  前30: {raw_tids[:30]}")
                 print(f"  similar_to_pass_tids 数量: {len(pass_tids)}  前30: {pass_tids[:30]}")
                 print(f"  final_term_ids_for_paper 数量: {n_final}  前30: {final_tids[:30]}")
-                for label, in_final in (fcl.get("contains_check") or {}).items():
-                    print(f"  contains {label}: {in_final}")
+                # contains_check 已在 Stage5 默认降级，避免重复输出低收益闭环信息
 
                 top_contrib = db.get("top_terms_final_contrib") or []
                 if top_contrib:

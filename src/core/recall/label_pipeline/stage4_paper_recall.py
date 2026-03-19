@@ -1,8 +1,13 @@
 import time
+import json
+import os
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+
 from src.utils.time_features import compute_paper_recency
+from config import ABSTRACT_MAP_PATH, INDEX_DIR
 
 # 层级守卫：单 term 最多贡献论文数，避免泛词占满 paper 池
 TERM_MAX_PAPERS = 50
@@ -145,20 +150,25 @@ def run_stage4(
             "cybersecurity",
         ]
         if any(kw in t for kw in off_keywords):
-            # Stage4 需要“压分”而不是“灭门”：收敛力道先降一档
-            off_topic_penalty *= 0.75
+            # 加重泛交通/物流/工业流程偏题惩罚，优先清理“看似相关但主轴不对”的高分论文
+            off_topic_penalty *= 0.55
 
         # RL 相关额外约束：如不是机器人/控制体系，则压
         if ("reinforcement learning" in term_text) or ("q-learning" in term_text):
             if not any(
-                kw in t for kw in ["robot", "robotic", "control", "manipulator", "motion"]
+                kw in t
+                for kw in ["robot", "robotic", "control", "manipulator", "motion", "locomotion", "planning"]
             ):
-                off_topic_penalty *= 0.75
+                # RL 词必须更贴机器人/控制主轴，否则强压
+                off_topic_penalty *= 0.45
 
         # route planning 相关额外约束：更像交通规划则压
         if "route planning" in term_text:
-            if any(kw in t for kw in ["charging station", "traffic", "transportation", "vehicle"]):
-                off_topic_penalty *= 0.75
+            if any(
+                kw in t
+                for kw in ["charging station", "traffic", "transportation", "vehicle", "bus", "rescue route", "ship"]
+            ):
+                off_topic_penalty *= 0.40
 
         # robotic arm 相关额外约束：纯器件/结构而非控制也压一点
         if "robotic arm" in term_text:
@@ -170,16 +180,216 @@ def run_stage4(
                     "motion",
                     "dynamics",
                     "planning",
+                    "kinematics",
+                    "manipulation",
+                    "grasp",
                 ]
             ):
-                off_topic_penalty *= 0.88
+                off_topic_penalty *= 0.60
 
-        grounding = (0.35 * lexical_hit + 0.25 * anchor_axis_hit + 0.40 * jd_axis_match)
+        # 提高词面命中权重，降低“只沾主轴泛词”论文的 grounding 分
+        grounding = (0.55 * lexical_hit + 0.20 * anchor_axis_hit + 0.25 * jd_axis_match)
         if retrieval_role == "paper_support":
             grounding *= 0.92
 
         grounding = max(0.0, min(1.0, float(grounding)))
         return {"grounding": grounding, "off_topic_penalty": float(off_topic_penalty)}
+
+    def _ensure_stage4_resources() -> None:
+        """
+        Stage4 资源懒加载（最小补丁）：
+        1) 论文摘要向量矩阵
+        2) paper_id -> row_idx 映射
+        3) 缓存到 recall 对象，避免重复加载
+        """
+        if bool(getattr(recall, "_stage4_vec_ready", False)):
+            return
+
+        vec_path = os.path.join(INDEX_DIR, "abstract_vectors.npy")
+        map_path = ABSTRACT_MAP_PATH
+
+        paper_vecs = None
+        paper_id_to_row: Dict[str, int] = {}
+        paper_norms = None
+
+        try:
+            if os.path.exists(vec_path):
+                paper_vecs = np.load(vec_path)
+        except Exception:
+            paper_vecs = None
+
+        try:
+            if os.path.exists(map_path):
+                with open(map_path, "r", encoding="utf-8") as f:
+                    raw_map = json.load(f)
+                if isinstance(raw_map, list):
+                    paper_id_to_row = {str(pid): i for i, pid in enumerate(raw_map)}
+                elif isinstance(raw_map, dict):
+                    paper_id_to_row = {str(pid): int(idx) for pid, idx in raw_map.items()}
+        except Exception:
+            paper_id_to_row = {}
+
+        if isinstance(paper_vecs, np.ndarray) and paper_vecs.size > 0:
+            try:
+                paper_norms = np.linalg.norm(paper_vecs, axis=1)
+                paper_norms = np.where(paper_norms <= 1e-12, 1e-12, paper_norms)
+            except Exception:
+                paper_norms = None
+
+        setattr(recall, "_paper_abstract_vecs", paper_vecs)
+        setattr(recall, "_paper_id_to_row", paper_id_to_row)
+        setattr(recall, "_paper_abstract_norms", paper_norms)
+        setattr(recall, "_stage4_vec_ready", True)
+
+        dim = int(paper_vecs.shape[1]) if isinstance(paper_vecs, np.ndarray) and paper_vecs.ndim == 2 else 0
+        print(f"[Stage4 vec ready] papers={len(paper_id_to_row)} dim={dim}")
+
+    def _score_paper_for_term(
+        vid: int,
+        wid: str,
+        title: str,
+        domains: str,
+        year: Any,
+        idf_weight: float,
+        domain_bonus: float,
+        term_final: float,
+        role_weight: float,
+        query_vec_1d: Optional[np.ndarray],
+        query_norm: float,
+    ) -> Dict[str, float]:
+        """
+        Stage4 单篇打分（最小侵入版）：
+        在原有 term grounding + penalty 基础上，新增 JD↔摘要向量 jd_align 软融合。
+        """
+        tt = term_type_cache.get(vid)
+        if tt is None:
+            tt = _compute_term_type_factors(vid)
+            term_type_cache[vid] = tt
+
+        ground = _compute_grounding_score(vid, title, domains)
+        term_grounding = float(ground["grounding"]) * float(tt["grounding_factor"])
+        term_grounding = max(0.0, min(1.0, term_grounding))
+        off_topic_penalty = float(ground["off_topic_penalty"])
+        term_paper_role_factor = float(tt["paper_factor"])
+
+        # 默认中性值：向量缺失时不一票否决
+        jd_align = 0.50
+        paper_vecs = getattr(recall, "_paper_abstract_vecs", None)
+        paper_id_to_row = getattr(recall, "_paper_id_to_row", {}) or {}
+        paper_norms = getattr(recall, "_paper_abstract_norms", None)
+        row_idx = paper_id_to_row.get(str(wid))
+        if (
+            row_idx is not None
+            and isinstance(paper_vecs, np.ndarray)
+            and isinstance(paper_norms, np.ndarray)
+            and query_vec_1d is not None
+            and query_norm > 1e-12
+            and 0 <= int(row_idx) < len(paper_vecs)
+            and int(row_idx) < len(paper_norms)
+        ):
+            try:
+                pv = np.asarray(paper_vecs[int(row_idx)], dtype=np.float32).flatten()
+                if pv.size == query_vec_1d.size:
+                    cos = float(np.dot(query_vec_1d, pv) / (query_norm * float(paper_norms[int(row_idx)])))
+                    jd_align = 0.5 * (cos + 1.0)
+                    jd_align = max(0.0, min(1.0, jd_align))
+            except Exception:
+                jd_align = 0.50
+
+        # 关键融合（最小修正）：
+        # 1) term_grounding 继续当主轴
+        # 2) jd_align 只做弱辅助，不能“救活”term 不够像的论文
+        # 3) term_grounding 很低时，JD 相似度影响进一步缩小
+        jd_boost = 0.85 + 0.15 * jd_align
+        if term_grounding < 0.20:
+            jd_boost = 0.92 + 0.08 * jd_align
+
+        hybrid_grounding = term_grounding * jd_boost
+        hybrid_grounding = max(0.0, min(1.0, float(hybrid_grounding)))
+
+        recency = compute_paper_recency(year, None)
+        base_term_contrib = term_final * role_weight * idf_weight * domain_bonus * recency
+        final_paper_score = (
+            base_term_contrib
+            * (0.10 + 0.90 * hybrid_grounding)
+            * off_topic_penalty
+            * term_paper_role_factor
+        )
+
+        return {
+            "term_grounding": term_grounding,
+            "jd_align": jd_align,
+            "hybrid_grounding": hybrid_grounding,
+            "offtopic_penalty": off_topic_penalty,
+            "paper_factor": term_paper_role_factor,
+            "year_factor": recency,
+            "domain_bonus": domain_bonus,
+            "idf_weight": idf_weight,
+            "final_paper_score": final_paper_score,
+        }
+
+    def _compute_term_type_factors(vid: int) -> Dict[str, float]:
+        """
+        Stage4 最小 term-type 因子（无词表硬编码）：
+        - 方法骨架词：grounding 略放宽、local cap 略放宽
+        - 对象型词：grounding / paper 贡献 / local cap 略收紧
+        """
+        meta = _get_term_meta(vid)
+        retrieval_role = str(meta.get("retrieval_role") or "").strip().lower()
+        stage3_bucket = str(meta.get("stage3_bucket") or "").strip().lower()
+        can_expand = bool(meta.get("can_expand", False))
+        term_role = str(meta.get("term_role") or "").strip().lower()
+
+        object_like_penalty = float(meta.get("object_like_penalty", 1.0) or 1.0)
+        bonus_term_penalty = float(meta.get("bonus_term_penalty", 1.0) or 1.0)
+        generic_penalty = float(meta.get("generic_penalty", 1.0) or 1.0)
+        object_like_risk = 1.0 - max(0.0, min(1.0, object_like_penalty))
+        generic_risk = 1.0 - max(0.0, min(1.0, generic_penalty))
+        bonus_risk = 1.0 - max(0.0, min(1.0, bonus_term_penalty))
+
+        method_like = (
+            can_expand
+            or stage3_bucket == "core"
+            or retrieval_role == "paper_primary"
+            or term_role == "primary"
+        )
+        object_like = object_like_risk >= 0.35 or object_like_penalty <= 0.82
+
+        grounding_factor = 1.00
+        paper_factor = 1.00
+        local_cap = TERM_MAX_PAPERS
+
+        if method_like and not object_like:
+            grounding_factor = 1.14
+            local_cap = min(TERM_MAX_PAPERS, 15)
+        elif object_like:
+            # 对象型 term（继续收紧版）：保留召回，但进一步压制作者榜“对象词霸榜”
+            # - grounding_factor 下调：降低仅靠主轴泛命中的通过强度
+            # - paper_factor 下调：削弱进入作者聚合前的单篇贡献
+            # - local_cap 收紧到 3：减少同一对象词向 Stage5 喂入的高分论文数量
+            grounding_factor = 0.72
+            paper_factor = 0.60 if retrieval_role == "paper_primary" else 0.70
+            local_cap = min(TERM_MAX_PAPERS, 3)
+        else:
+            # 普通词：轻微收敛，防止泛词累积分过快
+            if retrieval_role == "paper_primary":
+                paper_factor = 0.93
+            local_cap = min(TERM_MAX_PAPERS, 12)
+
+        # 泛词/bonus 风险高时，再做轻微收敛（不做硬门）
+        if generic_risk > 0.40:
+            grounding_factor *= 0.96
+        if bonus_risk > 0.35:
+            paper_factor *= 0.96
+
+        return {
+            # 下限放宽到 0.70，允许对象词 grounding_factor=0.72 生效
+            "grounding_factor": max(0.70, min(1.20, float(grounding_factor))),
+            # 下限放宽到 0.55，允许对象词 primary 使用 0.60 真正生效
+            "paper_factor": max(0.55, min(1.00, float(paper_factor))),
+            # 下限放到 3，确保对象型 term 的收紧策略可真实生效
+            "local_cap": int(max(3, min(TERM_MAX_PAPERS, local_cap))),
+        }
 
     # ---------- 第一层：按 term 拉 (vid, wid, idf_weight, domain_bonus, year)，无论文层硬过滤 ----------
     params: Dict[str, Any] = {"v_ids": v_ids, "total_w": total_w}
@@ -258,8 +468,26 @@ def run_stage4(
     term_low_grounding_samples: Dict[int, List[Dict[str, Any]]] = defaultdict(list)  # 每 term 最多 3
     term_local_cap_cut_samples: Dict[int, List[Dict[str, Any]]] = defaultdict(list)  # 每 term 最多 3
 
+    # Stage4 摘要向量资源懒加载（只做一次）
+    _ensure_stage4_resources()
+    query_vec_1d: Optional[np.ndarray] = None
+    query_norm: float = 0.0
+    try:
+        enc = getattr(recall, "_query_encoder", None)
+        if enc is not None and jd_text:
+            qv, _ = enc.encode(jd_text)
+            if qv is not None:
+                query_vec_1d = np.asarray(qv, dtype=np.float32).flatten()
+                query_norm = float(np.linalg.norm(query_vec_1d))
+    except Exception:
+        query_vec_1d = None
+        query_norm = 0.0
+
     term_capped_unique_wids: Dict[int, set] = defaultdict(set)
     wid_to_paper_meta: Dict[str, Dict[str, str]] = {}  # wid -> {title, domains}
+    term_type_cache: Dict[int, Dict[str, float]] = {}
+    # 审计用：按 term 收集进入 Stage4 评分链路的论文分解，便于定位 Stage4->Stage5 放大点
+    term_kept_paper_audit: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     for r in rows:
         vid = int(r["vid"])
         raw_wid = r["wid"]
@@ -279,17 +507,44 @@ def run_stage4(
         domains = str(r.get("domains") or "")
         wid_to_paper_meta[wid] = {"title": title, "domains": domains}
 
-        recency = compute_paper_recency(year, None)
         term_final = _term_score(vid)
         role_weight = get_term_role_weight(term_retrieval_roles, vid)
-
-        base_term_contrib = term_final * role_weight * idf_weight * domain_bonus * recency
-        ground = _compute_grounding_score(vid, title, domains)
-        grounding = float(ground["grounding"])
-        off_topic_penalty = float(ground["off_topic_penalty"])
-
-        # 主轴落地乘子 + 偏题惩罚：避免 reinforcement learning / route planning / robotic arm 等泛命中池偏移
-        term_contrib = base_term_contrib * (0.45 + 0.55 * grounding) * off_topic_penalty
+        score_detail = _score_paper_for_term(
+            vid=vid,
+            wid=wid,
+            title=title,
+            domains=domains,
+            year=year,
+            idf_weight=idf_weight,
+            domain_bonus=domain_bonus,
+            term_final=term_final,
+            role_weight=role_weight,
+            query_vec_1d=query_vec_1d,
+            query_norm=query_norm,
+        )
+        term_contrib = float(score_detail["final_paper_score"])
+        grounding = float(score_detail["term_grounding"])  # 硬门：先保证论文真的像这个 term
+        hybrid_grounding = float(score_detail["hybrid_grounding"])  # 软排：JD 只参与排序
+        off_topic_penalty = float(score_detail["offtopic_penalty"])
+        # 记录“论文贡献前的因子分解”：只用于 debug 打印，不参与排序逻辑
+        term_kept_paper_audit[vid].append(
+            {
+                "paper_id": wid,
+                "title": title,
+                "term_grounding": float(score_detail["term_grounding"]),
+                "jd_align": float(score_detail["jd_align"]),
+                "hybrid_grounding": float(score_detail["hybrid_grounding"]),
+                "grounding": grounding,
+                "gating_grounding": grounding,
+                "hybrid_grounding": hybrid_grounding,
+                "offtopic_penalty": off_topic_penalty,
+                "paper_factor": float(score_detail["paper_factor"]),
+                "year_factor": float(score_detail["year_factor"]),
+                "domain_bonus": domain_bonus,
+                "idf_weight": idf_weight,
+                "final_paper_score": term_contrib,
+            }
+        )
 
         # 低落地主轴论文直接不进池
         # 放松硬截断：避免把真正的主轴论文也直接砍光
@@ -315,11 +570,11 @@ def run_stage4(
     limited: List[tuple] = []
     for vid, triples in by_term.items():
         triples.sort(key=lambda x: -x[1])
-        role = (term_retrieval_roles.get(vid) or term_retrieval_roles.get(str(vid)) or "").strip().lower()
-        local_cap = TERM_MAX_PAPERS
-        if role == "paper_support":
-                # support 词本来就更少；先把上限从 15 放到 30
-                local_cap = min(TERM_MAX_PAPERS, 30)
+        tt = term_type_cache.get(vid)
+        if tt is None:
+            tt = _compute_term_type_factors(vid)
+            term_type_cache[vid] = tt
+        local_cap = int(tt["local_cap"])
 
         term_funnel_counts[vid]["after_offtopic_penalty_sort"] = term_funnel_counts[vid][
             "after_grounding_gate"
@@ -497,6 +752,41 @@ def run_stage4(
                     f"penalty={float(g.get('off_topic_penalty') or 1.0):.3f} "
                     f"final_paper_score={final_score:.3f} title={meta3.get('title')[:80]!r}"
                 )
+
+    # 精准审计块 1/3：
+    # [Stage4 kept paper score audit] 聚焦“论文分 -> 作者分”前的 paper_factor 分解，
+    # 用于判断是 Stage4 因子过松，还是 Stage5 聚合过度放大。
+    print("\n[Stage4 kept paper score audit]")
+    for vid in v_ids:
+        meta = _get_term_meta(vid)
+        term_name = str(meta.get("term") or meta.get("anchor") or meta.get("parent_primary") or vid)
+        rows_audit = term_kept_paper_audit.get(vid, [])
+        rows_audit.sort(key=lambda x: float(x.get("final_paper_score") or 0.0), reverse=True)
+        print(f"term='{term_name}' kept={len(rows_audit)}")
+        for i, p in enumerate(rows_audit[:10], 1):
+            print(
+                f"[Stage4 jd audit] term='{term_name}' pid='{p.get('paper_id')}' "
+                f"tg={float(p.get('term_grounding') or 0.0):.3f} "
+                f"jd={float(p.get('jd_align') or 0.5):.3f} "
+                f"hybrid={float(p.get('hybrid_grounding') or p.get('grounding') or 0.0):.3f} "
+                f"penalty={float(p.get('offtopic_penalty') or 1.0):.3f} "
+                f"final={float(p.get('final_paper_score') or 0.0):.3f} "
+                f"title={str(p.get('title') or '')[:80]!r}"
+            )
+            print(
+                f"  #{i} pid={p.get('paper_id')} "
+                f"tg={float(p.get('term_grounding') or 0.0):.3f} "
+                f"jd={float(p.get('jd_align') or 0.5):.3f} "
+                f"hybrid={float(p.get('hybrid_grounding') or p.get('grounding') or 0.0):.3f} "
+                f"grounding={float(p.get('grounding') or 0.0):.3f} "
+                f"penalty={float(p.get('offtopic_penalty') or 1.0):.3f} "
+                f"paper_factor={float(p.get('paper_factor') or 1.0):.3f} "
+                f"year_factor={float(p.get('year_factor') or 1.0):.3f} "
+                f"domain_bonus={float(p.get('domain_bonus') or 1.0):.3f} "
+                f"idf_weight={float(p.get('idf_weight') or 0.0):.3f} "
+                f"final_paper_score={float(p.get('final_paper_score') or 0.0):.3f} "
+                f"title={str(p.get('title') or '')[:70]!r}"
+            )
 
     if not sorted_wids:
         sub_ms["total"] = (time.perf_counter() - t0) * 1000.0

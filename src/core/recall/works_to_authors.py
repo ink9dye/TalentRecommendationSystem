@@ -114,6 +114,10 @@ def accumulate_author_scores(
             author_work_scores[aid][wid] = prev + contrib
 
     # 对每个作者做 TopK 聚合
+    # 关键改动（第一优先）：
+    # - 不再线性累加同一作者的多篇论文贡献，改为按作者内排名递减累计。
+    # - 目的：抑制“同一 term 下多篇高分论文线性吃满”导致的作者榜失衡。
+    DECAY_BY_RANK = [1.00, 0.55, 0.30, 0.18, 0.10]
     author_scores: Dict[str, float] = {}
     author_top_works: Dict[str, List[Tuple[str, float]]] = {}
 
@@ -124,12 +128,23 @@ def accumulate_author_scores(
         if top_k_per_author is not None and top_k_per_author > 0:
             items = items[:top_k_per_author]
 
-        total = sum(score for _, score in items)
+        weighted_items: List[Tuple[str, float]] = []
+        total = 0.0
+        for i, (wid, score) in enumerate(items):
+            if i < len(DECAY_BY_RANK):
+                factor = DECAY_BY_RANK[i]
+            else:
+                factor = 0.06
+            adj = float(score) * float(factor)
+            if adj <= 0:
+                continue
+            weighted_items.append((wid, adj))
+            total += adj
         if total <= 0:
             continue
 
         author_scores[aid] = total
-        author_top_works[aid] = items
+        author_top_works[aid] = weighted_items
 
     return AuthorScoreResult(author_scores, author_top_works)
 

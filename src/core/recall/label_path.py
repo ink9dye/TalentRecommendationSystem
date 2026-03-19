@@ -1534,7 +1534,15 @@ class LabelRecallPath:
         """
         return stage3_term_filtering.run_stage3(self, raw_candidates, query_vector, anchor_vids=anchor_vids)
 
-    def _stage4_graph_search(self, vocab_ids, regex_str, score_map=None, term_retrieval_roles=None):
+    def _stage4_graph_search(
+        self,
+        vocab_ids,
+        regex_str,
+        score_map=None,
+        term_retrieval_roles=None,
+        term_meta=None,
+        jd_text=None,
+    ):
         """
         阶段 4：图检索。用学术词 ID 反查 Work 与 Author，带 Stage3 词权与 retrieval_role（paper_primary / paper_support）参与 paper_score。
         返回: list of { 'aid': str, 'papers': [ { wid, hits, weight, title, year, domains }, ... ] }。
@@ -1548,6 +1556,8 @@ class LabelRecallPath:
             self, vocab_ids, regex_str,
             term_scores=term_scores,
             term_retrieval_roles=term_retrieval_roles,
+            term_meta=term_meta,
+            jd_text=jd_text,
         )
 
     def _stage5_score_and_rank_authors(self, author_papers_list, score_map, term_map, active_domain_set, dominance, debug_1):
@@ -1707,11 +1717,28 @@ class LabelRecallPath:
             final_term_ids_for_paper = [int(r.get("tid")) for r in paper_terms if r.get("tid") is not None]
             term_scores_for_paper = {int(r["tid"]): float(r.get("final_score") or 0.0) for r in paper_terms if r.get("tid") is not None}
             term_retrieval_roles = {int(r["tid"]): (r.get("retrieval_role") or "paper_support") for r in paper_terms if r.get("tid") is not None}
+            term_meta_for_stage4 = {
+                int(r["tid"]): {
+                    "term": r.get("term"),
+                    "parent_anchor": r.get("parent_anchor"),
+                    "parent_primary": r.get("parent_primary"),
+                    "retrieval_role": r.get("retrieval_role"),
+                    "stage3_bucket": r.get("stage3_bucket"),
+                    "term_role": r.get("term_role"),
+                    "can_expand": r.get("can_expand"),
+                    "object_like_penalty": (r.get("stage3_explain") or {}).get("object_like_penalty"),
+                    "bonus_term_penalty": (r.get("stage3_explain") or {}).get("bonus_term_penalty"),
+                    "generic_penalty": (r.get("stage3_explain") or {}).get("generic_penalty"),
+                }
+                for r in paper_terms
+                if r.get("tid") is not None
+            }
             term_family_keys = {int(r["tid"]): (r.get("family_key") or "") for r in paper_terms if r.get("tid") is not None}
         else:
             final_term_ids_for_paper = self._select_terms_for_paper(score_map, term_map, max_terms=20)
             term_scores_for_paper = None
             term_retrieval_roles = None
+            term_meta_for_stage4 = None
             term_family_keys = None
         checkpoints.append({"stage": "S3_select", "final_term_ids": len(final_term_ids_for_paper or []), "ok": bool(final_term_ids_for_paper)})
         if getattr(term_scoring, "STAGE3_DEBUG", False):
@@ -1750,6 +1777,8 @@ class LabelRecallPath:
             regex_str,
             score_map=term_scores_for_paper if term_scores_for_paper is not None else score_map,
             term_retrieval_roles=term_retrieval_roles,
+            term_meta=term_meta_for_stage4,
+            jd_text=semantic_query_text or query_text,
         )
         _print_label_sub_stage_ms("S4", getattr(self.debug_info, "stage4_sub_ms", None) or {})
         n_papers = sum(len(p.get("papers") or []) for p in (author_papers_list or []))

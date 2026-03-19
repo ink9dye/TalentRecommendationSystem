@@ -133,26 +133,81 @@ def run_stage5(
     paper_map: Dict[str, Dict[str, Any]] = {}
     author_raw_paper_cnt: Dict[str, int] = collections.Counter()
 
+    def _merge_hits(old_hits: List[Any], new_hits: List[Any]) -> List[Any]:
+        """
+        合并同一论文来自不同路径的 hits。
+        - dict hit：按 vid 去重，并保留更高 idf（避免重复累加同 term）。
+        - 非 dict hit：按值去重，保序追加。
+        """
+        merged_dict_hits: Dict[str, Dict[str, Any]] = {}
+        merged_other_hits: List[Any] = []
+        merged_other_seen: Set[str] = set()
+
+        for hit in (old_hits or []) + (new_hits or []):
+            if isinstance(hit, dict):
+                vid_s = str(hit.get("vid") or "")
+                if not vid_s:
+                    key = repr(hit)
+                    if key not in merged_other_seen:
+                        merged_other_seen.add(key)
+                        merged_other_hits.append(hit)
+                    continue
+                idf_new = float(hit.get("idf") or 0.0)
+                prev = merged_dict_hits.get(vid_s)
+                if prev is None:
+                    merged_dict_hits[vid_s] = dict(hit)
+                else:
+                    idf_prev = float(prev.get("idf") or 0.0)
+                    if idf_new > idf_prev:
+                        merged_dict_hits[vid_s] = dict(hit)
+            else:
+                key = repr(hit)
+                if key not in merged_other_seen:
+                    merged_other_seen.add(key)
+                    merged_other_hits.append(hit)
+
+        return list(merged_dict_hits.values()) + merged_other_hits
+
     for record in author_papers_list:
         aid = record["aid"]
         for paper in record["papers"]:
             wid = paper["wid"]
-            entry = paper_map.setdefault(
-                wid,
-                {
+            entry = paper_map.get(wid)
+            if entry is None:
+                entry = {
                     "wid": wid,
-                    "hits": paper["hits"],
+                    "hits": list(paper.get("hits") or []),
                     "title": paper["title"],
                     "year": paper["year"],
                     "domains": paper["domains"],
                     "authors": [],
-                },
+                }
+                paper_map[wid] = entry
+            else:
+                # 批注：同一 wid 可能从不同 term 路径进入，这里必须并集保留多 term 命中证据。
+                entry["hits"] = _merge_hits(
+                    list(entry.get("hits") or []),
+                    list(paper.get("hits") or []),
+                )
+            entry["authors"].append(
+                {
+                    "aid": aid,
+                    "pos_weight": float(paper.get("weight") or 1.0),
+                }
             )
-            entry["authors"].append({"aid": aid, "pos_weight": float(paper.get("weight") or 1.0)})
             author_raw_paper_cnt[aid] += 1
 
     t1 = time.perf_counter()
     stage5_sub_ms["merge_paper_map"] = (t1 - t0) * 1000.0
+    print("\n[Stage5 merged paper multi-hit audit]")
+    multi_hit_rows: List[Tuple[str, str, List[str]]] = []
+    for wid, info in paper_map.items():
+        hits = info.get("hits") or []
+        if len(hits) >= 2:
+            multi_hit_rows.append((wid, info.get("title") or "", list(hits)))
+    print(f"multi_hit_papers={len(multi_hit_rows)}")
+    for wid, title, hits in multi_hit_rows[:20]:
+        print(f"  wid={wid} hits={hits} title='{title[:100]}'")
 
     # 标题向量：供 JD 语义门控；LABEL_NO_JD_TITLE_GATE 开启时跳过（省 SQLite / encode）
     wids = list(paper_map.keys())
@@ -250,6 +305,16 @@ def run_stage5(
 
     t2 = time.perf_counter()
     stage5_sub_ms["paper_contribution"] = (t2 - t1) * 1000.0
+    print("\n[Stage5 paper term_weights audit]")
+    multi_term_weight_rows: List[Tuple[str, float, List[Tuple[str, float]]]] = []
+    for p in papers_for_agg:
+        tw = p.get("term_weights") or {}
+        nz = [(tid, round(float(w), 6)) for tid, w in tw.items() if float(w) > 1e-9]
+        if len(nz) >= 2:
+            multi_term_weight_rows.append((p["wid"], float(p["score"]), nz[:10]))
+    print(f"multi_term_weight_papers={len(multi_term_weight_rows)}")
+    for wid, score, nz in multi_term_weight_rows[:20]:
+        print(f"  wid={wid} score={score:.6f} term_weights={nz}")
 
     pc_prof = context.pop("_paper_contrib_prof", None)
     if isinstance(pc_prof, dict) and pc_prof:
@@ -302,21 +367,67 @@ def run_stage5(
     t4 = time.perf_counter()
     stage5_sub_ms["term_paper_index"] = (t4 - t3a) * 1000.0
 
+    # -------------------------
+    # Stage5 稍稳版修正（核心）：
+    # 1) 不再只看 author_top_works，而是从 papers_for_agg 全量构造 author->term hit list
+    # 2) 再做“同词递减聚合”，抑制同一 term 多篇论文线性灌榜
+    # -------------------------
+    author_term_hit_lists: Dict[str, Dict[str, List[float]]] = collections.defaultdict(
+        lambda: collections.defaultdict(list)
+    )
+    # 保留作者的全量 retained works，供后续 best_paper/过滤/时间特征复用
+    author_all_retained_works: Dict[str, List[Tuple[str, float]]] = collections.defaultdict(list)
+    for p in papers_for_agg:
+        wid = p["wid"]
+        s_final = float(p.get("score") or 0.0)
+        r_score = float(p.get("rank_score") or 1.0)
+        tw = p.get("term_weights") or {}
+        authors = p.get("authors") or []
+        if r_score <= 0 or s_final <= 0:
+            continue
+
+        for a in authors:
+            aid = a.get("aid")
+            pos_weight = float(a.get("pos_weight") or 1.0)
+            if not aid:
+                continue
+
+            # 作者在该论文上的贡献片段（复用既有署名权重）
+            author_piece = s_final * pos_weight
+            if author_piece > 0:
+                author_all_retained_works[str(aid)].append((wid, author_piece))
+
+            # 将论文贡献按 term 权重分摊到 author->term 命中列表
+            for vid_s, w in tw.items():
+                frac = float(w) / float(r_score)
+                term_piece = s_final * pos_weight * frac
+                if term_piece <= 0:
+                    continue
+                author_term_hit_lists[str(aid)][str(vid_s)].append(term_piece)
+
+    # 为兼容后续逻辑，切到 retained works 口径（不再仅 top3）
+    author_top_works = author_all_retained_works
+
     author_term_contrib: Dict[str, Dict[str, float]] = collections.defaultdict(
         lambda: collections.defaultdict(float)
     )
-    for aid, works in author_top_works.items():
-        for wid, contrib in works:
-            info = paper_map.get(wid, {})
-            r_score = info.get("rank_score") or 1.0
-            tw = info.get("term_weights") or {}
-            if r_score <= 0:
-                continue
-            for vid_s, w in tw.items():
-                author_term_contrib[aid][vid_s] += contrib * (w / r_score)
+    TERM_REPEAT_DECAY = 0.60
+    for aid, term_hits in author_term_hit_lists.items():
+        for tid_s, hit_list in term_hits.items():
+            hit_list = sorted(hit_list, reverse=True)
+            agg = 0.0
+            for i, x in enumerate(hit_list):
+                agg += float(x) * (TERM_REPEAT_DECAY ** i)
+            author_term_contrib[aid][tid_s] = agg
 
     t5 = time.perf_counter()
     stage5_sub_ms["term_contrib_matrix"] = (t5 - t4) * 1000.0
+
+    # 用“同词递减聚合后”的 term 贡献重建 author 总分，避免单词线性灌榜
+    recomputed_author_scores: Dict[str, float] = {}
+    for aid, atc in author_term_contrib.items():
+        recomputed_author_scores[aid] = float(sum(float(v) for v in atc.values()))
+    author_scores = recomputed_author_scores
 
     if author_scores:
         years_by_author: Dict[str, List[Any]] = {}
@@ -334,27 +445,23 @@ def run_stage5(
             score = float(base_score) * float(time_weight) * float(recency_by_latest)
             author_scores[aid] = score
 
-        # Family coverage bonus + family balance penalty（不依赖具体领域词，只看 family 结构）
-        term_family_keys = debug_1.get("term_family_keys") or {}
+        # 通用 term concentration penalty（不依赖 family/领域词/黑白名单）
+        # - 惩罚单 term 独占过强
+        # - 奖励多个 term 都有真实贡献
         for aid in list(author_scores.keys()):
-            works = author_top_works.get(aid, [])
-            family_counter: Dict[str, float] = {}
-            for wid, contrib in works:
-                info = paper_map.get(wid, {})
-                tw = info.get("term_weights") or {}
-                total_w = sum(tw.values()) or 1.0
-                for vid_s, w in tw.items():
-                    vid_int = int(vid_s) if vid_s is not None else None
-                    if vid_int is None:
-                        continue
-                    fk = term_family_keys.get(vid_int) or term_family_keys.get(str(vid_int)) or f"self::{vid_s}"
-                    family_counter[fk] = family_counter.get(fk, 0.0) + float(contrib) * (float(w) / total_w)
-            family_count = len(family_counter)
-            coverage_bonus = 1.0 + 0.10 * min(family_count, 5)
-            total_fam = sum(family_counter.values()) or 1.0
-            max_family_share = max(family_counter.values()) / total_fam if family_counter else 0.0
-            family_balance_penalty = 1.0 / (1.0 + 0.6 * max_family_share)
-            author_scores[aid] = author_scores[aid] * coverage_bonus * family_balance_penalty
+            atc = author_term_contrib.get(aid, {})
+            vals = [float(v) for v in atc.values() if float(v) > 0]
+            if not vals:
+                continue
+
+            total_term_mass = sum(vals)
+            max_term_share = max(vals) / max(total_term_mass, 1e-9)
+            effective_term_count = sum(1 for v in vals if v >= 0.08 * max(vals))
+
+            concentration_penalty = 1.0 - 0.35 * (max_term_share ** 2)
+            diversity_bonus = 1.0 + 0.06 * min(max(effective_term_count - 1, 0), 3)
+
+            author_scores[aid] = author_scores[aid] * concentration_penalty * diversity_bonus
 
     t6 = time.perf_counter()
     stage5_sub_ms["time_and_family"] = (t6 - t5) * 1000.0
@@ -501,41 +608,8 @@ def run_stage5(
     )
     filter_closed_loop.setdefault("final_term_count", len(score_map))
 
-    for kw in (debug_1.get("industrial_kws") or []):
-        label = f"industrial_kw:{kw}"
-        filter_closed_loop.setdefault("contains_check", {})
-        filter_closed_loop["contains_check"][label] = any(kw in t[0] for t in sorted_terms[:50])
-
-    for tid in (anchor_skills or {}).keys():
-        label = f"anchor_tid:{tid}"
-        filter_closed_loop.setdefault("contains_check", {})
-        filter_closed_loop["contains_check"][label] = any(
-            str(tid) == str(t_id) for t_id, _ in sorted_terms[:50]
-        )
-
-    # 机器人/控制方向桥接后的英文学术短语命中情况（便于诊断 bridge 是否生效）
-    bridged_kws = [
-        "kinematics",
-        "robot kinematics",
-        "dynamics",
-        "robot dynamics",
-        "state estimation",
-        "motion planning",
-        "trajectory planning",
-        "trajectory optimization",
-        "optimal control",
-        "whole-body control",
-        "robot control",
-        "real-time control",
-        "sim-to-real",
-        "collision avoidance",
-    ]
-    for kw in bridged_kws:
-        label = f"bridged_kw:{kw}"
-        filter_closed_loop.setdefault("contains_check", {})
-        filter_closed_loop["contains_check"][label] = any(
-            kw.lower() in (t[0].lower() if t[0] else "") for t, _ in sorted_terms[:50]
-        )
+    # 低价值闭环检查降级：contains_check（industrial_kw/anchor_tid/bridged_kw）
+    # 当前瓶颈已转向 Stage4/Stage5 的贡献聚合，默认不再填充该大块重复信息。
 
     recall.debug_info.filter_closed_loop = filter_closed_loop
     recall.debug_info.recall_vocab_count = len(score_map)
@@ -543,6 +617,82 @@ def run_stage5(
     recall.debug_info.author_count = len(scored_authors)
     recall.debug_info.top_terms_final_contrib = top20_term_debug
     recall.debug_info.top_samples = scored_authors[:50]
+
+    # -------------------------
+    # 精准审计块 2/3：
+    # [Stage5 term->author contribution top]
+    # 目的：看每个 term 是否集中砸向少量作者，确认是否单 term 放大失衡。
+    # -------------------------
+    final_term_ids_for_paper = sorted(score_map.keys(), key=lambda t: score_map.get(t, 0.0), reverse=True)
+    term_author_rows: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
+    for aid, atc in author_term_contrib.items():
+        # 作者总分取 term 贡献和，避免受后续归一化影响 share 观察
+        author_total = float(sum(float(v) for v in atc.values()) or 0.0)
+        if author_total <= 0:
+            continue
+        term_hit_counter: Dict[str, int] = collections.Counter()
+        for wid, _ in author_top_works.get(aid, []):
+            tw = (paper_map.get(wid) or {}).get("term_weights") or {}
+            for vid_s, w in tw.items():
+                if float(w or 0.0) > 0:
+                    term_hit_counter[str(vid_s)] += 1
+        for tid in final_term_ids_for_paper:
+            tid_s = str(tid)
+            term_contrib = float(atc.get(tid_s, 0.0) or 0.0)
+            if term_contrib <= 0:
+                continue
+            term_name = term_map.get(tid, "") or term_map.get(tid_s, "") or tid_s
+            term_author_rows[term_name].append(
+                {
+                    "author_id": aid,
+                    "term_contrib": term_contrib,
+                    "paper_hits": int(term_hit_counter.get(tid_s, 0)),
+                    "author_total_score": author_total,
+                }
+            )
+
+    print("\n[Stage5 term->author contribution top]")
+    for tid in final_term_ids_for_paper:
+        tid_s = str(tid)
+        term_name = term_map.get(tid, "") or term_map.get(tid_s, "") or tid_s
+        rows = sorted(
+            term_author_rows.get(term_name, []),
+            key=lambda x: float(x.get("term_contrib") or 0.0),
+            reverse=True,
+        )[:10]
+        print(f"term='{term_name}' authors={len(term_author_rows.get(term_name, []))}")
+        for i, r in enumerate(rows, 1):
+            total = max(float(r.get("author_total_score") or 0.0), 1e-9)
+            share = float(r.get("term_contrib") or 0.0) / total
+            print(
+                f"  #{i} author={r.get('author_id')} "
+                f"term_contrib={float(r.get('term_contrib') or 0.0):.6f} "
+                f"paper_hits={int(r.get('paper_hits') or 0)} "
+                f"share_in_author={share:.3f}"
+            )
+
+    # -------------------------
+    # 精准审计块 3/3：
+    # [Stage5 top-author term mix]
+    # 目的：查看 Top 作者是否被单一 term 主导（dominant_share 是否过高）。
+    # -------------------------
+    print("\n[Stage5 top-author term mix]")
+    for a in scored_authors[:20]:
+        aid = str(a.get("aid"))
+        atc = author_term_contrib.get(aid, {})
+        contribs = sorted(
+            ((term_map.get(tid, "") or term_map.get(str(tid), "") or str(tid), float(v)) for tid, v in atc.items() if float(v or 0.0) > 0),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )
+        total = sum(v for _, v in contribs) or 1e-9
+        top3 = contribs[:3]
+        mix = [f"{term}={v:.6f}({v/total:.2%})" for term, v in top3]
+        dom_share = (top3[0][1] / total) if top3 else 0.0
+        print(
+            f"author={aid} final={float(a.get('score') or 0.0):.4f} "
+            f"dominant_share={dom_share:.2%} top3={' | '.join(mix)}"
+        )
 
     t11 = time.perf_counter()
     stage5_sub_ms["filter_closed_loop_meta"] = (t11 - t10) * 1000.0
