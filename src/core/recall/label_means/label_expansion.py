@@ -168,7 +168,7 @@ RETAIN_MIN = 0.40                 # 仅保留（不扩）准入 retain_score 下
 # Stage2A 终稿：三档分桶阈值（主线回 primary_expandable，歧义/弱词压住）
 STAGE2A_MAINLINE_PREF_MIN = 0.50   # 主线偏好下限 → primary_expandable
 STAGE2A_EXPANDABLE_IDENTITY_MIN = 0.52  # 锚点一致性下限 → 可扩散
-STAGE2A_WEAK_KEEP_MIN = 0.20       # 低于此且非 normal/weak_retain → reject
+STAGE2A_WEAK_KEEP_MIN = 0.20       # 文档/门槛与 PRIMARY_KEEP 对齐；不再用于 select_primary_per_anchor 前置 reject
 # Stage2A pre-primary 分桶：明显坏分支 hard_reject，弱相关技术词 primary_keep_no_expand
 STAGE2A_REJECT_IDENTITY_FLOOR = 0.33   # low_identity_no_context 阈值
 STAGE2A_REJECT_MAINLINE_FLOOR = 0.40   # low_mainline_no_context 阈值
@@ -198,7 +198,7 @@ STAGE2A_ID_WEAK = 0.45           # mainline_candidate 弱线（identity_ok 或 j
 STAGE2A_JD_OK = 0.74             # 与 STAGE2A_WEAK_TECH_JD_MIN 一致，主线 jd_align 可用线
 STAGE2A_CTX_FLOOR = 0.42         # 双路/静态时 context_sim 最低可用线
 STAGE2A_CTX_DROP_TOL = 0.08      # 静态强匹配允许 context_sim 略低于 semantic_score 的容差
-STAGE2A_PRIMARY_KEEP_MIN = 0.20  # 保守留存门槛（= WEAK_KEEP_MIN），低于则 reject
+STAGE2A_PRIMARY_KEEP_MIN = STAGE2A_WEAK_KEEP_MIN  # 保守留存门槛（judge/弱保留链）；非 select 前置 reject
 SEED_SCORE_MIN = 0.50              # Stage2B：check_seed 通过后按 seed_score≥此裁剪（仅 can_expand_from_2a 可过 check）
 
 # ---------- Stage2 最小收尾：primary（宽）与 expand（严）解耦 + 空锚 fallback ----------
@@ -2812,6 +2812,7 @@ def select_primary_per_anchor(
     - primary_keep_no_expand：可做 primary，但 can_expand_from_2a=False
     - rejected：拒绝
     primary 资格与 expand 资格在 judge_primary_and_expandability 中解耦。
+    前置硬拒绝仅 retain_mode=="reject"；低 primary_score 不在这里 reject，交给 judge。
     """
     if not candidates:
         return {"primary_expandable": [], "primary_keep_no_expand": [], "rejected": []}
@@ -2835,17 +2836,20 @@ def select_primary_per_anchor(
         ctx_ok = flags["ctx_ok"]
 
         # --------------------------------------------------
-        # 0. 先处理硬拒绝（与 pre-primary 一致）
+        # 0. 先处理真正的硬拒绝（仅 retain_mode == "reject"）
+        #    低 primary_score 不再在此 reject，交给 judge_primary_and_expandability()
+        #    判 primary_keep_no_expand / reject（避免弱主线技术词过早进 rejected）。
+        #    STAGE2A_WEAK_KEEP_MIN 仅作文档阈值对齐，见模块常量注释。
         # --------------------------------------------------
-        obvious_bad = retain_mode == "reject" or primary_score < STAGE2A_WEAK_KEEP_MIN
-        if obvious_bad:
+        if retain_mode == "reject":
             c.primary_bucket = "reject"
+            c.survive_primary = False
             c.can_expand = False
             c.can_expand_from_2a = False
             c.fallback_primary = False
-            c.reject_reason = "obvious_bad"
-            setattr(c, "bucket_reason", "obvious_bad")
-            setattr(c, "mainline_block_reason", "retain_mode_reject" if retain_mode == "reject" else "primary_score_below_weak_keep")
+            c.reject_reason = "retain_mode_reject"
+            setattr(c, "bucket_reason", "retain_mode_reject")
+            setattr(c, "mainline_block_reason", "retain_mode_reject")
             rejected.append(c)
             continue
 
