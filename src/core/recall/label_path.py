@@ -44,7 +44,7 @@ from src.utils.time_features import (
     compute_author_time_features,
     compute_author_recency_by_latest
 )
-from src.core.recall.label_encoder_snapshots import (
+from src.core.recall.label_means.label_encoder_snapshots import (
     save_domain_vectors,
     try_load_domain_vectors,
 )

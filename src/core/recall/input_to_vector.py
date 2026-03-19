@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from config import SBERT_DIR, DB_PATH, SBERT_MODEL_NAME, HARDCORE_LEXICON_SNAPSHOT_PATH
-from src.core.recall.label_encoder_snapshots import load_or_build_hardcore_lexicon
+from src.core.recall.label_means.label_encoder_snapshots import load_or_build_hardcore_lexicon
 
 
 class QueryEncoder:
