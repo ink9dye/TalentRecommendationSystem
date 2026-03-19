@@ -63,6 +63,26 @@ def run_stage4(
     """
     di = getattr(recall, "debug_info", None)
 
+    def _merge_hits(old_hits: List[Dict[str, Any]], new_hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        按 canonical vid 合并 hit，避免同 wid 下多次覆盖/重复。
+        规则：同 vid 保留 idf 更高的一条（视为更强命中证据）。
+        """
+        by_vid: Dict[str, Dict[str, Any]] = {}
+        for h in (old_hits or []) + (new_hits or []):
+            if not isinstance(h, dict):
+                continue
+            vid_s = str(h.get("vid") or "")
+            if not vid_s:
+                continue
+            prev = by_vid.get(vid_s)
+            if prev is None:
+                by_vid[vid_s] = dict(h)
+                continue
+            if float(h.get("idf") or 0.0) > float(prev.get("idf") or 0.0):
+                by_vid[vid_s] = dict(h)
+        return list(by_vid.values())
+
     def _save_sub(ms: Dict[str, float]) -> None:
         if di is not None:
             di.stage4_sub_ms = ms
@@ -441,7 +461,10 @@ def run_stage4(
     # Stage4 诊断：过滤漏斗/死因/样本
     # 只做计数与打印，不改变筛选与聚合逻辑
     # -------------------------
-    GROUNDING_MIN = 0.12
+    # 批注：将单一硬门改为“双阈值门”，保留主命中严格性，同时允许高 JD 对齐的弱辅助命中进入。
+    PRIMARY_GROUNDING_MIN = 0.12
+    SECONDARY_GROUNDING_MIN = 0.06
+    SECONDARY_JD_ALIGN_MIN = 0.78
 
     def _new_funnel() -> Dict[str, int]:
         return {
@@ -484,8 +507,11 @@ def run_stage4(
         query_norm = 0.0
 
     term_capped_unique_wids: Dict[int, set] = defaultdict(set)
-    wid_to_paper_meta: Dict[str, Dict[str, str]] = {}  # wid -> {title, domains}
+    wid_to_paper_meta: Dict[str, Dict[str, Any]] = {}  # wid -> {title, domains, year}
     term_type_cache: Dict[int, Dict[str, float]] = {}
+    # 调试断点：cap 前/后按 term 的论文行，用于 overlap 与生存性分析
+    term_rows_before_cap: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    term_rows_after_cap: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     # 审计用：按 term 收集进入 Stage4 评分链路的论文分解，便于定位 Stage4->Stage5 放大点
     term_kept_paper_audit: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     for r in rows:
@@ -505,7 +531,7 @@ def run_stage4(
         year = r.get("year")
         title = str(r.get("title") or "")
         domains = str(r.get("domains") or "")
-        wid_to_paper_meta[wid] = {"title": title, "domains": domains}
+        wid_to_paper_meta[wid] = {"title": title, "domains": domains, "year": year}
 
         term_final = _term_score(vid)
         role_weight = get_term_role_weight(term_retrieval_roles, vid)
@@ -525,6 +551,7 @@ def run_stage4(
         term_contrib = float(score_detail["final_paper_score"])
         grounding = float(score_detail["term_grounding"])  # 硬门：先保证论文真的像这个 term
         hybrid_grounding = float(score_detail["hybrid_grounding"])  # 软排：JD 只参与排序
+        jd_align = float(score_detail["jd_align"])
         off_topic_penalty = float(score_detail["offtopic_penalty"])
         # 记录“论文贡献前的因子分解”：只用于 debug 打印，不参与排序逻辑
         term_kept_paper_audit[vid].append(
@@ -546,9 +573,19 @@ def run_stage4(
             }
         )
 
-        # 低落地主轴论文直接不进池
-        # 放松硬截断：避免把真正的主轴论文也直接砍光
-        if grounding < GROUNDING_MIN:
+        # 双阈值门：
+        # - primary：grounding 必须 >= 0.12
+        # - secondary：允许 grounding 较低但 jd_align 足够高的辅助命中进入
+        allow_hit = False
+        hit_level = "primary"
+        if grounding >= PRIMARY_GROUNDING_MIN:
+            allow_hit = True
+            hit_level = "primary"
+        elif grounding >= SECONDARY_GROUNDING_MIN and jd_align >= SECONDARY_JD_ALIGN_MIN:
+            allow_hit = True
+            hit_level = "secondary"
+
+        if not allow_hit:
             term_reject_reason_counts[vid]["low_grounding"] += 1
             if len(term_low_grounding_samples[vid]) < 3:
                 term_low_grounding_samples[vid].append(
@@ -559,12 +596,30 @@ def run_stage4(
                         "reason": "low_grounding",
                         "grounding": grounding,
                         "penalty": off_topic_penalty,
+                        "jd_align": jd_align,
                     }
                 )
             continue
 
         term_funnel_counts[vid]["after_grounding_gate"] += 1
-        by_term[vid].append((wid, term_contrib, idf_weight))
+        # 批注：secondary 命中保留但做轻降权，防止弱命中反客为主。
+        effective_term_contrib = term_contrib * (0.65 if hit_level == "secondary" else 1.0)
+        by_term[vid].append(
+            (
+                wid,
+                effective_term_contrib,
+                idf_weight,
+                hit_level,
+                grounding,
+                jd_align,
+            )
+        )
+        term_rows_before_cap[vid].append(
+            {
+                "pid": wid,
+                "final_paper_score": float(effective_term_contrib),
+            }
+        )
 
     # 每个 term 最多保留 TERM_MAX_PAPERS 篇（按 term_contrib 降序）
     limited: List[tuple] = []
@@ -586,7 +641,7 @@ def run_stage4(
         # local cap samples（用于打印，不影响 limited）
         if cut_cnt > 0 and len(term_local_cap_cut_samples[vid]) < 3:
             cut_triples = triples[local_cap : local_cap + 3]
-            for (cut_wid, _, _) in cut_triples:
+            for (cut_wid, *_rest) in cut_triples:
                 meta = wid_to_paper_meta.get(cut_wid) or {"title": "", "domains": ""}
                 if len(term_local_cap_cut_samples[vid]) < 3:
                     term_local_cap_cut_samples[vid].append(
@@ -600,24 +655,130 @@ def run_stage4(
 
         kept_triples = triples[:local_cap]
         term_funnel_counts[vid]["after_local_cap"] = len(kept_triples)
-        for (kept_wid, _, _) in kept_triples:
+        for (kept_wid, *_rest) in kept_triples:
             term_capped_unique_wids[vid].add(kept_wid)
+            term_rows_after_cap[vid].append({"pid": kept_wid})
 
-        for (wid, term_contrib, idf_weight) in triples[:local_cap]:
-            limited.append((wid, vid, term_contrib, idf_weight))
+        for (wid, term_contrib, idf_weight, hit_level, grounding, jd_align) in triples[:local_cap]:
+            limited.append((wid, vid, term_contrib, idf_weight, hit_level, grounding, jd_align))
 
-    # 按 wid 聚合：paper_score = Σ term_contrib，hits = [ {vid, idf}, ... ]
-    by_wid: Dict[str, tuple] = {}
-    for (wid, vid, term_contrib, idf_weight) in limited:
+        # 批注：输出每个 term 在关键层级的数量，优先判断是 grounding 还是 cap 在砍样本。
+        meta = _get_term_meta(vid)
+        term_name = str(meta.get("term") or meta.get("anchor") or meta.get("parent_primary") or vid)
+        print(
+            f"[Stage4 term stats] term='{term_name}' "
+            f"raw={term_funnel_counts[vid].get('cypher_raw', 0)} "
+            f"after_grounding={term_funnel_counts[vid].get('after_grounding_gate', 0)} "
+            f"before_cap={len(term_rows_before_cap.get(vid, []))} "
+            f"after_cap={len(term_rows_after_cap.get(vid, []))}"
+        )
+        rows_for_paper_map = kept_triples
+        term = term_name
+        print(f"[Stage4 paper_map source] term='{term}' source_stage='after_cap' rows={len(rows_for_paper_map)}")
+
+    # 断点 1：local cap 前的 cross-term overlap
+    print("\n[Stage4 overlap before local-cap]")
+    term_pid_map_before_local_cap: Dict[int, set] = {
+        vid: {str(r.get("pid")) for r in rows if r.get("pid") is not None}
+        for vid, rows in term_rows_before_cap.items()
+    }
+    overlap_pairs: List[tuple] = []
+    v_ids_sorted = sorted(term_pid_map_before_local_cap.keys())
+    for i, vid_a in enumerate(v_ids_sorted):
+        for vid_b in v_ids_sorted[i + 1 :]:
+            inter = sorted(term_pid_map_before_local_cap[vid_a].intersection(term_pid_map_before_local_cap[vid_b]))
+            if not inter:
+                continue
+            name_a = str((_get_term_meta(vid_a) or {}).get("term") or vid_a)
+            name_b = str((_get_term_meta(vid_b) or {}).get("term") or vid_b)
+            print(f"  {name_a} x {name_b} -> overlap={len(inter)} sample={inter[:10]}")
+            overlap_pairs.append((vid_a, vid_b, inter))
+
+    # 统计型打印：全局 multi-hit 潜力（cap 前）
+    pid_term_count: Dict[str, set] = defaultdict(set)
+    for vid, rows in term_rows_before_cap.items():
+        term_name = str((_get_term_meta(vid) or {}).get("term") or vid)
+        for r in rows:
+            pid = str(r.get("pid") or "")
+            if pid:
+                pid_term_count[pid].add(term_name)
+    multi_candidates = [(pid, sorted(list(ts))) for pid, ts in pid_term_count.items() if len(ts) >= 2]
+    print(f"\n[Stage4 multi-hit potential before cap] count={len(multi_candidates)}")
+    for pid, terms in multi_candidates[:20]:
+        print(f"  pid='{pid}' terms={terms}")
+
+    # 断点 2：overlap 论文在各 term 的 cap 前后生存情况
+    cross_term_overlap_pids = {pid for (_, _, inter) in overlap_pairs for pid in inter}
+    print("\n[Stage4 overlap survival audit]")
+    for vid, rows in term_rows_before_cap.items():
+        term_name = str((_get_term_meta(vid) or {}).get("term") or vid)
+        rows_sorted = sorted(rows, key=lambda x: float(x.get("final_paper_score") or 0.0), reverse=True)
+        top_after_cap = {str(r.get("pid")) for r in term_rows_after_cap.get(vid, []) if r.get("pid") is not None}
+        for rank, r in enumerate(rows_sorted, 1):
+            pid = str(r.get("pid") or "")
+            if not pid or pid not in cross_term_overlap_pids:
+                continue
+            print(
+                f"term='{term_name}' pid='{pid}' "
+                f"rank_before_cap={rank} "
+                f"score={float(r.get('final_paper_score') or 0.0):.3f} "
+                f"survive_after_cap={pid in top_after_cap}"
+            )
+
+    # 按 wid 聚合：paper_score = Σ term_contrib，hits 合并为 canonical term 证据
+    by_wid: Dict[str, Dict[str, Any]] = {}
+    for (wid, vid, term_contrib, idf_weight, hit_level, grounding, jd_align) in limited:
+        tt = term_type_cache.get(vid)
+        if tt is None:
+            tt = _compute_term_type_factors(vid)
+            term_type_cache[vid] = tt
+        meta = _get_term_meta(vid)
+        retrieval_role = (
+            term_retrieval_roles.get(vid)
+            or term_retrieval_roles.get(str(vid))
+            or meta.get("retrieval_role")
+            or "paper_primary"
+        )
+        hit = {
+            "vid": str(vid),
+            # 批注：Stage4 不再二次清洗 term，直接使用 Stage3/canonical term。
+            "term": str(meta.get("term") or ""),
+            "idf": float(idf_weight),
+            "role": str(retrieval_role),
+            "term_score": float(_term_score(vid)),
+            "paper_factor": float(tt.get("paper_factor") or 1.0),
+            "hit_level": str(hit_level),
+            "grounding": float(grounding),
+            "jd_align": float(jd_align),
+        }
         if wid not in by_wid:
-            by_wid[wid] = (0.0, [])
-        score, hits = by_wid[wid]
-        by_wid[wid] = (score + term_contrib, hits + [{"vid": vid, "idf": idf_weight}])
+            wid_meta = wid_to_paper_meta.get(wid) or {"title": "", "domains": ""}
+            by_wid[wid] = {
+                "wid": wid,
+                "title": wid_meta.get("title") or "",
+                "year": wid_meta.get("year"),
+                "domains": wid_meta.get("domains") or "",
+                "paper_score": 0.0,
+                "hits": [],
+            }
+        old_hits = list(by_wid[wid].get("hits") or [])
+        old_terms = [str(h.get("term") or h.get("vid") or "") for h in old_hits if isinstance(h, dict)]
+        by_wid[wid]["paper_score"] = float(by_wid[wid]["paper_score"]) + float(term_contrib)
+        by_wid[wid]["hits"] = _merge_hits(by_wid[wid].get("hits") or [], [hit])
+        new_hits = list(by_wid[wid].get("hits") or [])
+        new_terms = [str(h.get("term") or h.get("vid") or "") for h in new_hits if isinstance(h, dict)]
+        # 断点 3：paper_map 写入过程，确认是“追加合并”还是“覆盖丢失”
+        print(
+            f"[Stage4 paper_map write] wid='{wid}' "
+            f"incoming_term='{str(hit.get('term') or hit.get('vid') or '')}' "
+            f"old_hit_count={len(old_hits)} new_hit_count={len(new_hits)} "
+            f"old_terms={old_terms} new_terms={new_terms}"
+        )
 
     # 全局按 paper_score 排序，取前 GLOBAL_PAPER_LIMIT
     sorted_wids = sorted(
         by_wid.keys(),
-        key=lambda w: -by_wid[w][0],
+        key=lambda w: -float((by_wid[w] or {}).get("paper_score") or 0.0),
     )[:GLOBAL_PAPER_LIMIT]
     selected_wids_set = set(sorted_wids)
 
@@ -719,12 +880,12 @@ def run_stage4(
             # kept papers：最终入选（selected_wids_set）里，取对该 term 贡献的 top3（按 paper_score）
             capped_wids = term_capped_unique_wids.get(vid, set()) or set()
             kept_wids = list(capped_wids.intersection(selected_wids_set))
-            kept_wids.sort(key=lambda w: -by_wid.get(w, (0.0, []))[0])
+            kept_wids.sort(key=lambda w: -float((by_wid.get(w) or {}).get("paper_score") or 0.0))
             kept_wids = kept_wids[:3]
             for i, w in enumerate(kept_wids, start=1):
                 meta3 = wid_to_paper_meta.get(w) or {"title": "", "domains": ""}
                 g = _compute_grounding_score(vid, meta3.get("title") or "", meta3.get("domains") or "")
-                final_score = float(by_wid.get(w, (0.0, []))[0] or 0.0)
+                final_score = float((by_wid.get(w) or {}).get("paper_score") or 0.0)
                 print(
                     f"[Stage4 kept papers] term='{term_name}' rank={i} pid='{w}' "
                     f"grounding={float(g.get('grounding') or 0.0):.3f} "
@@ -743,9 +904,10 @@ def run_stage4(
             for w in rejected_wids:
                 meta3 = wid_to_paper_meta.get(w) or {"title": "", "domains": ""}
                 g = _compute_grounding_score(vid, meta3.get("title") or "", meta3.get("domains") or "")
-                final_score = float(by_wid.get(w, (0.0, []))[0] or 0.0)
+                final_score = float((by_wid.get(w) or {}).get("paper_score") or 0.0)
                 # 是否 low_grounding：看 grounding 是否低于阈值
-                reason = "low_grounding" if float(g.get("grounding") or 0.0) < GROUNDING_MIN else "pruned_after_terms"
+                gg = float(g.get("grounding") or 0.0)
+                reason = "low_grounding" if gg < PRIMARY_GROUNDING_MIN else "pruned_after_terms"
                 print(
                     f"[Stage4 rejected papers] term='{term_name}' pid='{w}' reason='{reason}' "
                     f"grounding={float(g.get('grounding') or 0.0):.3f} "
@@ -793,6 +955,29 @@ def run_stage4(
         _save_sub(sub_ms)
         return []
 
+    # 审计 1：确认 Stage4 内部 wid 聚合后确实存在 multi-hit 论文
+    print("\n[Stage4 merged wid multi-hit audit]")
+    stage4_multi_hit_rows: List[tuple] = []
+    for wid, rec in by_wid.items():
+        hits = rec.get("hits") or []
+        if len(hits) >= 2:
+            terms = [str(h.get("term") or h.get("vid") or "") for h in hits if isinstance(h, dict)]
+            stage4_multi_hit_rows.append((wid, rec.get("title") or "", terms))
+    print(f"multi_hit_papers={len(stage4_multi_hit_rows)}")
+    for wid, title, terms in stage4_multi_hit_rows[:20]:
+        print(f"  wid={wid} hit_terms={terms} title='{(title or '')[:100]}'")
+    # 断点 4A：merged paper_map 细节（每条多 hit 明细）
+    print("\n[Stage4 merged wid multi-hit detail]")
+    for wid, rec in by_wid.items():
+        hits = rec.get("hits") or []
+        if len(hits) < 2:
+            continue
+        terms = [str(h.get("term") or h.get("vid") or "") for h in hits if isinstance(h, dict)]
+        print(
+            f"wid='{wid}' hit_count={len(hits)} terms={terms} "
+            f"title='{str(rec.get('title') or '')[:100]}'"
+        )
+
     # ---------- 第二层：按 wid 查作者与论文元数据，按 aid 聚合为 author_papers_list ----------
     params2 = {"wids": sorted_wids}
     cypher_layer2 = """
@@ -816,7 +1001,16 @@ def run_stage4(
     sub_ms["cypher2"] = (t4 - t3) * 1000.0
 
     # 为每篇 paper 挂上 Stage4 算好的 hits 与 score（供 Stage5 / debug 使用）
-    wid_to_hits_and_score = {wid: (hits, score) for wid, (score, hits) in by_wid.items()}
+    wid_to_hits_and_score = {
+        str(wid): (
+            list((rec or {}).get("hits") or []),
+            float((rec or {}).get("paper_score") or 0.0),
+            (rec or {}).get("title"),
+            (rec or {}).get("domains"),
+            (rec or {}).get("year"),
+        )
+        for wid, rec in by_wid.items()
+    }
 
     out: List[Dict[str, Any]] = []
     for rec in author_rows:
@@ -827,14 +1021,15 @@ def run_stage4(
             wid = p.get("wid")
             if wid is None:
                 continue
-            hits, score = wid_to_hits_and_score.get(wid, ([], 0.0))
+            wid_s = str(wid)
+            hits, score, title_s4, domains_s4, year_s4 = wid_to_hits_and_score.get(wid_s, ([], 0.0, None, None, None))
             papers.append({
-                "wid": wid,
+                "wid": wid_s,
                 "hits": hits,
                 "weight": p.get("weight"),
-                "title": p.get("title"),
-                "year": p.get("year"),
-                "domains": p.get("domains"),
+                "title": title_s4 if title_s4 is not None else p.get("title"),
+                "year": year_s4 if year_s4 is not None else p.get("year"),
+                "domains": domains_s4 if domains_s4 is not None else p.get("domains"),
                 "score": score,
             })
         if aid is not None and papers:
@@ -845,4 +1040,27 @@ def run_stage4(
     sub_ms["build_list"] = (time.perf_counter() - t4) * 1000.0
     sub_ms["total"] = (time.perf_counter() - t0) * 1000.0
     _save_sub(sub_ms)
+
+    # 审计 2：确认下发到 author payload 的论文仍携带 multi-hit
+    print("\n[Stage4 author payload audit]")
+    payload_multi_cnt = 0
+    for rec in out[:20]:
+        aid = rec.get("aid")
+        for p in (rec.get("papers") or [])[:5]:
+            hits = p.get("hits") or []
+            if len(hits) >= 2:
+                payload_multi_cnt += 1
+                terms = [str(h.get("term") or h.get("vid") or "") for h in hits if isinstance(h, dict)]
+                print(f"aid={aid} wid={p.get('wid')} hit_terms={terms}")
+    print(f"author_payload_multi_hit_papers={payload_multi_cnt}")
+    # 断点 4B：author payload 多 hit 明细
+    print("\n[Stage4 author payload multi-hit detail]")
+    for rec in out:
+        aid = rec.get("aid")
+        for p in rec.get("papers") or []:
+            hits = p.get("hits") or []
+            if len(hits) < 2:
+                continue
+            terms = [str(h.get("term") or h.get("vid") or "") for h in hits if isinstance(h, dict)]
+            print(f"aid='{aid}' wid='{p.get('wid')}' hit_count={len(hits)} terms={terms}")
     return out
