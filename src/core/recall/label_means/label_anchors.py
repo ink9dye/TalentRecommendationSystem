@@ -20,6 +20,16 @@ BACKBONE_W_TASK_LIKE = 0.35
 BACKBONE_W_SIM = 0.2  # query 向量相似度（可选）
 BACKBONE_FLOOR_FOR_BAODI = 0.5  # 层0 保底词的最低得分，确保参与排序后有机会进 TopN
 
+# JD 进入 SBERT 的统一字符切片：与历史 anchor_ctx 中 query_for_ctx[:800] 一致（不 strip），
+# 供 supplement 与 prefill 共用同一次 forward，避免 [:500]+strip 与 [:800] 各编一次。
+LABEL_JD_ENCODE_MAX_CHARS = 800
+
+
+def canonical_jd_text_for_encode(query_text: str) -> str:
+    """与 Stage1 条件化锚点 JD 向量使用的切片一致。"""
+    return (query_text or "")[:LABEL_JD_ENCODE_MAX_CHARS]
+
+
 # 缩写词典 key 集合缓存，供 classify_anchor_type 判断 acronym
 _ABBR_KEYS_CACHE: Set[str] | None = None
 
@@ -523,6 +533,73 @@ def encode_text_with_optional_cache(
     return v
 
 
+def prefill_encode_cache_for_anchor_ctx(
+    encoder: Any,
+    anchor_skills: Dict[str, Any],
+    raw_text: str,
+    encode_cache: Dict[str, np.ndarray],
+) -> None:
+    """
+    在 build_conditioned_anchor_representation 循环前，收集本 JD 下所有待编码短文本，
+    按「共振后字符串」去重后 encode_batch 一次并写入 encode_cache（键与 lookup_or_encode 一致）。
+    数值与逐条 encode 等价，显著减少 S1 anchor_ctx 的模型前向次数。
+    """
+    if not raw_text or not anchor_skills or encoder is None or not encode_cache:
+        return
+    if not hasattr(encoder, "encode_batch") or not hasattr(encoder, "_apply_dynamic_resonance"):
+        return
+
+    cleaned_list = [info.get("term") or "" for info in (anchor_skills or {}).values() if info.get("term")]
+    raws_ordered: List[str] = []
+    if raw_text:
+        jd_head = canonical_jd_text_for_encode(raw_text)
+        if jd_head:
+            enh0 = encoder._apply_dynamic_resonance(jd_head)
+            # 已在 Stage1 单次编码写入缓存时跳过 batch，避免 JD 再进 encode_batch
+            if enh0 not in encode_cache:
+                raws_ordered.append(jd_head)
+
+    for _vid, info in anchor_skills.items():
+        term = (info.get("term") or "").strip()
+        if not term:
+            continue
+        raws_ordered.append(term[:200])
+        other_terms = [
+            info2.get("term") or ""
+            for _vid2, info2 in (anchor_skills or {}).items()
+            if str(info2.get("term", "")).strip().lower() != term.strip().lower()
+        ]
+        local_phrases = build_anchor_local_context(term, raw_text, cleaned_list)
+        co_terms = collect_co_anchor_terms(term, other_terms, raw_text)
+        if local_phrases:
+            raws_ordered.append(" ; ".join(local_phrases[:5])[:300])
+        if co_terms:
+            raws_ordered.append(" ; ".join(co_terms[:5])[:300])
+
+    # 按共振后文本去重，保持首次出现顺序（与逐条 encode 的缓存键一致）
+    unique_raws: List[str] = []
+    seen_enh: Set[str] = set()
+    for raw in raws_ordered:
+        if not raw:
+            continue
+        enh = encoder._apply_dynamic_resonance(raw)
+        if enh in seen_enh:
+            continue
+        seen_enh.add(enh)
+        unique_raws.append(raw)
+
+    if not unique_raws:
+        return
+
+    batch = encoder.encode_batch(unique_raws)
+    if batch.shape[0] != len(unique_raws):
+        return
+    for i, raw in enumerate(unique_raws):
+        enh = encoder._apply_dynamic_resonance(raw)
+        row = np.asarray(batch[i], dtype=np.float32).reshape(1, -1).copy()
+        encode_cache[enh] = row
+
+
 def build_conditioned_anchor_representation(
     anchor_term: str,
     anchor_info: Dict[str, Any],
@@ -558,7 +635,9 @@ def build_conditioned_anchor_representation(
     if jd_vec_precomputed is not None:
         v_jd = np.asarray(jd_vec_precomputed, dtype=np.float32).flatten()
     else:
-        v_jd_t = encode_text_with_optional_cache(encoder, raw_text[:800], encode_cache)
+        v_jd_t = encode_text_with_optional_cache(
+            encoder, canonical_jd_text_for_encode(raw_text), encode_cache
+        )
         if v_jd_t is None:
             v_jd = v_anchor
         else:
@@ -614,10 +693,19 @@ def build_conditioned_anchor_representation(
     return out
 
 
-def supplement_anchors_from_jd_vector(label, query_text, anchor_skills, total_j=None, top_k=None, active_domain_ids=None) -> None:
+def supplement_anchors_from_jd_vector(
+    label,
+    query_text,
+    anchor_skills,
+    total_j=None,
+    top_k=None,
+    active_domain_ids=None,
+    jd_encode_cache: Optional[Dict[str, np.ndarray]] = None,
+) -> None:
     """
     复用 LabelRecallPath._supplement_anchors_from_jd_vector 的逻辑（移动到独立模块）。
     label 需提供：vocab_index/stats_conn/graph/_query_encoder/_load_vocab_meta/_vocab_meta 以及阈值常量。
+    jd_encode_cache：可选，若已含 canonical_jd_text_for_encode(query_text) 的共振键则复用向量，避免重复 JD forward。
     """
     if not query_text or not getattr(label, "vocab_index", None):
         label.debug_info.supplement_anchors = []
@@ -629,7 +717,8 @@ def supplement_anchors_from_jd_vector(label, query_text, anchor_skills, total_j=
     total_j = float(total_j or 0) or label.total_job_count
     label._load_vocab_meta()
     encoder = label._query_encoder
-    jd_snippet = (query_text or "").strip()[:500]
+    # 与 anchor_ctx 统一为 canonical_jd_text_for_encode（前 800、不 strip），与单次编码缓存对齐
+    jd_snippet = canonical_jd_text_for_encode(query_text)
     if getattr(label, "verbose", False):
         print(f"[Bridge Debug] semantic_query_text 片段: {jd_snippet[:120]}")
     if not jd_snippet:
@@ -639,9 +728,11 @@ def supplement_anchors_from_jd_vector(label, query_text, anchor_skills, total_j=
         label._last_supplement_anchors_report = label.debug_info.supplement_anchors_report
         return
 
-    # 通过 QueryEncoder.encode 复用与主召回一致的文本预处理/桥接逻辑，再手动做 L2 归一化，
-    # 避免 supplement 链路绕开 input_to_vector 的增强。
-    v_jd, _ = encoder.encode(jd_snippet)
+    # 与 anchor_ctx 共用共振缓存键时走 lookup_or_encode，否则单独 encode（数值与未缓存时一致）
+    if jd_encode_cache is not None and hasattr(encoder, "lookup_or_encode"):
+        v_jd = encoder.lookup_or_encode(jd_snippet, jd_encode_cache)
+    else:
+        v_jd, _ = encoder.encode(jd_snippet)
     if v_jd is None:
         label.debug_info.supplement_anchors = []
         label.debug_info.supplement_anchors_report = []

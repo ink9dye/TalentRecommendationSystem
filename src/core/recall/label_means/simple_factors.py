@@ -1,7 +1,17 @@
 import math
+import os
 from typing import Iterable, Any, Optional
 
 import numpy as np
+
+
+def is_label_jd_title_gate_disabled() -> bool:
+    """
+    环境变量 LABEL_NO_JD_TITLE_GATE：为 1/true/yes/on 时关闭
+    「论文标题 ↔ JD」向量余弦门控（Stage5 paper_scoring 中 gate 恒为 1.0，且不 encode 标题）。
+    """
+    v = os.environ.get("LABEL_NO_JD_TITLE_GATE", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 from src.utils.tools import apply_text_decay
 
@@ -53,7 +63,11 @@ def paper_jd_semantic_gate_factor(
       - 0.3 <= cos < 0.5 -> 0.4
       - 否则 1.0
     paper_vec_precomputed: 与 encoder.encode(raw_title) 同分布的标题向量（可 batch 预计算），传入则不再 encode。
+
+    试验开关：环境变量 LABEL_NO_JD_TITLE_GATE=1（或 true/yes/on）时本函数恒返回 1.0，且不调用 encoder。
     """
+    if is_label_jd_title_gate_disabled():
+        return 1.0
     if jd_vec is None or not raw_title or encoder is None:
         return 1.0
     try:

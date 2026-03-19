@@ -1,3 +1,4 @@
+import os
 import traceback
 
 import faiss
@@ -11,6 +12,13 @@ def run_label_debug_cli() -> None:
         domain_choice = input("\n请选择领域编号 (0跳过): ").strip() or "0"
         mode_choice = input("输出模式 (0=仅人选列表  1=完整诊断) [0]: ").strip() or "0"
         verbose = mode_choice != "0"
+        gate_choice = input(
+            "标题↔JD 语义门控 (0=开启默认  1=关闭以加速) [0]: "
+        ).strip() or "0"
+        if gate_choice == "1":
+            os.environ["LABEL_NO_JD_TITLE_GATE"] = "1"
+        else:
+            os.environ.pop("LABEL_NO_JD_TITLE_GATE", None)
         l_path = LabelRecallPath(recall_limit=200, verbose=verbose)
         encoder = l_path._query_encoder
 

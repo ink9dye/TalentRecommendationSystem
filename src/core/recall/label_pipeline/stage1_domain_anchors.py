@@ -4,6 +4,9 @@ from typing import Any, Dict, List, Set, Tuple
 
 import numpy as np
 
+# SQLite 变量占位上限保守值，避免 IN (...) 过长
+_SQLITE_IN_CHUNK = 900
+
 from src.core.recall.label_means import label_anchors
 from src.core.recall.label_means.hierarchy_guard import parse_json_dist
 from src.core.recall.label_means.label_debug import debug_print
@@ -48,6 +51,47 @@ def attach_anchor_contexts(
         info["phrase_context"] = phrase or info.get("local_context", "")[: 30]
 
 
+def _batch_load_vocabulary_stats_for_tids(
+    recall,
+    tids: Set[int],
+) -> Tuple[Dict[int, Any], Dict[int, Any]]:
+    """
+    批量加载 vocabulary_topic_stats / vocabulary_domain_stats，与逐条 WHERE voc_id=? 结果一致。
+    返回 (topic_row_by_voc_id, domain_dist_by_voc_id)；topic 行为整行 tuple，与 fetchone 相同列序。
+    """
+    topic_map: Dict[int, Any] = {}
+    domain_dist_map: Dict[int, Any] = {}
+    if not tids or not getattr(recall, "stats_conn", None):
+        return topic_map, domain_dist_map
+    conn = recall.stats_conn
+    tid_list = sorted(int(t) for t in tids)
+    for i in range(0, len(tid_list), _SQLITE_IN_CHUNK):
+        chunk = tid_list[i : i + _SQLITE_IN_CHUNK]
+        if not chunk:
+            continue
+        ph = ",".join("?" * len(chunk))
+        try:
+            rows = conn.execute(
+                f"SELECT voc_id, field_id, subfield_id, topic_id, field_dist, subfield_dist, topic_dist "
+                f"FROM vocabulary_topic_stats WHERE voc_id IN ({ph})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                topic_map[int(row[0])] = row
+        except Exception:
+            pass
+        try:
+            rows = conn.execute(
+                f"SELECT voc_id, domain_dist FROM vocabulary_domain_stats WHERE voc_id IN ({ph})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                domain_dist_map[int(row[0])] = row[1]
+        except Exception:
+            pass
+    return topic_map, domain_dist_map
+
+
 def build_jd_hierarchy_profile(
     anchor_skills: Dict[str, Any],
     query_text: str,
@@ -82,6 +126,8 @@ def build_jd_hierarchy_profile(
     all_subfield: Dict[str, float] = {}
     all_topic: Dict[str, float] = {}
     total_weight = 0.0
+    # (tid, weight) 保留锚点×相似词的多重贡献，与原先逐条 SQL 语义一致
+    tid_weight_pairs: List[Tuple[int, float]] = []
     for vid_str, info in (anchor_skills or {}).items():
         try:
             anchor_vid = int(vid_str)
@@ -110,30 +156,30 @@ def build_jd_hierarchy_profile(
             except (TypeError, ValueError):
                 continue
             w = float(r.get("s") or 0.5)
-            # 读 topic_stats
-            row_t = recall.stats_conn.execute(
-                "SELECT field_id, subfield_id, topic_id, field_dist, subfield_dist, topic_dist FROM vocabulary_topic_stats WHERE voc_id=?",
-                (tid,),
-            ).fetchone()
-            row_d = recall.stats_conn.execute(
-                "SELECT domain_dist FROM vocabulary_domain_stats WHERE voc_id=?",
-                (tid,),
-            ).fetchone()
-            if row_t:
-                fd = parse_json_dist(row_t[3])
-                sd = parse_json_dist(row_t[4])
-                td = parse_json_dist(row_t[5])
-                for k, v in fd.items():
-                    all_field[k] = all_field.get(k, 0.0) + v * w
-                for k, v in sd.items():
-                    all_subfield[k] = all_subfield.get(k, 0.0) + v * w
-                for k, v in td.items():
-                    all_topic[k] = all_topic.get(k, 0.0) + v * w
-            if row_d and row_d[0]:
-                dd = parse_json_dist(row_d[0])
-                for k, v in dd.items():
-                    all_domain[k] = all_domain.get(k, 0.0) + v * w
-            total_weight += w
+            tid_weight_pairs.append((tid, w))
+
+    unique_tids = {t for t, _ in tid_weight_pairs}
+    topic_map, domain_dist_map = _batch_load_vocabulary_stats_for_tids(recall, unique_tids)
+
+    for tid, w in tid_weight_pairs:
+        row_t = topic_map.get(tid)
+        dist_json = domain_dist_map.get(tid)
+        row_d = (dist_json,) if dist_json is not None else None
+        if row_t:
+            fd = parse_json_dist(row_t[3])
+            sd = parse_json_dist(row_t[4])
+            td = parse_json_dist(row_t[5])
+            for k, v in fd.items():
+                all_field[k] = all_field.get(k, 0.0) + v * w
+            for k, v in sd.items():
+                all_subfield[k] = all_subfield.get(k, 0.0) + v * w
+            for k, v in td.items():
+                all_topic[k] = all_topic.get(k, 0.0) + v * w
+        if row_d and row_d[0]:
+            dd = parse_json_dist(row_d[0])
+            for k, v in dd.items():
+                all_domain[k] = all_domain.get(k, 0.0) + v * w
+        total_weight += w
     if total_weight <= 0:
         return jd_profile
     def _norm(d: Dict[str, float]) -> Dict[str, float]:
@@ -199,6 +245,17 @@ def run_stage1(
     _t0 = time.perf_counter()
     stage1_sub_ms["prep"] = (_t0 - _t_stage1) * 1000.0
 
+    # JD 与 anchor_ctx / supplement 共用同一段文本切片 + 单次编码（共振键写入 jd_encode_cache）
+    query_for_ctx = (semantic_query_text or query_text) or ""
+    jd_canonical = label_anchors.canonical_jd_text_for_encode(query_for_ctx)
+    encoder = getattr(recall, "_query_encoder", None)
+    jd_encode_cache: Dict[str, np.ndarray] = {}
+    if encoder and jd_canonical:
+        try:
+            encoder.lookup_or_encode(jd_canonical, jd_encode_cache)
+        except Exception:
+            pass
+
     # 1) 领域与岗位：优先使用 DomainDetector，缺失时回退到旧实现
     if getattr(recall, "domain_detector", None) is not None:
         active_set, _, debug = recall.domain_detector.detect(
@@ -233,6 +290,7 @@ def run_stage1(
             anchor_skills,
             total_j=recall.total_job_count,
             top_k=recall.JD_VOCAB_TOP_K,
+            jd_encode_cache=jd_encode_cache,
         )
     _t2 = time.perf_counter()
     stage1_sub_ms["anchors"] = (_t2 - _t1) * 1000.0
@@ -289,17 +347,18 @@ def run_stage1(
     stage1_sub_ms["domain_regex"] = (_t3 - _t2) * 1000.0
 
     # 4) 锚点上下文化 + JD 四层领域画像（供 Stage2 层级守卫）
-    query_for_ctx = (semantic_query_text or query_text) or ""
     attach_anchor_contexts(anchor_skills, query_for_ctx, window=12)
     # 条件化锚点表示：泛锚点带 JD 上下文，供 Stage2A 用 conditioned_vec 做落点打分
-    encoder = getattr(recall, "_query_encoder", None)
     if encoder and query_for_ctx and anchor_skills:
-        # 单条 JD 内：JD 片段只编码一次 + 共振键缓存，与逐锚点重复 encode 数值等价
-        encode_cache: Dict[str, np.ndarray] = {}
+        # 复用 supplement 前写入的 JD 共振缓存，prefill 内跳过 JD 的 encode_batch 重复项
+        encode_cache = jd_encode_cache
+        label_anchors.prefill_encode_cache_for_anchor_ctx(
+            encoder, anchor_skills, query_for_ctx, encode_cache
+        )
         jd_vec_once = None
         try:
             jd_arr = label_anchors.encode_text_with_optional_cache(
-                encoder, query_for_ctx[:800], encode_cache
+                encoder, jd_canonical, encode_cache
             )
             if jd_arr is not None:
                 jd_vec_once = np.asarray(jd_arr, dtype=np.float32).flatten().copy()

@@ -41,6 +41,12 @@ VOCAB_STATS_DB_PATH = os.path.join(INDEX_DIR, 'vocab_stats.db')
 # 论文标题向量离线索引（与 QueryEncoder 同空间，供 Stage5 JD 门控查表，缺失则在线 encode）
 WORK_TITLE_EMB_DB_PATH = os.path.join(INDEX_DIR, "work_title_embeddings.db")
 
+# QueryEncoder 共振词表快照（随主库 mtime 失效；首次运行从 DB 构建并写入）
+HARDCORE_LEXICON_SNAPSHOT_PATH = os.path.join(INDEX_DIR, "query_encoder_hardcore_lexicon.json")
+# 标签路领域向量快照（随 DOMAIN_MAP / SBERT config.json 失效；首次在 LabelRecallPath 内编码并写入）
+LABEL_DOMAIN_VECTORS_NPZ_PATH = os.path.join(INDEX_DIR, "label_domain_vectors.npz")
+LABEL_DOMAIN_VECTORS_META_PATH = os.path.join(INDEX_DIR, "label_domain_vectors_meta.json")
+
 # --- 6.1 标签路召回参数（学术词过滤与 SIMILAR_TO 约束）---
 VOCAB_P95_PAPER_COUNT = 800   # 学术词 paper_count 上限，过滤泛词（如 machine learning / algorithm）
 SIMILAR_TO_TOP_K = 3         # 每个锚点词最多扩展的学术词数量
@@ -222,6 +228,9 @@ CONFIG_DICT = {
     "SBERT_DIR": SBERT_DIR,
     "SBERT_MODEL_NAME": SBERT_MODEL_NAME,
     "WORK_TITLE_EMB_DB_PATH": WORK_TITLE_EMB_DB_PATH,
+    "HARDCORE_LEXICON_SNAPSHOT_PATH": HARDCORE_LEXICON_SNAPSHOT_PATH,
+    "LABEL_DOMAIN_VECTORS_NPZ_PATH": LABEL_DOMAIN_VECTORS_NPZ_PATH,
+    "LABEL_DOMAIN_VECTORS_META_PATH": LABEL_DOMAIN_VECTORS_META_PATH,
 }
 
 # --- 11. SQLite 索引初始化脚本 ---
@@ -244,7 +253,11 @@ SQL_INIT_SCRIPTS = [
     "CREATE INDEX IF NOT EXISTS idx_aship_work_author ON authorships(work_id, author_id, inst_id, source_id)",
 
     # 3. 反向拓扑覆盖索引：解决协同路计算和图谱全量导出的性能瓶颈
-    "CREATE INDEX IF NOT EXISTS idx_aship_author_work ON authorships(author_id, work_id)"
+    "CREATE INDEX IF NOT EXISTS idx_aship_author_work ON authorships(author_id, work_id)",
+
+    # 4. Label Stage1 jd_profile：按 voc_id 批量查 stats 时走索引（与逐条查询结果一致）
+    "CREATE INDEX IF NOT EXISTS idx_vocabulary_topic_stats_voc_id ON vocabulary_topic_stats(voc_id)",
+    "CREATE INDEX IF NOT EXISTS idx_vocabulary_domain_stats_voc_id ON vocabulary_domain_stats(voc_id)",
 ]
 
 # --- 12. KGATAX 训练数据的存放路径 ---

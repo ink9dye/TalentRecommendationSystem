@@ -27,7 +27,13 @@ from src.core.recall.works_to_authors import accumulate_author_scores
 from src.utils.domain_utils import DomainProcessor
 from src.utils.domain_detector import DomainDetector
 from config import (
-    DB_PATH, VOCAB_P95_PAPER_COUNT, SIMILAR_TO_TOP_K, SIMILAR_TO_MIN_SCORE,
+    DB_PATH,
+    VOCAB_P95_PAPER_COUNT,
+    SIMILAR_TO_TOP_K,
+    SIMILAR_TO_MIN_SCORE,
+    SBERT_DIR,
+    LABEL_DOMAIN_VECTORS_NPZ_PATH,
+    LABEL_DOMAIN_VECTORS_META_PATH,
 )
 from src.utils.domain_config import (
     DOMAIN_MAP,
@@ -37,6 +43,10 @@ from src.utils.time_features import (
     compute_paper_recency,
     compute_author_time_features,
     compute_author_recency_by_latest
+)
+from src.core.recall.label_encoder_snapshots import (
+    save_domain_vectors,
+    try_load_domain_vectors,
 )
 from src.core.recall.label_means.simple_factors import (
     survey_decay_factor,
@@ -342,16 +352,38 @@ class LabelRecallPath:
         """
         用领域中文名编码得到领域向量（与 QueryEncoder 同空间、已 L2 归一化），
         供 recall 时从 Top5 候选领域中按与 query 的余弦相似度选 Top3。
-        使用 self._query_encoder 单例，不再在此处新建编码器。
+        使用 self._query_encoder 单例；优先读快照（label_domain_vectors*.npz/meta），缺失则编码并写入。
         """
         try:
+            loaded = try_load_domain_vectors(
+                SBERT_DIR,
+                DOMAIN_MAP,
+                LABEL_DOMAIN_VECTORS_NPZ_PATH,
+                LABEL_DOMAIN_VECTORS_META_PATH,
+            )
+            if loaded is not None:
+                self.domain_vectors = loaded
+                print(
+                    f"[OK] 领域向量已从快照加载 (共 {len(self.domain_vectors)} 个) "
+                    f"path={LABEL_DOMAIN_VECTORS_NPZ_PATH}",
+                    flush=True,
+                )
+                return
+
             encoder = self._query_encoder
             for domain_id, name in DOMAIN_MAP.items():
                 vec, _ = encoder.encode(name)
                 if vec is not None and vec.size > 0:
                     self.domain_vectors[str(domain_id)] = np.asarray(vec.flatten(), dtype=np.float32)
             if self.domain_vectors:
-                print(f"[OK] 领域向量已构建 (共 {len(self.domain_vectors)} 个)")
+                print(f"[OK] 领域向量已构建 (共 {len(self.domain_vectors)} 个)，已写入快照", flush=True)
+                save_domain_vectors(
+                    self.domain_vectors,
+                    SBERT_DIR,
+                    DOMAIN_MAP,
+                    LABEL_DOMAIN_VECTORS_NPZ_PATH,
+                    LABEL_DOMAIN_VECTORS_META_PATH,
+                )
         except Exception as e:
             print(f"[Warn] 领域向量构建失败: {e}，将退化为按候选领域顺序取前 3")
 
@@ -454,7 +486,15 @@ class LabelRecallPath:
     def _extract_anchor_skills(self, target_job_ids, query_vector=None, total_j=None):
         return label_anchors.extract_anchor_skills(self, target_job_ids, query_vector=query_vector, total_j=total_j)
 
-    def _supplement_anchors_from_jd_vector(self, query_text, anchor_skills, total_j=None, top_k=None, active_domain_ids=None):
+    def _supplement_anchors_from_jd_vector(
+        self,
+        query_text,
+        anchor_skills,
+        total_j=None,
+        top_k=None,
+        active_domain_ids=None,
+        jd_encode_cache=None,
+    ):
         return label_anchors.supplement_anchors_from_jd_vector(
             self,
             query_text,
@@ -462,6 +502,7 @@ class LabelRecallPath:
             total_j=total_j,
             top_k=top_k,
             active_domain_ids=active_domain_ids,
+            jd_encode_cache=jd_encode_cache,
         )
 
     # --- 第三阶段：语义扩展 ---

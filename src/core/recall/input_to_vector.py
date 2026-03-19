@@ -8,7 +8,8 @@ from typing import Dict, List, Optional
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from config import SBERT_DIR, DB_PATH, SBERT_MODEL_NAME
+from config import SBERT_DIR, DB_PATH, SBERT_MODEL_NAME, HARDCORE_LEXICON_SNAPSHOT_PATH
+from src.core.recall.label_encoder_snapshots import load_or_build_hardcore_lexicon
 
 
 class QueryEncoder:
@@ -31,9 +32,13 @@ class QueryEncoder:
         self.model.max_seq_length = 1024
         self.model.eval()
 
-        self.hardcore_lexicon = self._build_dynamic_lexicon()
+        self.hardcore_lexicon = load_or_build_hardcore_lexicon(
+            DB_PATH,
+            HARDCORE_LEXICON_SNAPSHOT_PATH,
+            self._build_dynamic_lexicon,
+        )
 
-        print(f"[OK] 动态特征库加载完毕 (核心词条: {len(self.hardcore_lexicon)})")
+        print(f"[OK] 动态特征库就绪 (核心词条: {len(self.hardcore_lexicon)})")
         print(f"[*] 语义编码器就绪，耗时: {time.time() - start_load:.4f}s")
     def _build_dynamic_lexicon(self):
         """（保持原有的统计学过滤逻辑不变）"""
