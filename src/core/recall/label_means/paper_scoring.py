@@ -160,10 +160,13 @@ def compute_contribution(
 
     # 7.5 paper-level JD semantic gate
     jd_vec = context.get("query_vector")
+    title_vecs = context.get("paper_title_vec_by_title") or {}
+    paper_vec_pre = title_vecs.get(raw_title) if raw_title else None
     gate_factor = paper_jd_semantic_gate_factor(
         raw_title,
         jd_vec,
         getattr(recall, "_query_encoder", None),
+        paper_vec_precomputed=paper_vec_pre,
     )
     score *= gate_factor
 

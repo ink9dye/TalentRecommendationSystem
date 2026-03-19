@@ -112,14 +112,28 @@ class RecallDebugInfo:
         self.cluster_expansion_log: List[Dict[str, Any]] = []
         # 标签路追踪：Stage3 被过滤候选及原因
         self.dropped_with_reason: List[Dict[str, Any]] = []
+        # Stage4 子阶段耗时（毫秒），供 recall 汇总打印
+        self.stage4_sub_ms: Dict[str, float] = {}
 
 
-def _emit_label_pipeline_checkpoints(checkpoints, debug_1=None):
+def _print_label_sub_stage_ms(stage_label: str, sub_ms: Optional[Dict[str, Any]] = None) -> None:
+    """打印单个大阶段内的子计时（毫秒）。sub_ms 为 {名称: 毫秒}。"""
+    if not sub_ms:
+        return
+    parts: list[str] = []
+    for name, ms in sub_ms.items():
+        if isinstance(ms, (int, float)):
+            parts.append(f"{name}={ms:.0f}ms")
+    if parts:
+        print(f"[Label {stage_label} 子阶段耗时] " + " ".join(parts))
+
+
+def _emit_label_pipeline_checkpoints(checkpoints, debug_1=None, do_print=True):
     """
     标签路必查日志：每阶段关键计数，用于定位「从哪一步开始跑偏」。
-    必打一行汇总；若某步 ok=False 或计数为 0，该步即为首次跑偏点。
+    do_print=False 时不输出（不打印模式下不显示）。
     """
-    if not checkpoints:
+    if not checkpoints or not do_print:
         return
     parts = []
     first_bad = None
@@ -1519,6 +1533,14 @@ class LabelRecallPath:
             return [], 0
         start_t = time.time()
 
+        # 统一由 verbose 控制各模块是否打印
+        from src.core.recall.label_means import label_expansion
+        label_expansion.LABEL_EXPANSION_DEBUG = self.verbose
+        label_expansion.STAGE2_VERBOSE_DEBUG = self.verbose
+        stage3_term_filtering.LABEL_PATH_TRACE = self.verbose
+        stage3_term_filtering.STAGE3_DETAIL_DEBUG = self.verbose
+        term_scoring.STAGE3_DEBUG = self.verbose
+
         # 阶段 1：领域与锚点
         active_domain_set, regex_str, anchor_skills, debug_1 = self._stage1_domain_and_anchors(
             query_vector,
@@ -1526,13 +1548,18 @@ class LabelRecallPath:
             semantic_query_text=semantic_query_text,
             domain_id=domain_id,
         )
+        _print_label_sub_stage_ms("S1", debug_1.get("stage1_sub_ms") if isinstance(debug_1, dict) else None)
         checkpoints = []
         checkpoints.append({"stage": "S1", "anchors": len(anchor_skills or {}), "active_domains": len(active_domain_set or set()), "ok": bool(anchor_skills)})
+        t_s1 = time.time()
+        s1_ms = (t_s1 - start_t) * 1000
         if not anchor_skills:
-            _emit_label_pipeline_checkpoints(checkpoints, None)
+            total_ms = (time.time() - start_t) * 1000
+            print(f"[Label 各阶段耗时] S1={s1_ms:.0f}ms 总={total_ms:.0f}ms")
+            _emit_label_pipeline_checkpoints(checkpoints, None, self.verbose)
             self.last_debug_info = dict(debug_1) if isinstance(debug_1, dict) else {}
             self.last_debug_info["pipeline_checkpoints"] = checkpoints
-            return [], (time.time() - start_t) * 1000
+            return [], total_ms
 
         # 阶段 2：学术词扩展（仅产出候选，不算权）；传入 jd_profile 供层级守卫
         jd_profile = getattr(self._last_stage1_result, "jd_profile", None) if getattr(self, "_last_stage1_result", None) else None
@@ -1545,11 +1572,15 @@ class LabelRecallPath:
             jd_profile=jd_profile,
         )
         checkpoints.append({"stage": "S2", "raw_candidates": len(raw_candidates or []), "ok": bool(raw_candidates)})
+        t_s2 = time.time()
+        s2_ms = (t_s2 - t_s1) * 1000
         if not raw_candidates:
-            _emit_label_pipeline_checkpoints(checkpoints, debug_1)
+            total_ms = (time.time() - start_t) * 1000
+            print(f"[Label 各阶段耗时] S1={s1_ms:.0f}ms S2={s2_ms:.0f}ms 总={total_ms:.0f}ms")
+            _emit_label_pipeline_checkpoints(checkpoints, debug_1, self.verbose)
             self.last_debug_info = dict(debug_1) if isinstance(debug_1, dict) else {}
             self.last_debug_info["pipeline_checkpoints"] = checkpoints
-            return [], (time.time() - start_t) * 1000
+            return [], total_ms
         debug_1["stage2_anchor_evidence_table"] = getattr(self.debug_info, "stage2_anchor_evidence_table", None) or []
         self.debug_info.raw_candidate_tids = sorted(
             set(r.get("tid") for r in raw_candidates if r.get("tid") is not None)
@@ -1625,6 +1656,8 @@ class LabelRecallPath:
             score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map = stage3_out
             paper_terms = []
         checkpoints.append({"stage": "S3", "score_map_terms": len(score_map or {}), "ok": bool(score_map)})
+        t_s3 = time.time()
+        s3_ms = (t_s3 - t_s2) * 1000
 
         # 精检：优先 family 保送式 paper_terms（每 family 1 primary + 1 support）；否则回退到 _select_terms_for_paper
         if paper_terms:
@@ -1675,8 +1708,11 @@ class LabelRecallPath:
             score_map=term_scores_for_paper if term_scores_for_paper is not None else score_map,
             term_retrieval_roles=term_retrieval_roles,
         )
+        _print_label_sub_stage_ms("S4", getattr(self.debug_info, "stage4_sub_ms", None) or {})
         n_papers = sum(len(p.get("papers") or []) for p in (author_papers_list or []))
         checkpoints.append({"stage": "S4", "authors": len(author_papers_list or []), "papers": n_papers, "ok": bool(author_papers_list)})
+        t_s4 = time.time()
+        s4_ms = (t_s4 - t_s3) * 1000
 
         # 调试：按 term 打印 papers_before_filter / papers_after_filter / authors_before_merge / top_paper_ids
         if getattr(term_scoring, "STAGE3_DEBUG", False) and final_term_ids_for_paper:
@@ -1725,12 +1761,16 @@ class LabelRecallPath:
             author_papers_list, score_map, term_map, active_domain_set, dominance, debug_1
         )
         checkpoints.append({"stage": "S5", "ranked_authors": len(author_ids or []), "ok": True})
+        t_s5 = time.time()
+        s5_ms = (t_s5 - t_s4) * 1000
+        elapsed_ms = (t_s5 - start_t) * 1000
         debug_1["pipeline_checkpoints"] = checkpoints
         if last_debug_info is not None:
             last_debug_info["pipeline_checkpoints"] = checkpoints
-        _emit_label_pipeline_checkpoints(checkpoints, debug_1)
+        print(f"[Label 各阶段耗时] S1={s1_ms:.0f}ms S2={s2_ms:.0f}ms S3={s3_ms:.0f}ms S4={s4_ms:.0f}ms S5={s5_ms:.0f}ms 总={elapsed_ms:.0f}ms")
+        _print_label_sub_stage_ms("S5", (last_debug_info or {}).get("stage5_sub_ms"))
+        _emit_label_pipeline_checkpoints(checkpoints, debug_1, self.verbose)
 
-        elapsed_ms = (time.time() - start_t) * 1000
         author_list = (author_ids or [])[: self.recall_limit]
         meta_list = [
             {

@@ -1,3 +1,4 @@
+import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
@@ -51,10 +52,18 @@ def run_stage4(
 
     返回: list of { 'aid': str, 'papers': [ { wid, hits, weight, title, year, domains }, ... ] }，供 Stage5 消费。
     """
+    di = getattr(recall, "debug_info", None)
+
+    def _save_sub(ms: Dict[str, float]) -> None:
+        if di is not None:
+            di.stage4_sub_ms = ms
+
     if not vocab_ids or not getattr(recall, "graph", None):
+        _save_sub({})
         return []
     v_ids = [int(x) for x in vocab_ids if x is not None]
     if not v_ids:
+        _save_sub({})
         return []
     total_w = float(getattr(recall, "total_work_count", 1e6) or 1e6)
     term_scores = term_scores or {}
@@ -84,13 +93,23 @@ def run_stage4(
     """
     params["melt_ratio"] = MELT_RATIO
 
+    sub_ms: Dict[str, float] = {}
+    t0 = time.perf_counter()
     try:
         cursor = recall.graph.run(cypher_layer1, **params)
         rows = list(cursor)
     except Exception:
+        sub_ms["cypher1"] = (time.perf_counter() - t0) * 1000.0
+        sub_ms["total"] = sub_ms["cypher1"]
+        _save_sub(sub_ms)
         return []
 
+    t1 = time.perf_counter()
+    sub_ms["cypher1"] = (t1 - t0) * 1000.0
+
     if not rows:
+        sub_ms["total"] = (time.perf_counter() - t0) * 1000.0
+        _save_sub(sub_ms)
         return []
 
     # ---------- Python：recency、role_weight、term_contrib，per-term 限流，再按 paper 聚合 ----------
@@ -132,7 +151,11 @@ def run_stage4(
         by_wid.keys(),
         key=lambda w: -by_wid[w][0],
     )[:GLOBAL_PAPER_LIMIT]
+    t2 = time.perf_counter()
+    sub_ms["python_agg"] = (t2 - t1) * 1000.0
     if not sorted_wids:
+        sub_ms["total"] = (time.perf_counter() - t0) * 1000.0
+        _save_sub(sub_ms)
         return []
 
     # ---------- 第二层：按 wid 查作者与论文元数据，按 aid 聚合为 author_papers_list ----------
@@ -144,11 +167,18 @@ def run_stage4(
     WITH aid, collect({wid: wid, weight: weight, title: title, year: year, domains: domains}) AS papers
     RETURN aid, papers
     """
+    t3 = time.perf_counter()
     try:
         cursor2 = recall.graph.run(cypher_layer2, **params2)
         author_rows = list(cursor2)
     except Exception:
+        sub_ms["cypher2"] = (time.perf_counter() - t3) * 1000.0
+        sub_ms["total"] = (time.perf_counter() - t0) * 1000.0
+        _save_sub(sub_ms)
         return []
+
+    t4 = time.perf_counter()
+    sub_ms["cypher2"] = (t4 - t3) * 1000.0
 
     # 为每篇 paper 挂上 Stage4 算好的 hits 与 score（供 Stage5 / debug 使用）
     wid_to_hits_and_score = {wid: (hits, score) for wid, (score, hits) in by_wid.items()}
@@ -177,4 +207,7 @@ def run_stage4(
                 "aid": str(aid),
                 "papers": papers,
             })
+    sub_ms["build_list"] = (time.perf_counter() - t4) * 1000.0
+    sub_ms["total"] = (time.perf_counter() - t0) * 1000.0
+    _save_sub(sub_ms)
     return out

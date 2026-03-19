@@ -1,4 +1,5 @@
 import re
+import time
 from typing import Any, Dict, List, Set, Tuple
 
 import numpy as np
@@ -180,6 +181,8 @@ def run_stage1(
     dominance: float = 0.0
     job_previews: list[dict[str, Any]] = []
     anchor_debug: Dict[str, Any] = {}
+    stage1_sub_ms: Dict[str, float] = {}
+    _t_stage1 = time.perf_counter()
 
     # 0) 预清洗当前 JD 的技能短语，供 Step2 稀疏锚点保活使用
     # 使用 extract_skills 保持与 JD 技能抽取链路一致，只在本次查询作用域内生效。
@@ -193,6 +196,8 @@ def run_stage1(
     # 每次调用都覆盖上一轮缓存，避免跨查询串扰
     setattr(recall, "_jd_cleaned_terms", jd_terms_cleaned)
     setattr(recall, "_jd_raw_text", text_for_skills or "")
+    _t0 = time.perf_counter()
+    stage1_sub_ms["prep"] = (_t0 - _t_stage1) * 1000.0
 
     # 1) 领域与岗位：优先使用 DomainDetector，缺失时回退到旧实现
     if getattr(recall, "domain_detector", None) is not None:
@@ -211,6 +216,8 @@ def run_stage1(
         job_ids, inferred_domains, dominance = recall._detect_domain_context(query_vector)
         job_previews = recall._get_job_previews(job_ids)
         anchor_debug = recall._get_anchor_debug_stats(job_ids[:20], recall.total_job_count) if job_ids else {}
+    _t1 = time.perf_counter()
+    stage1_sub_ms["domain_detect"] = (_t1 - _t0) * 1000.0
 
     # 2) 工业锚点：岗位技能提取 + JD 语义补充
     anchor_skills = label_anchors.extract_anchor_skills(
@@ -227,13 +234,17 @@ def run_stage1(
             total_j=recall.total_job_count,
             top_k=recall.JD_VOCAB_TOP_K,
         )
+    _t2 = time.perf_counter()
+    stage1_sub_ms["anchors"] = (_t2 - _t1) * 1000.0
     if not anchor_skills:
         # 无锚点时，后续阶段直接短路
+        stage1_sub_ms["total"] = (_t2 - _t_stage1) * 1000.0
         return set(), "", {}, {
             "job_ids": job_ids,
             "job_previews": job_previews,
             "anchor_debug": anchor_debug,
             "dominance": dominance,
+            "stage1_sub_ms": stage1_sub_ms,
         }
 
     # 方式1：扩展现有 anchor_skills，为每个锚点打上 anchor_type，供 Stage2/Stage3 按类型分策略
@@ -274,6 +285,8 @@ def run_stage1(
             active_domain_set = set(sorted(candidate_5)[: recall.ACTIVE_DOMAINS_TOP_K])
 
     regex_str = DomainProcessor.build_neo4j_regex(active_domain_set)
+    _t3 = time.perf_counter()
+    stage1_sub_ms["domain_regex"] = (_t3 - _t2) * 1000.0
 
     # 4) 锚点上下文化 + JD 四层领域画像（供 Stage2 层级守卫）
     query_for_ctx = (semantic_query_text or query_text) or ""
@@ -281,6 +294,17 @@ def run_stage1(
     # 条件化锚点表示：泛锚点带 JD 上下文，供 Stage2A 用 conditioned_vec 做落点打分
     encoder = getattr(recall, "_query_encoder", None)
     if encoder and query_for_ctx and anchor_skills:
+        # 单条 JD 内：JD 片段只编码一次 + 共振键缓存，与逐锚点重复 encode 数值等价
+        encode_cache: Dict[str, np.ndarray] = {}
+        jd_vec_once = None
+        try:
+            jd_arr = label_anchors.encode_text_with_optional_cache(
+                encoder, query_for_ctx[:800], encode_cache
+            )
+            if jd_arr is not None:
+                jd_vec_once = np.asarray(jd_arr, dtype=np.float32).flatten().copy()
+        except Exception:
+            jd_vec_once = None
         anchor_ctx_count = 0
         for _vid, info in anchor_skills.items():
             term = (info.get("term") or "").strip()
@@ -288,7 +312,13 @@ def run_stage1(
                 continue
             try:
                 ctx = label_anchors.build_conditioned_anchor_representation(
-                    term, info, anchor_skills, query_for_ctx, encoder
+                    term,
+                    info,
+                    anchor_skills,
+                    query_for_ctx,
+                    encoder,
+                    jd_vec_precomputed=jd_vec_once,
+                    encode_cache=encode_cache,
                 )
                 if ctx.get("conditioned_vec") is not None:
                     info["conditioned_vec"] = ctx["conditioned_vec"]
@@ -309,7 +339,11 @@ def run_stage1(
                     anchor_ctx_count += 1
             except Exception:
                 pass
+    _t4 = time.perf_counter()
+    stage1_sub_ms["anchor_ctx"] = (_t4 - _t3) * 1000.0
     jd_profile = build_jd_hierarchy_profile(anchor_skills, query_for_ctx, recall)
+    _t5 = time.perf_counter()
+    stage1_sub_ms["jd_profile"] = (_t5 - _t4) * 1000.0
     jd_profile["active_domains"] = list(active_domain_set)
 
     debug_1: Dict[str, Any] = {
@@ -320,7 +354,10 @@ def run_stage1(
         "industrial_kws": industrial_kws,
         "anchor_skills": anchor_skills,
         "jd_profile": jd_profile,
+        "stage1_sub_ms": stage1_sub_ms,
     }
+    stage1_sub_ms["finalize"] = (time.perf_counter() - _t5) * 1000.0
+    stage1_sub_ms["total"] = (time.perf_counter() - _t_stage1) * 1000.0
 
     # 5) 回填 Stage1Result（含 jd_profile 供 Stage2 使用）
     recall._last_stage1_result = Stage1Result(

@@ -1,5 +1,6 @@
 import collections
 import math
+import time
 from typing import Any, Dict, List, Set, Tuple
 
 import numpy as np
@@ -84,10 +85,13 @@ def run_stage5(
     term_map = term_map or {}
     active_domain_set = active_domain_set or set()
     industrial_kws = debug_1.get("industrial_kws", []) if debug_1 else []
+    stage5_sub_ms: Dict[str, float] = {}
+    t_stage5 = time.perf_counter()
     if not author_papers_list:
         recall.debug_info.work_count = 0
         recall.debug_info.author_count = 0
         recall.debug_info.recall_vocab_count = len(score_map)
+        stage5_sub_ms["total"] = (time.perf_counter() - t_stage5) * 1000.0
         recall.last_debug_info = {
             "active_domains": [str(d) for d in sorted(active_domain_set)],
             "dominance": float(dominance),
@@ -99,7 +103,10 @@ def run_stage5(
             "author_count": 0,
             "recall_vocab_count": len(score_map),
             "filter_closed_loop": (debug_1 or {}).get("filter_closed_loop") or {},
+            "stage5_sub_ms": stage5_sub_ms,
         }
+        if debug_1 and debug_1.get("stage1_sub_ms") is not None:
+            recall.last_debug_info["stage1_sub_ms"] = debug_1["stage1_sub_ms"]
         return [], recall.last_debug_info
 
     industrial_kws = debug_1.get("industrial_kws", [])
@@ -119,6 +126,7 @@ def run_stage5(
         "decay_rate": _get_decay_rate_for_domains(active_domain_set),
         "query_vector": debug_1.get("query_vector"),
     }
+    t0 = time.perf_counter()
 
     paper_map: Dict[str, Dict[str, Any]] = {}
     author_raw_paper_cnt: Dict[str, int] = collections.Counter()
@@ -140,6 +148,35 @@ def run_stage5(
             )
             entry["authors"].append({"aid": aid, "pos_weight": float(paper.get("weight") or 1.0)})
             author_raw_paper_cnt[aid] += 1
+
+    t1 = time.perf_counter()
+    stage5_sub_ms["merge_paper_map"] = (t1 - t0) * 1000.0
+
+    # 唯一论文标题一次 batch 编码，与逐篇 gate 内 encode(title) 数值等价（同共振+L2）
+    enc = getattr(recall, "_query_encoder", None)
+    paper_title_vec_by_title: Dict[str, Any] = {}
+    if enc is not None and paper_map:
+        titles_unique: List[str] = []
+        seen_t: Set[str] = set()
+        for _wid, info in paper_map.items():
+            t = (info.get("title") or "")
+            if not t or t in seen_t:
+                continue
+            seen_t.add(t)
+            titles_unique.append(t)
+        if titles_unique:
+            if hasattr(enc, "encode_batch"):
+                batch_m = enc.encode_batch(titles_unique)
+                for i, t in enumerate(titles_unique):
+                    paper_title_vec_by_title[t] = (
+                        np.asarray(batch_m[i], dtype=np.float32).reshape(1, -1).copy()
+                    )
+            else:
+                for t in titles_unique:
+                    v, _ = enc.encode(t)
+                    if v is not None:
+                        paper_title_vec_by_title[t] = np.asarray(v, dtype=np.float32).copy()
+    context["paper_title_vec_by_title"] = paper_title_vec_by_title
 
     papers_for_agg: List[Dict[str, Any]] = []
     paper_hit_terms: Dict[str, List[str]] = {}
@@ -183,6 +220,9 @@ def run_stage5(
             }
         )
 
+    t2 = time.perf_counter()
+    stage5_sub_ms["paper_contribution"] = (t2 - t1) * 1000.0
+
     if papers_for_agg:
         paper_scores = [p["score"] for p in papers_for_agg]
         try:
@@ -198,11 +238,17 @@ def run_stage5(
             for p in papers_for_agg:
                 p["score"] = _compress(float(p["score"]))
 
+    t3 = time.perf_counter()
+    stage5_sub_ms["percentile_compress"] = (t3 - t2) * 1000.0
+
     agg_result = accumulate_author_scores(papers_for_agg, top_k_per_author=3)
     author_scores = agg_result.author_scores
     author_top_works = agg_result.author_top_works
     paper_scores_by_wid = {p["wid"]: float(p["score"]) for p in papers_for_agg}
     author_evidence_by_term_role = aggregate_author_evidence_by_term_role(papers_for_agg)
+
+    t3a = time.perf_counter()
+    stage5_sub_ms["accumulate_authors"] = (t3a - t3) * 1000.0
 
     term_paper_contrib: Dict[str, List[Tuple[str, float]]] = collections.defaultdict(list)
     for p in papers_for_agg:
@@ -217,6 +263,9 @@ def run_stage5(
         for vid_s, w in tw.items():
             term_paper_contrib[vid_s].append((wid, (w / r_score) * s_final))
 
+    t4 = time.perf_counter()
+    stage5_sub_ms["term_paper_index"] = (t4 - t3a) * 1000.0
+
     author_term_contrib: Dict[str, Dict[str, float]] = collections.defaultdict(
         lambda: collections.defaultdict(float)
     )
@@ -229,6 +278,9 @@ def run_stage5(
                 continue
             for vid_s, w in tw.items():
                 author_term_contrib[aid][vid_s] += contrib * (w / r_score)
+
+    t5 = time.perf_counter()
+    stage5_sub_ms["term_contrib_matrix"] = (t5 - t4) * 1000.0
 
     if author_scores:
         years_by_author: Dict[str, List[Any]] = {}
@@ -268,6 +320,9 @@ def run_stage5(
             family_balance_penalty = 1.0 / (1.0 + 0.6 * max_family_share)
             author_scores[aid] = author_scores[aid] * coverage_bonus * family_balance_penalty
 
+    t6 = time.perf_counter()
+    stage5_sub_ms["time_and_family"] = (t6 - t5) * 1000.0
+
     if papers_for_agg and author_scores and author_top_works:
         paper_scores_by_wid = {p["wid"]: float(p["score"]) for p in papers_for_agg}
         max_paper = max(paper_scores_by_wid.values()) if paper_scores_by_wid else 0.0
@@ -290,6 +345,11 @@ def run_stage5(
         if max_score > 0:
             for aid in author_scores:
                 author_scores[aid] = author_scores[aid] / max_score
+
+    t7 = time.perf_counter()
+    stage5_sub_ms["filter_normalize"] = (t7 - t6) * 1000.0
+
+    t8 = time.perf_counter()
 
     scored_authors: List[Dict[str, Any]] = []
     for aid, total_score in sorted(author_scores.items(), key=lambda x: x[1], reverse=True):
@@ -346,12 +406,18 @@ def run_stage5(
             }
         )
 
+    t9 = time.perf_counter()
+    stage5_sub_ms["build_ranked_list"] = (t9 - t8) * 1000.0
+
     scored_authors.sort(key=lambda x: x["score"], reverse=True)
     sorted_terms = sorted(
         [(term_map.get(tid, ""), score_map.get(tid, 0.0)) for tid in score_map],
         key=lambda x: x[1],
         reverse=True,
     )
+
+    t9b = time.perf_counter()
+    stage5_sub_ms["sort_authors_and_terms"] = (t9b - t9) * 1000.0
 
     top20_term_debug: List[Dict[str, Any]] = []
     if score_map and getattr(recall, "_last_tag_purity_debug", None):
@@ -383,6 +449,9 @@ def run_stage5(
                     else None,
                 }
             )
+
+    t10 = time.perf_counter()
+    stage5_sub_ms["top20_term_debug"] = (t10 - t9b) * 1000.0
 
     filter_closed_loop = debug_1.get("filter_closed_loop") or {}
     similar_to_pass = recall.debug_info.similar_to_pass or []
@@ -439,6 +508,10 @@ def run_stage5(
     recall.debug_info.top_terms_final_contrib = top20_term_debug
     recall.debug_info.top_samples = scored_authors[:50]
 
+    t11 = time.perf_counter()
+    stage5_sub_ms["filter_closed_loop_meta"] = (t11 - t10) * 1000.0
+    stage5_sub_ms["total"] = (t11 - t_stage5) * 1000.0
+
     author_evidence_debug = {
         aid: author_evidence_by_term_role.get(aid, {})
         for a in scored_authors[:50]
@@ -460,7 +533,13 @@ def run_stage5(
         "author_count": len(scored_authors),
         "recall_vocab_count": len(score_map),
         "author_evidence_by_term_role": author_evidence_debug,
+        "stage5_sub_ms": stage5_sub_ms,
     }
+    if debug_1 and debug_1.get("stage1_sub_ms") is not None:
+        recall.last_debug_info["stage1_sub_ms"] = debug_1["stage1_sub_ms"]
+    s4 = getattr(getattr(recall, "debug_info", None), "stage4_sub_ms", None)
+    if s4:
+        recall.last_debug_info["stage4_sub_ms"] = dict(s4)
 
     return [a["aid"] for a in scored_authors], recall.last_debug_info
 

@@ -1,5 +1,5 @@
 import math
-from typing import Iterable, Any
+from typing import Iterable, Any, Optional
 
 import numpy as np
 
@@ -40,18 +40,29 @@ def paper_cluster_bonus(cluster_ids: Iterable[Any]) -> float:
     return math.log1p(cluster_count) if cluster_count > 0 else 1.0
 
 
-def paper_jd_semantic_gate_factor(raw_title: str, jd_vec, encoder) -> float:
+def paper_jd_semantic_gate_factor(
+    raw_title: str,
+    jd_vec,
+    encoder,
+    paper_vec_precomputed: Optional[np.ndarray] = None,
+) -> float:
     """
     论文标题与 JD 的语义相似度门控因子。
     等价于 LabelRecallPath._paper_jd_semantic_gate_factor 中的逻辑：
       - cos < 0.3 -> 0.1
       - 0.3 <= cos < 0.5 -> 0.4
       - 否则 1.0
+    paper_vec_precomputed: 与 encoder.encode(raw_title) 同分布的标题向量（可 batch 预计算），传入则不再 encode。
     """
     if jd_vec is None or not raw_title or encoder is None:
         return 1.0
     try:
-        paper_vec, _ = encoder.encode(raw_title)
+        if paper_vec_precomputed is not None:
+            paper_vec = paper_vec_precomputed
+            if getattr(paper_vec, "ndim", 0) == 1:
+                paper_vec = paper_vec.reshape(1, -1)
+        else:
+            paper_vec, _ = encoder.encode(raw_title)
         if paper_vec is None or paper_vec.size == 0:
             return 1.0
         jd_flat = np.asarray(jd_vec, dtype=np.float32).flatten()

@@ -2,7 +2,7 @@ import json
 import math
 import os
 import sqlite3
-from typing import Dict, Any, Set, List, Tuple
+from typing import Dict, Any, Set, List, Tuple, Optional
 
 import faiss
 import numpy as np
@@ -511,12 +511,26 @@ def collect_co_anchor_terms(anchor_term: str, selected_anchor_terms: List[str], 
     return out[:top_k]
 
 
+def encode_text_with_optional_cache(
+    encoder: Any, text: str, encode_cache: Optional[Dict[str, np.ndarray]]
+) -> Optional[np.ndarray]:
+    """与 encoder.encode(text) 同语义；encode_cache 命中时复用向量（无损）。"""
+    if not text:
+        return None
+    if encode_cache is not None and hasattr(encoder, "lookup_or_encode"):
+        return encoder.lookup_or_encode(text, encode_cache)
+    v, _ = encoder.encode(text)
+    return v
+
+
 def build_conditioned_anchor_representation(
     anchor_term: str,
     anchor_info: Dict[str, Any],
     anchor_skills: Dict[str, Any],
     raw_text: str,
     encoder: Any,
+    jd_vec_precomputed: Optional[np.ndarray] = None,
+    encode_cache: Optional[Dict[str, np.ndarray]] = None,
 ) -> Dict[str, Any]:
     """
     构造条件化锚点表示：anchor_vec + local_phrase_vec + co_anchor_vec + jd_vec 加权组合。
@@ -535,17 +549,20 @@ def build_conditioned_anchor_representation(
         return out
     cleaned_list = [info.get("term") or "" for info in (anchor_skills or {}).values() if info.get("term")]
     try:
-        v_anchor, _ = encoder.encode(anchor_term.strip()[:200])
-        if v_anchor is None:
+        v_anchor_t = encode_text_with_optional_cache(encoder, anchor_term.strip()[:200], encode_cache)
+        if v_anchor_t is None:
             return out
-        v_anchor = np.asarray(v_anchor, dtype=np.float32).flatten()
+        v_anchor = np.asarray(v_anchor_t, dtype=np.float32).flatten()
     except Exception:
         return out
-    v_jd, _ = encoder.encode(raw_text[:800])
-    if v_jd is None:
-        v_jd = v_anchor
+    if jd_vec_precomputed is not None:
+        v_jd = np.asarray(jd_vec_precomputed, dtype=np.float32).flatten()
     else:
-        v_jd = np.asarray(v_jd, dtype=np.float32).flatten()
+        v_jd_t = encode_text_with_optional_cache(encoder, raw_text[:800], encode_cache)
+        if v_jd_t is None:
+            v_jd = v_anchor
+        else:
+            v_jd = np.asarray(v_jd_t, dtype=np.float32).flatten()
     local_phrases = build_anchor_local_context(anchor_term, raw_text, cleaned_list)
     other_terms = [info.get("term") or "" for vid, info in (anchor_skills or {}).items() if str(info.get("term", "")).strip().lower() != anchor_term.strip().lower()]
     co_terms = collect_co_anchor_terms(anchor_term, other_terms, raw_text)
@@ -554,14 +571,18 @@ def build_conditioned_anchor_representation(
     try:
         if local_phrases:
             text_local = " ; ".join(local_phrases[:5])
-            v_local, _ = encoder.encode(text_local[:300])
-            out["local_phrase_vec"] = np.asarray(v_local, dtype=np.float32).flatten() if v_local is not None else v_anchor.copy()
+            v_local = encode_text_with_optional_cache(encoder, text_local[:300], encode_cache)
+            out["local_phrase_vec"] = (
+                np.asarray(v_local, dtype=np.float32).flatten() if v_local is not None else v_anchor.copy()
+            )
         else:
             out["local_phrase_vec"] = v_anchor.copy()
         if co_terms:
             text_co = " ; ".join(co_terms[:5])
-            v_co, _ = encoder.encode(text_co[:300])
-            out["co_anchor_vec"] = np.asarray(v_co, dtype=np.float32).flatten() if v_co is not None else v_anchor.copy()
+            v_co = encode_text_with_optional_cache(encoder, text_co[:300], encode_cache)
+            out["co_anchor_vec"] = (
+                np.asarray(v_co, dtype=np.float32).flatten() if v_co is not None else v_anchor.copy()
+            )
         else:
             out["co_anchor_vec"] = v_anchor.copy()
     except Exception:

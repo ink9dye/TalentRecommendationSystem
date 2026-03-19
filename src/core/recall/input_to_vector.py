@@ -4,6 +4,8 @@ import sqlite3
 import re
 import time
 import collections
+from typing import Dict, List, Optional
+
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from config import SBERT_DIR, DB_PATH, SBERT_MODEL_NAME
@@ -76,7 +78,8 @@ class QueryEncoder:
         执行向量化（SentenceTransformer，与 build_vector_index 向量空间一致）
         返回 (vector, duration)，vector 为 (1, dim) 的 float32 数组，已 L2 归一化。
         """
-        if not text: return None
+        if not text:
+            return None, 0.0
 
         enhanced_text = self._apply_dynamic_resonance(text)
         start_encode = time.time()
@@ -85,10 +88,45 @@ class QueryEncoder:
             [enhanced_text],
             normalize_embeddings=True,
             show_progress_bar=False
-        ).astype('float32')
+        ).astype("float32")
 
         duration = time.time() - start_encode
         return vector, duration
+
+    def lookup_or_encode(self, text: str, cache: Dict[str, np.ndarray]) -> Optional[np.ndarray]:
+        """
+        同 encode 的文本预处理与模型行为，按「共振后字符串」去重缓存。
+        用于单条 JD 内多锚点/多论文标题复用，数值与未缓存的 encode 一致。
+        """
+        if not text:
+            return None
+        enhanced = self._apply_dynamic_resonance(text)
+        if enhanced in cache:
+            return cache[enhanced]
+        start_encode = time.time()
+        vector = self.model.encode(
+            [enhanced],
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ).astype("float32")
+        _ = time.time() - start_encode
+        cache[enhanced] = vector
+        return vector
+
+    def encode_batch(self, texts: List[str]) -> np.ndarray:
+        """
+        批量编码，每行与对同一字符串单独 encode 等价（同一共振与归一化）。
+        返回 shape (n, dim) 的 float32；texts 为空时返回 shape (0, dim) 的空数组。
+        """
+        if not texts:
+            dim = int(self.model.get_sentence_embedding_dimension())
+            return np.zeros((0, dim), dtype=np.float32)
+        enhanced = [self._apply_dynamic_resonance(t) for t in texts]
+        return self.model.encode(
+            enhanced,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ).astype("float32")
 
 
 if __name__ == "__main__":
