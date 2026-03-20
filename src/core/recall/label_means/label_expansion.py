@@ -120,7 +120,8 @@ def _debug_stage2a_focus(anchor_term: str, term: str, bucket: str, reason: str, 
 
 
 def _debug_stage2a_commit(anchor_term: str, c: Any) -> None:
-    if not LABEL_EXPANSION_DEBUG:
+    # 与 Focus / reconcile 重复信息多；默认关，仅 STAGE2_NOISY_DEBUG 且命中 focus 时打出。
+    if not LABEL_EXPANSION_DEBUG or not STAGE2_NOISY_DEBUG:
         return
     term = (getattr(c, "term", "") or "").strip()
     if not _is_stage2a_focus_case(anchor_term, term):
@@ -386,6 +387,10 @@ STAGE2A_CTX_DROP_TOL = 0.08      # 静态强匹配允许 context_sim 略低于 s
 STAGE2A_PRIMARY_KEEP_MIN = STAGE2A_WEAK_KEEP_MIN  # 保守留存门槛（judge/弱保留链）；非 select 前置 reject
 SEED_SCORE_MIN = 0.50              # Stage2B：check_seed 通过后按 seed_score≥此裁剪（仅 can_expand_from_2a 可过 check）
 SEED_SCORE_MIN_WEAK = 0.54         # Stage2B：主线近邻弱 seed（primary_support_seed）略高的 seed_score 下限
+# 与 check_seed_eligibility 中 strong 的 axis_consistency_seed 下限一致；select 仅当过此线才维持/升格 primary_expandable
+SEED_AXIS_CONSISTENCY_STRONG_MIN = 0.45
+# keep/seed 救回 expandable：须为组内 axis_consistency_seed 第 1，且与第 2 名间隔≥此，避免 supervised/hand 与真主线并列升格
+STAGE2A_PROMOTE_MIN_AXIS_GAP = 0.03
 DENSE_MAX_PER_PRIMARY_WEAK = 2     # Stage2B：弱 seed 的 dense 每 primary 上限（强 seed 见 DENSE_MAX_PER_PRIMARY）
 
 # ---------- Stage2A 五层落点（primary_expandable / primary_support_seed / primary_support_keep / risky_keep / reject）----------
@@ -1610,11 +1615,11 @@ def check_seed_eligibility(
     emit_seed_factors: bool = True,
 ) -> Tuple[bool, float, Optional[str]]:
     """
-    Stage2B 唯一 seed 决策入口（最小收尾版）：
-    - 仅当 Stage2A 标记 can_expand_from_2a=True 时可扩散（强主线 primary_expandable 或弱 seed primary_support_seed）
-    - fallback_primary / 非 seed 桶一律不扩
-    - 仍做语义错配硬挡；seed_score 用于 eligible 后的排序裁剪（强 seed：SEED_SCORE_MIN；弱 seed：SEED_SCORE_MIN_WEAK）
-    - emit_seed_factors=False：抑制 [Stage2B seed factors]（供 expand_from_vocab_dense_neighbors 内二次调用，避免与主流程重复刷屏）
+    Stage2B 唯一 seed 决策入口：
+    - 先挡 fallback / tier=none / semantic_mismatch；再 **`blocked_by_2a`**（can_expand_from_2a=False）
+    - **strong / weak** 按 **seed_score** 与 **axis_consistency_seed**（identity+family+jd+mainline_pref）分流；weak 另拦 **conditioned_only** 与 **generic/poly/object** 上限
+    - seed_score 仍参与排序裁剪（SEED_SCORE_MIN / SEED_SCORE_MIN_WEAK）
+    - emit_seed_factors=False：dense 内复核时不重复打印 [Stage2B seed factors]
     """
     def _emit_sf(*args: Any, **kwargs: Any) -> None:
         if emit_seed_factors:
@@ -1748,82 +1753,65 @@ def check_seed_eligibility(
         setattr(p, "seed_block_reason", None)
         return True, seed_score, None
 
-    # ---------- strong：保留 method_like + 原 seed_ok 结构 ----------
-    if seed_tier == "strong":
-        method_like_seed_risk = (
-            generic_risk >= 0.48
-            or polysemy_risk >= 0.45
-            or role_in_anchor == "side"
-        )
-        grounding_ok = (
-            dual_support
-            or cross_anchor_support >= 2
-            or has_family_evidence
-            or anchor_identity >= 0.60
-            or jd_align >= 0.76
-        )
-        if method_like_seed_risk and not grounding_ok:
-            return _fail("method_like_without_grounding")
+    # 2A 已收口 can_expand_from_2a；此处硬挡，避免支线桶误扩。
+    if not can_expand_from_2a:
+        return _fail("blocked_by_2a")
 
-        similar_to_relaxed_seed = (
-            source_type_norm == "similar_to"
-            and dual_support
-            and ctx_present
-            and ctx_val >= 0.78
-            and ctx_drop <= 0.06
-            and generic_risk <= 0.55
-            and object_like_risk <= 0.25
-            and polysemy_risk <= 0.30
+    pl_src = _primary_landing_source_type_set(p)
+    conditioned_only_seed = (
+        "conditioned_vec" in pl_src
+        and "similar_to" not in pl_src
+        and "family_landing" not in pl_src
+    )
+    family_match_seed = float(getattr(p, "family_match", 0.0) or 0.0)
+    if family_match_seed <= 0.0:
+        family_match_seed = anchor_identity
+    # axis：与 Stage2A 主线一致性同族，专用于 seed 门（不靠词表）
+    axis_consistency_seed = (
+        0.35 * anchor_identity
+        + 0.30 * family_match_seed
+        + 0.20 * jd_align
+        + 0.15 * max(0.0, float(getattr(p, "mainline_pref_score", 0.0) or 0.0))
+    )
+
+    def _weak_seed_audit(ok: bool, br: Optional[str]) -> None:
+        if seed_tier != "weak" or not (LABEL_EXPANSION_DEBUG and STAGE2_RULING_DEBUG):
+            return
+        print(
+            f"[Stage2B weak-seed audit] term={primary_term!r} "
+            f"tier={seed_tier!r} score={seed_score:.3f} "
+            f"axis={axis_consistency_seed:.3f} "
+            f"conditioned_only={conditioned_only_seed} "
+            f"eligible={ok} reason={br!r}"
         )
-        conditioned_vec_strict_seed = (
-            source_type_norm == "conditioned_vec"
-            and dual_support
-            and anchor_identity >= SEED_MIN_IDENTITY
-            and ctx_present
-            and ctx_val >= max(SEED_CTX_MIN, 0.80)
-            and seed_score >= SEED_SCORE_STRONG
-            and generic_risk <= 0.50
-            and object_like_risk <= 0.18
-            and polysemy_risk <= 0.28
-        )
-        strong_identity_seed = (
-            anchor_identity >= SEED_MIN_IDENTITY
-            and ctx_present
-            and ctx_val >= SEED_CTX_MIN
-        )
-        dual_strong_seed = dual_support and seed_score >= SEED_SCORE_STRONG
-        seed_ok = False
-        if source_type_norm == "similar_to":
-            seed_ok = similar_to_relaxed_seed or strong_identity_seed or dual_strong_seed
-        elif source_type_norm == "conditioned_vec":
-            seed_ok = conditioned_vec_strict_seed
-        else:
-            seed_ok = strong_identity_seed or dual_strong_seed
-        if not seed_ok:
-            return _fail("weak_expandable_seed")
+
+    # ---------- strong：轴一致 + seed_score（替换原多路 method_like 结构，减少误放行）----------
+    if seed_tier == "strong":
         if seed_score < SEED_SCORE_MIN:
             return _fail("strong_seed_score_low")
+        if axis_consistency_seed < SEED_AXIS_CONSISTENCY_STRONG_MIN:
+            return _fail("strong_seed_axis_low")
         return _ok()
 
-    # ---------- weak：仅 similar_to 主线近邻（2A 已挡 conditioned-only）；更严分数与风险 ----------
+    # ---------- weak：轴更严 + 风险上限；conditioned_only 一律不扩 ----------
     if seed_tier == "weak":
-        if source_type_norm == "conditioned_vec":
-            return _fail("weak_seed_conditioned_only_block")
-        weak_gate = (
-            dual_support
-            and ctx_present
-            and ctx_val >= 0.73
-            and generic_risk < 0.60
-            and polysemy_risk < 0.38
-            and object_like_risk < 0.32
-        )
-        if not weak_gate:
-            return _fail("weak_expandable_seed")
+        if conditioned_only_seed:
+            _weak_seed_audit(False, "conditioned_only_weak_seed")
+            return _fail("conditioned_only_weak_seed")
         if seed_score < SEED_SCORE_MIN_WEAK:
+            _weak_seed_audit(False, "weak_seed_score_low")
             return _fail("weak_seed_score_low")
+        if axis_consistency_seed < 0.50:
+            _weak_seed_audit(False, "weak_seed_axis_low")
+            return _fail("weak_seed_axis_low")
+        if generic_risk >= 0.55 or polysemy_risk >= 0.35 or object_like_risk >= 0.25:
+            _weak_seed_audit(False, "weak_seed_risk_high")
+            return _fail("weak_seed_risk_high")
+        _weak_seed_audit(True, None)
         return _ok()
 
-    return _fail("unknown_seed_tier")
+    _weak_seed_audit(False, "tier_none")
+    return _fail("tier_none")
 
 
 def _anchor_skills_to_prepared_anchors(label, anchor_skills: Dict[str, Any]) -> List[PreparedAnchor]:
@@ -2860,9 +2848,8 @@ def judge_primary_and_expandability(
     primary_expandable / primary_support_seed / primary_support_keep / risky_keep / reject。
     primary：须（真实 conditioned 上下文合格）或（多锚 + 高 family）或（双路 + conditioned 合格）；
     禁止仅凭 static 相似 + 无 conditioned 进主线。
-    expand：强档须真实 conditioned_sim + 高 ctx + 低风险；未达强档时经 _classify_keepish_primary_bucket
-    分流为 **主线近邻弱 seed**（primary_support_seed）或支线保留 / 高风险保留。
-    另：在 branch_blocked 时仅对「强上下文 + 强/好主线 + 窄风险剖面」走 control_mainline_escape 窄口升格可扩。
+    **expand 与 seed 身份**：在 primary_ok 之后，用连续特征构造 **axis_consistency / effective_mainline**
+   （主线一致性）二次收口，避免「弱相关但近邻」误判为 expandable 或弱 seed（详见 README）。
     返回 (bucket, reason, snapshot) 供 [Stage2A primary factors] 与 expand 调试打印。
     anchor_term：仅用于定点 Focus 调试打印，可省略。
     """
@@ -2941,170 +2928,124 @@ def judge_primary_and_expandability(
         _debug_stage2a_focus(_anc, _term_dbg, "reject", "not_primary_enough", snap0)
         return "reject", "not_primary_enough", snap0
 
-    # ---------- expand：强上下文主线；无真实 conditioned → 仅支线/高风险（不给弱 seed）----------
-    if getattr(c, "family_fallback_only", False) or not has_real_ctx:
-        snap0["expand_block"] = "no_real_conditioned_or_family_fallback"
-        snap0["source_type"] = (getattr(c, "source_type", None) or getattr(c, "source", "") or "").strip().lower()
-        bk, rs = _classify_keepish_primary_bucket(
-            c,
-            snap0,
-            expand_block="no_real_conditioned_or_family_fallback",
-            prefer_seed=False,
-            no_real_ctx=True,
-        )
-        _debug_stage2a_focus(_anc, _term_dbg, bk, rs, snap0)
-        return bk, rs, snap0
-
-    drop_ok_exp = (static_sim <= STAGE2A_CONDITIONED_SIM_EPS) or (ctx_drop <= STAGE2A_EXPAND_MAX_CTX_DROP)
-    obj = float(getattr(c, "object_like_risk", 0) or 0)
-    gen = float(getattr(c, "generic_risk", 0) or 0)
-    poly = float(getattr(c, "polysemy_risk", 0) or 0)
-    drift = float(getattr(c, "semantic_drift_risk", 0.0) or 0.0)
-    bonus_pen = float(getattr(c, "bonus_term_penalty", 0.0) or 0.0)
-    branch_blocked = (
-        obj >= STAGE2A_EXPAND_MAX_OBJECT_LIKE
-        or gen >= STAGE2A_EXPAND_MAX_GENERIC_RISK
-        or poly >= STAGE2A_EXPAND_MAX_POLY_RISK
+    # ---------- primary_ok 之后：主线一致性（axis）分桶，替代旧 expand/weak_seed 分叉 ----------
+    static_sim, ctx_sim, ctx_drop, best_sim = _stage2a_static_ctx_for_primary_expand_split(c)
+    jd_align = float(getattr(c, "jd_align", 0.0) or 0.0)
+    anchor_identity = float(getattr(c, "anchor_identity_score", 0.0) or 0.0)
+    fm = float(getattr(c, "family_match", 0.0) or 0.0)
+    if fm <= 0.0:
+        fm = anchor_identity
+    obj_risk = float(getattr(c, "object_like_risk", 0.0) or 0.0)
+    gen_risk = float(getattr(c, "generic_risk", 0.0) or 0.0)
+    poly_risk = float(getattr(c, "polysemy_risk", 0.0) or 0.0)
+    conditioned_only = _stage2a_is_conditioned_only_for_seed(c)
+    ctx_tail = max(0.0, ctx_sim - min(ctx_drop, 0.25))
+    mainline_pref = float(getattr(c, "mainline_pref_score", 0.0) or 0.0)
+    # axis_consistency：identity + 家族 + JD 对齐 + 上下文稳态 + 主线偏好（无词表）
+    axis_consistency = (
+        0.30 * anchor_identity
+        + 0.25 * fm
+        + 0.20 * jd_align
+        + 0.15 * ctx_tail
+        + 0.10 * max(0.0, mainline_pref)
     )
+    risk_penalty = 0.45 * obj_risk + 0.35 * gen_risk + 0.20 * poly_risk
+    effective_mainline = axis_consistency - risk_penalty
 
     source_type = (getattr(c, "source_type", None) or getattr(c, "source", "") or "").strip().lower()
-    src_ok = source_type in ("similar_to", "conditioned_vec")
-    strong_mainline_direct = (
-        src_ok
-        and has_real_ctx
-        and static_sim >= 0.83
-        and ctx_sim >= 0.82
-        and ctx_drop <= 0.08
-        and family_match >= 0.50
-        and (dual_support or multi_anchor_ok or family_match >= 0.72)
-    )
-    if strong_mainline_direct and drop_ok_exp and not branch_blocked:
-        snap0.update({
-            "drop_ok_exp": drop_ok_exp,
-            "branch_blocked": branch_blocked,
-            "object_like_risk": obj,
-            "generic_risk": gen,
-            "polysemy_risk": poly,
-            "can_expand_from_2a": True,
-            "strong_mainline_direct": True,
-            "strong_static_ok": True,
-            "strong_ctx_ok": True,
-            "source_type": source_type,
-        })
-        _debug_stage2a_focus(_anc, _term_dbg, "primary_expandable", "strong_mainline_direct", snap0)
-        return "primary_expandable", "strong_mainline_direct", snap0
-
-    dual_expand_ok = dual_support and ctx_sim >= STAGE2A_EXPAND_DUAL_MIN_CTX
-    multi_expand_ok = multi_anchor_ok and ctx_sim >= STAGE2A_EXPAND_MULTI_MIN_CTX
-    solo_ctx_expand = (
-        ctx_sim >= STAGE2A_EXPAND_SOLO_STRONG_CTX
-        and family_match >= STAGE2A_EXPAND_SOLO_MIN_FAMILY
-    )
-    base_ctx_ok = ctx_sim >= STAGE2A_EXPAND_MIN_CTX_SIM
-    can_expand = base_ctx_ok and (dual_expand_ok or multi_expand_ok or solo_ctx_expand)
-    # good_mainline 只作为“候选条件”：要再过一层风险/identity 过滤，才给 expandable
-    # 并对 conditioned_vec 来源再加一道更严格门，避免补锚旁支拿到扩散权。
-    base_good_mainline_expandable = (
-        can_expand
-        and family_match >= 0.56
-        and gen <= 0.62
-        and drift <= 0.58
-        and bonus_pen <= 0.40
-    )
-    conditioned_vec_expandable = (
-        source_type == "conditioned_vec"
-        and can_expand
-        and dual_support
-        and multi_anchor_ok
-        and family_match >= 0.64
-        and ctx_sim >= 0.82
-        and gen <= 0.48
-        and obj <= 0.12
-        and poly <= 0.24
-        and drift <= 0.50
-        and bonus_pen <= 0.32
-    )
-    if source_type == "conditioned_vec":
-        good_mainline_expandable = conditioned_vec_expandable
-    else:
-        good_mainline_expandable = base_good_mainline_expandable
-    snap0.update({
-        "drop_ok_exp": drop_ok_exp,
-        "branch_blocked": branch_blocked,
-        "object_like_risk": obj,
-        "generic_risk": gen,
-        "polysemy_risk": poly,
-        "semantic_drift_risk": drift,
-        "bonus_term_penalty": bonus_pen,
-        "source_type_conditioned_strict_gate": (source_type == "conditioned_vec"),
-        "conditioned_vec_expandable": conditioned_vec_expandable,
-        "dual_expand_ok": dual_expand_ok,
-        "multi_expand_ok": multi_expand_ok,
-        "solo_ctx_expand": solo_ctx_expand,
-        "base_ctx_ok": base_ctx_ok,
-        "can_expand_from_2a": can_expand,
-        "good_mainline_expandable": good_mainline_expandable,
+    snap_axis: Dict[str, Any] = {
+        "static_sim": static_sim,
+        "ctx_sim": ctx_sim,
+        "ctx_drop": ctx_drop,
+        "best_sim": best_sim,
+        "ctx_present": has_real_ctx,
+        "dual_support": dual_support,
+        "multi_anchor_ok": multi_anchor_ok,
+        "family_match": fm,
+        "semantic_ok": semantic_ok,
+        "context_path_ok": ctx_path_ok,
+        "structural_multi": structural_multi,
+        "structural_dual": structural_dual,
+        "primary_ok": True,
+        "drop_ok_primary": drop_ok_primary,
+        "axis_consistency": axis_consistency,
+        "effective_mainline": effective_mainline,
+        "conditioned_only": conditioned_only,
+        "object_like_risk": obj_risk,
+        "generic_risk": gen_risk,
+        "polysemy_risk": poly_risk,
+        "anchor_identity_score": anchor_identity,
+        "jd_align": jd_align,
+        "source_type": source_type,
         "strong_static_ok": static_sim >= STAGE2A_PRIMARY_MIN_SIM,
         "strong_ctx_ok": has_real_ctx and ctx_sim >= STAGE2A_EXPAND_MIN_CTX_SIM,
-        "source_type": source_type,
         "strong_mainline_direct": False,
-    })
-    # ------------------------------------------------------------------
-    # 控制主线「窄逃生口」：branch_blocked 原先把「真泛词」与「被 generic-risk 误伤的控制主线词」一锅端。
-    # 仅在极强上下文 + 强/好主线 tier + 双路支撑 + 风险剖面像「高 generic、低 poly/object」时放行扩散，
-    # 优先救 motion control 一类（poly≤0.22）；刻意不救 robot/digital 等 poly 常≥0.25 的节点。
-    # context_ok 与 [Stage2A primary factors] 打印一致，采用 ctx_path_ok。
-    # ------------------------------------------------------------------
-    mainline_strong_or_good = strong_mainline_direct or can_expand
-    context_ok = ctx_path_ok
-    ctx_present = has_real_ctx
-    control_mainline_escape = (
-        branch_blocked
-        and drop_ok_exp
-        and semantic_ok
-        and context_ok
-        and base_ctx_ok
-        and ctx_present
-        and float(ctx_sim or 0.0) >= 0.84
-        and dual_support
-        and mainline_strong_or_good
-        and float(gen or 0.0) >= 0.50
-        and float(poly or 0.0) <= 0.22
-        and float(obj or 0.0) <= 0.05
-    )
-    snap0["control_mainline_escape"] = control_mainline_escape
-    if control_mainline_escape:
-        esc_reason = "strong_mainline_direct" if strong_mainline_direct else "good_mainline"
-        snap0["can_expand_from_2a"] = True
-        snap0["expand_escape"] = "control_mainline_escape"
-        snap0["strong_mainline_direct"] = bool(strong_mainline_direct)
-        _debug_stage2a_focus(_anc, _term_dbg, "primary_expandable", esc_reason, snap0)
-        return "primary_expandable", esc_reason, snap0
+    }
 
-    if not drop_ok_exp or branch_blocked:
-        snap0["expand_block"] = "ctx_drop_or_branch_risk"
-        bk, rs = _classify_keepish_primary_bucket(
-            c, snap0, expand_block="ctx_drop_or_branch_risk", prefer_seed=True, no_real_ctx=False
-        )
-        _debug_stage2a_focus(_anc, _term_dbg, bk, rs, snap0)
-        return bk, rs, snap0
+    bucket: str
+    reason: str
+    can_expand_flag: bool
+    expand_block: Optional[str] = None
 
-    if good_mainline_expandable:
-        _debug_stage2a_focus(_anc, _term_dbg, "primary_expandable", "good_mainline", snap0)
-        return "primary_expandable", "good_mainline", snap0
-    if can_expand:
-        snap0["expand_block"] = "good_mainline_but_risky_or_weak_identity"
-        bk, rs = _classify_keepish_primary_bucket(
-            c, snap0, expand_block="good_mainline_but_risky_or_weak_identity", prefer_seed=True, no_real_ctx=False
-        )
-        _debug_stage2a_focus(_anc, _term_dbg, bk, rs, snap0)
-        return bk, rs, snap0
-    snap0["expand_block"] = "ctx_thresholds_not_met"
-    bk, rs = _classify_keepish_primary_bucket(
-        c, snap0, expand_block="ctx_thresholds_not_met", prefer_seed=True, no_real_ctx=False
+    if obj_risk >= 0.55 or poly_risk >= 0.60:
+        bucket, reason = "reject", "object_or_poly_bad"
+        can_expand_flag = False
+        expand_block = "object_or_poly_bad"
+    elif (
+        effective_mainline >= 0.52
+        and anchor_identity >= 0.52
+        and fm >= 0.48
+        and ctx_sim >= 0.42
+        and ctx_drop <= 0.10
+        and gen_risk <= 0.52
+        and not conditioned_only
+    ):
+        bucket, reason = "primary_expandable", "axis_strong_mainline"
+        can_expand_flag = True
+    elif (
+        effective_mainline >= 0.42
+        and anchor_identity >= 0.42
+        and fm >= 0.38
+        and jd_align >= 0.50
+        and gen_risk <= 0.58
+        and poly_risk <= 0.35
+        and obj_risk <= 0.25
+    ):
+        can_expand_flag = (not conditioned_only) and (effective_mainline >= 0.46)
+        if can_expand_flag:
+            bucket, reason = "primary_support_seed", "axis_neighbor_weak_seed"
+        else:
+            bucket, reason = "primary_support_keep", "axis_weak_or_conditioned_only"
+        expand_block = None if can_expand_flag else "axis_weak_or_conditioned_only"
+    elif effective_mainline >= 0.28 and jd_align >= 0.45:
+        bucket, reason = "primary_support_keep", "axis_keep_no_expand"
+        can_expand_flag = False
+        expand_block = "demote_to_keep"
+    elif float(best_sim) >= 0.36:
+        bucket, reason = "risky_keep", "weak_line_not_primary"
+        can_expand_flag = False
+        expand_block = "risky_keep_only"
+    else:
+        bucket, reason = "reject", "low_mainline"
+        can_expand_flag = False
+        expand_block = "low_mainline"
+
+    snap_axis["can_expand_from_2a"] = bool(
+        can_expand_flag and bucket in ("primary_expandable", "primary_support_seed")
     )
-    _debug_stage2a_focus(_anc, _term_dbg, bk, rs, snap0)
-    return bk, rs, snap0
+    snap_axis["expand_block"] = expand_block
+
+    # 无真实 conditioned 或 family_fallback：只允许保留类落点，禁止 2B 扩散（结构型 primary_ok 仍可能为 True）
+    if getattr(c, "family_fallback_only", False) or not has_real_ctx:
+        snap_axis["expand_block"] = snap_axis.get("expand_block") or "no_real_conditioned_or_family_fallback"
+        if bucket == "primary_expandable":
+            bucket, reason = "primary_support_keep", "no_real_ctx_demote_expandable"
+        elif bucket == "primary_support_seed":
+            bucket, reason = "primary_support_keep", "no_real_ctx_demote_seed"
+        snap_axis["can_expand_from_2a"] = False
+
+    _debug_stage2a_focus(_anc, _term_dbg, bucket, reason, snap_axis)
+    return bucket, reason, snap_axis
 
 
 def _print_stage2a_primary_factors(
@@ -3191,6 +3132,15 @@ def _stage2a_source_type_set(c: "Stage2ACandidate") -> Set[str]:
     if ss:
         return {str(x).strip().lower() for x in ss if x}
     st = (getattr(c, "source_type", None) or getattr(c, "source", "") or "").strip().lower()
+    return {st} if st else set()
+
+
+def _primary_landing_source_type_set(p: Any) -> Set[str]:
+    """PrimaryLanding 上的 source_set / source_type，与 _stage2a_source_type_set 对齐。"""
+    ss = getattr(p, "source_set", None)
+    if ss:
+        return {str(x).strip().lower() for x in ss if x}
+    st = (getattr(p, "source_type", None) or getattr(p, "source", "") or "").strip().lower()
     return {st} if st else set()
 
 
@@ -3314,12 +3264,33 @@ def pick_fallback_primary_for_anchor(
     return best
 
 
+def _stage2a_promote_strong_allowed(
+    w: Dict[str, Any],
+    *,
+    axis_gap_ok: bool,
+    has_judge_expandable_stable: bool,
+) -> Tuple[bool, str]:
+    """
+    keep/seed → primary_expandable 的最后一跳：须组内 axis_consistency_seed 排名第 1、与第 2 名间隔够大，
+    且 judge 未已给出「稳定强 expandable」；否则交由 weak seed 或 sk，避免 2A 比 2B strong gate 更松。
+    """
+    if w["group_rank"] != 1:
+        return False, "not_group_top1"
+    if not axis_gap_ok:
+        return False, "group_axis_gap_too_small"
+    if has_judge_expandable_stable and w["pre_bucket"] in ("primary_support_keep", "primary_support_seed"):
+        return False, "judge_expandable_stable_exists"
+    return True, ""
+
+
 def select_primary_per_anchor(
     anchor: PreparedAnchor,
     candidates: List["Stage2ACandidate"],
 ) -> Dict[str, List["Stage2ACandidate"]]:
     """
     Stage2A 组内选主（五层落点版，见 README）：
+    - judge_primary_and_expandability 给出 axis 初桶后，本函数做 **final bucket reconcile**（两阶段）：
+      先按锚点组收集候选再算 **组内排名**；**keep_promote_strong_mainline / seed_promote_to_expandable** 还须 **axis_consistency_seed≥SEED_AXIS_CONSISTENCY_STRONG_MIN** 且 **组内第 1 名**、**与第 2 名 axis 间隔≥STAGE2A_PROMOTE_MIN_AXIS_GAP**、且 **judge 未已产出稳定强 expandable**（否则旁枝不再二次抬 strong），与 Stage2B strong gate 口径一致。
     - primary_expandable：强主线 + 强 seed（stage2b_seed_tier=strong）
     - primary_support_seed：主线近邻弱 seed（can_expand_from_2a=True，tier=weak）
     - primary_support_keep：支线保留，不参与 2B 扩散
@@ -3348,6 +3319,8 @@ def select_primary_per_anchor(
 
     def _rank_key(x: "Stage2ACandidate") -> float:
         return float(getattr(x, "composite_rank_score", 0) or getattr(x, "primary_score", 0) or 0.0)
+
+    work_rows: List[Dict[str, Any]] = []
 
     for c in candidates:
         primary_score = float(getattr(c, "primary_score", 0.0) or getattr(c, "composite_rank_score", 0) or 0.0)
@@ -3405,14 +3378,294 @@ def select_primary_per_anchor(
         # 1. primary / expand 解耦判定
         # --------------------------------------------------
         bucket, reason, p_snap = judge_primary_and_expandability(c, anchor_term=anchor_term_sel)
+
+        # ------------------------------------------------------------------
+        # final bucket reconcile：仅压制「conditioned-only / 高风险 / 上下文虚」，
+        # 对 **similar_to + primary_ok + 真实 ctx** 的强/次主线放行或从 sk 救回，避免 Stage2B 入口被 sk 掐死。
+        # judge 已定 axis 初桶；此处用结构化证据二次校正，与 README「 reconcile 层」一致。
+        # ------------------------------------------------------------------
+        _ps_static = float(p_snap.get("static_sim", 0.0) or 0.0)
+        _ps_ctx = float(p_snap.get("ctx_sim", 0.0) or 0.0)
+        _ps_drop = float(p_snap.get("ctx_drop", 1.0) or 1.0)
+        _fam = float(p_snap.get("family_match", 0.0) or 0.0)
+        if _fam <= 0.0:
+            _fam = float(getattr(c, "family_match", 0.0) or getattr(c, "anchor_identity_score", 0.0) or 0.0)
+        _aid = float(p_snap.get("anchor_identity_score", 0.0) or 0.0)
+        if _aid <= 0.0:
+            _aid = float(getattr(c, "anchor_identity_score", 0.0) or 0.0)
+        _jd = float(p_snap.get("jd_align", 0.0) or getattr(c, "jd_align", 0.0) or 0.0)
+        _gen = float(p_snap.get("generic_risk", getattr(c, "generic_risk", 0.0)) or 0.0)
+        _poly = float(p_snap.get("polysemy_risk", getattr(c, "polysemy_risk", 0.0)) or 0.0)
+        _obj = float(p_snap.get("object_like_risk", getattr(c, "object_like_risk", 0.0)) or 0.0)
+        _dual = bool(p_snap.get("dual_support", False))
+        _multi = bool(p_snap.get("multi_anchor_ok", False))
+        _ctx_path = bool(p_snap.get("context_path_ok", False))
+        _sem_ok = bool(p_snap.get("semantic_ok", False))
+        _primary_ok = bool(p_snap.get("primary_ok", False))
+        _src = _stage2a_source_type_set(c)
+        _has_sim = "similar_to" in _src
+        _has_real_ctx = bool(_ps_ctx > 0.0)
+        _cond_only = _stage2a_is_conditioned_only_for_seed(c)
+
+        strong_mainline_path_a = (
+            _has_sim
+            and _sem_ok
+            and _ctx_path
+            and _dual
+            and _has_real_ctx
+            and _ps_drop <= 0.065
+            and _gen <= 0.50
+            and _poly <= 0.26
+            and _obj <= 0.20
+        )
+        strong_mainline_path_b = (
+            _has_sim
+            and _sem_ok
+            and _primary_ok
+            and _aid >= 0.55
+            and _jd >= 0.50
+            and _fam >= 0.40
+            and _ps_drop <= 0.065
+            and _gen <= 0.50
+            and _poly <= 0.26
+            and _obj <= 0.20
+        )
+        strong_mainline_path_c = (
+            _has_sim
+            and _sem_ok
+            and _primary_ok
+            and _multi
+            and _aid >= 0.50
+            and _jd >= 0.50
+            and _gen <= 0.45
+            and _poly <= 0.24
+            and _obj <= 0.20
+        )
+        strong_expandable_ok = bool(
+            strong_mainline_path_a or strong_mainline_path_b or strong_mainline_path_c
+        )
+        weak_seed_ok = (
+            _has_sim
+            and _sem_ok
+            and _primary_ok
+            and _has_real_ctx
+            and _ps_drop <= 0.08
+            and _fam >= 0.36
+            and _gen <= 0.58
+            and _poly <= 0.30
+            and _obj <= 0.25
+        )
+        keep_no_expand_only = (
+            _cond_only
+            or _gen > 0.58
+            or _poly > 0.30
+            or _obj > 0.25
+            or not _has_real_ctx
+        )
+        # Stage2B strong 同源（check_seed_eligibility）；维持/升格 primary_expandable 须同阈，避免 strong_seed_axis_low
+        _mlp = float(getattr(c, "mainline_pref_score", 0.0) or 0.0)
+        axis_consistency_seed = (
+            0.35 * _aid
+            + 0.30 * _fam
+            + 0.20 * _jd
+            + 0.15 * max(0.0, _mlp)
+        )
+        p_snap["axis_consistency_seed"] = axis_consistency_seed
+        _strong_axis_ok = bool(axis_consistency_seed >= SEED_AXIS_CONSISTENCY_STRONG_MIN)
+
+        work_rows.append({
+            "c": c,
+            "pre_bucket": bucket,
+            "pre_reason": reason,
+            "p_snap": p_snap,
+            "axis_consistency_seed": axis_consistency_seed,
+            "strong_expandable_ok": strong_expandable_ok,
+            "weak_seed_ok": weak_seed_ok,
+            "keep_no_expand_only": keep_no_expand_only,
+            "_strong_axis_ok": _strong_axis_ok,
+            "_primary_ok": _primary_ok,
+            "_has_sim": _has_sim,
+            "_cond_only": _cond_only,
+            "_ps_drop": _ps_drop,
+            "_fam": _fam,
+            "_gen": _gen,
+            "_poly": _poly,
+            "_obj": _obj,
+            "_mlp": _mlp,
+            "_jd": _jd,
+            "_ps_ctx": _ps_ctx,
+        })
+
+    sorted_w = sorted(
+        work_rows,
+        key=lambda ww: (ww["axis_consistency_seed"], ww["_mlp"], ww["_jd"], ww["_ps_ctx"]),
+        reverse=True,
+    )
+    nw = len(sorted_w)
+    for i, ww in enumerate(sorted_w):
+        ww["group_rank"] = i + 1
+    top0_axis = sorted_w[0]["axis_consistency_seed"] if sorted_w else 0.0
+    top1_axis_val = sorted_w[1]["axis_consistency_seed"] if len(sorted_w) > 1 else None
+    axis_gap_ok = top1_axis_val is None or (top0_axis - top1_axis_val >= STAGE2A_PROMOTE_MIN_AXIS_GAP)
+    has_judge_expandable_stable = any(
+        ww["pre_bucket"] == "primary_expandable" and ww["strong_expandable_ok"] and ww["_strong_axis_ok"]
+        for ww in work_rows
+    )
+
+    if LABEL_EXPANSION_DEBUG and sorted_w:
+        print(
+            f"\n[Stage2A group rank] anchor={anchor_term_sel!r} n={nw} "
+            f"axis_gap_ok={axis_gap_ok} gap_min={STAGE2A_PROMOTE_MIN_AXIS_GAP:.3f} "
+            f"judge_exp_stable={has_judge_expandable_stable}"
+        )
+        for ww in sorted_w:
+            cc = ww["c"]
+            print(
+                f"  rank={ww['group_rank']}/{nw} term={(getattr(cc, 'term', '') or '')!r} "
+                f"pre_bucket={ww['pre_bucket']!r} axis_seed={ww['axis_consistency_seed']:.3f} "
+                f"mainline_pref={ww['_mlp']:.3f} jd={ww['_jd']:.3f}"
+            )
+
+    for w in work_rows:
+        c = w["c"]
+        p_snap = w["p_snap"]
+        axis_consistency_seed = w["axis_consistency_seed"]
+        strong_expandable_ok = w["strong_expandable_ok"]
+        weak_seed_ok = w["weak_seed_ok"]
+        keep_no_expand_only = w["keep_no_expand_only"]
+        _strong_axis_ok = w["_strong_axis_ok"]
+        _primary_ok = w["_primary_ok"]
+        _has_sim = w["_has_sim"]
+        _cond_only = w["_cond_only"]
+        _ps_drop = w["_ps_drop"]
+        _fam = w["_fam"]
+        _gen = w["_gen"]
+        _poly = w["_poly"]
+        _obj = w["_obj"]
+
+        bucket = w["pre_bucket"]
+        reason = w["pre_reason"]
+        pre_bucket = bucket
+        pre_reason = reason
+
+        if bucket not in ("reject", "risky_keep"):
+            if bucket == "primary_expandable":
+                if strong_expandable_ok and _strong_axis_ok:
+                    bucket, reason = "primary_expandable", "axis_strong_mainline"
+                    p_snap["can_expand_from_2a"] = True
+                elif weak_seed_ok:
+                    bucket, reason = "primary_support_seed", "axis_neighbor_weak_seed"
+                    p_snap["can_expand_from_2a"] = True
+                elif strong_expandable_ok and not _strong_axis_ok:
+                    bucket, reason = "primary_support_keep", "expandable_demote_strong_seed_axis_low"
+                    p_snap["can_expand_from_2a"] = False
+                else:
+                    bucket, reason = "primary_support_keep", "expandable_demote_axis_not_hard_enough"
+                    p_snap["can_expand_from_2a"] = False
+            elif bucket == "primary_support_seed":
+                if strong_expandable_ok and _strong_axis_ok:
+                    _p_ok, _p_blk = _stage2a_promote_strong_allowed(
+                        w, axis_gap_ok=axis_gap_ok, has_judge_expandable_stable=has_judge_expandable_stable
+                    )
+                    if _p_ok:
+                        bucket, reason = "primary_expandable", "seed_promote_to_expandable"
+                        p_snap["can_expand_from_2a"] = True
+                    elif weak_seed_ok:
+                        bucket, reason = "primary_support_seed", "axis_neighbor_weak_seed"
+                        p_snap["can_expand_from_2a"] = True
+                    else:
+                        _rs = f"seed_promote_blocked_{_p_blk}" if _p_blk else "seed_promote_blocked_group_gate"
+                        bucket, reason = "primary_support_keep", _rs
+                        p_snap["can_expand_from_2a"] = False
+                elif weak_seed_ok:
+                    bucket, reason = "primary_support_seed", "axis_neighbor_weak_seed"
+                    p_snap["can_expand_from_2a"] = True
+                elif strong_expandable_ok and not _strong_axis_ok:
+                    bucket, reason = "primary_support_keep", "seed_demote_strong_seed_axis_low"
+                    p_snap["can_expand_from_2a"] = False
+                else:
+                    bucket, reason = "primary_support_keep", "weak_seed_demote_axis_weak"
+                    p_snap["can_expand_from_2a"] = False
+            elif bucket == "primary_support_keep":
+                if strong_expandable_ok and not keep_no_expand_only and _strong_axis_ok:
+                    _p_ok, _p_blk = _stage2a_promote_strong_allowed(
+                        w, axis_gap_ok=axis_gap_ok, has_judge_expandable_stable=has_judge_expandable_stable
+                    )
+                    if _p_ok:
+                        bucket, reason = "primary_expandable", "keep_promote_strong_mainline"
+                        p_snap["can_expand_from_2a"] = True
+                    elif weak_seed_ok and not keep_no_expand_only:
+                        bucket, reason = "primary_support_seed", "keep_promote_weak_seed"
+                        p_snap["can_expand_from_2a"] = True
+                    else:
+                        _rs = f"keep_promote_blocked_{_p_blk}" if _p_blk else "keep_promote_blocked_group_gate"
+                        bucket, reason = "primary_support_keep", _rs
+                        p_snap["can_expand_from_2a"] = False
+                elif weak_seed_ok and not keep_no_expand_only:
+                    bucket, reason = "primary_support_seed", "keep_promote_weak_seed"
+                    p_snap["can_expand_from_2a"] = True
+                else:
+                    p_snap["can_expand_from_2a"] = False
+
+        if LABEL_EXPANSION_DEBUG and w["pre_bucket"] in ("primary_support_keep", "primary_support_seed"):
+            if strong_expandable_ok and _strong_axis_ok:
+                _p_ok, _p_blk = _stage2a_promote_strong_allowed(
+                    w, axis_gap_ok=axis_gap_ok, has_judge_expandable_stable=has_judge_expandable_stable
+                )
+                _agap = (top0_axis - top1_axis_val) if top1_axis_val is not None else 1.0
+                print(
+                    f"[Stage2A promote audit] anchor={anchor_term_sel!r} term={(getattr(c, 'term', '') or '')!r} "
+                    f"pre_bucket={w['pre_bucket']!r} axis_seed={axis_consistency_seed:.3f} "
+                    f"group_rank={w['group_rank']}/{len(work_rows)} "
+                    f"top1_term={(getattr(sorted_w[0]['c'], 'term', '') or '')!r} "
+                    f"axis_gap={_agap:.3f} promote_allowed={_p_ok} promote_block={_p_blk!r} "
+                    f"final_bucket={bucket!r} reason={reason!r}"
+                )
+
+        if pre_bucket != bucket and LABEL_EXPANSION_DEBUG:
+            print(
+                f"[Stage2A final bucket reconcile] "
+                f"anchor={anchor_term_sel!r} term={(getattr(c, 'term', '') or '')!r} "
+                f"pre_bucket={pre_bucket!r} pre_reason={pre_reason!r} "
+                f"final_bucket={bucket!r} reason={reason!r} "
+                f"axis_consistency_seed={axis_consistency_seed:.3f} "
+                f"group_rank={w['group_rank']}/{len(work_rows)} "
+                f"strong_axis_min={SEED_AXIS_CONSISTENCY_STRONG_MIN:.2f}"
+            )
+
         static_sim, ctx_sim, ctx_drop, _best = _stage2a_static_ctx_for_primary_expand_split(c)
+
+        if bucket == "primary_support_keep" and _primary_ok and LABEL_EXPANSION_DEBUG:
+            print(
+                f"[Stage2A expand deny summary] "
+                f"anchor={anchor_term_sel!r} term={(getattr(c, 'term', '') or '')!r} "
+                f"deny_main={reason!r} "
+                f"axis_consistency_seed={axis_consistency_seed:.3f} (min_strong={SEED_AXIS_CONSISTENCY_STRONG_MIN:.2f}) "
+                f"group_rank={w['group_rank']}/{len(work_rows)} "
+                f"has_similar_to={_has_sim} conditioned_only={_cond_only} "
+                f"ctx_drop={_ps_drop:.3f} family={_fam:.3f} "
+                f"generic={_gen:.3f} poly={_poly:.3f} obj={_obj:.3f}"
+            )
         setattr(c, "is_good_mainline", bucket not in ("reject",))
         setattr(c, "_stage2a_primary_snap", p_snap)
 
         if LABEL_EXPANSION_DEBUG and STAGE2_RULING_DEBUG:
+            _axis_c = float(p_snap.get("axis_consistency", 0.0) or 0.0)
+            _eff = float(p_snap.get("effective_mainline", 0.0) or 0.0)
+            _cond_only = bool(p_snap.get("conditioned_only", False))
+            term_axis = (getattr(c, "term", None) or "")[:40]
+            _acs = float(p_snap.get("axis_consistency_seed", 0.0) or 0.0)
+            print(
+                f"[Stage2A axis audit] term={term_axis!r} "
+                f"axis={_axis_c:.3f} effective={_eff:.3f} "
+                f"axis_consistency_seed={_acs:.3f} "
+                f"conditioned_only={_cond_only} "
+                f"final_bucket={bucket!r} reason={reason!r}"
+            )
             _print_stage2a_primary_factors(anchor, c, bucket, reason, p_snap)
 
-        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+        # RULING 已打 axis audit + primary factors 时不再重复本行，降噪
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and not STAGE2_RULING_DEBUG:
             anchor_term = getattr(anchor, "anchor", "") or ""
             term_short = (getattr(c, "term", None) or "")[:28]
             print(
@@ -5180,9 +5433,9 @@ def expand_from_vocab_dense_neighbors(
     jd_topic_ids: Optional[Set[str]] = None,
     jd_profile: Optional[Dict[str, Any]] = None,
 ) -> List[ExpandedTermCandidate]:
-    """从词汇向量索引取 primary 的学术近邻；默认须过 support_expandable_for_anchor 四道门 + keep_score。
-    对 **强主线 seed**（seed_score≥0.68 或 static/conditioned 双高）略降 domain_fit 下限，并在四门略松失败时
-    按近邻相似度 + anchor/family 一致性走 **weak_support_release_for_strong_seed**（每 seed 仍 cap max_keep）。"""
+    """从词汇向量索引取 primary 的学术近邻；须过 support_expandable_for_anchor + **按 seed tier 分档**的 dense 闸：
+    strong：略松检索 cap、min_dense_sim=0.80、anchor/family/context_stability 阈值见实现；
+    weak：max_keep=1、min_dense_sim=0.84、一致性阈值更严，且不用 weak_support_release（防弱 seed 带脏邻）。"""
     top_k_per_primary = top_k_per_primary or DENSE_MAX_PER_PRIMARY
     if not primary_landings or not getattr(label, "vocab_index", None) or not getattr(label, "vocab_to_idx", None):
         return []
@@ -5226,8 +5479,14 @@ def expand_from_vocab_dense_neighbors(
         strong_seed = (tier_dn != "weak") and (seed_score >= 0.68 or (sem_p >= 0.83 and cond_p >= 0.80))
         if tier_dn == "weak":
             max_keep = 1
+            min_dense_sim = 0.84
+            min_anchor_consistency = 0.78
+            min_family_support = 0.74
         else:
             max_keep = 3 if strong_seed else 2
+            min_dense_sim = 0.80
+            min_anchor_consistency = 0.72
+            min_family_support = 0.68
         idx = label.vocab_to_idx.get(str(p.vid))
         if idx is None:
             continue
@@ -5317,7 +5576,7 @@ def expand_from_vocab_dense_neighbors(
                 continue
             n_src += 1
             sim = max(0.0, min(1.0, float(score)))
-            if sim < 0.55:
+            if sim < min_dense_sim:
                 continue
             n_sim += 1
             if active_domain_set is not None or jd_field_ids or jd_subfield_ids or jd_topic_ids:
@@ -5349,7 +5608,8 @@ def expand_from_vocab_dense_neighbors(
                 candidate_vid=tid,
                 candidate_term=term,
             )
-            if not keep and strong_seed:
+            # 弱 seed 禁止 weak_support_release，仅靠四门 + 下方 tier 一致性闸。
+            if not keep and strong_seed and tier_dn != "weak":
                 wm = _dense_neighbor_support_scores(tid)
                 ac_w = float(wm.get("anchor_consistency", 0.0) or 0.0) if wm else 0.0
                 fs_w = float(wm.get("family_support", 0.0) or 0.0) if wm else 0.0
@@ -5372,6 +5632,24 @@ def expand_from_vocab_dense_neighbors(
                         0.55 * sim + 0.25 * domain_fit + 0.20 * ac_w,
                     )
                     keep_meta["reason"] = "weak_support_release_for_strong_seed"
+            if keep:
+                wm_gate = _dense_neighbor_support_scores(tid)
+                if not wm_gate:
+                    keep = False
+                    keep_meta = {"reason": "dense_tier_gate_no_support_scores"}
+                else:
+                    ac_g = float(wm_gate.get("anchor_consistency", 0.0) or 0.0)
+                    fs_g = float(wm_gate.get("family_support", 0.0) or 0.0)
+                    cs_g = float(wm_gate.get("context_stability", 0.0) or 0.0)
+                    if bool(wm_gate.get("has_anchor_vec")) and ac_g < min_anchor_consistency:
+                        keep = False
+                        keep_meta = {"reason": "dense_tier_anchor_consistency_low"}
+                    elif fs_g < min_family_support:
+                        keep = False
+                        keep_meta = {"reason": "dense_tier_family_support_low"}
+                    elif cs_g < 0.72:
+                        keep = False
+                        keep_meta = {"reason": "dense_tier_context_stability_low"}
             if not keep:
                 if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
                     ac = keep_meta.get("anchor_consistency")
@@ -7363,7 +7641,7 @@ def stage2_generate_academic_terms(
             setattr(p, "conditioned_sim", float(_cs) if _cs is not None else None)
             setattr(p, "dual_support", bool(getattr(cand, "dual_support", False)))
             setattr(p, "source_type", getattr(cand, "source_type", None) or getattr(cand, "source", "") or "")
-            # Stage2A 审计字段 → PrimaryLanding → merge → raw_candidates 顶层（供 Stage3 _support_grounded_enough 等）
+            # Stage2A 审计字段 → PrimaryLanding → merge → raw_candidates 顶层（供 Stage3 分桶/连续分/paper 门）
             setattr(p, "admission_reason", str(getattr(cand, "admission_reason", "") or ""))
             _crj = getattr(cand, "reject_reason", None)
             setattr(p, "reject_reason", str(_crj) if _crj is not None else "")

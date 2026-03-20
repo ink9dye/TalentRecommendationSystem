@@ -2,10 +2,11 @@ import time
 import json
 import os
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
+from src.core.recall.label_pipeline import stage1_domain_anchors as _stage1_anchors
 from src.utils.time_features import compute_paper_recency
 from config import ABSTRACT_MAP_PATH, INDEX_DIR
 
@@ -22,8 +23,262 @@ DOMAIN_BONUS_NO_MATCH = 1.0
 
 # 全局 paper 池上限
 GLOBAL_PAPER_LIMIT = 2000
-# True：逐条打印 paper_map 合并；False：仅在多 hit 或 hit 条数异常变化时打印（降噪）
+# True：逐条打印 paper_map 合并；False：默认关闭（降噪，避免刷屏与大量重复 wid）
 STAGE4_PAPER_MAP_WRITE_VERBOSE = False
+# [Stage4 jd audit] 每条 term 打印前 K 条 pre_gate 行（默认 3；原为 10）
+STAGE4_JD_AUDIT_TOP_K = 3
+# 仅对「final_score 最高的前 K 个 paper_primary」打明细 jd audit（降噪）；True 则全量
+STAGE4_JD_AUDIT_PRIMARY_DETAIL_K = int(os.environ.get("STAGE4_JD_AUDIT_PRIMARY_DETAIL_K", "3"))
+STAGE4_JD_AUDIT_FULL = os.environ.get("STAGE4_JD_AUDIT_FULL", "").strip().lower() in ("1", "true", "yes")
+# overlap survival 审计最大行数（优先 survive_after_cap=True）
+STAGE4_OVERLAP_SURVIVAL_MAX_LINES = int(os.environ.get("STAGE4_OVERLAP_SURVIVAL_MAX_LINES", "30"))
+# 三级领域共识软乘子：词侧 vocabulary_topic_stats × JD field/subfield/topic 画像，不对论文硬筛
+STAGE4_HIERARCHY_CONSENSUS_ENABLED = os.environ.get("STAGE4_HIERARCHY_CONSENSUS_ENABLED", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+STAGE4_HIERARCHY_AUDIT_TOP_BY_SCORE = int(os.environ.get("STAGE4_HIERARCHY_AUDIT_TOP_BY_SCORE", "10"))
+STAGE4_HIERARCHY_AUDIT_TOP_BY_DELTA = int(os.environ.get("STAGE4_HIERARCHY_AUDIT_TOP_BY_DELTA", "10"))
+STAGE4_TOPIC_META_COVERAGE_AUDIT = os.environ.get("STAGE4_TOPIC_META_COVERAGE_AUDIT", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+# 方案 B：bonus 以池内 consensus 中位数为锚，相对拉开（不是全局压到 ~0.8x）
+STAGE4_HIERARCHY_BONUS_BETA = float(os.environ.get("STAGE4_HIERARCHY_BONUS_BETA", "12.0"))
+STAGE4_HIERARCHY_BONUS_CLIP_LOW = float(os.environ.get("STAGE4_HIERARCHY_BONUS_CLIP_LOW", "0.82"))
+STAGE4_HIERARCHY_BONUS_CLIP_HIGH = float(os.environ.get("STAGE4_HIERARCHY_BONUS_CLIP_HIGH", "1.15"))
+STAGE4_HIERARCHY_DISTRIBUTION_TOP_N = int(os.environ.get("STAGE4_HIERARCHY_DISTRIBUTION_TOP_N", "10"))
+# True：打印 author payload 逐条 multi-hit；False：仅保留汇总计数（默认）
+STAGE4_AUTHOR_PAYLOAD_AUDIT_VERBOSE = False
+
+
+def _normalize_topic_dist(raw: Any) -> Dict[str, float]:
+    """
+    统一解析 vocabulary_topic_stats / jd_profile 中的分布：JSON 串或 dict，key→str，值归一化后和为 1。
+    """
+    if not raw:
+        return {}
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return {}
+        try:
+            raw = json.loads(s)
+        except Exception:
+            return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, float] = {}
+    for k, v in raw.items():
+        ks = str(k).strip()
+        if not ks:
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if fv > 0:
+            out[ks] = fv
+    tot = sum(out.values())
+    if tot > 0:
+        out = {k: v / tot for k, v in out.items()}
+    return out
+
+
+def _build_term_topic_meta_from_row(row: Any) -> Dict[str, Any]:
+    """
+    批注：批量 SQL 列序为 voc_id, field_id, subfield_id, topic_id, field_dist, subfield_dist, topic_dist, source。
+    优先用 *_ dist（含 cooc 补全）；无 dist 再退主值 one-hot，避免「只有主 id 的词」在 overlap 里永远是 0。
+    """
+    if row is None:
+        return {}
+    try:
+        field_id = row[1]
+        subfield_id = row[2]
+        topic_id = row[3]
+        field_dist = _normalize_topic_dist(row[4])
+        subfield_dist = _normalize_topic_dist(row[5])
+        topic_dist = _normalize_topic_dist(row[6])
+        source = row[7] if len(row) > 7 else None
+    except (TypeError, IndexError):
+        return {}
+    if not field_dist and field_id is not None and str(field_id).strip():
+        field_dist = {str(field_id).strip(): 1.0}
+    if not subfield_dist and subfield_id is not None and str(subfield_id).strip():
+        subfield_dist = {str(subfield_id).strip(): 1.0}
+    if not topic_dist and topic_id is not None and str(topic_id).strip():
+        topic_dist = {str(topic_id).strip(): 1.0}
+    return {
+        "field_dist": field_dist,
+        "subfield_dist": subfield_dist,
+        "topic_dist": topic_dist,
+        "field_id": str(field_id).strip() if field_id is not None and str(field_id).strip() else None,
+        "subfield_id": str(subfield_id).strip() if subfield_id is not None and str(subfield_id).strip() else None,
+        "topic_id": str(topic_id).strip() if topic_id is not None and str(topic_id).strip() else None,
+        "source": str(source).strip() if source else None,
+    }
+
+
+def _dist_overlap(a: Dict[str, float], b: Dict[str, float]) -> float:
+    """分布点积 overlap（a、b 已归一化时等价于同一底层事件空间下的 Σ p·q）。"""
+    if not a or not b:
+        return 0.0
+    return sum(float(a.get(k, 0.0)) * float(b.get(k, 0.0)) for k in a)
+
+
+def _accumulate_weighted_dist(acc: Dict[str, float], dist: Dict[str, float], w: float) -> None:
+    if w <= 0 or not dist:
+        return
+    for k, p in dist.items():
+        acc[str(k)] = acc.get(str(k), 0.0) + w * float(p)
+
+
+def compute_hierarchy_consensus_for_paper(
+    paper_hits: List[Dict[str, Any]],
+    term_topic_meta: Dict[int, Dict[str, Any]],
+    jd_topic_profile: Dict[str, Dict[str, float]],
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    同一 wid：各命中词的三层 dist 按 term_score×idf 加权混合，再与 JD 同层归一化分布做点积，得 hierarchy_consensus。
+    无层级信号时 consensus=0（后续由池内中位数相对映射 bonus，而不是整池 ×0.8）。
+    """
+    field_acc: Dict[str, float] = {}
+    subfield_acc: Dict[str, float] = {}
+    topic_acc: Dict[str, float] = {}
+    total_w = 0.0
+
+    for hit in paper_hits or []:
+        if not isinstance(hit, dict):
+            continue
+        try:
+            tid = int(hit.get("vid"))
+        except (TypeError, ValueError):
+            continue
+        ts = float(hit.get("term_score") or 0.0)
+        idf = float(hit.get("idf") or 0.0)
+        w = max(0.0, ts * idf)
+        if w <= 0:
+            continue
+        meta = term_topic_meta.get(tid) or {}
+        fd = meta.get("field_dist") or {}
+        sd = meta.get("subfield_dist") or {}
+        td = meta.get("topic_dist") or {}
+        if not fd and not sd and not td:
+            continue
+        total_w += w
+        _accumulate_weighted_dist(field_acc, fd, w)
+        _accumulate_weighted_dist(subfield_acc, sd, w)
+        _accumulate_weighted_dist(topic_acc, td, w)
+
+    if total_w <= 0:
+        return 0.0, {
+            "reason": "no_hits_with_topic_signal",
+            "field_cons": 0.0,
+            "subfield_cons": 0.0,
+            "topic_cons": 0.0,
+            "hierarchy_consensus": 0.0,
+        }
+
+    def _norm_mix(d: Dict[str, float]) -> Dict[str, float]:
+        s = sum(d.values())
+        return {k: v / s for k, v in d.items()} if s > 0 else {}
+
+    mix_f = _norm_mix(field_acc)
+    mix_s = _norm_mix(subfield_acc)
+    mix_t = _norm_mix(topic_acc)
+
+    jd_f = jd_topic_profile.get("field_dist") or {}
+    jd_s = jd_topic_profile.get("subfield_dist") or {}
+    jd_t = jd_topic_profile.get("topic_dist") or {}
+    if not jd_f and not jd_s and not jd_t:
+        return 0.0, {
+            "reason": "empty_jd_topic_profile",
+            "field_cons": 0.0,
+            "subfield_cons": 0.0,
+            "topic_cons": 0.0,
+            "hierarchy_consensus": 0.0,
+        }
+
+    field_cons = _dist_overlap(mix_f, jd_f) if mix_f and jd_f else 0.0
+    subfield_cons = _dist_overlap(mix_s, jd_s) if mix_s and jd_s else 0.0
+    topic_cons = _dist_overlap(mix_t, jd_t) if mix_t and jd_t else 0.0
+    hierarchy_consensus = 0.20 * field_cons + 0.35 * subfield_cons + 0.45 * topic_cons
+    detail = {
+        "field_cons": round(field_cons, 4),
+        "subfield_cons": round(subfield_cons, 4),
+        "topic_cons": round(topic_cons, 4),
+        "hierarchy_consensus": round(hierarchy_consensus, 6),
+    }
+    return float(hierarchy_consensus), detail
+
+
+def _hierarchy_bonus_from_delta(delta: float, beta: float, lo: float, hi: float) -> float:
+    """方案 B：以 1.0 为中心，相对池内中位数拉开。"""
+    return float(np.clip(1.0 + beta * delta, lo, hi))
+
+
+def _audit_hierarchy_bonus_distribution(dist_rows: List[Dict[str, Any]], top_n: int) -> None:
+    if not dist_rows:
+        return
+    cons = np.array([float(r["consensus"]) for r in dist_rows], dtype=np.float64)
+    bon = np.array([float(r["bonus"]) for r in dist_rows], dtype=np.float64)
+
+    def _pct(x: np.ndarray, q: float) -> float:
+        return float(np.percentile(x, q))
+
+    print("\n[Stage4 hierarchy bonus distribution]")
+    print(f"candidate_papers={len(dist_rows)} beta={STAGE4_HIERARCHY_BONUS_BETA} clip=[{STAGE4_HIERARCHY_BONUS_CLIP_LOW},{STAGE4_HIERARCHY_BONUS_CLIP_HIGH}]")
+    print(
+        f"hierarchy_consensus min={float(np.min(cons)):.4f} p25={_pct(cons, 25):.4f} "
+        f"p50={_pct(cons, 50):.4f} p75={_pct(cons, 75):.4f} max={float(np.max(cons)):.4f}"
+    )
+    print(
+        f"hierarchy_bonus min={float(np.min(bon)):.4f} p25={_pct(bon, 25):.4f} "
+        f"p50={_pct(bon, 50):.4f} p75={_pct(bon, 75):.4f} max={float(np.max(bon)):.4f}"
+    )
+    _tn = max(0, top_n)
+    boosted = sorted(dist_rows, key=lambda r: -float(r["bonus"]))[:_tn]
+    penalized = sorted(dist_rows, key=lambda r: float(r["bonus"]))[:_tn]
+    print(f"top_{_tn}_boosted (by hierarchy_bonus):")
+    for i, r in enumerate(boosted, 1):
+        print(
+            f"  #{i} pid={r['wid']!r} bonus={float(r['bonus']):.4f} consensus={float(r['consensus']):.4f} "
+            f"delta_vs_median={float(r.get('delta_vs_median', 0.0)):.4f} "
+            f"paper_score_before={float(r.get('paper_score_before', 0.0)):.4f} title={str(r.get('title') or '')[:75]!r}"
+        )
+    print(f"top_{_tn}_penalized (by hierarchy_bonus):")
+    for i, r in enumerate(penalized, 1):
+        print(
+            f"  #{i} pid={r['wid']!r} bonus={float(r['bonus']):.4f} consensus={float(r['consensus']):.4f} "
+            f"delta_vs_median={float(r.get('delta_vs_median', 0.0)):.4f} "
+            f"paper_score_before={float(r.get('paper_score_before', 0.0)):.4f} title={str(r.get('title') or '')[:75]!r}"
+        )
+
+
+def _jd_topic_profile_from_stage1(jd_src: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+    """Stage1 的 weights 已是 dict，此处再做 key/str 与归一化，与词侧 dist 同空间可比。"""
+    return {
+        "field_dist": _normalize_topic_dist(jd_src.get("field_weights")),
+        "subfield_dist": _normalize_topic_dist(jd_src.get("subfield_weights")),
+        "topic_dist": _normalize_topic_dist(jd_src.get("topic_weights")),
+    }
+
+
+def _audit_jd_topic_profile(jd_topic_profile: Dict[str, Dict[str, float]]) -> None:
+    jd_f = jd_topic_profile.get("field_dist") or {}
+    jd_s = jd_topic_profile.get("subfield_dist") or {}
+    jd_t = jd_topic_profile.get("topic_dist") or {}
+
+    def _top_entries(d: Dict[str, float], n: int = 5) -> List[Tuple[str, float]]:
+        return sorted(d.items(), key=lambda x: -x[1])[:n]
+
+    print("\n[Stage4 jd-topic-profile audit]")
+    print(
+        f"field_keys_count={len(jd_f)} subfield_keys_count={len(jd_s)} topic_keys_count={len(jd_t)} "
+        f"top_field_keys={_top_entries(jd_f)} top_subfield_keys={_top_entries(jd_s)} top_topic_keys={_top_entries(jd_t)}"
+    )
 
 
 def get_term_role_weight(term_retrieval_roles: Optional[Dict[int, str]], vid: int) -> float:
@@ -51,7 +306,8 @@ def run_stage4(
     阶段 4：二层论文召回。用带权学术词沿 HAS_TOPIC 拉论文，按 paper_score 全局排序后截断。
 
     - 取消论文层 domain 硬过滤，改为软奖励（匹配则乘 DOMAIN_BONUS_MATCH，否则 1.0）。
-    - paper_score = Σ (term_final_score × idf_weight × domain_bonus × recency_factor)，含 Stage3 词质量与 per-term 限流。
+    - per-(vid,wid) 贡献链不变；按 wid 合并 hits 后乘 **hierarchy_consensus_bonus**（词侧 vocabulary_topic_stats 与 JD 三级 overlap 得 consensus；再相对**本批 wid 池** consensus **中位数**映射：clip(1+β·Δ, 默认 [0.82,1.15])，无硬过滤）。
+    - paper_score = Σ term_contrib × hierarchy_bonus（再全局排序截断），含 Stage3 词质量与 per-term 限流。
     - 词侧熔断放宽为 MELT_RATIO（默认 5%），避免合理词被误杀。
 
     输入:
@@ -807,9 +1063,10 @@ def run_stage4(
     for pid, terms in multi_candidates[:20]:
         print(f"  pid='{pid}' terms={terms}")
 
-    # 断点 2：overlap 论文在各 term 的 cap 前后生存情况
+    # 断点 2：overlap 论文在各 term 的 cap 前后生存情况（默认限行长，优先 survive_after_cap）
     cross_term_overlap_pids = {pid for (_, _, inter) in overlap_pairs for pid in inter}
     print("\n[Stage4 overlap survival audit]")
+    survival_lines: List[tuple] = []
     for vid, rows in term_rows_before_cap.items():
         term_name = str((_get_term_meta(vid) or {}).get("term") or vid)
         rows_sorted = sorted(rows, key=lambda x: float(x.get("final_paper_score") or 0.0), reverse=True)
@@ -818,12 +1075,18 @@ def run_stage4(
             pid = str(r.get("pid") or "")
             if not pid or pid not in cross_term_overlap_pids:
                 continue
-            print(
-                f"term='{term_name}' pid='{pid}' "
-                f"rank_before_cap={rank} "
-                f"score={float(r.get('final_paper_score') or 0.0):.3f} "
-                f"survive_after_cap={pid in top_after_cap}"
-            )
+            sc = float(r.get("final_paper_score") or 0.0)
+            surv = pid in top_after_cap
+            survival_lines.append((not surv, -sc, term_name, pid, rank, sc, surv))
+    survival_lines.sort()
+    for _k in survival_lines[: max(0, STAGE4_OVERLAP_SURVIVAL_MAX_LINES)]:
+        term_name, pid, rank, sc, surv = _k[2], _k[3], _k[4], _k[5], _k[6]
+        print(
+            f"term='{term_name}' pid='{pid}' "
+            f"rank_before_cap={rank} "
+            f"score={sc:.3f} "
+            f"survive_after_cap={surv}"
+        )
 
     # 按 wid 聚合：paper_score = Σ term_contrib，hits 合并为 canonical term 证据
     by_wid: Dict[str, Dict[str, Any]] = {}
@@ -867,15 +1130,130 @@ def run_stage4(
         by_wid[wid]["hits"] = _merge_hits(by_wid[wid].get("hits") or [], [hit])
         new_hits = list(by_wid[wid].get("hits") or [])
         new_terms = [str(h.get("term") or h.get("vid") or "") for h in new_hits if isinstance(h, dict)]
-        # 断点 3：paper_map 写入过程，确认是“追加合并”还是“覆盖丢失”
+        # 小样本调试：默认关；避免每条 wid 刷屏
+        if STAGE4_PAPER_MAP_WRITE_VERBOSE:
+            print(
+                f"[Stage4 paper_map write] wid='{wid}' "
+                f"incoming_term='{str(hit.get('term') or hit.get('vid') or '')}' "
+                f"old_hit_count={len(old_hits)} new_hit_count={len(new_hits)} "
+                f"old_terms={old_terms} new_terms={new_terms}"
+            )
+
+    # ---------- wid 级：三级领域共识软乘子（词 vocabulary_topic_stats × JD 画像；论文无需三级领域）----------
+    jd_src = getattr(getattr(recall, "_last_stage1_result", None), "jd_profile", None) or {}
+    jd_topic_profile = _jd_topic_profile_from_stage1(jd_src)
+    _audit_jd_topic_profile(jd_topic_profile)
+    has_jd_hier = any(jd_topic_profile.get(k) for k in ("field_dist", "subfield_dist", "topic_dist"))
+    all_hit_vids: Set[int] = set()
+    for _rec0 in by_wid.values():
+        for _h in (_rec0.get("hits") or []):
+            if not isinstance(_h, dict):
+                continue
+            try:
+                all_hit_vids.add(int(_h.get("vid")))
+            except (TypeError, ValueError):
+                pass
+    topic_load_tids: Set[int] = set(int(x) for x in v_ids) | all_hit_vids
+    topic_map, _ = _stage1_anchors._batch_load_vocabulary_stats_for_tids(recall, topic_load_tids)
+    term_topic_meta = {
+        int(vid): _build_term_topic_meta_from_row(topic_map.get(int(vid))) for vid in topic_load_tids
+    }
+
+    if STAGE4_TOPIC_META_COVERAGE_AUDIT:
+        print("\n[Stage4 topic-meta coverage audit]")
+        for _ctid in sorted(topic_load_tids):
+            _tname = str((_get_term_meta(_ctid) or {}).get("term") or _ctid)
+            _row = topic_map.get(_ctid)
+            _mm = term_topic_meta.get(_ctid) or {}
+            _src = _mm.get("source") if _row is not None else "missing"
+            if not _src:
+                _src = "-"
+            print(
+                f"term={_tname!r} tid={_ctid} topic_meta_found={_row is not None} source={_src} "
+                f"has_field_id={bool(_mm.get('field_id'))} has_subfield_id={bool(_mm.get('subfield_id'))} "
+                f"has_topic_id={bool(_mm.get('topic_id'))} has_field_dist={bool(_mm.get('field_dist'))} "
+                f"has_subfield_dist={bool(_mm.get('subfield_dist'))} has_topic_dist={bool(_mm.get('topic_dist'))}"
+            )
+
+    def _print_hier_line(
+        _tag: str,
+        _i: int,
+        _wid: str,
+        _rec: Dict[str, Any],
+        _bef: float,
+        _aft: float,
+        _bon: float,
+        _det: Dict[str, Any],
+        _hits: List[Dict[str, Any]],
+    ) -> None:
+        _terms = [str(h.get("term") or h.get("vid") or "") for h in _hits if isinstance(h, dict)]
         print(
-            f"[Stage4 paper_map write] wid='{wid}' "
-            f"incoming_term='{str(hit.get('term') or hit.get('vid') or '')}' "
-            f"old_hit_count={len(old_hits)} new_hit_count={len(new_hits)} "
-            f"old_terms={old_terms} new_terms={new_terms}"
+            f"{_tag} #{_i} pid={_wid!r} title={(str(_rec.get('title') or ''))[:80]!r} "
+            f"hit_terms={_terms} "
+            f"field_cons={_det.get('field_cons')} subfield_cons={_det.get('subfield_cons')} "
+            f"topic_cons={_det.get('topic_cons')} hierarchy_consensus={_det.get('hierarchy_consensus')} "
+            f"hierarchy_bonus={_bon:.4f} paper_score_before={_bef:.4f} paper_score_after={_aft:.4f}"
         )
 
-    # 全局按 paper_score 排序，取前 GLOBAL_PAPER_LIMIT
+    hierarchy_audit_rows: List[tuple] = []
+    if STAGE4_HIERARCHY_CONSENSUS_ENABLED and has_jd_hier:
+        # 批注：先收集本批 wid 的 raw consensus，再取中位数；bonus = clip(1 + β(cons−median), …)，避免 JD 重叠整体偏小时全员挤在 ~0.82。
+        _pre: List[tuple] = []
+        for _wid, _rec in by_wid.items():
+            _before = float(_rec.get("paper_score") or 0.0)
+            _hits = list(_rec.get("hits") or [])
+            _cons, _det0 = compute_hierarchy_consensus_for_paper(_hits, term_topic_meta, jd_topic_profile)
+            _pre.append((_wid, _rec, _before, _hits, float(_cons), dict(_det0)))
+        _consensus_list = [t[4] for t in _pre]
+        _median_c = float(np.median(np.array(_consensus_list, dtype=np.float64))) if _consensus_list else 0.0
+        dist_rows: List[Dict[str, Any]] = []
+        for _wid, _rec, _before, _hits, _cons, _det0 in _pre:
+            _delta = float(_cons) - _median_c
+            _bonus = _hierarchy_bonus_from_delta(
+                _delta,
+                STAGE4_HIERARCHY_BONUS_BETA,
+                STAGE4_HIERARCHY_BONUS_CLIP_LOW,
+                STAGE4_HIERARCHY_BONUS_CLIP_HIGH,
+            )
+            _after = _before * _bonus
+            _det = {
+                **_det0,
+                "median_consensus": round(_median_c, 6),
+                "beta": STAGE4_HIERARCHY_BONUS_BETA,
+                "delta_vs_median": round(_delta, 6),
+                "hierarchy_bonus": round(_bonus, 6),
+            }
+            _rec["paper_score"] = _after
+            _rec["hierarchy_consensus_bonus"] = _bonus
+            _rec["hierarchy_consensus_detail"] = _det
+            hierarchy_audit_rows.append((_before, _after, _wid, _rec, _bonus, _det, _hits))
+            dist_rows.append(
+                {
+                    "wid": _wid,
+                    "title": _rec.get("title") or "",
+                    "consensus": _cons,
+                    "bonus": _bonus,
+                    "delta_vs_median": _delta,
+                    "paper_score_before": _before,
+                }
+            )
+        _audit_hierarchy_bonus_distribution(dist_rows, STAGE4_HIERARCHY_DISTRIBUTION_TOP_N)
+        _by_before = sorted(hierarchy_audit_rows, key=lambda x: -x[0])[: max(0, STAGE4_HIERARCHY_AUDIT_TOP_BY_SCORE)]
+        _by_delta = sorted(hierarchy_audit_rows, key=lambda x: -abs(x[1] - x[0]))[
+            : max(0, STAGE4_HIERARCHY_AUDIT_TOP_BY_DELTA)
+        ]
+        print("\n[Stage4 hierarchy consensus audit] top_by_paper_score_before")
+        for _i, (_bef, _aft, _wid, _rec, _bon, _det, _hits) in enumerate(_by_before, 1):
+            _print_hier_line("before", _i, _wid, _rec, _bef, _aft, _bon, _det, _hits)
+        print("\n[Stage4 hierarchy consensus audit] top_by_abs_score_delta")
+        for _i, (_bef, _aft, _wid, _rec, _bon, _det, _hits) in enumerate(_by_delta, 1):
+            _print_hier_line("delta", _i, _wid, _rec, _bef, _aft, _bon, _det, _hits)
+    else:
+        for _rec in by_wid.values():
+            _rec["hierarchy_consensus_bonus"] = 1.0
+            _rec["hierarchy_consensus_detail"] = {"reason": "disabled_or_no_jd_profile"}
+
+    # 全局按 paper_score 排序，取前 GLOBAL_PAPER_LIMIT（已乘 hierarchy_consensus_bonus）
     sorted_wids = sorted(
         by_wid.keys(),
         key=lambda w: -float((by_wid[w] or {}).get("paper_score") or 0.0),
@@ -1018,24 +1396,31 @@ def run_stage4(
     # 精准审计块 1/3：
     # [Stage4 pre-gate paper score audit] 收集于 grounding 门之前，行数 = pre_cap 前的 scored_rows，不是 cap 后 kept。
     print("\n[Stage4 pre-gate paper score audit]")
+    jd_audit_primary_vids: Set[int] = set()
+    for _va in v_ids:
+        _ma = _get_term_meta(_va)
+        _rra = (
+            str(_ma.get("retrieval_role") or (term_retrieval_roles or {}).get(_va) or "").strip().lower()
+        )
+        if _rra == "paper_primary":
+            jd_audit_primary_vids.add(_va)
+    _primary_ranked = sorted(jd_audit_primary_vids, key=_term_score, reverse=True)
+    jd_audit_primary_detail_vids = set(_primary_ranked[: max(0, STAGE4_JD_AUDIT_PRIMARY_DETAIL_K)])
     for vid in v_ids:
         meta = _get_term_meta(vid)
         term_name = str(meta.get("term") or meta.get("anchor") or meta.get("parent_primary") or vid)
         rows_audit = term_kept_paper_audit.get(vid, [])
         rows_audit.sort(key=lambda x: float(x.get("final_paper_score") or 0.0), reverse=True)
-        print(f"term='{term_name}' pre_gate_scored_rows={len(rows_audit)}")
-        for i, p in enumerate(rows_audit[:10], 1):
+        detail_jd = bool(STAGE4_JD_AUDIT_FULL or vid in jd_audit_primary_detail_vids)
+        print(
+            f"term='{term_name}' pre_gate_scored_rows={len(rows_audit)} "
+            f"jd_audit_detail={detail_jd}"
+        )
+        if not detail_jd:
+            continue
+        for i, p in enumerate(rows_audit[:STAGE4_JD_AUDIT_TOP_K], 1):
             print(
-                f"[Stage4 jd audit] term='{term_name}' pid='{p.get('paper_id')}' "
-                f"tg={float(p.get('term_grounding') or 0.0):.3f} "
-                f"jd={float(p.get('jd_align') or 0.5):.3f} "
-                f"hybrid={float(p.get('hybrid_grounding') or p.get('grounding') or 0.0):.3f} "
-                f"penalty={float(p.get('offtopic_penalty') or 1.0):.3f} "
-                f"final={float(p.get('final_paper_score') or 0.0):.3f} "
-                f"title={str(p.get('title') or '')[:80]!r}"
-            )
-            print(
-                f"  #{i} pid={p.get('paper_id')} "
+                f"[Stage4 jd audit] #{i} term='{term_name}' pid='{p.get('paper_id')}' "
                 f"tg={float(p.get('term_grounding') or 0.0):.3f} "
                 f"jd={float(p.get('jd_align') or 0.5):.3f} "
                 f"hybrid={float(p.get('hybrid_grounding') or p.get('grounding') or 0.0):.3f} "
@@ -1045,8 +1430,8 @@ def run_stage4(
                 f"year_factor={float(p.get('year_factor') or 1.0):.3f} "
                 f"domain_bonus={float(p.get('domain_bonus') or 1.0):.3f} "
                 f"idf_weight={float(p.get('idf_weight') or 0.0):.3f} "
-                f"final_paper_score={float(p.get('final_paper_score') or 0.0):.3f} "
-                f"title={str(p.get('title') or '')[:70]!r}"
+                f"final={float(p.get('final_paper_score') or 0.0):.3f} "
+                f"title={str(p.get('title') or '')[:80]!r}"
             )
 
     if not sorted_wids:
@@ -1140,26 +1525,27 @@ def run_stage4(
     sub_ms["total"] = (time.perf_counter() - t0) * 1000.0
     _save_sub(sub_ms)
 
-    # 审计 2：确认下发到 author payload 的论文仍携带 multi-hit
+    # 审计 2：multi-hit 计数；逐条明细默认关闭（污染已在 term 侧定位时优先看 Stage3）
     print("\n[Stage4 author payload audit]")
     payload_multi_cnt = 0
-    for rec in out[:20]:
-        aid = rec.get("aid")
-        for p in (rec.get("papers") or [])[:5]:
+    for rec in out:
+        for p in rec.get("papers") or []:
             hits = p.get("hits") or []
             if len(hits) >= 2:
                 payload_multi_cnt += 1
-                terms = [str(h.get("term") or h.get("vid") or "") for h in hits if isinstance(h, dict)]
-                print(f"aid={aid} wid={p.get('wid')} hit_terms={terms}")
+                if STAGE4_AUTHOR_PAYLOAD_AUDIT_VERBOSE:
+                    aid = rec.get("aid")
+                    terms = [str(h.get("term") or h.get("vid") or "") for h in hits if isinstance(h, dict)]
+                    print(f"aid={aid} wid={p.get('wid')} hit_terms={terms}")
     print(f"author_payload_multi_hit_papers={payload_multi_cnt}")
-    # 断点 4B：author payload 多 hit 明细
-    print("\n[Stage4 author payload multi-hit detail]")
-    for rec in out:
-        aid = rec.get("aid")
-        for p in rec.get("papers") or []:
-            hits = p.get("hits") or []
-            if len(hits) < 2:
-                continue
-            terms = [str(h.get("term") or h.get("vid") or "") for h in hits if isinstance(h, dict)]
-            print(f"aid='{aid}' wid='{p.get('wid')}' hit_count={len(hits)} terms={terms}")
+    if STAGE4_AUTHOR_PAYLOAD_AUDIT_VERBOSE:
+        print("\n[Stage4 author payload multi-hit detail]")
+        for rec in out:
+            aid = rec.get("aid")
+            for p in rec.get("papers") or []:
+                hits = p.get("hits") or []
+                if len(hits) < 2:
+                    continue
+                terms = [str(h.get("term") or h.get("vid") or "") for h in hits if isinstance(h, dict)]
+                print(f"aid='{aid}' wid='{p.get('wid')}' hit_count={len(hits)} terms={terms}")
     return out

@@ -21,6 +21,55 @@ TERM_ROLE_WEIGHT = {
     "cooc_expansion": 0.50,
 }
 
+# Stage5 / paper_scoring：同一篇论文上，support 命中不得在无 primary 时与主线词「同工同酬」抬作者
+# （paper_primary / paper_support 来自 Stage3→Stage4 hit.role；缺省 role 视为旧路径，不当作 support 独狼压权）
+STAGE5_SUPPORT_WITH_PRIMARY_FACTOR = 0.45
+STAGE5_SUPPORT_SOLO_FACTOR = 0.12
+STAGE5_SUPPORT_MAINLINE_MH_BASE = 0.50
+STAGE5_SUPPORT_MAINLINE_MH_SCALE = 0.25
+
+
+def _paper_has_retrieval_primary(hits: List[Dict[str, Any]]) -> bool:
+    """同一 wid 的命中里是否至少有一条 Stage4 `role=paper_primary`。"""
+    for hit in hits or []:
+        if not isinstance(hit, dict):
+            continue
+        rr = (hit.get("role") or "").strip().lower()
+        if rr == "paper_primary":
+            return True
+    return False
+
+
+def _retrieval_support_role_factor(
+    hit: Dict[str, Any],
+    paper_has_primary: bool,
+    vid_s: str,
+    context: Dict[str, Any],
+) -> float:
+    """
+    paper_support：与 primary 共现在同一篇论文上 → 辅证系数；仅 support → 强衰减。
+    再乘 mainline_hits 浅开关（来自 term_paper_meta），避免宽词在无主线证据时仍过量贡献。
+    """
+    rr = (hit.get("role") or "").strip().lower()
+    if rr != "paper_support":
+        return 1.0
+    base = STAGE5_SUPPORT_WITH_PRIMARY_FACTOR if paper_has_primary else STAGE5_SUPPORT_SOLO_FACTOR
+    tm = context.get("term_paper_meta") or {}
+    meta = tm.get(vid_s)
+    if meta is None:
+        try:
+            meta = tm.get(int(vid_s))
+        except (TypeError, ValueError):
+            meta = None
+    mh = 0
+    if isinstance(meta, dict):
+        try:
+            mh = int(meta.get("mainline_hits") or 0)
+        except (TypeError, ValueError):
+            mh = 0
+    mainline_taper = min(1.0, STAGE5_SUPPORT_MAINLINE_MH_BASE + STAGE5_SUPPORT_MAINLINE_MH_SCALE * min(mh, 3))
+    return float(base * mainline_taper)
+
 
 def compute_primary_term_coverage(
     paper_hits: List[Dict[str, Any]],
@@ -101,7 +150,10 @@ def compute_contribution(
     valid_hids: List[int] = []
     hit_terms: List[str] = []
 
-    for hit in paper.get("hits", []):
+    hits_list = paper.get("hits") or []
+    paper_has_rp = _paper_has_retrieval_primary(hits_list)
+
+    for hit in hits_list:
         vid_s = str(hit["vid"])
         if vid_s not in score_map:
             continue
@@ -112,7 +164,9 @@ def compute_contribution(
             role = (term_role_map.get(vid_s) or "primary").strip().lower()
             term_confidence = TERM_ROLE_WEIGHT.get(role, 1.0)
         term_uniqueness = float(term_uniqueness_map.get(vid_s, 1.0))
-        w = term_weight * term_confidence * paper_match_strength * term_uniqueness
+        # 批注：Stage4 多 term 命中同一 wid 时，paper_support 仅作附着证据；独狼 support 大幅降权。
+        attach = _retrieval_support_role_factor(hit, paper_has_rp, vid_s, context)
+        w = term_weight * term_confidence * paper_match_strength * term_uniqueness * attach
         rank_score += w
         term_weights[vid_s] = w
         valid_hids.append(hit["vid"])

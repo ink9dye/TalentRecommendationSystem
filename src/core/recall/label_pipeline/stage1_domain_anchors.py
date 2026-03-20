@@ -89,7 +89,7 @@ def _batch_load_vocabulary_stats_for_tids(
         ph = ",".join("?" * len(chunk))
         try:
             rows = conn.execute(
-                f"SELECT voc_id, field_id, subfield_id, topic_id, field_dist, subfield_dist, topic_dist "
+                f"SELECT voc_id, field_id, subfield_id, topic_id, field_dist, subfield_dist, topic_dist, source "
                 f"FROM vocabulary_topic_stats WHERE voc_id IN ({ph})",
                 chunk,
             ).fetchall()
@@ -201,9 +201,11 @@ def build_jd_hierarchy_profile(
         dist_json = domain_dist_map.get(tid)
         row_d = (dist_json,) if dist_json is not None else None
         if row_t:
-            fd = parse_json_dist(row_t[3])
-            sd = parse_json_dist(row_t[4])
-            td = parse_json_dist(row_t[5])
+            # 批注：SELECT 列为 voc_id, field_id, subfield_id, topic_id, field_dist, subfield_dist, topic_dist, source
+            # 必须用 [4][5][6] 取三层 JSON；误用 [3] 会把 topic_id 当成 field_dist，导致 JD 画像与词侧 key 全对不上、Stage4 overlap 恒为 0。
+            fd = parse_json_dist(row_t[4])
+            sd = parse_json_dist(row_t[5])
+            td = parse_json_dist(row_t[6])
             for k, v in fd.items():
                 all_field[k] = all_field.get(k, 0.0) + v * w
             for k, v in sd.items():

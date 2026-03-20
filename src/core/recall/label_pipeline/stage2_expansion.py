@@ -92,7 +92,7 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
         rec["context_continuity"] = float(getattr(c, "context_continuity", 0) or 0)
         rec["jd_candidate_alignment"] = float(getattr(c, "jd_candidate_alignment", 0.5) or getattr(c, "jd_align", 0.5) or 0.5)
         # 批注：以下键必须在顶层 dict 中（不能只放在 _debug）；Stage3 去重合并只从 winning 行的
-        # 顶层键拷贝到聚合 rec，_support_grounded_enough 等读的是 primary_bucket 等字段。
+        # 顶层键拷贝到聚合 rec，供分桶观测、统一连续分特征与 paper 硬挡（fallback 等）使用。
         rec["primary_bucket"] = getattr(c, "primary_bucket", "") or ""
         rec["can_expand_from_2a"] = bool(getattr(c, "can_expand_from_2a", False))
         rec["fallback_primary"] = bool(getattr(c, "fallback_primary", False))

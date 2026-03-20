@@ -1726,6 +1726,7 @@ class LabelRecallPath:
                     "stage3_bucket": r.get("stage3_bucket"),
                     "term_role": r.get("term_role"),
                     "can_expand": r.get("can_expand"),
+                    "mainline_hits": int(r.get("mainline_hits") or 0),
                     "object_like_penalty": (r.get("stage3_explain") or {}).get("object_like_penalty"),
                     "bonus_term_penalty": (r.get("stage3_explain") or {}).get("bonus_term_penalty"),
                     "generic_penalty": (r.get("stage3_explain") or {}).get("generic_penalty"),
@@ -1828,6 +1829,9 @@ class LabelRecallPath:
         # 阶段 5：作者打分与排序（debug_1 中补上 regex_str、query_vector 供 last_debug_info 与 paper semantic gate）
         debug_1["regex_str"] = regex_str
         debug_1["query_vector"] = query_vector
+        # paper_scoring：support/primary 附着衰减、主 line 浅开关、Stage5 审计用
+        debug_1["term_paper_meta"] = term_meta_for_stage4 if term_meta_for_stage4 is not None else {}
+        debug_1["term_retrieval_roles"] = term_retrieval_roles if term_retrieval_roles is not None else {}
         dominance = debug_1.get("dominance", 0.0)
         author_ids, last_debug_info = self._stage5_score_and_rank_authors(
             author_papers_list, score_map, term_map, active_domain_set, dominance, debug_1

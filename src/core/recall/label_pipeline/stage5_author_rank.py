@@ -15,6 +15,8 @@ from src.core.recall.works_to_authors import accumulate_author_scores
 from src.core.recall.label_means import paper_scoring
 from src.core.recall.label_means.simple_factors import is_label_jd_title_gate_disabled
 
+# True：打印 [Stage5 support dominance audit]，看作者是否被 support 独狼论文抬榜
+STAGE5_SUPPORT_DOMINANCE_AUDIT = True
 
 def _is_primary_supported(primary_count: int, supporting_count: int) -> bool:
     """护栏 5 条件：≥1 个 primary 或 ≥2 个 primary/supporting 为 primary_supported。"""
@@ -62,6 +64,95 @@ def aggregate_author_evidence_by_term_role(
                 if wid is not None:
                     out[aid]["expansion_supported_wids"].append(wid)
     return out
+
+
+def _retrieval_role_for_paper_term(debug_1: Dict[str, Any], tid_s: str) -> str:
+    """Stage3 入 paper 的 retrieval_role（paper_primary / paper_support）；缺省偏保守记 primary。"""
+    tr = debug_1.get("term_retrieval_roles") or {}
+    v = tr.get(int(tid_s)) if tid_s.isdigit() else None
+    if v is None:
+        v = tr.get(tid_s)
+    if v is None:
+        tm = debug_1.get("term_paper_meta") or {}
+        meta = tm.get(int(tid_s)) if tid_s.isdigit() else None
+        if meta is None:
+            meta = tm.get(tid_s)
+        if isinstance(meta, dict):
+            v = meta.get("retrieval_role")
+    s = (str(v or "paper_primary")).strip().lower()
+    return s if s in ("paper_primary", "paper_support") else "paper_primary"
+
+
+def _print_stage5_support_dominance_audit(
+    scored_authors: List[Dict[str, Any]],
+    author_term_contrib: Dict[str, Dict[str, float]],
+    author_all_retained_works: Dict[str, List[Tuple[str, float]]],
+    paper_map: Dict[str, Dict[str, Any]],
+    term_map: Dict[str, str],
+    debug_1: Dict[str, Any],
+    top_k: int = 25,
+) -> None:
+    """
+    看 Top 作者：总分里 primary vs support 分解、dominant term 角色、论文侧是否「独狼 support」结构。
+    term 贡献来自 author_term_contrib（递减聚合后、未乘时间权重）；final_score 为之后管线分。
+    """
+    if not STAGE5_SUPPORT_DOMINANCE_AUDIT or not scored_authors:
+        return
+    print("\n" + "-" * 80)
+    print(
+        "[Stage5 support dominance audit] "
+        "author_id | final_score | top_pri_c | top_sup_c | sup_share | "
+        "sup_only_papers | sup+w_pri_papers | dominant_term | dom_role"
+    )
+    print("-" * 80)
+    for row in scored_authors[:top_k]:
+        aid = str(row.get("aid") or "")
+        final_score = float(row.get("score") or 0.0)
+        atc = author_term_contrib.get(aid, {}) or {}
+        total = sum(float(v) for v in atc.values()) or 1e-12
+        pri_vals: List[float] = []
+        sup_vals: List[float] = []
+        for tid_s, c in atc.items():
+            c = float(c)
+            if c <= 0:
+                continue
+            rr = _retrieval_role_for_paper_term(debug_1, str(tid_s))
+            if rr == "paper_support":
+                sup_vals.append(c)
+            else:
+                pri_vals.append(c)
+        top_pri = max(pri_vals) if pri_vals else 0.0
+        top_sup = max(sup_vals) if sup_vals else 0.0
+        sup_sum = sum(sup_vals)
+        sup_share = sup_sum / total
+        dom_tid, dom_c = max(atc.items(), key=lambda x: float(x[1])) if atc else ("", 0.0)
+        dom_term = term_map.get(str(dom_tid), str(dom_tid))[:32]
+        dom_role = _retrieval_role_for_paper_term(debug_1, str(dom_tid))
+        sup_only = 0
+        sup_with = 0
+        for wid, piece in author_all_retained_works.get(aid, []):
+            if float(piece or 0.0) <= 0:
+                continue
+            info = paper_map.get(str(wid)) or paper_map.get(wid) or {}
+            hits = info.get("hits") or []
+            has_p = any(
+                (h.get("role") or "").strip().lower() == "paper_primary"
+                for h in hits
+                if isinstance(h, dict)
+            )
+            has_s = any(
+                (h.get("role") or "").strip().lower() == "paper_support"
+                for h in hits
+                if isinstance(h, dict)
+            )
+            if has_p:
+                sup_with += 1
+            elif has_s:
+                sup_only += 1
+        print(
+            f"{aid:16} | {final_score:11.4f} | {top_pri:9.4f} | {top_sup:9.4f} | {sup_share:8.3f} | "
+            f"{sup_only:^15} | {sup_with:^18} | {dom_term!r} | {dom_role}"
+        )
 
 
 # 层级守卫方案预留：AuthorScore = PaperSum * CoverageBonus * HierarchyConsistency * FamilyBalancePenalty
@@ -122,6 +213,7 @@ def run_stage5(
         "term_role_map": term_role_map,
         "term_confidence_map": term_confidence_map,
         "term_uniqueness_map": term_uniqueness_map,
+        "term_paper_meta": debug_1.get("term_paper_meta") or {},
         "anchor_kws": [k.lower() for k in industrial_kws],
         "active_domain_set": active_domain_set,
         "dominance": dominance,
@@ -553,6 +645,15 @@ def run_stage5(
     stage5_sub_ms["build_ranked_list"] = (t9 - t8) * 1000.0
 
     scored_authors.sort(key=lambda x: x["score"], reverse=True)
+    _print_stage5_support_dominance_audit(
+        scored_authors,
+        author_term_contrib,
+        author_top_works,
+        paper_map,
+        term_map,
+        debug_1 or {},
+        top_k=25,
+    )
     # 批注：看 Top 作者分数来自哪几篇论文（全局 paper_score vs 作者贡献份额），便于判断偏题是否 Stage4 混入。
     paper_scores_by_wid_dbg = {p["wid"]: float(p["score"]) for p in papers_for_agg}
     print("\n[Stage5 top-author paper provenance]")
