@@ -12,6 +12,7 @@ from src.core.recall.label_means.label_expansion import (
     PreparedAnchor,
     ExpandedTermCandidate,
     LABEL_EXPANSION_DEBUG,
+    STAGE2_NOISY_DEBUG,
     _anchor_skills_to_prepared_anchors,
     stage2_generate_academic_terms,
 )
@@ -113,13 +114,26 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
             rec["parent_anchor_step2_rank"] = _rk
         out.append(rec)
     if LABEL_EXPANSION_DEBUG and out:
-        for rec in out[:10]:
-            print(
-                f"[Stage2->3 field audit] term={rec['term']!r} "
-                f"primary_bucket={rec.get('primary_bucket')!r} "
-                f"can_expand_from_2a={rec.get('can_expand_from_2a')!r} "
-                f"fallback_primary={rec.get('fallback_primary')!r}"
-            )
+        n = len(out)
+        n_2a = sum(1 for r in out if r.get("can_expand_from_2a"))
+        n_fb = sum(1 for r in out if r.get("fallback_primary"))
+        buckets: Dict[str, int] = {}
+        for r in out:
+            pb = str(r.get("primary_bucket") or "") or "(empty)"
+            buckets[pb] = buckets.get(pb, 0) + 1
+        top_pb = sorted(buckets.items(), key=lambda x: -x[1])[:4]
+        pb_s = ",".join(f"{k}:{v}" for k, v in top_pb)
+        print(
+            f"[Stage2->3 field audit] n={n} can_expand_from_2a={n_2a} fallback_primary={n_fb} "
+            f"primary_bucket_top=[{pb_s}] （逐条前10需 STAGE2_NOISY_DEBUG）"
+        )
+        if STAGE2_NOISY_DEBUG:
+            for rec in out[:10]:
+                print(
+                    f"  term={rec['term']!r} primary_bucket={rec.get('primary_bucket')!r} "
+                    f"can_expand_from_2a={rec.get('can_expand_from_2a')!r} "
+                    f"fallback_primary={rec.get('fallback_primary')!r}"
+                )
     return out
 
 

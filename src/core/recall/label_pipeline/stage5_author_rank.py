@@ -20,8 +20,55 @@ from src.core.recall.label_means.simple_factors import is_label_jd_title_gate_di
 STAGE5_SUPPORT_DOMINANCE_AUDIT = True
 # True：打印 [Stage5 term-cap audit]，确认单 term 作者占比上限是否作用在最终聚合前
 STAGE5_TERM_CAP_AUDIT = True
-# True：打印 [Stage5 author structure audit]，看结构乘子前后分数与单 term/单篇 压制是否生效
+# True：打印 [Stage5 author structure audit]（base×结构乘子→after，含分项 mult）
 STAGE5_AUTHOR_STRUCTURE_AUDIT = True
+# 单篇论文「作者 fan-out」：进入 accumulate_author_scores 前轻缩 p["score"]，削弱一篇拖出一串作者（与作者内递减 / term cap / 结构乘子正交叠加）。
+PAPER_AUTHOR_FANOUT_PENALTY_ENABLED = True
+PAPER_AUTHOR_FANOUT_SOFT_K = 4.0
+PAPER_AUTHOR_FANOUT_MIN_FACTOR = 0.72
+PAPER_AUTHOR_FANOUT_MAX_COUNT = 12
+STAGE5_FANOUT_AUDIT = True
+
+
+def _try_hit_terms_wid(
+    paper_hit_terms: Dict[str, List[str]], wid: Any
+) -> List[str]:
+    if wid is None:
+        return []
+    h = paper_hit_terms.get(wid)
+    if h is not None:
+        return h
+    return paper_hit_terms.get(str(wid), []) or []
+
+
+def _print_stage5_paper_fanout_audit(
+    papers_for_agg: List[Dict[str, Any]],
+    paper_hit_terms: Dict[str, List[str]],
+    top_n: int = 20,
+) -> None:
+    if not STAGE5_FANOUT_AUDIT or not papers_for_agg:
+        return
+    print("\n[Stage5 paper fanout audit]")
+    print("wid | score_before | authors_n | fanout_factor | score_after | hit_terms")
+    rows = sorted(
+        papers_for_agg,
+        key=lambda x: float(
+            x.get("score_before_fanout") if x.get("score_before_fanout") is not None else x.get("score") or 0.0
+        ),
+        reverse=True,
+    )[:top_n]
+    for p in rows:
+        wid = p.get("wid")
+        authors = p.get("authors") or []
+        ht = _try_hit_terms_wid(paper_hit_terms, wid)
+        print(
+            f"{wid} | "
+            f"{float(p.get('score_before_fanout') or 0.0):.4f} | "
+            f"{len(authors):^3} | "
+            f"{float(p.get('fanout_factor') or 1.0):.3f} | "
+            f"{float(p.get('score') or 0.0):.4f} | "
+            f"{ht[:4]!r}"
+        )
 
 
 def _apply_term_max_author_share_cap(
@@ -32,7 +79,7 @@ def _apply_term_max_author_share_cap(
     单 term 对作者总贡献占比上限（与 stage4_paper_recall.TERM_MAX_AUTHOR_SHARE 同源）。
 
     对每个 author：先求各 term 的原始贡献和 raw_total，再令每项 capped_t = min(raw_t, max_share * raw_total)，
-    重算 capped_total。仅缩放分值，不改变「单 term 100% dominant_share」形状；打散singleton 依赖后续的 coverage_bonus / singleton_penalty。
+    重算 capped_total。仅缩放分值，不改变「单 term 100% dominant_share」形状；打散单词单篇作者依赖后续 **结构乘子**（`_compute_author_structure_shape`）。
     """
     capped_out: Dict[str, Dict[str, float]] = {}
     audit: Dict[str, Dict[str, Any]] = {}
@@ -87,8 +134,10 @@ def _compute_author_structure_shape(
     paper_map: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Any]:
     """
-    作者层结构乘子（批注）：弱 log 型 coverage 对 Top 榜常退化为同一组系数；改为一组高分辨率规则 + 显式连乘，
-    把 Stage4 已产出的 multi-hit 证据转成排序优势，区分「单词单篇」与「岗位多证据」作者。无词表、无黑名单。
+    作者层结构乘子（批注）：**分立 structure_factor** 先把「单词单篇、无 multi-hit」与「多强词 / multi-term 论文」拉开，
+    再乘较轻的 **term_strength_mult × paper_evidence_mult × multi_hit_mult**，避免多乘子叠回去把 singleton 作者抬回前排。
+    **st** = 贡献 ≥ 0.35·max(term_contrib) 的强词个数；**pc** / **mtp** / **single_term_papers** 见保留论文与 wid_n_terms。
+    无词表、无 RL/robot 特判。
     """
     vals = [float(v) for v in (atc or {}).values() if float(v) > 1e-18]
     max_tc = max(vals) if vals else 0.0
@@ -114,19 +163,22 @@ def _compute_author_structure_shape(
     sp = int(strong_paper_count)
     pc = int(paper_count)
 
-    # 分立结构惩奖：单 term + 单篇 + 无 multi-hit → 强压；多强词或 multi-term 论文 → 基准 + 按 mtp 加价
-    if st == 1 and pc <= 1 and mtp == 0:
-        structure_factor = 0.62
-    elif st == 1 and mtp == 0:
-        structure_factor = 0.78
-    elif st >= 2 or mtp >= 1:
-        structure_factor = 1.00 + 0.08 * min(mtp, 3)
+    # 分立结构惩奖：单 term + 单篇 + 无 multi-hit → 更强压；单 term + 少量篇仍无 mtp → 中压；
+    # 有 multi-term 论文或多强词 → 奖励区（略收敛 bonus 斜率，避免与平滑三项叠乘过度放大）。
+    if st <= 1 and pc <= 1 and mtp == 0:
+        structure_factor = 0.42
+    elif st <= 1 and pc <= 2 and mtp == 0:
+        structure_factor = 0.58
+    elif st <= 1 and mtp == 0:
+        structure_factor = 0.72
+    elif mtp >= 1 or st >= 2:
+        structure_factor = 1.00 + 0.06 * min(mtp, 3)
     else:
-        structure_factor = 0.90
+        structure_factor = 0.88
 
-    term_strength_mult = 0.85 + 0.15 * min(st, 3) / 3.0
-    paper_evidence_mult = 0.80 + 0.20 * min(pc, 4) / 4.0
-    multi_hit_mult = 1.00 + 0.12 * min(mtp, 3)
+    term_strength_mult = 0.90 + 0.10 * min(st, 3) / 3.0
+    paper_evidence_mult = 0.88 + 0.12 * min(pc, 4) / 4.0
+    multi_hit_mult = 1.00 + 0.08 * min(mtp, 3)
     structure_mult_total = float(
         structure_factor * term_strength_mult * paper_evidence_mult * multi_hit_mult
     )
@@ -145,7 +197,7 @@ def _compute_author_structure_shape(
                 [h for h in (meta.get("hits") or []) if h is not None]
             )
 
-    return {
+    out: Dict[str, Any] = {
         "strong_term_count": st,
         "strong_paper_count": sp,
         "multi_term_paper_count": mtp,
@@ -158,6 +210,7 @@ def _compute_author_structure_shape(
         "multi_hit_mult": float(multi_hit_mult),
         "structure_mult_total": float(structure_mult_total),
     }
+    return out
 
 
 def _print_stage5_term_cap_audit(
@@ -199,25 +252,34 @@ def _print_stage5_author_structure_audit(
     author_structure_audit: Dict[str, Dict[str, Any]],
     top_k: int = 25,
 ) -> None:
-    """结构乘子前后对照：谁因单 term/单篇被压、谁因 multi-term 证据被抬。"""
+    """
+    结构乘子施加前后：base_score（×时间权重后、结构前）、st/pc/mtp、单篇论文数、最佳篇命中词数、
+    struct_f 与三项平滑 mult、struct_tot、after。用于判断 Top 是否仍被「单词单篇」统治。
+    """
     if not STAGE5_AUTHOR_STRUCTURE_AUDIT or not scored_authors:
         return
     print("\n" + "-" * 80)
     print(
         "[Stage5 author structure audit] "
-        "author_id | papers | st_terms | mtp | single_term_papr | best_wid_n_terms | "
-        "struct_f | mult_tot | score_before | score_after"
+        "author_id | base_score | st | pc | mtp | st_papr | singl_papr | best_hit | "
+        "struct_f | t_mult | p_mult | m_mult | struct_tot | after"
     )
     print("-" * 80)
     for row in scored_authors[:top_k]:
         aid = str(row.get("aid") or "")
         r = author_structure_audit.get(aid) or {}
         print(
-            f"{aid:16} | {int(r.get('paper_count') or 0):^6} | {int(r.get('strong_term_count') or 0):^8} | "
-            f"{int(r.get('multi_term_paper_count') or 0):^3} | {int(r.get('single_term_papers') or 0):^16} | "
-            f"{int(r.get('best_paper_hit_terms_count') or 0):^16} | "
-            f"{float(r.get('structure_factor') or 1.0):8.3f} | {float(r.get('structure_mult_total') or 1.0):8.3f} | "
-            f"{float(r.get('final_before_structure') or 0.0):12.6f} | {float(r.get('final_after_structure') or 0.0):12.6f}"
+            f"{aid:16} | {float(r.get('final_before_structure') or 0.0):10.4f} | "
+            f"{int(r.get('strong_term_count') or 0):^2} | {int(r.get('paper_count') or 0):^2} | "
+            f"{int(r.get('multi_term_paper_count') or 0):^3} | "
+            f"{int(r.get('strong_paper_count') or 0):^7} | {int(r.get('single_term_papers') or 0):^8} | "
+            f"{int(r.get('best_paper_hit_terms_count') or 0):^8} | "
+            f"{float(r.get('structure_factor') or 1.0):8.3f} | "
+            f"{float(r.get('term_strength_mult') or 1.0):6.3f} | "
+            f"{float(r.get('paper_evidence_mult') or 1.0):6.3f} | "
+            f"{float(r.get('multi_hit_mult') or 1.0):6.3f} | "
+            f"{float(r.get('structure_mult_total') or 1.0):10.4f} | "
+            f"{float(r.get('final_after_structure') or 0.0):10.4f}"
         )
 
 
@@ -358,7 +420,7 @@ def _print_stage5_support_dominance_audit(
         )
 
 
-# 已实现：时间权重 × coverage_bonus × singleton_penalty（见 _compute_author_coverage_shape）。
+# 已实现：时间权重 × structure_mult_total（structure_factor × term/paper/mhit 平滑项，见 _compute_author_structure_shape）。
 # 预留：HierarchyConsistency、按 term_family 的 FamilyBalancePenalty。
 
 
@@ -636,6 +698,27 @@ def run_stage5(
     t3 = time.perf_counter()
     stage5_sub_ms["percentile_compress"] = (t3 - t2) * 1000.0
 
+    # fan-out：作者数 >1 时缩论文总分；n≤4 附近接近不压，长作者表有下.floor（见 PAPER_AUTHOR_FANOUT_*）。
+    t_fan0 = time.perf_counter()
+    for p in papers_for_agg:
+        authors = p.get("authors") or []
+        n_auth = min(len(authors), int(PAPER_AUTHOR_FANOUT_MAX_COUNT))
+        s0 = float(p.get("score") or 0.0)
+        p["score_before_fanout"] = s0
+        if PAPER_AUTHOR_FANOUT_PENALTY_ENABLED and n_auth > 1:
+            denom = max(float(n_auth), float(PAPER_AUTHOR_FANOUT_SOFT_K))
+            fanout_factor = max(
+                float(PAPER_AUTHOR_FANOUT_MIN_FACTOR),
+                math.sqrt(float(PAPER_AUTHOR_FANOUT_SOFT_K) / denom),
+            )
+        else:
+            fanout_factor = 1.0
+        p["fanout_factor"] = float(fanout_factor)
+        p["score"] = s0 * float(fanout_factor)
+    t3_fan = time.perf_counter()
+    stage5_sub_ms["author_fanout_penalty"] = (t3_fan - t_fan0) * 1000.0
+    _print_stage5_paper_fanout_audit(papers_for_agg, paper_hit_terms)
+
     agg_result = accumulate_author_scores(papers_for_agg, top_k_per_author=3)
     author_scores = agg_result.author_scores
     author_top_works = agg_result.author_top_works
@@ -643,7 +726,7 @@ def run_stage5(
     author_evidence_by_term_role = aggregate_author_evidence_by_term_role(papers_for_agg)
 
     t3a = time.perf_counter()
-    stage5_sub_ms["accumulate_authors"] = (t3a - t3) * 1000.0
+    stage5_sub_ms["accumulate_authors"] = (t3a - t3_fan) * 1000.0
 
     term_paper_contrib: Dict[str, List[Tuple[str, float]]] = collections.defaultdict(list)
     for p in papers_for_agg:
@@ -753,8 +836,7 @@ def run_stage5(
             score = float(base_score) * float(time_weight) * float(recency_by_latest)
             author_scores[aid] = score
 
-        # 批注：高分辨率结构乘子（弱 log coverage 升级版）。规则分支 + term/paper/multi-hit 三连乘，
-        # 专压 st=1 & 单篇 & mtp=0，抬高 st≥2 或 mtp≥1（与 Stage4 multi-hit 对齐）；strong_term 阈值 0.35·max 避免全员 st=1。
+        # 批注：结构乘子 = structure_factor（按 st/pc/mtp 分段）× term_strength_mult × paper_evidence_mult × multi_hit_mult。
         for aid in list(author_scores.keys()):
             aid_s = str(aid)
             before_struct = float(author_scores[aid])
@@ -964,7 +1046,7 @@ def run_stage5(
     # -------------------------
     # 精准审计块 2/3：
     # [Stage5 term->author contribution top]
-    # 目的：看每个 term 是否集中砸向少量作者，确认是否单 term 放大失衡。
+    # 目的：看每个 term 是否集中砸向少数作者；降噪：仅 **paper term 前 4 × 每 term 作者前 5**，避免淹没结构审计。
     # -------------------------
     final_term_ids_for_paper = sorted(score_map.keys(), key=lambda t: score_map.get(t, 0.0), reverse=True)
     term_author_rows: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
@@ -994,15 +1076,15 @@ def run_stage5(
                 }
             )
 
-    print("\n[Stage5 term->author contribution top]")
-    for tid in final_term_ids_for_paper:
+    print("\n[Stage5 term->author contribution top] (top 4 paper terms × 5 authors/term)")
+    for tid in final_term_ids_for_paper[:4]:
         tid_s = str(tid)
         term_name = term_map.get(tid, "") or term_map.get(tid_s, "") or tid_s
         rows = sorted(
             term_author_rows.get(term_name, []),
             key=lambda x: float(x.get("term_contrib") or 0.0),
             reverse=True,
-        )[:10]
+        )[:5]
         print(f"term='{term_name}' authors={len(term_author_rows.get(term_name, []))}")
         for i, r in enumerate(rows, 1):
             total = max(float(r.get("author_total_score") or 0.0), 1e-9)

@@ -1,3 +1,4 @@
+import math
 from collections import defaultdict
 from typing import Any, Dict, List, Set, Tuple
 
@@ -37,6 +38,14 @@ PAPER_RECALL_MAX_TERMS = 12
 # Paper 入稿：统一分数相对截断（相对 Top1 与绝对下限取 max）；避免弱支线索性跟跑
 PAPER_RECALL_DYNAMIC_FLOOR_REL = 0.62
 PAPER_RECALL_DYNAMIC_FLOOR_ABS = 0.12
+# --- 大池词已入选后的「尾部补位」（不改 gate / unified / paper_select_score 公式；仅在主 cutoff 之后最多再塞 1~2 词）---
+# 典型动机：RL 等大池 core 仍可选用，但避免 final_term_ids 只剩极少数词；near-miss 的 core / primary_support_seed 可跟选 1~2 个。
+PAPER_RECALL_TAIL_EXPAND_ENABLED = True
+PAPER_RECALL_TAIL_EXPAND_MAX_EXTRA = 2
+PAPER_RECALL_TAIL_EXPAND_DELTA_MAX = 0.045
+PAPER_RECALL_TAIL_EXPAND_REQUIRE_CORE_OR_SEED = True
+PAPER_RECALL_BIG_POOL_PAPERS_MIN = 120
+PAPER_RECALL_BIG_POOL_SELECTED_MIN = 1
 # paper_readiness · 锚点先验（Stage3）：以 Step2 锚点分为「主证据」，名次只做轻平滑（避免 rank 主导把 robot control 等主线词打出 dynamic_floor）
 PAPER_READINESS_ANCHOR_SCORE_NORM = 1.20  # anchor_score_norm = clip(score / 此值, 0, 1)
 PAPER_READINESS_ANCHOR_PRIOR_W_SCORE = 0.88  # 先验里分值权重（主）
@@ -46,6 +55,29 @@ PAPER_READINESS_ANCHOR_READINESS_BLEND_LO = 0.82  # readiness *= LO + HI * ancho
 PAPER_READINESS_ANCHOR_READINESS_BLEND_HI = 0.18
 # core + 已命中主线 + 可扩：paper_readiness 保底（结构信号，非词表）；防「主线可扩却被 floor 误杀」
 PAPER_READINESS_CORE_MAINLINE_EXPAND_MIN = 0.78
+# paper_select_score：在 final_score×paper_readiness 底分上 **加性轻注入**（仅 eligible 排序 + dynamic_floor；**不改 final_score**）
+# 直接吃 Stage2A `primary_bucket`、主线命中、可扩、`parent_anchor_*`，抬高 JD 主轴词、压低弱桶/无主线 — 无量词黑名单。
+PAPER_SELECT_SCORE_ANCHOR_NORM = 1.20
+PAPER_SELECT_BUCKET_BONUS_EXPANDABLE = 0.055
+PAPER_SELECT_BUCKET_BONUS_SUPPORT_SEED = 0.020
+PAPER_SELECT_BUCKET_PENALTY_SUPPORT_KEEP = -0.010
+PAPER_SELECT_BUCKET_PENALTY_RISKY_KEEP = -0.030
+PAPER_SELECT_BONUS_MAINLINE_HIT = 0.020
+PAPER_SELECT_PENALTY_MAINLINE_NONE = -0.015
+PAPER_SELECT_BONUS_CAN_EXPAND = 0.020
+PAPER_SELECT_PENALTY_NO_EXPAND = -0.010
+PAPER_SELECT_RANK_BONUS_LE3 = 0.035
+PAPER_SELECT_RANK_BONUS_LE6 = 0.020
+PAPER_SELECT_RANK_BONUS_LE10 = 0.008
+PAPER_SELECT_ANCHOR_SCORE_BONUS_COEF = 0.015  # × anchor_score_norm；过强可改 0.05（README 备选）
+PAPER_SELECT_ROLE_BONUS_PRIMARY = 0.015
+PAPER_SELECT_ROLE_PENALTY_PRIMARY_SIDE = -0.010
+PAPER_SELECT_ROLE_PENALTY_DENSE_EXP = -0.020
+# Paper 选词：候选池规模惩罚（log10、系数上限）。小 final N 时缓释「大池词抬高 paper_select_score 与 dynamic_floor」；
+# 信号来自 `papers_before_filter` 或回落 `degree_w`（Stage3 词汇论文规模），**非**词表黑名单。
+PAPER_SELECT_POOL_PENALTY_ENABLED = True
+PAPER_SELECT_POOL_PENALTY_LOG_COEF = 0.015
+PAPER_SELECT_POOL_PENALTY_MAX = 0.08
 # Paper bridge：weak support 结构门（非词表拦词）。统一分只负责排序；是否进 paper 由本组常量做最后结构裁决。
 STAGE3_PAPER_SUPPORT_BLOCK_ENABLED = True
 STAGE3_PAPER_SUPPORT_MAX_ANCHOR_COUNT = 1
@@ -56,11 +88,29 @@ STAGE3_PAPER_SUPPORT_MIN_GROUNDING = 0.62
 STAGE3_PAPER_SUPPORT_MIN_FINAL_SCORE = 0.30
 # conditioned-only 的 support 默认更严（易漂移）
 STAGE3_PAPER_SUPPORT_BLOCK_COND_ONLY = True
+# ---- support → paper：在满足 weak_support_contamination 时，**小配额软放行**（折扣 readiness），扩 eligible / final N；非词表。----
+SUPPORT_TO_PAPER_ENABLED = True
+SUPPORT_TO_PAPER_MAX = 3
+SUPPORT_TO_PAPER_MAX_FRAC = 1.0 / 3.0  # 入选 support 同时受「最多 SUPPORT_TO_PAPER_MAX」与「不超过 max_terms 的 1/3」约束
+PAPER_SUPPORT_SEED_FACTOR = 0.72  # primary_support_seed 软放行：乘入 paper_readiness（随后进 paper_select_score 底分）
+PAPER_SUPPORT_KEEP_FACTOR = 0.58  # primary_support_keep 且结构信号达标时软放行
+# core 未过 JD 全局主轴门（rk∨a_sc）：**不**再硬拒；降级 support_pool，乘 readiness 后进 `paper_select_score` 竞争（配额仍走 support 槽）
+PAPER_CORE_AXIS_NEAR_MISS_FACTOR = 0.72
+# 未触 risky_side_block 的 risky：保守进 support_pool，略压 readiness，避免与主轴 core 同权
+PAPER_RISKY_SUPPORT_LANE_FACTOR = 0.88
+# 其它少见桶：与「非主轴」同哲学，轻压后进池
+PAPER_FALLBACK_SUPPORT_LANE_FACTOR = 0.90
 # Paper：risky + 无主线命中 + 不可扩 + side/expansion 角色 — 仅靠 unified 分过线仍会混入（如 motion controller）
 STAGE3_PAPER_RISKY_SIDE_BLOCK_ENABLED = True
 STAGE3_PAPER_RISKY_SIDE_TERM_ROLES = frozenset(
     {"primary_side", "dense_expansion", "cluster_expansion", "cooc_expansion"}
 )
+# Paper：JD 全局主轴门（非词表）。仅 stage3_bucket=core：**父锚 rank 与 a_sc 二选一达线即过**（OR），
+# 避免 AND 把「分略低但名次尚可」或「名次靠后但分仍高」一并双杀；两侧皆弱仍拒（与 AND 相同）。
+# 调参：单调改 MAX_RANK / MIN_SCORE；若 rk 与 a_sc 双不达线仍落选，需再放宽常数或引入其它 Stage3 结构信号。
+STAGE3_PAPER_MAIN_AXIS_GATE_ENABLED = True
+STAGE3_PAPER_MAIN_AXIS_MAX_RANK = 10
+STAGE3_PAPER_MAIN_AXIS_MIN_SCORE = 0.90
 # Stage3 第二段 — 统一连续分权重（无 bucket / primary_bucket 条件乘子；调参只改标量）
 STAGE3_UNIFIED_W_SEED = 0.34
 STAGE3_UNIFIED_W_ANCHOR_ID = 0.18
@@ -78,6 +128,8 @@ STAGE3_PAPER_GATE_DEBUG = False  # 默认降噪；需要逐项 gate 时再开
 STAGE3_PAPER_CUTOFF_AUDIT = True  # [Stage3 paper cutoff] 排名与截断原因
 STAGE3_SUPPORT_CONTAMINATION_AUDIT = True  # Stage3→4 之间：可疑 support 摘要
 STAGE3_UNIFIED_SCORE_DEBUG = True  # 连续分特征拆解（替代原「规则乘子」视角）
+# 默认只打 TopN（paper 瓶颈在看 eligible / support 软放行；unified 仅辅）
+STAGE3_UNIFIED_SCORE_DEBUG_TOP_K = 3
 # Stage3 窄表审计：final adjust / cross-anchor / support·risky / paper bridge（与 bucket reason 互补）
 STAGE3_AUDIT_DEBUG = True
 # Stage3 score_mult 单词明细 / 重点词 watch / rerank TopN（仅 stage3_build_score_map）
@@ -265,8 +317,11 @@ def _paper_recall_dynamic_floor(
     return max(PAPER_RECALL_DYNAMIC_FLOOR_ABS, top * PAPER_RECALL_DYNAMIC_FLOOR_REL)
 
 
-def _print_stage3_unified_breakdown(survivors: List[Dict[str, Any]], top_k: int = 16) -> None:
-    """打印连续分特征拆解，便于回答「谁被哪一项抬高/压低」。"""
+def _print_stage3_unified_breakdown(
+    survivors: List[Dict[str, Any]],
+    top_k: int = STAGE3_UNIFIED_SCORE_DEBUG_TOP_K,
+) -> None:
+    """打印连续分特征拆解。默认 Top 很少（见 `STAGE3_UNIFIED_SCORE_DEBUG_TOP_K`）；paper 优先看 pool / centrality。**STAGE3_DEBUG_FOCUS_TERMS** 非空时只打命中行。"""
     if not STAGE3_UNIFIED_SCORE_DEBUG or not survivors:
         return
     rows = sorted(survivors, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
@@ -329,11 +384,14 @@ def _print_stage3_paper_selection_narrow_audit(ordered: List[Dict[str, Any]]) ->
     print("\n" + "-" * 80)
     print("[Stage3 paper selection audit] eligible · structural ranking (no blocklist)")
     print("-" * 80)
-    hdr = "term · fs · ready · p_sel · bucket · role · ml · anch · … · panch · a_sc · rk · outcome"
+    hdr = (
+        "term · fs · ready · p_sel · bucket · role · ml · anch · exp co pg sel · "
+        "panch · a_sc · rk · a_n · r_sm · psf · sup_reason · outcome"
+    )
     print(hdr)
-    print("-" * 90)
+    print("-" * 96)
     for rec in ordered:
-        term = (rec.get("term") or "")[:20]
+        term = (rec.get("term") or "")[:18]
         fs = float(rec.get("final_score") or 0.0)
         ready = float(rec.get("paper_readiness") or 0.0)
         pss = float(rec.get("paper_select_score") or 0.0)
@@ -358,15 +416,361 @@ def _print_stage3_paper_selection_narrow_audit(ordered: List[Dict[str, Any]]) ->
         if par is None:
             par = rec.get("parent_anchor_step2_rank")
         par_i = int(par) if par is not None else 0
-        panch = (rec.get("parent_anchor") or "")[:12]
+        panch = (rec.get("parent_anchor") or "")[:10]
         if not panch and rec.get("parent_anchors"):
             pa_list = rec.get("parent_anchors") or []
-            panch = str(pa_list[0])[:12] if pa_list else ""
+            panch = str(pa_list[0])[:10] if pa_list else ""
+        a_n = float(rec.get("paper_anchor_score_norm") or 0.0)
+        r_sm = float(rec.get("paper_anchor_rank_smooth") or 0.0)
+        psf = float(rec.get("paper_support_factor") or 1.0)
+        sr = str(rec.get("paper_support_reason") or "-")[:22]
         print(
-            f"{term:20} | {fs:4.2f} | {ready:5.2f} | {pss:5.2f} | {b:6} | {role:10} | {ml:^2} | {anch:^4} | "
+            f"{term:18} | {fs:4.2f} | {ready:5.2f} | {pss:5.2f} | {b:6} | {role:10} | {ml:^2} | {anch:^4} | "
             f"{str(exp)[:1]:^3} | {str(co)[:1]:^5} | {pg:4.2f} | {str(sel)[:1]:^3} | "
-            f"panch={panch:12} a_sc={pas:4.2f} r={par_i:^3} | {outcome[:20]}"
+            f"panch={panch:10} a_sc={pas:4.2f} r={par_i:^3} "
+            f"a_n={a_n:4.2f} r_sm={r_sm:4.2f} | psf={psf:4.2f} | {sr:22} | {outcome[:18]}"
         )
+
+
+def _print_stage3_paper_floor_block_audit(
+    ordered: List[Dict[str, Any]],
+    floor: float,
+) -> None:
+    """
+    [Stage3 paper floor block audit]
+    仅 core、未入选、且因 dynamic_floor 被拒：对齐「主线可扩却被 paper_select_score 压出 floor」类误杀排查。
+    """
+    if not STAGE3_PAPER_CUTOFF_AUDIT or not ordered:
+        return
+    blocks: List[Dict[str, Any]] = []
+    for rec in ordered:
+        if rec.get("selected_for_paper"):
+            continue
+        if (rec.get("stage3_bucket") or "").strip().lower() != "core":
+            continue
+        reason = str(rec.get("paper_reject_reason") or rec.get("select_reason") or "")
+        cutoff = str(rec.get("paper_cutoff_reason") or "")
+        if "below_dynamic_floor" not in reason and "below_dynamic_floor" not in cutoff:
+            continue
+        blocks.append(rec)
+    if not blocks:
+        return
+    print("\n" + "-" * 80)
+    print(
+        "[Stage3 paper floor block audit] core · below_dynamic_floor（主场：robot control / route planning 等误杀）"
+    )
+    print(f"  dynamic_floor(paper_select_score)={floor:.4f}")
+    print("-" * 80)
+    print(
+        "term          | final | ready | p_sel | floor | Δfloor | ml | exp | p_anchor      | pa_sc"
+    )
+    print("-" * 80)
+    for rec in blocks:
+        t = (rec.get("term") or "")[:14]
+        fs = float(rec.get("final_score") or 0.0)
+        rd = float(rec.get("paper_readiness") or 0.0)
+        pss = float(rec.get("paper_select_score") or 0.0)
+        delta = floor - pss
+        ml = int(rec.get("mainline_hits") or 0)
+        exp = bool(rec.get("can_expand", False) or rec.get("can_expand_from_2a", False))
+        pa = str(rec.get("parent_anchor") or "")[:14]
+        if not pa and rec.get("parent_anchors"):
+            pa = str((rec.get("parent_anchors") or [""])[0])[:14]
+        pas = float(
+            rec.get("best_parent_anchor_final_score")
+            or rec.get("parent_anchor_final_score")
+            or 0.0
+        )
+        print(
+            f"{t:14} | {fs:5.3f} | {rd:5.3f} | {pss:5.3f} | {floor:5.3f} | {delta:+6.3f} | "
+            f"{ml:^2} | {str(exp)[:1]:^3} | {pa:14} | {pas:5.3f}"
+        )
+
+
+def _print_stage3_paper_centrality_audit(ordered: List[Dict[str, Any]], top_n: int = 12) -> None:
+    """
+    paper_select_score 结构化分解：一眼看 RL / robotic arm 仍在是因为 fs 高还是主线/父锚弱；含 **池规模** 便于对照 pool penalty。
+    """
+    if not STAGE3_PAPER_CUTOFF_AUDIT or not ordered:
+        return
+    rows = sorted(
+        ordered,
+        key=lambda x: float(x.get("paper_select_score") or 0.0),
+        reverse=True,
+    )[:top_n]
+    print("\n" + "-" * 80)
+    print("[Stage3 paper centrality audit] top eligible by paper_select_score (base=L×R + Stage2 bonuses − pool)")
+    print("-" * 80)
+    print(
+        "term                  | p_bef | parent_anch  | a_sc | rk | primary_bucket | ml | ex | "
+        "fs   | ready | base | +bonus | p_sel"
+    )
+    print("-" * 80)
+    for row in rows:
+        term = str(row.get("term") or "")[:22]
+        p_bef = int(
+            row.get("paper_select_pool_size")
+            or row.get("papers_before_filter")
+            or row.get("degree_w")
+            or 0
+        )
+        panch = str(row.get("parent_anchor") or "")[:12]
+        if not panch and row.get("parent_anchors"):
+            panch = str((row.get("parent_anchors") or [""])[0])[:12]
+        a_sc = float(
+            row.get("best_parent_anchor_final_score")
+            or row.get("parent_anchor_final_score")
+            or 0.0
+        )
+        rk = row.get("best_parent_anchor_step2_rank")
+        if rk is None:
+            rk = row.get("parent_anchor_step2_rank")
+        rk_i = int(rk) if rk is not None else 999
+        pb = str(row.get("primary_bucket") or "")[:14]
+        ml = int(row.get("mainline_hits") or 0)
+        ex = bool(row.get("can_expand_from_2a", False) or row.get("can_expand", False))
+        fs = float(row.get("final_score") or 0.0)
+        ready = float(row.get("paper_readiness") or 0.0)
+        base = float(row.get("paper_select_score_base") or fs * ready)
+        btot = float(row.get("paper_select_score_bonus_total") or 0.0)
+        psel = float(row.get("paper_select_score") or 0.0)
+        print(
+            f"{term:22} | {p_bef:5d} | {panch:12} | {a_sc:4.2f} | {rk_i:2d} | {pb:14} | {ml:^2} | "
+            f"{'T' if ex else 'F':^2} | {fs:4.3f} | {ready:5.3f} | {base:5.3f} | {btot:+6.3f} | {psel:5.3f}"
+        )
+
+
+def _print_stage3_paper_pool_penalty_audit(ordered: List[Dict[str, Any]], top_n: int = 16) -> None:
+    """eligible 内 paper 排序键分解：底分、加性 bonus、**池规模惩罚**、最终 p_sel（与 centrality 同序）。"""
+    if not STAGE3_PAPER_CUTOFF_AUDIT or not ordered:
+        return
+    rows = sorted(
+        ordered,
+        key=lambda x: float(x.get("paper_select_score") or 0.0),
+        reverse=True,
+    )[:top_n]
+    print("\n" + "-" * 80)
+    print(
+        "[Stage3 paper pool penalty audit] eligible · base + bonus − pool_penalty(log10 papers) → p_sel "
+        f"(enabled={PAPER_SELECT_POOL_PENALTY_ENABLED}, coef={PAPER_SELECT_POOL_PENALTY_LOG_COEF}, "
+        f"max={PAPER_SELECT_POOL_PENALTY_MAX})"
+    )
+    print("-" * 80)
+    print(
+        "term                  | papers_bef | base  | +bonus | -pool_pen | p_sel"
+    )
+    print("-" * 80)
+    for row in rows:
+        term = str(row.get("term") or "")[:22]
+        pbf = int(
+            row.get("paper_select_pool_size")
+            or row.get("papers_before_filter")
+            or row.get("degree_w")
+            or 0
+        )
+        base = float(row.get("paper_select_score_base") or 0.0)
+        btot = float(row.get("paper_select_score_bonus_total") or 0.0)
+        ppen = float(row.get("paper_select_pool_penalty") or 0.0)
+        psel = float(row.get("paper_select_score") or 0.0)
+        print(
+            f"{term:22} | {pbf:10d} | {base:5.3f} | {btot:+6.3f} | {-ppen:9.3f} | {psel:5.3f}"
+        )
+
+
+def _print_stage3_eligible_core_close_call_audit(
+    ordered: List[Dict[str, Any]],
+    top_n: int = 18,
+) -> None:
+    """
+    eligible 内 **stage3_bucket=core** 按 paper_select_score 名次截取：显式 p_sel_base / bonus / total，
+    便于判断截断附近是底分还是加性项（含 anchor_score_bonus）在抬位。
+    """
+    if not STAGE3_PAPER_CUTOFF_AUDIT or not ordered:
+        return
+    core_rows = [
+        r
+        for r in ordered
+        if (r.get("stage3_bucket") or "").strip().lower() == "core"
+    ]
+    if not core_rows:
+        return
+    core_rows = core_rows[:top_n]
+    print("\n" + "-" * 80)
+    print(
+        "[Stage3 eligible core close-call audit] "
+        "eligible core by paper_select rank — p_sel_base / p_sel_bonus / p_sel_total vs final×ready"
+    )
+    print("-" * 80)
+    print(
+        "term              | final | ready | p_sel_base | p_sel_bonus | p_sel_total | "
+        "parent_anch  | a_sc | rk"
+    )
+    print("-" * 80)
+    for row in core_rows:
+        term = str(row.get("term") or "")[:16]
+        fs = float(row.get("final_score") or 0.0)
+        ready = float(row.get("paper_readiness") or 0.0)
+        pb = float(row.get("paper_select_score_base") or fs * ready)
+        pbon = float(row.get("paper_select_score_bonus_total") or 0.0)
+        ptot = float(row.get("paper_select_score") or 0.0)
+        panch = str(row.get("parent_anchor") or "")[:12]
+        if not panch and row.get("parent_anchors"):
+            panch = str((row.get("parent_anchors") or [""])[0])[:12]
+        a_sc = float(
+            row.get("best_parent_anchor_final_score")
+            or row.get("parent_anchor_final_score")
+            or 0.0
+        )
+        rk_raw = row.get("best_parent_anchor_step2_rank")
+        if rk_raw is None:
+            rk_raw = row.get("parent_anchor_step2_rank")
+        rk_i = int(rk_raw) if rk_raw is not None else 999
+        print(
+            f"{term:16} | {fs:5.3f} | {ready:5.3f} | {pb:10.3f} | {pbon:+11.3f} | "
+            f"{ptot:11.3f} | {panch:12} | {a_sc:4.2f} | {rk_i:2d}"
+        )
+
+
+def _print_stage3_paper_main_axis_gate_audit(records: List[Dict[str, Any]]) -> None:
+    """
+    全量 input 顺序：每条是否因「非 JD 全局主轴父锚」在进 eligible 前被挡；对照 RL / robotic arm 等仍存活原因。
+    """
+    if not STAGE3_PAPER_CUTOFF_AUDIT or not records:
+        return
+    print("\n" + "-" * 80)
+    print(
+        "[Stage3 paper main-axis gate audit] core → 父锚 (rk≤MAX) ∨ (a_sc≥MIN) 过门；双不达仍拒；非 core 跳过本门"
+    )
+    print(
+        f"  (STAGE3_PAPER_MAIN_AXIS_GATE_ENABLED={STAGE3_PAPER_MAIN_AXIS_GATE_ENABLED}, "
+        f"MAX_RANK={STAGE3_PAPER_MAIN_AXIS_MAX_RANK}, MIN_SCORE={STAGE3_PAPER_MAIN_AXIS_MIN_SCORE})"
+    )
+    print("-" * 80)
+    print(
+        "term                  | bucket | parent_anchor  | a_sc | rk | axis_pass | reason"
+    )
+    print("-" * 80)
+    for rec in records:
+        term = str(rec.get("term") or "")[:22]
+        bucket = str(rec.get("stage3_bucket") or "")[:6]
+        panch = str(rec.get("parent_anchor") or "")[:12]
+        if not panch and rec.get("parent_anchors"):
+            panch = str((rec.get("parent_anchors") or [""])[0])[:12]
+        a_sc = float(
+            rec.get("best_parent_anchor_final_score")
+            or rec.get("parent_anchor_final_score")
+            or 0.0
+        )
+        rk_raw = rec.get("best_parent_anchor_step2_rank")
+        if rk_raw is None:
+            rk_raw = rec.get("parent_anchor_step2_rank")
+        rk = int(rk_raw) if rk_raw is not None else 999
+        ap = rec.get("paper_main_axis_gate_pass")
+        if ap is None:
+            axis_cell = "n/a"
+            reason = str(rec.get("paper_reject_reason") or rec.get("paper_cutoff_reason") or "")[
+                :28
+            ]
+        else:
+            axis_cell = str(bool(ap))[:9]
+            reason = str(rec.get("paper_main_axis_gate_reason") or "")[:28]
+        print(
+            f"{term:22} | {bucket:6} | {panch:12} | {a_sc:4.2f} | {rk:2d} | {axis_cell:9} | {reason}"
+        )
+
+
+def _print_stage3_paper_gate_summary(
+    *,
+    core_at_main_axis_gate: int,
+    axis_direct_core: int,
+    support_pool_n: int,
+    merged_eligible_n: int,
+    blocked_support: int,
+    blocked_risky: int,
+    support_soft_admit: int = 0,
+    core_axis_near_miss_soft_admit: int = 0,
+) -> None:
+    """
+    一眼区分：paper 入口收窄来自「前置硬挡」还是「合并后排序/配额/floor」。
+    - axis_direct_core：过主轴门、进 primary 槽参与排序的 core 条数（合并前在 eligible 主干）。
+    - support_pool_n：含 support 统一下池、core 主轴 near-miss 降级、risky 保守入池等（合并前）。
+    merged_eligible_n：eligible.extend(support_pool) 后总长（readiness / paper_select_score 的输入规模）。
+    """
+    if not STAGE3_PAPER_CUTOFF_AUDIT:
+        return
+    print(
+        f"[Stage3 paper gate summary] core_at_main_axis_gate={core_at_main_axis_gate} "
+        f"axis_direct_core={axis_direct_core} "
+        f"support_pool_n={support_pool_n} "
+        f"merged_eligible_n={merged_eligible_n} "
+        f"support_soft_admit(weak_sup)={support_soft_admit} "
+        f"core_axis_near_miss_soft_admit={core_axis_near_miss_soft_admit} "
+        f"blocked_main_axis_hard=0 "
+        f"blocked_support={blocked_support} "
+        f"blocked_risky={blocked_risky}"
+    )
+
+
+def _print_stage3_paper_gate_reject_audit(counts: Dict[str, int]) -> None:
+    """进合并池之前的前置门：按 reject/cutoff 原因聚合计数（解释 survivors 为何没进 merged eligible）。"""
+    if not STAGE3_PAPER_CUTOFF_AUDIT or not counts:
+        return
+    parts = [f"{k}={v}" for k, v in sorted(counts.items(), key=lambda x: (-x[1], x[0]))]
+    print(f"[Stage3 paper gate reject audit] " + " ".join(parts))
+
+
+def _print_stage3_support_soft_admit_audit(rows: List[Dict[str, Any]]) -> None:
+    """weak_support_contamination 路径：谁被软放进 eligible、谁仍被硬挡。"""
+    if not STAGE3_PAPER_CUTOFF_AUDIT or not rows:
+        return
+    print("\n" + "-" * 80)
+    print(
+        "[Stage3 support soft-admit audit] weak_support_contamination 路径 · "
+        f"SUPPORT_TO_PAPER_ENABLED={SUPPORT_TO_PAPER_ENABLED}"
+    )
+    print("-" * 80)
+    hdr = (
+        "term                 | pbucket        | ml | exp | psf  | p_bef | "
+        "admitted | reason"
+    )
+    print(hdr)
+    print("-" * 80)
+    for r in rows:
+        t = str(r.get("term") or "")[:20]
+        pb = str(r.get("primary_bucket") or "")[:14]
+        ml = int(r.get("mainline_hits") or 0)
+        ex = "T" if r.get("can_expand") else "F"
+        psf = float(r.get("paper_support_factor") or 0.0)
+        pbf = int(r.get("papers_before") or 0)
+        adm = str(bool(r.get("admitted")))[:5]
+        rs = str(r.get("support_reason") or r.get("block_reason") or "")[:40]
+        print(
+            f"{t:20} | {pb:14} | {ml:^2} | {ex:^3} | {psf:4.2f} | {pbf:5d} | "
+            f"{adm:8} | {rs}"
+        )
+
+
+def _print_stage3_paper_quota_audit(
+    selected: List[Dict[str, Any]],
+    max_terms: int,
+    support_cap: int,
+    support_quota_full_cnt: int,
+) -> None:
+    """最终入选里 core/support 计数与 support 配额触顶次数。"""
+    if not STAGE3_PAPER_CUTOFF_AUDIT:
+        return
+    n_primary_lane = sum(
+        1 for r in selected if (r.get("paper_recall_quota_lane") or "") == "primary"
+    )
+    n_support_lane = sum(
+        1 for r in selected if (r.get("paper_recall_quota_lane") or "") == "support"
+    )
+    print(
+        f"[Stage3 paper quota audit] max_terms={max_terms} support_cap={support_cap} "
+        f"selected_total={len(selected)} selected_primary_lane={n_primary_lane} "
+        f"selected_support_lane={n_support_lane} "
+        f"support_quota_full_count={support_quota_full_cnt}"
+    )
 
 
 def _print_stage3_paper_near_miss_audit(
@@ -406,10 +810,16 @@ def _print_stage3_paper_near_miss_audit(
         f"  floor={floor:.4f} min_selected_p_sel={min_sel:.4f} fifth_selected={fifth:.4f}"
     )
     print("-" * 80)
-    print("term                 | final | ready | p_sel  | Δ末席  | a_sc | rk | reject/cutoff")
+    pa_hdr = "parent_anch"
+    print(
+        f"term                 | bkt  | pbucket      | final | ready | p_sel  | Δ末席  | "
+        f"a_sc | rk | {pa_hdr:^10} | sup_reason | reject/cutoff"
+    )
     print("-" * 80)
     for pss, rec, reason, delta in rows[:24]:
         t = (rec.get("term") or "")[:20]
+        bkt = str(rec.get("stage3_bucket") or "")[:4]
+        pbk = str(rec.get("primary_bucket") or "")[:12]
         fs = float(rec.get("final_score") or 0.0)
         rd = float(rec.get("paper_readiness") or 0.0)
         pas = float(
@@ -421,8 +831,13 @@ def _print_stage3_paper_near_miss_audit(
         if pr is None:
             pr = rec.get("parent_anchor_step2_rank")
         pr_i = int(pr) if pr is not None else 0
+        panch = str(rec.get("parent_anchor") or "")[:10]
+        if not panch and rec.get("parent_anchors"):
+            panch = str((rec.get("parent_anchors") or [""])[0])[:10]
+        sup_rs = str(rec.get("paper_support_reason") or "")[:18]
         print(
-            f"{t:20} | {fs:5.3f} | {rd:5.3f} | {pss:6.3f} | {delta:+6.3f} | {pas:4.2f} | {pr_i:2d} | {reason[:36]}"
+            f"{t:20} | {bkt:4} | {pbk:12} | {fs:5.3f} | {rd:5.3f} | {pss:6.3f} | {delta:+6.3f} | "
+            f"{pas:4.2f} | {pr_i:2d} | {panch:10} | {sup_rs:18} | {reason[:22]}"
         )
 
 
@@ -1618,6 +2033,150 @@ def _print_paper_term_selection_audit(ordered: List[Dict[str, Any]], limit: int 
             print(f"  paper_final_score_need={float(rec.get('paper_final_score_need')):.4f}")
         if rec.get("paper_grounding_need") is not None:
             print(f"  paper_grounding_need={rec.get('paper_grounding_need')!r}")
+        print(
+            f"  paper_anchor_score_norm={float(rec.get('paper_anchor_score_norm') or 0):.4f} "
+            f"paper_anchor_rank_smooth={float(rec.get('paper_anchor_rank_smooth') or 0):.4f} "
+            f"paper_anchor_prior={float(rec.get('paper_anchor_prior') or 0):.4f}"
+        )
+
+
+def _paper_gate_is_fallback_primary(rec: Dict[str, Any]) -> bool:
+    """与 select_terms_for_paper_recall 前置门一致的 fallback_primary 判定（供 tail expand 复用）。"""
+    fb = bool(rec.get("fallback_primary", False))
+    pb = (rec.get("primary_bucket") or "").strip().lower()
+    pr = (rec.get("primary_reason") or "").strip().lower()
+    return fb or pb == "primary_fallback_keep_no_expand" or pr == "anchor_core_fallback"
+
+
+def _apply_paper_recall_tail_expand(
+    selected: List[Dict[str, Any]],
+    ordered: List[Dict[str, Any]],
+    used_family: Set[str],
+    floor: float,
+    max_terms: int,
+) -> int:
+    """
+    主截断完成后：若已选词里出现「大池」命中（papers_before_filter 阈），从 near-miss 带再补 1~2 槽。
+    优先 core_axis_near_miss、再 support_seed，仍用 family 去重；不放宽 risky / fallback / conditioned_only。
+    """
+    if not PAPER_RECALL_TAIL_EXPAND_ENABLED or not ordered:
+        return 0
+    cap_total = max_terms + int(PAPER_RECALL_TAIL_EXPAND_MAX_EXTRA)
+    selected_big_pool = [
+        x
+        for x in selected
+        if float(x.get("papers_before_filter") or 0) >= float(PAPER_RECALL_BIG_POOL_PAPERS_MIN)
+    ]
+    if len(selected_big_pool) < int(PAPER_RECALL_BIG_POOL_SELECTED_MIN):
+        return 0
+
+    tail_candidates: List[Dict[str, Any]] = []
+    for rec in ordered:
+        if rec.get("selected_for_paper"):
+            continue
+        if _paper_gate_is_fallback_primary(rec):
+            continue
+        if _stage3_is_conditioned_only(rec):
+            continue
+        if (rec.get("stage3_bucket") or "").strip().lower() == "risky":
+            continue
+
+        p_sel = float(rec.get("paper_select_score") or 0.0)
+        if p_sel < float(floor) - float(PAPER_RECALL_TAIL_EXPAND_DELTA_MAX):
+            continue
+
+        bkt = (rec.get("stage3_bucket") or "").strip().lower()
+        pb = (rec.get("primary_bucket") or "").strip().lower()
+        if PAPER_RECALL_TAIL_EXPAND_REQUIRE_CORE_OR_SEED:
+            if not (bkt == "core" or pb == "primary_support_seed"):
+                continue
+
+        sup_rs = str(rec.get("paper_support_reason") or "")
+        if sup_rs.startswith("core_axis_near_miss"):
+            pri = 2
+        elif sup_rs.startswith("support_seed"):
+            pri = 1
+        else:
+            pri = 0
+        rec["_tail_expand_priority"] = pri
+        tail_candidates.append(rec)
+
+    tail_candidates.sort(
+        key=lambda x: (
+            int(x.get("_tail_expand_priority") or 0),
+            float(x.get("paper_select_score") or 0.0),
+            float(x.get("final_score") or 0.0),
+            int(x.get("mainline_hits") or 0),
+            1 if bool(x.get("can_expand") or x.get("can_expand_from_2a")) else 0,
+        ),
+        reverse=True,
+    )
+
+    extra_n = 0
+    for rec in tail_candidates:
+        if extra_n >= int(PAPER_RECALL_TAIL_EXPAND_MAX_EXTRA):
+            break
+        if len(selected) >= cap_total:
+            break
+        fam = str(rec.get("family_key") or "").strip()
+        if not fam:
+            fam = build_family_key(rec)
+            rec["family_key"] = fam
+        if fam and fam in used_family:
+            continue
+
+        lane = str(rec.get("paper_recall_quota_lane") or "")
+        rec["selected_for_paper"] = True
+        rec["paper_reject_reason"] = ""
+        rec["paper_cutoff_reason"] = "tail_expand_after_big_pool_core"
+        rec["select_reason"] = "tail_expand_after_big_pool_core"
+        rec["retrieval_role"] = "paper_primary" if lane == "primary" else "paper_support"
+        used_family.add(fam)
+        selected.append(rec)
+        extra_n += 1
+        rec.pop("_tail_expand_priority", None)
+
+    for rec in tail_candidates:
+        rec.pop("_tail_expand_priority", None)
+
+    return extra_n
+
+
+def _print_stage3_tail_expand_audit(
+    extra_n: int,
+    floor: float,
+    selected_before: int,
+    selected_big_pool_n: int,
+) -> None:
+    if not STAGE3_PAPER_CUTOFF_AUDIT:
+        return
+    print(
+        f"\n[Stage3 tail expand audit] enabled={PAPER_RECALL_TAIL_EXPAND_ENABLED} "
+        f"extra_added={extra_n} floor={floor:.4f} selected_before={selected_before} "
+        f"big_pool_selected={selected_big_pool_n} "
+        f"(papers≥{PAPER_RECALL_BIG_POOL_PAPERS_MIN}, "
+        f"Δ≤{PAPER_RECALL_TAIL_EXPAND_DELTA_MAX}, max_extra={PAPER_RECALL_TAIL_EXPAND_MAX_EXTRA})"
+    )
+
+
+def _support_to_paper_quota_cap(max_terms: int) -> int:
+    """最终 paper terms 中最多入选几条 stage3_bucket=support（与 max_terms 成比例）。"""
+    if not SUPPORT_TO_PAPER_ENABLED or max_terms <= 0:
+        return 0
+    return min(SUPPORT_TO_PAPER_MAX, int(max_terms * SUPPORT_TO_PAPER_MAX_FRAC))
+
+
+def _paper_select_pool_size_for_penalty(rec: Dict[str, Any]) -> int:
+    """词汇侧论文池规模：优先 `papers_before_filter`，否则 `degree_w`；至少 1 避免 log(0)。"""
+    for key in ("papers_before_filter", "degree_w"):
+        v = rec.get(key)
+        if v is None:
+            continue
+        try:
+            return max(1, int(v))
+        except (TypeError, ValueError):
+            continue
+    return 1
 
 
 def _paper_grounding_score(rec: Dict[str, Any]) -> float:
@@ -1638,11 +2197,122 @@ def _paper_grounding_score(rec: Dict[str, Any]) -> float:
     )
 
 
+def _compute_paper_select_score(row: Dict[str, Any]) -> float:
+    """
+    仅用于 Stage3 **论文检索词**排序键（`paper_select_score`）。
+    在 **`final_score × paper_readiness`** 底分上：**加性** Stage2 结构 bonus − **对数型候选池规模惩罚**（见 `PAPER_SELECT_POOL_PENALTY_*`）。
+    **不修改** `final_score`，不回头改 Stage2。
+    """
+    # 与 tid 合并字段对齐，便于日志与外部工具读 `parent_anchor_final_score` / `parent_anchor_step2_rank`
+    if row.get("parent_anchor_final_score") is None and row.get("best_parent_anchor_final_score") is not None:
+        try:
+            row["parent_anchor_final_score"] = float(row["best_parent_anchor_final_score"])
+        except (TypeError, ValueError):
+            pass
+    if row.get("parent_anchor_step2_rank") is None and row.get("best_parent_anchor_step2_rank") is not None:
+        try:
+            row["parent_anchor_step2_rank"] = int(row["best_parent_anchor_step2_rank"])
+        except (TypeError, ValueError):
+            pass
+
+    fs = float(row.get("final_score") or 0.0)
+    ready = float(row.get("paper_readiness") or 0.0)
+
+    parent_anchor_score = float(
+        row.get("best_parent_anchor_final_score")
+        or row.get("parent_anchor_final_score")
+        or 0.0
+    )
+    parent_anchor_rank = int(
+        row.get("best_parent_anchor_step2_rank")
+        or row.get("parent_anchor_step2_rank")
+        or 999
+    )
+
+    mainline_hits = int(row.get("mainline_hits") or 0)
+    can_expand = bool(row.get("can_expand_from_2a", False) or row.get("can_expand", False))
+    primary_bucket = (row.get("primary_bucket") or "").strip().lower()
+    term_role = (row.get("term_role") or "").strip().lower()
+
+    base = fs * ready
+
+    bucket_bonus = 0.0
+    if primary_bucket == "primary_expandable":
+        bucket_bonus = PAPER_SELECT_BUCKET_BONUS_EXPANDABLE
+    elif primary_bucket == "primary_support_seed":
+        bucket_bonus = PAPER_SELECT_BUCKET_BONUS_SUPPORT_SEED
+    elif primary_bucket == "primary_support_keep":
+        bucket_bonus = PAPER_SELECT_BUCKET_PENALTY_SUPPORT_KEEP
+    elif primary_bucket == "risky_keep":
+        bucket_bonus = PAPER_SELECT_BUCKET_PENALTY_RISKY_KEEP
+    elif primary_bucket in {"primary_keep_no_expand", "primary_fallback_keep_no_expand"}:
+        bucket_bonus = PAPER_SELECT_BUCKET_PENALTY_SUPPORT_KEEP
+
+    mainline_bonus = (
+        PAPER_SELECT_BONUS_MAINLINE_HIT if mainline_hits > 0 else PAPER_SELECT_PENALTY_MAINLINE_NONE
+    )
+    expand_bonus = (
+        PAPER_SELECT_BONUS_CAN_EXPAND if can_expand else PAPER_SELECT_PENALTY_NO_EXPAND
+    )
+
+    if parent_anchor_rank <= 3:
+        anchor_rank_bonus = PAPER_SELECT_RANK_BONUS_LE3
+    elif parent_anchor_rank <= 6:
+        anchor_rank_bonus = PAPER_SELECT_RANK_BONUS_LE6
+    elif parent_anchor_rank <= 10:
+        anchor_rank_bonus = PAPER_SELECT_RANK_BONUS_LE10
+    else:
+        anchor_rank_bonus = 0.0
+
+    anchor_score_norm = (
+        max(0.0, min(1.0, parent_anchor_score / PAPER_SELECT_SCORE_ANCHOR_NORM))
+        if parent_anchor_score > 0
+        else 0.0
+    )
+    anchor_score_bonus = PAPER_SELECT_ANCHOR_SCORE_BONUS_COEF * anchor_score_norm
+
+    role_bonus = 0.0
+    if term_role == "primary":
+        role_bonus = PAPER_SELECT_ROLE_BONUS_PRIMARY
+    elif term_role == "primary_side":
+        role_bonus = PAPER_SELECT_ROLE_PENALTY_PRIMARY_SIDE
+    elif term_role == "dense_expansion":
+        role_bonus = PAPER_SELECT_ROLE_PENALTY_DENSE_EXP
+
+    bonus_total = (
+        bucket_bonus
+        + mainline_bonus
+        + expand_bonus
+        + anchor_rank_bonus
+        + anchor_score_bonus
+        + role_bonus
+    )
+
+    pool_size = _paper_select_pool_size_for_penalty(row)
+    pool_penalty = 0.0
+    if PAPER_SELECT_POOL_PENALTY_ENABLED:
+        pool_penalty = min(
+            float(PAPER_SELECT_POOL_PENALTY_MAX),
+            float(PAPER_SELECT_POOL_PENALTY_LOG_COEF) * math.log10(float(pool_size)),
+        )
+    score = base + bonus_total - pool_penalty
+
+    row["paper_select_pool_size"] = int(pool_size)
+    row["paper_select_pool_penalty"] = float(pool_penalty)
+    row["paper_select_score_base"] = float(base)
+    row["paper_select_score_bonus_total"] = float(bonus_total)
+
+    return max(score, 0.0)
+
+
 def _apply_paper_readiness_for_recall(rec: Dict[str, Any]) -> None:
     """
     Paper 选词序专用乘子（不改 final_score）：stage3 结构字段 + **Step2 锚点主线强度**（无词表）。
-    - `best_parent_anchor_final_score`：tid 合并时对各来源 `parent_anchor_final_score` 取 max（对应 JD 里更强的工业锚）。
-    - 无分则 `best_parent_anchor_step2_rank`（Step2 列表名次，1 最强）→ 递减式 rank prior。
+    - **锚点先验**：同时读 `best_parent_anchor_final_score` 与 `best_parent_anchor_step2_rank`；
+      `anchor_score_norm` 主导，`rank_smooth=1/(1+λ·max(rank-1,0))` 仅轻量调和；再
+      `readiness *= (blend_lo + blend_hi * anchor_prior)`，避免旧版「无分时 rank 单路倒数」压穿 paper。
+    - **core + mainline_hits≥1 + 可扩**：`paper_readiness` 不低于 **`PAPER_READINESS_CORE_MAINLINE_EXPAND_MIN`**，减轻 dynamic_floor 对主轴词的误杀。
+    - **`paper_select_score`** 不在此函数内做简单乘法，而在写入 readiness 后交给 **`_compute_paper_select_score`**（底分×ready + Stage2 结构加性项）。
     """
     paper_readiness = 1.0
     bucket = (rec.get("stage3_bucket") or "").strip().lower()
@@ -1682,33 +2352,51 @@ def _apply_paper_readiness_for_recall(rec: Dict[str, Any]) -> None:
     # 7) grounding proxy：越像可落 paper 项越保留
     paper_readiness *= 0.82 + 0.18 * paper_grounding
 
-    # 8) 锚点主线先验：同结构下区分「背后锚是 JD 主轴」vs「弱锚/加分锚」（解决 ready 同化）
-    best_fs = float(
+    # 8) 锚点主线先验：**以 parent 锚点分为准**，Step2 名次只做轻平滑；再线性混入 readiness（(rank) 不再单独主导整条乘子链）
+    anchor_score = float(
         rec.get("best_parent_anchor_final_score")
         or rec.get("parent_anchor_final_score")
         or 0.0
     )
-    if best_fs > 1e-6:
-        apn = max(
-            0.0,
-            min(1.0, best_fs / PAPER_READINESS_ANCHOR_SCORE_NORM),
-        )
-        anchor_prior_mult = PAPER_READINESS_ANCHOR_PRIOR_LO + PAPER_READINESS_ANCHOR_PRIOR_HI * apn
-    else:
-        ar = int(
-            rec.get("best_parent_anchor_step2_rank")
-            or rec.get("parent_anchor_step2_rank")
-            or 999
-        )
-        anchor_prior_mult = 1.0 / (
-            1.0 + PAPER_READINESS_ANCHOR_RANK_LAMBDA * max(0, ar - 1)
-        )
+    anchor_rank = int(
+        rec.get("best_parent_anchor_step2_rank")
+        or rec.get("parent_anchor_step2_rank")
+        or 999
+    )
+    anchor_score_norm = max(
+        0.0,
+        min(1.0, anchor_score / PAPER_READINESS_ANCHOR_SCORE_NORM),
+    )
+    rank_smooth = 1.0 / (
+        1.0
+        + PAPER_READINESS_ANCHOR_RANK_SMOOTH_LAMBDA * max(anchor_rank - 1, 0)
+    )
+    anchor_prior = (
+        PAPER_READINESS_ANCHOR_PRIOR_W_SCORE * anchor_score_norm
+        + PAPER_READINESS_ANCHOR_PRIOR_W_RANK * rank_smooth
+    )
+    anchor_prior_mult = (
+        PAPER_READINESS_ANCHOR_READINESS_BLEND_LO
+        + PAPER_READINESS_ANCHOR_READINESS_BLEND_HI * anchor_prior
+    )
     paper_readiness *= anchor_prior_mult
+    rec["paper_anchor_score_norm"] = float(anchor_score_norm)
+    rec["paper_anchor_rank_smooth"] = float(rank_smooth)
+    rec["paper_anchor_prior"] = float(anchor_prior)
     rec["paper_anchor_prior_mult"] = float(anchor_prior_mult)
 
-    paper_select_score = float(rec.get("final_score") or 0.0) * paper_readiness
+    # 9) 主线可扩 core 保底：避免锚先验与连乘把「paper 主轴词」ready 压过低以至触发 below_dynamic_floor（非 RL 专惠，靠 bucket+ml+exp 结构）
+    if bucket == "core" and mainline_hits >= 1 and can_expand:
+        paper_readiness = max(paper_readiness, float(PAPER_READINESS_CORE_MAINLINE_EXPAND_MIN))
+
+    # 10) support 软放行：在 `select_terms_for_paper_recall` 已写入 `paper_support_factor`(<1) 时压低 readiness，再进入底分×bonus−pool
+    psf = float(rec.get("paper_support_factor") or 1.0)
+    if psf < 1.0 - 1e-9:
+        paper_readiness *= psf
+
     rec["paper_readiness"] = float(paper_readiness)
-    rec["paper_select_score"] = float(paper_select_score)
+    # paper 赛道最终排序键：底分×readiness + Stage2 主线/父锚/role 轻量加性项（见 _compute_paper_select_score）
+    rec["paper_select_score"] = float(_compute_paper_select_score(rec))
 
 
 def select_terms_for_paper_recall(
@@ -1717,14 +2405,22 @@ def select_terms_for_paper_recall(
 ) -> List[Dict[str, Any]]:
     """
     Paper 召回选词（重写）：
-    - 仍阻断：conditioned_only + 单锚、fallback_primary（与 Stage2A 漂移锚对齐，纯安全网）。
-    - **弱 support 结构门**（见 STAGE3_PAPER_SUPPORT_*）：在进 eligible 前拦截「support + primary_support_*」
-      且锚/主线/grounding/可扩/conditioned 结构薄弱 的词；统一分只管排序，本门管「该不该上 paper bridge」。
-    - **risky_side_block**（STAGE3_PAPER_RISKY_SIDE_*）：`stage3_bucket=risky` 且不可扩、无 mainline 命中、
-      **`term_role` 为 side/expansion** 的词不进 paper，避免 motion controller 类尾词靠分+floor 混入。
-    - **eligible 内主排序键**：`paper_select_score = final_score * paper_readiness`（readiness = 结构连乘 × **Step2 锚点分/名次先验**，无词表）；
-      仍 **family_key 去重** + **dynamic_floor（与 paper_select_score 同尺度）** + **topN**。
-    - `final_score` 仍为 Stage3 全局统一分；paper 侧分离「背后锚是否 JD 主轴」主要靠在 readiness 中显式吃进 **`best_parent_anchor_*`**。
+    - 仍**硬挡**（真坏词）：`conditioned_only`+单锚、`fallback_primary`；**`weak_support_contamination`** 且未满足软放行；
+      **`risky_side_block`**（STAGE3_PAPER_RISKY_SIDE_*）。`paper_select_score` **只在合并后的 eligible 内排序**，
+      不应承担「先把绝大多数字死在 eligible 外」的职责。
+    - **弱 support·contamination**（`STAGE3_PAPER_SUPPORT_*`）：默认硬挡；若 **`SUPPORT_TO_PAPER_ENABLED`** 且结构达标，
+      **`support_pool`** + **`paper_support_factor`**（readiness 折扣），见 **`support_seed_soft_admit` / `support_keep_soft_admit`**。
+    - **JD 全局主轴门**（`STAGE3_PAPER_MAIN_AXIS_*`，**仅 core**）：**`rk≤MAX ∨ a_sc≥MIN`** 过门者
+      **`paper_recall_quota_lane=primary`**，直接进排序主干；**双弱不再硬拒**，改为 **`core_axis_near_miss_soft_admit`**：
+      进 **`support_pool`**、×**`PAPER_CORE_AXIS_NEAR_MISS_FACTOR`**、`paper_recall_quota_lane=support`。
+      ——与 Stage2「可保留但不扩散」对齐：**不扩散 ≠ 禁止参与 paper 竞争**；扩散步仍由 2A/2B 控制。
+    - **除过门 core 外**：凡未触上述硬挡者，**统一经 `support_pool` 合并**（干净 **support**、`risky` 保守 lanes、其它少见桶），
+      再 **`eligible.extend(support_pool)`**；最终 **`support_cap`** 对 **`paper_recall_quota_lane==support`** 计配额，
+      **`retrieval_role`**：`primary` lane → `paper_primary`，否则 `paper_support`。
+    - **排序**：`paper_select_score` = 底分 × readiness + 加性 bonus − 池惩罚；**family** + **dynamic_floor** + **topN**。
+    - **尾部补位**（**`PAPER_RECALL_TAIL_EXPAND_*`**）：主截断完成后，若已选词里 **`papers_before_filter≥BIG_POOL_MIN`** 至少 **`BIG_POOL_SELECTED_MIN`** 条，
+      从未入选的 **near-miss**（**`p_sel≥floor−Δ`**）中再补最多 **`TAIL_EXPAND_MAX_EXTRA`** 条 **core / primary_support_seed**（禁 risky / fallback / conditioned_only），
+      仍 **family** 去重；见 **`[Stage3 tail expand audit]`**。不修改 gate 与 `paper_select_score` 定义。
     """
     if not records:
         return []
@@ -1733,6 +2429,14 @@ def select_terms_for_paper_recall(
     selected: List[Dict[str, Any]] = []
 
     eligible: List[Dict[str, Any]] = []
+    support_pool: List[Dict[str, Any]] = []
+    support_soft_audit_rows: List[Dict[str, Any]] = []
+    gate_reject_counts: Dict[str, int] = defaultdict(int)
+    blocked_support_cnt = 0
+    blocked_risky_cnt = 0
+    core_at_main_axis_gate_cnt = 0
+    weak_support_soft_admit_cnt = 0
+    core_axis_near_miss_soft_admit_cnt = 0
     for rec in records:
         anchor_count = int(rec.get("anchor_count") or 1) or 1
         primary_bucket = (rec.get("primary_bucket") or "").strip().lower()
@@ -1760,11 +2464,13 @@ def select_terms_for_paper_recall(
         if conditioned_only and anchor_count <= 1:
             rec["paper_reject_reason"] = "conditioned_only_single_anchor_block"
             rec["paper_cutoff_reason"] = "conditioned_only_single_anchor_block"
+            gate_reject_counts["conditioned_only_single_anchor_block"] += 1
             continue
 
         if is_fallback_primary:
             rec["paper_reject_reason"] = "fallback_primary_block"
             rec["paper_cutoff_reason"] = "fallback_primary_block"
+            gate_reject_counts["fallback_primary_block"] += 1
             continue
 
         # ---- weak support contamination：入 eligible 前的结构 gate（复用 _paper_grounding_score）----
@@ -1800,9 +2506,64 @@ def select_terms_for_paper_recall(
             )
         )
         if weak_support_contamination:
+            mainline_candidate = bool(rec.get("mainline_candidate"))
+            allow_soft = False
+            support_factor = 1.0
+            support_reason = ""
+            if SUPPORT_TO_PAPER_ENABLED:
+                if pb == "primary_support_seed":
+                    allow_soft = True
+                    support_factor = float(PAPER_SUPPORT_SEED_FACTOR)
+                    support_reason = "support_seed_soft_admit"
+                elif pb == "primary_support_keep" and (
+                    mainline_candidate or mainline_hits >= 1 or can_expand
+                ):
+                    allow_soft = True
+                    support_factor = float(PAPER_SUPPORT_KEEP_FACTOR)
+                    support_reason = "support_keep_soft_admit"
+            pool_sz = _paper_select_pool_size_for_penalty(rec)
+            if allow_soft:
+                rec["paper_support_gate"] = "support_soft_admit"
+                rec["paper_support_factor"] = float(support_factor)
+                rec["paper_support_reason"] = support_reason
+                rec["paper_recall_quota_lane"] = "support"
+                fk = rec.get("family_key") or build_family_key(rec)
+                rec["family_key"] = fk
+                support_pool.append(rec)
+                weak_support_soft_admit_cnt += 1
+                if STAGE3_PAPER_CUTOFF_AUDIT:
+                    support_soft_audit_rows.append(
+                        {
+                            "term": rec.get("term") or "",
+                            "primary_bucket": pb,
+                            "mainline_hits": mainline_hits,
+                            "can_expand": can_expand,
+                            "paper_support_factor": support_factor,
+                            "support_reason": support_reason,
+                            "papers_before": pool_sz,
+                            "admitted": True,
+                        }
+                    )
+                continue
             rec["paper_support_gate"] = "weak_support_contamination_block"
             rec["paper_reject_reason"] = "weak_support_contamination_block"
             rec["paper_cutoff_reason"] = "weak_support_contamination_block"
+            blocked_support_cnt += 1
+            gate_reject_counts["weak_support_contamination_block"] += 1
+            if STAGE3_PAPER_CUTOFF_AUDIT:
+                support_soft_audit_rows.append(
+                    {
+                        "term": rec.get("term") or "",
+                        "primary_bucket": pb,
+                        "mainline_hits": mainline_hits,
+                        "can_expand": can_expand,
+                        "paper_support_factor": 0.0,
+                        "support_reason": "",
+                        "papers_before": pool_sz,
+                        "admitted": False,
+                        "block_reason": "weak_support_contamination_block",
+                    }
+                )
             continue
 
         # ---- risky side / expansion 尾词：非主线、无 ml、不可扩，仅靠分数+floor 会混进 paper_support ----
@@ -1819,15 +2580,100 @@ def select_terms_for_paper_recall(
             rec["paper_support_gate"] = "risky_side_block"
             rec["paper_reject_reason"] = "risky_side_block"
             rec["paper_cutoff_reason"] = "risky_side_block"
+            blocked_risky_cnt += 1
+            gate_reject_counts["risky_side_block"] += 1
             continue
 
-        rec["paper_support_gate"] = "pass"
+        # ---- JD 全局主轴门：core 须 rk∨a_sc 达线；过线 → primary lane；双弱 → support_pool（near-miss），不再整词硬拒 ----
+        parent_anchor_score = float(
+            rec.get("best_parent_anchor_final_score")
+            or rec.get("parent_anchor_final_score")
+            or 0.0
+        )
+        prk = rec.get("best_parent_anchor_step2_rank")
+        if prk is None:
+            prk = rec.get("parent_anchor_step2_rank")
+        parent_anchor_rank = int(prk) if prk is not None else 999
+        if STAGE3_PAPER_MAIN_AXIS_GATE_ENABLED and bucket == "core":
+            core_at_main_axis_gate_cnt += 1
+            # 单侧强证据即过（OR）；rk 与 a_sc 皆弱则与旧 AND 相同仍拒
+            core_main_axis_gate = (
+                (parent_anchor_rank <= STAGE3_PAPER_MAIN_AXIS_MAX_RANK)
+                or (parent_anchor_score >= STAGE3_PAPER_MAIN_AXIS_MIN_SCORE)
+            )
+            rec["paper_main_axis_gate_pass"] = bool(core_main_axis_gate)
+            if core_main_axis_gate:
+                rec["paper_main_axis_gate_reason"] = ""
+            else:
+                rec["paper_main_axis_gate_pass"] = False
+                rec["paper_main_axis_gate_reason"] = "core_axis_near_miss_soft_admit"
+                rec["core_axis_soft_admit_to_support"] = True
+                rec["paper_support_gate"] = "core_axis_near_miss_soft_admit"
+                rec["paper_support_factor"] = float(PAPER_CORE_AXIS_NEAR_MISS_FACTOR)
+                rec["paper_support_reason"] = "core_axis_near_miss_soft_admit"
+                rec["paper_recall_quota_lane"] = "support"
+                fk = rec.get("family_key") or build_family_key(rec)
+                rec["family_key"] = fk
+                support_pool.append(rec)
+                core_axis_near_miss_soft_admit_cnt += 1
+                continue
+        else:
+            rec["paper_main_axis_gate_pass"] = True
+            rec["paper_main_axis_gate_reason"] = ""
 
         fk = rec.get("family_key") or build_family_key(rec)
         rec["family_key"] = fk
-        eligible.append(rec)
+        if bucket == "core":
+            # 仅过主轴门的 core
+            rec["paper_support_gate"] = "pass"
+            rec["paper_recall_quota_lane"] = "primary"
+            rec.pop("core_axis_soft_admit_to_support", None)
+            eligible.append(rec)
+        elif bucket == "support":
+            if rec.get("paper_support_factor") is None:
+                rec["paper_support_factor"] = 1.0
+            rec["paper_support_reason"] = rec.get("paper_support_reason") or "support_lane"
+            rec["paper_support_gate"] = "support_lane"
+            rec["paper_recall_quota_lane"] = "support"
+            rec.pop("core_axis_soft_admit_to_support", None)
+            support_pool.append(rec)
+        elif bucket == "risky":
+            rec["paper_support_factor"] = float(PAPER_RISKY_SUPPORT_LANE_FACTOR)
+            rec["paper_support_reason"] = "risky_support_lane"
+            rec["paper_support_gate"] = "risky_support_lane"
+            rec["paper_recall_quota_lane"] = "support"
+            rec.pop("core_axis_soft_admit_to_support", None)
+            support_pool.append(rec)
+        else:
+            rec["paper_support_factor"] = float(
+                rec.get("paper_support_factor") or PAPER_FALLBACK_SUPPORT_LANE_FACTOR
+            )
+            rec["paper_support_reason"] = rec.get("paper_support_reason") or "fallback_support_lane"
+            rec["paper_support_gate"] = "fallback_support_lane"
+            rec["paper_recall_quota_lane"] = "support"
+            rec.pop("core_axis_soft_admit_to_support", None)
+            support_pool.append(rec)
 
-    # eligible 内：结构 readiness × final_score → paper 赛道排序（与全局 final_score 解耦）
+    axis_direct_core_n = len(eligible)
+    support_pool_n_pre = len(support_pool)
+    eligible.extend(support_pool)
+    merged_eligible_n = len(eligible)
+
+    _print_stage3_paper_gate_reject_audit(gate_reject_counts)
+    _print_stage3_support_soft_admit_audit(support_soft_audit_rows)
+    _print_stage3_paper_main_axis_gate_audit(records)
+    _print_stage3_paper_gate_summary(
+        core_at_main_axis_gate=core_at_main_axis_gate_cnt,
+        axis_direct_core=axis_direct_core_n,
+        support_pool_n=support_pool_n_pre,
+        merged_eligible_n=merged_eligible_n,
+        blocked_support=blocked_support_cnt,
+        blocked_risky=blocked_risky_cnt,
+        support_soft_admit=weak_support_soft_admit_cnt,
+        core_axis_near_miss_soft_admit=core_axis_near_miss_soft_admit_cnt,
+    )
+
+    # merged eligible：先算 readiness，再算 paper_select_score（含 Stage2 加性纠偏）
     for rec in eligible:
         _apply_paper_readiness_for_recall(rec)
 
@@ -1837,11 +2683,24 @@ def select_terms_for_paper_recall(
         key=lambda r: float(r.get("paper_select_score") or 0.0),
         reverse=True,
     )
+    _print_stage3_paper_centrality_audit(ordered, top_n=12)
+    _print_stage3_paper_pool_penalty_audit(ordered, top_n=16)
+    _print_stage3_eligible_core_close_call_audit(ordered, top_n=18)
 
+    support_cap = _support_to_paper_quota_cap(max_terms)
+    selected_support = 0
+    support_quota_full_cnt = 0
     for rec in ordered:
         pss = float(rec.get("paper_select_score") or 0.0)
         fk = str(rec.get("family_key") or "")
-        bucket = (rec.get("stage3_bucket") or "").strip().lower()
+        lane = str(rec.get("paper_recall_quota_lane") or "")
+        counts_to_support_cap = lane == "support"
+
+        if counts_to_support_cap and support_cap > 0 and selected_support >= support_cap:
+            rec["paper_reject_reason"] = "support_quota_full"
+            rec["paper_cutoff_reason"] = "support_quota_full"
+            support_quota_full_cnt += 1
+            continue
 
         if pss < floor:
             rec["paper_reject_reason"] = "below_dynamic_floor"
@@ -1856,11 +2715,32 @@ def select_terms_for_paper_recall(
         rec["selected_for_paper"] = True
         rec["paper_cutoff_reason"] = "top_n_paper_select_score"
         rec["select_reason"] = "paper_select_score_rank"
-        rec["retrieval_role"] = "paper_primary" if bucket == "core" else "paper_support"
+        rec["retrieval_role"] = (
+            "paper_primary" if lane == "primary" else "paper_support"
+        )
         used_family.add(fk)
         selected.append(rec)
+        if counts_to_support_cap:
+            selected_support += 1
         if len(selected) >= max_terms:
             break
+
+    # 大池词（如 RL）已进 final 时，主 cutoff 之后再补 1~2 个 near-miss core/seed，扩宽 term set；不动前置 gate 与 p_sel 公式。
+    selected_before_tail = len(selected)
+    selected_big_pool_n = len(
+        [
+            x
+            for x in selected
+            if float(x.get("papers_before_filter") or 0)
+            >= float(PAPER_RECALL_BIG_POOL_PAPERS_MIN)
+        ]
+    )
+    extra_tail = _apply_paper_recall_tail_expand(
+        selected, ordered, used_family, floor, max_terms
+    )
+    _print_stage3_tail_expand_audit(
+        extra_tail, floor, selected_before_tail, selected_big_pool_n
+    )
 
     # 提前填满 max_terms 后，后续名次仅差一轮标注（便于 cutoff 表读因）
     for rec in ordered:
@@ -1874,6 +2754,10 @@ def select_terms_for_paper_recall(
     # cutoff / narrow 表与真实选词序一致（eligible · paper_select_score）
     _print_stage3_paper_cutoff_audit(ordered, floor, max_terms)
     _print_stage3_paper_selection_narrow_audit(ordered)
+    _print_stage3_paper_quota_audit(
+        selected, max_terms, support_cap, support_quota_full_cnt
+    )
+    _print_stage3_paper_floor_block_audit(ordered, floor)
     _print_stage3_paper_near_miss_audit(ordered, selected, floor)
     _print_paper_term_selection_audit(
         sorted(
@@ -1917,7 +2801,7 @@ def stage3_build_score_map(survivors: List[Dict[str, Any]]) -> List[Dict[str, An
         rec["bucket_reason_flags"] = _collect_stage3_bucket_reason_flags(rec)
 
     if STAGE3_UNIFIED_SCORE_DEBUG:
-        _print_stage3_unified_breakdown(survivors, top_k=16)
+        _print_stage3_unified_breakdown(survivors)
 
     if DEBUG_LABEL_PATH:
         print("\n" + "-" * 80)

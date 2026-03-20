@@ -1662,41 +1662,76 @@ class LabelRecallPath:
         # 标签路追踪：source anchor、similar_to 原始候选（便于定位从哪一步开始跑偏）
         _label_trace = self.verbose or getattr(stage3_term_filtering, "LABEL_PATH_TRACE", False) or getattr(term_scoring, "STAGE3_DEBUG", False)
         if _label_trace:
-            # source anchor：本 query 的锚点（来自 Stage1）
-            _anchors = list(anchor_skills.keys())[:30] if anchor_skills else []
-            _anchor_preview = []
-            for k in _anchors:
+            na = len(anchor_skills or {})
+            _keys = list(anchor_skills.keys())[:5] if anchor_skills else []
+            _terms_short: List[str] = []
+            for k in _keys:
                 v = anchor_skills.get(k)
                 if isinstance(v, dict):
-                    _anchor_preview.append(f"{k}={v.get('term', v.get('skill', k))!r}")
+                    _terms_short.append(str(v.get("term", v.get("skill", k)))[:22])
                 else:
-                    _anchor_preview.append(str(k))
-            print("[标签路-source anchor] 锚点数量=%s 前30: %s" % (len(anchor_skills or {}), _anchor_preview[:20]))
-            # similar_to 原始候选：SIMILAR_TO 拉出的原始行（src_vid -> tid, term, sim_score）
+                    _terms_short.append(str(k)[:22])
+            _noisy = bool(getattr(label_expansion, "STAGE2_NOISY_DEBUG", False))
+            print(
+                "[标签路-source anchor] 数量=%s 预览(term 前5)=%s（全量 debug_info；键值明细开 STAGE2_NOISY_DEBUG）"
+                % (na, _terms_short)
+            )
+            if _noisy and anchor_skills:
+                _anchors = list(anchor_skills.keys())[:30]
+                _anchor_preview = []
+                for k in _anchors:
+                    v = anchor_skills.get(k)
+                    if isinstance(v, dict):
+                        _anchor_preview.append(f"{k}={v.get('term', v.get('skill', k))!r}")
+                    else:
+                        _anchor_preview.append(str(k))
+                print("  [标签路-source anchor 明细] 前30: %s" % (_anchor_preview[:20],))
             raw_rows = getattr(self.debug_info, "similar_to_raw_rows", None) or []
-            print("[标签路-similar_to 原始候选] 条数=%s" % len(raw_rows))
-            for i, r in enumerate(raw_rows[:25]):
-                print("  %s src_vid=%s tid=%s term=%r sim_score=%s" % (i + 1, r.get("src_vid"), r.get("tid"), (r.get("term") or "")[:28], r.get("sim_score")))
-            if len(raw_rows) > 25:
-                print("  ... 共 %s 条" % len(raw_rows))
+            sims = [float(r.get("sim_score") or 0.0) for r in raw_rows]
+            max_sim = max(sims) if sims else 0.0
+            print(
+                "[标签路-similar_to 原始候选] 条数=%s max_sim=%.3f（逐行见 debug_info；明细打印开 STAGE2_NOISY_DEBUG）"
+                % (len(raw_rows), max_sim)
+            )
+            if _noisy:
+                _sim_preview_n = 10
+                for i, r in enumerate(raw_rows[:_sim_preview_n]):
+                    print(
+                        "  %s src_vid=%s tid=%s term=%r sim_score=%s"
+                        % (
+                            i + 1,
+                            r.get("src_vid"),
+                            r.get("tid"),
+                            (r.get("term") or "")[:28],
+                            r.get("sim_score"),
+                        )
+                    )
+                if len(raw_rows) > _sim_preview_n:
+                    print("  ... 省略 %s 条" % (len(raw_rows) - _sim_preview_n))
             agg = getattr(self.debug_info, "similar_to_agg", None) or []
             pass_list = getattr(self.debug_info, "similar_to_pass", None) or []
-            print("[标签路-similar_to] 聚合后候选数=%s 领域过滤通过数=%s" % (len(agg), len(pass_list)))
-            # Stage2A 双路来源：term | sources | similar_to_score | conditioned_score | final_primary_score
+            print("[标签路-similar_to] 聚合=%s 领域通过=%s" % (len(agg), len(pass_list)))
             breakdown = getattr(self.debug_info, "stage2a_term_source_breakdown", None) or []
             if breakdown:
-                print("[Stage2A 双路来源] term | sources | similar_to_score | conditioned_score | final_primary_score")
-                for row in breakdown[:50]:
-                    term = (row.get("term") or "")[:32]
-                    srcs = ",".join(row.get("sources") or []) or "-"
-                    sim_s = row.get("similar_to_score")
-                    cond_s = row.get("conditioned_score")
-                    sim_str = "%.3f" % sim_s if sim_s is not None else "-"
-                    cond_str = "%.3f" % cond_s if cond_s is not None else "-"
-                    prim = row.get("final_primary_score") or 0
-                    print("  %s | %s | %s | %s | %.3f" % (term, srcs, sim_str, cond_str, prim))
-                if len(breakdown) > 50:
-                    print("  ... 共 %s 条" % len(breakdown))
+                if _noisy:
+                    print(
+                        "[Stage2A 双路来源] term | sources | similar_to_score | conditioned_score | final_primary_score"
+                    )
+                    for row in breakdown[:50]:
+                        term = (row.get("term") or "")[:32]
+                        srcs = ",".join(row.get("sources") or []) or "-"
+                        sim_s = row.get("similar_to_score")
+                        cond_s = row.get("conditioned_score")
+                        sim_str = "%.3f" % sim_s if sim_s is not None else "-"
+                        cond_str = "%.3f" % cond_s if cond_s is not None else "-"
+                        prim = row.get("final_primary_score") or 0
+                        print("  %s | %s | %s | %s | %.3f" % (term, srcs, sim_str, cond_str, prim))
+                    if len(breakdown) > 50:
+                        print("  ... 共 %s 条" % len(breakdown))
+                else:
+                    print(
+                        "[Stage2A 双路来源] n=%s（逐行开 STAGE2_NOISY_DEBUG）" % len(breakdown)
+                    )
 
         # 阶段 3：词权重（统一走复杂公式，传入锚点 ID 供锚点距离门控）
         anchor_vids = [int(k) for k in anchor_skills.keys()] if anchor_skills else None
@@ -1787,30 +1822,44 @@ class LabelRecallPath:
         t_s4 = time.time()
         s4_ms = (t_s4 - t_s3) * 1000
 
-        # 调试：按 term 打印 papers_before_filter / papers_after_filter / authors_before_merge / top_paper_ids
+        # 调试：按 term 汇总；top 论文用 **去重 wid + 该篇 hit_terms 数**，避免同一 wid 重复刷屏
         if getattr(term_scoring, "STAGE3_DEBUG", False) and final_term_ids_for_paper:
             _debug_rows = {}
             for row in (getattr(self, "_last_tag_purity_debug", None) or getattr(self.debug_info, "tag_purity_debug", None) or []):
                 tid = row.get("tid")
                 if tid is not None:
                     _debug_rows[str(tid)] = row
-            # 从 author_papers_list 按 vid 聚合：该 term 命中的论文数、作者数、top_paper_ids
             _papers_per_tid = collections.defaultdict(set)
             _authors_per_tid = collections.defaultdict(set)
-            _paper_list_per_tid = collections.defaultdict(list)
+            _wid_hitn_for_tid: Dict[int, Dict[Any, int]] = collections.defaultdict(dict)
             for ap in (author_papers_list or []):
                 aid = ap.get("aid")
                 for p in ap.get("papers") or []:
                     wid = p.get("wid")
-                    for h in p.get("hits") or []:
-                        vid = h.get("vid") if isinstance(h, dict) else getattr(h, "vid", None)
-                        if vid is not None:
-                            _papers_per_tid[int(vid)].add(wid)
-                            if aid:
-                                _authors_per_tid[int(vid)].add(str(aid))
-                            if wid is not None and len(_paper_list_per_tid[int(vid)]) < 20:
-                                _paper_list_per_tid[int(vid)].append(wid)
-            print("[final_term_ids_for_paper] tid | term | source_type | parent_primary | papers_before_filter | papers_after_filter | authors_before_merge | top_paper_ids")
+                    hits = p.get("hits") or []
+                    hit_vids = set()
+                    for h in hits:
+                        if isinstance(h, dict) and h.get("vid") is not None:
+                            hit_vids.add(int(h["vid"]))
+                    hit_n = len(hit_vids)
+                    for h in hits:
+                        if not isinstance(h, dict):
+                            continue
+                        vv = h.get("vid")
+                        if vv is None:
+                            continue
+                        tid_k = int(vv)
+                        _papers_per_tid[tid_k].add(wid)
+                        if aid:
+                            _authors_per_tid[tid_k].add(str(aid))
+                        prev = _wid_hitn_for_tid[tid_k].get(wid)
+                        if prev is None or hit_n > prev:
+                            _wid_hitn_for_tid[tid_k][wid] = hit_n
+            print(
+                "[final_term_ids_for_paper] tid | term | source_type | parent_primary | "
+                "papers_before_filter | papers_after_filter | authors_before_merge | "
+                "top_unique_papers(wid:hit_terms_count,...)"
+            )
             for i, tid in enumerate(final_term_ids_for_paper[:30], 1):
                 tid_str = str(tid)
                 term = term_map.get(tid_str, "")
@@ -1820,8 +1869,11 @@ class LabelRecallPath:
                 papers_before = int(row.get("degree_w") or 0)
                 papers_after = len(_papers_per_tid.get(int(tid), set()))
                 authors_before = len(_authors_per_tid.get(int(tid), set()))
-                top_ids = (_paper_list_per_tid.get(int(tid)) or [])[:10]
-                top_str = ",".join(str(x) for x in top_ids) if top_ids else "-"
+                items = sorted(
+                    (_wid_hitn_for_tid.get(int(tid)) or {}).items(),
+                    key=lambda x: (-x[1], str(x[0])),
+                )[:10]
+                top_str = ",".join(f"{w}:{n}" for w, n in items) if items else "-"
                 print(f"  {i} {tid} | {term!r} | {st} | {pp!r} | {papers_before} | {papers_after} | {authors_before} | {top_str}")
             if len(final_term_ids_for_paper) > 30:
                 print(f"  ... 共 {len(final_term_ids_for_paper)} 条")

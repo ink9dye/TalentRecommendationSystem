@@ -36,8 +36,18 @@ STAGE2_RULING_DEBUG = False
 # 默认关闭；仅在深度诊断时临时打开。
 STAGE2_NOISY_DEBUG = False
 
-# Stage2A 定点调试：仅命中下列锚点/学术词时打印 Focus/Commit 块，避免日志爆炸
-DEBUG_STAGE2A_FOCUS_TERMS = frozenset({"motion control", "robot control", "digital control"})
+# Stage2A 定点调试：仅命中下列锚点/学术词时打印 Focus 块（当前瓶颈在 Stage3 时仍以本集合为「关注词」主线）
+DEBUG_STAGE2A_FOCUS_TERMS = frozenset(
+    {
+        "motion control",
+        "robot control",
+        "digital control",
+        "route planning",
+        "path planning",
+        "reinforcement learning",
+        "robotic arm",
+    }
+)
 DEBUG_STAGE2A_FOCUS_ANCHORS = frozenset({"运动控制", "机器人运动控制", "传统控制", "Robot control"})
 _DEBUG_STAGE2A_FOCUS_ANCHORS_LOWER = frozenset(x.lower() for x in DEBUG_STAGE2A_FOCUS_ANCHORS)
 # [Stage2A merge evidence detail]：默认只打 support_seed/support_keep/近似 conditioned_only；非空时按 term 字面补行
@@ -72,7 +82,12 @@ def _is_stage2a_focus_case(anchor_term: str, term: str) -> bool:
 
 
 def _debug_stage2a_focus(anchor_term: str, term: str, bucket: str, reason: str, snap: Dict[str, Any]) -> None:
-    if not LABEL_EXPANSION_DEBUG or not _is_stage2a_focus_case(anchor_term, term):
+    # 大块 Focus：仅在开启 NOISY 且命中焦点词时打出；**调用方**若需「仅 reconcile 跨桶」，由 select_primary_per_anchor 在 pre≠final 时再调。
+    if (
+        not LABEL_EXPANSION_DEBUG
+        or not STAGE2_NOISY_DEBUG
+        or not _is_stage2a_focus_case(anchor_term, term)
+    ):
         return
     print("\n" + "=" * 72)
     print("[Stage2A Focus Debug]")
@@ -220,7 +235,7 @@ def _print_stage2b_seed_tier_audit(anchor_text: str, seed_rows: List[Tuple[Any, 
     [Stage2B seed tier audit]
     逐项对照 stage2b_seed_tier（strong/weak/none）与 check_seed_eligibility 结果，避免「2A 标了弱 seed 但 2B 又挡掉」时无从查因。
     """
-    if not (LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG) or not seed_rows:
+    if not (LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and STAGE2_NOISY_DEBUG) or not seed_rows:
         return
     print("\n" + "-" * 80)
     print(f"[Stage2B seed tier audit] anchor={anchor_text!r}")
@@ -1590,7 +1605,8 @@ def _print_stage2b_seed_factors(
     reason: Optional[str],
 ) -> None:
     """Stage2B seed 资格分解表：便于验证 2B 改完后是哪类 seed 被救活。"""
-    if not (LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG):
+    # 与 seed tier audit 同档降噪：默认关，深度诊断时再开 STAGE2_NOISY_DEBUG
+    if not (LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and STAGE2_NOISY_DEBUG):
         return
     ctx_sim_str = f"{ctx_sim_val:.3f}" if ctx_sim_val is not None else "N/A"
     print(
@@ -1605,6 +1621,60 @@ def _print_stage2b_seed_factors(
         f"  final_eligible={final_eligible}\n"
         f"  reason={reason!r}"
     )
+
+
+def _print_stage2b_blocked_weak_seed_audit(
+    anchor_text: str,
+    seed_detail: List[Tuple[Any, bool, float, Optional[str]]],
+) -> None:
+    """弱 seed 被 2B 门挡掉时的窄表（与 tier audit 互补：`LABEL_EXPANSION_DEBUG` 即可）。"""
+    if not LABEL_EXPANSION_DEBUG:
+        return
+    rows: List[Tuple[str, str, str, str, str, str]] = []
+    for p, eligible, seed_score, block_reason in seed_detail:
+        tier = (getattr(p, "stage2b_seed_tier", "") or "").strip().lower()
+        if tier != "weak" or eligible:
+            continue
+        pl_src = _primary_landing_source_type_set(p)
+        cond_only = (
+            "conditioned_vec" in pl_src
+            and "similar_to" not in pl_src
+            and "family_landing" not in pl_src
+        )
+        identity = float(getattr(p, "identity_score", 0.0) or 0.0)
+        anchor_identity = float(getattr(p, "anchor_identity_score", identity) or identity)
+        family_match_seed = float(getattr(p, "family_match", 0.0) or 0.0)
+        if family_match_seed <= 0.0:
+            family_match_seed = anchor_identity
+        jd_align = float(getattr(p, "jd_align", 0.5) or 0.5)
+        mlp = float(getattr(p, "mainline_pref_score", 0.0) or 0.0)
+        axis_cs = (
+            0.35 * anchor_identity
+            + 0.30 * family_match_seed
+            + 0.20 * jd_align
+            + 0.15 * max(0.0, mlp)
+        )
+        gen = float(getattr(p, "generic_risk", 0.0) or 0.0)
+        poly = float(getattr(p, "polysemy_risk", 0.0) or 0.0)
+        obj = float(getattr(p, "object_like_risk", 0.0) or 0.0)
+        rows.append(
+            (
+                (getattr(p, "term", "") or "")[:44],
+                f"{axis_cs:.3f}",
+                f"{seed_score:.3f}",
+                str(cond_only),
+                f"g={gen:.2f} p={poly:.2f} o={obj:.2f}",
+                (block_reason or "")[:56],
+            )
+        )
+    if not rows:
+        return
+    print(f"[Stage2B blocked weak seed audit] anchor={anchor_text!r} n_blocked_weak={len(rows)}")
+    for t, ax, ss, co, rsk, br in rows:
+        print(
+            f"  term={t!r} axis_consistency_seed={ax} seed_score={ss} "
+            f"conditioned_only={co} gen_poly_obj={rsk!r} blocked_reason={br!r}"
+        )
 
 
 def check_seed_eligibility(
@@ -2863,7 +2933,6 @@ def judge_primary_and_expandability(
             "bad_branch": True,
             "can_expand_from_2a": False,
         }
-        _debug_stage2a_focus(_anc, _term_dbg, "reject", "bad_branch", snap_bad)
         return "reject", "bad_branch", snap_bad
 
     static_sim = float(getattr(c, "semantic_score", 0.0) or 0.0)
@@ -2923,9 +2992,7 @@ def judge_primary_and_expandability(
         snap0["source_type"] = (getattr(c, "source_type", None) or getattr(c, "source", "") or "").strip().lower()
         # 无完整 primary 证据但仍有静态/弱相关：高风险保留，供 Stage3 降权（非直接 reject）
         if float(best_sim) >= STAGE2A_RISKY_KEEP_MIN_BEST_SIM:
-            _debug_stage2a_focus(_anc, _term_dbg, "risky_keep", "weak_line_not_primary", snap0)
             return "risky_keep", "weak_line_not_primary", snap0
-        _debug_stage2a_focus(_anc, _term_dbg, "reject", "not_primary_enough", snap0)
         return "reject", "not_primary_enough", snap0
 
     # ---------- primary_ok 之后：主线一致性（axis）分桶，替代旧 expand/weak_seed 分叉 ----------
@@ -3044,7 +3111,6 @@ def judge_primary_and_expandability(
             bucket, reason = "primary_support_keep", "no_real_ctx_demote_seed"
         snap_axis["can_expand_from_2a"] = False
 
-    _debug_stage2a_focus(_anc, _term_dbg, bucket, reason, snap_axis)
     return bucket, reason, snap_axis
 
 
@@ -3296,6 +3362,8 @@ def select_primary_per_anchor(
     - primary_support_keep：支线保留，不参与 2B 扩散
     - risky_keep：高风险弱保留，默认 weak_retain，不参与 2B
     - rejected：淘汰
+    **无 primary_expandable 时**：对 sd/sk/rk 做**极小家族保留**（每类最多 1 条，rk 仅当 sd 与 sk 皆空时兜底 1 条），
+    避免旧版「三桶合并只留全局一名」把整锚压成单点、 Stage3 无足够候选可重审；见 `[Stage2A no-expandable shrink audit]`。
     兼容字段 primary_keep_no_expand = seed+support_keep+risky（旧逻辑消费并集）。
     """
     empty_out = {
@@ -3632,6 +3700,8 @@ def select_primary_per_anchor(
                 f"group_rank={w['group_rank']}/{len(work_rows)} "
                 f"strong_axis_min={SEED_AXIS_CONSISTENCY_STRONG_MIN:.2f}"
             )
+            if STAGE2_NOISY_DEBUG and _is_stage2a_focus_case(anchor_term_sel, getattr(c, "term", "")):
+                _debug_stage2a_focus(anchor_term_sel, getattr(c, "term", ""), bucket, reason, p_snap)
 
         static_sim, ctx_sim, ctx_drop, _best = _stage2a_static_ctx_for_primary_expand_split(c)
 
@@ -3766,15 +3836,46 @@ def select_primary_per_anchor(
     primary_support_keep.sort(key=_rank_key, reverse=True)
     risky_keep.sort(key=_rank_key, reverse=True)
 
-    # 无强 expandable 时，非 reject 组最多共 1 条，避免弱词堆叠
+    # 无 primary_expandable：保留「可重审」极小家族，而不是 sd+sk+rk 合并后只留同一 tid 的一条（等于 2A 越权终审）。
     if not primary_expandable and (primary_support_seed or primary_support_keep or risky_keep):
-        combined = primary_support_seed + primary_support_keep + risky_keep
-        combined.sort(key=_rank_key, reverse=True)
-        winner = combined[0]
-        tid_w = getattr(winner, "tid", None)
-        primary_support_seed = [x for x in primary_support_seed if getattr(x, "tid", None) == tid_w]
-        primary_support_keep = [x for x in primary_support_keep if getattr(x, "tid", None) == tid_w]
-        risky_keep = [x for x in risky_keep if getattr(x, "tid", None) == tid_w]
+        n_sd_b = len(primary_support_seed)
+        n_sk_b = len(primary_support_keep)
+        n_rk_b = len(risky_keep)
+        top_sd_b = [getattr(x, "term", "") for x in primary_support_seed[:2]]
+        top_sk_b = [getattr(x, "term", "") for x in primary_support_keep[:2]]
+        top_rk_b = [getattr(x, "term", "") for x in risky_keep[:2]]
+
+        primary_support_seed.sort(key=_rank_key, reverse=True)
+        primary_support_keep.sort(key=_rank_key, reverse=True)
+        risky_keep.sort(key=_rank_key, reverse=True)
+
+        kept_seed = primary_support_seed[:1]
+        kept_keep = primary_support_keep[:1]
+        if kept_seed or kept_keep:
+            kept_risky: List["Stage2ACandidate"] = []
+            policy = "keep_top1_seed + keep_top1_support_keep + risky_cleared_when_seed_or_keep"
+            why_risky = ""
+        else:
+            kept_risky = risky_keep[:1]
+            policy = "risky_only_fallback_1"
+            why_risky = "no_support_seed_and_no_support_keep" if kept_risky else ""
+
+        primary_support_seed = kept_seed
+        primary_support_keep = kept_keep
+        risky_keep = kept_risky
+
+        if LABEL_EXPANSION_DEBUG:
+            top_sd_a = [getattr(x, "term", "") for x in primary_support_seed[:2]]
+            top_sk_a = [getattr(x, "term", "") for x in primary_support_keep[:2]]
+            top_rk_a = [getattr(x, "term", "") for x in risky_keep[:2]]
+            print(
+                f"[Stage2A no-expandable shrink audit] anchor={anchor_term_sel!r}\n"
+                f"  before: exp=0 sd={n_sd_b} {top_sd_b!r} | sk={n_sk_b} {top_sk_b!r} | rk={n_rk_b} {top_rk_b!r}\n"
+                f"  policy: {policy}\n"
+                f"  why_keep_risky_fallback: {why_risky!r}\n"
+                f"  after : sd={len(primary_support_seed)} {top_sd_a!r} | sk={len(primary_support_keep)} {top_sk_a!r} "
+                f"| rk={len(risky_keep)} {top_rk_a!r}"
+            )
 
     # --------------------------------------------------
     # 2. 高质量锚点空组保线：只保 keep_no_expand，不允许扩散
@@ -7919,7 +8020,9 @@ def stage2_generate_academic_terms(
             _seed_detail.append((p, eligible, seed_score, block_reason))
             if eligible:
                 diffusion_scored.append((p, seed_score))
-        _print_stage2b_seed_tier_audit(getattr(anchor, "anchor", "") or "", _seed_detail)
+        _anch_txt = getattr(anchor, "anchor", "") or ""
+        _print_stage2b_seed_tier_audit(_anch_txt, _seed_detail)
+        _print_stage2b_blocked_weak_seed_audit(_anch_txt, _seed_detail)
         diffusion_scored.sort(key=lambda x: x[1], reverse=True)
         seed_primaries = [p for p, _ in diffusion_scored]
         strong_seed_count = sum(
