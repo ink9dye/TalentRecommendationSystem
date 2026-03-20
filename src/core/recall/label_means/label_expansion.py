@@ -5684,21 +5684,30 @@ def expand_from_vocab_dense_neighbors(
             keep_score = float(keep_meta.get("keep_score", sim))
             parent_primary_score = float(getattr(p, "primary_score", 1.0) or 1.0)
             keep_score = min(keep_score, parent_primary_score * DENSE_PARENT_CAP)
-            out.append(
-                ExpandedTermCandidate(
-                    vid=tid,
-                    term=term,
-                    term_role="dense_expansion",
-                    identity_score=keep_score,
-                    source="dense",
-                    anchor_vid=p.anchor_vid,
-                    anchor_term=p.anchor_term,
-                    semantic_score=sim,
-                    src_vids=[p.vid],
-                    hit_count=1,
-                    parent_primary=p.term,
-                )
+            _dense_c = ExpandedTermCandidate(
+                vid=tid,
+                term=term,
+                term_role="dense_expansion",
+                identity_score=keep_score,
+                source="dense",
+                anchor_vid=p.anchor_vid,
+                anchor_term=p.anchor_term,
+                semantic_score=sim,
+                src_vids=[p.vid],
+                hit_count=1,
+                parent_primary=p.term,
             )
+            setattr(
+                _dense_c,
+                "parent_anchor_final_score",
+                float(getattr(p, "anchor_final_score", 0.0) or 0.0),
+            )
+            setattr(
+                _dense_c,
+                "parent_anchor_step2_rank",
+                int(getattr(p, "anchor_step2_rank", 999) or 999),
+            )
+            out.append(_dense_c)
             kept += 1
             if len(top_kept) < 5:
                 top_kept.append(term)
@@ -5860,21 +5869,30 @@ def expand_from_cooccurrence_support(
             seen.add(vid_other)
             meta = label._vocab_meta.get(vid_other, ("", ""))
             kt = (meta[0] or other or "")[:48]
-            out.append(
-                ExpandedTermCandidate(
-                    vid=vid_other,
-                    term=meta[0] or other,
-                    term_role="cooc_expansion",
-                    identity_score=cooc_strength,
-                    source="cooc",
-                    anchor_vid=getattr(p, "anchor_vid", 0),
-                    anchor_term=getattr(p, "anchor_term", "") or "",
-                    semantic_score=cooc_strength,
-                    src_vids=[getattr(p, "vid", 0)],
-                    hit_count=int(freq),
-                    parent_primary=term,
-                )
+            _cooc_c = ExpandedTermCandidate(
+                vid=vid_other,
+                term=meta[0] or other,
+                term_role="cooc_expansion",
+                identity_score=cooc_strength,
+                source="cooc",
+                anchor_vid=getattr(p, "anchor_vid", 0),
+                anchor_term=getattr(p, "anchor_term", "") or "",
+                semantic_score=cooc_strength,
+                src_vids=[getattr(p, "vid", 0)],
+                hit_count=int(freq),
+                parent_primary=term,
             )
+            setattr(
+                _cooc_c,
+                "parent_anchor_final_score",
+                float(getattr(p, "anchor_final_score", 0.0) or 0.0),
+            )
+            setattr(
+                _cooc_c,
+                "parent_anchor_step2_rank",
+                int(getattr(p, "anchor_step2_rank", 999) or 999),
+            )
+            out.append(_cooc_c)
             kept += 1
             if len(top_kept_co) < 5:
                 top_kept_co.append(kt)
@@ -7336,6 +7354,16 @@ def merge_primary_and_support_terms(
         setattr(e, "stage2b_seed_tier", str(getattr(p, "stage2b_seed_tier", None) or "none"))
         setattr(e, "mainline_candidate", bool(getattr(p, "mainline_candidate", False)))
         setattr(e, "primary_reason", str(getattr(p, "primary_reason", "") or ""))
+        setattr(
+            e,
+            "parent_anchor_final_score",
+            float(getattr(p, "anchor_final_score", 0.0) or 0.0),
+        )
+        setattr(
+            e,
+            "parent_anchor_step2_rank",
+            int(getattr(p, "anchor_step2_rank", 999) or 999),
+        )
         out.append(e)
     for c in dense_list:
         row = None
@@ -7472,6 +7500,8 @@ def stage2_generate_academic_terms(
         print(f"  JD 维度: field={jd_fields}  subfield={jd_sub}  topic={jd_top}  |  Stage2A=组内相对选主（无固定阈值）")
         print(f"  锚点列表: {[getattr(a, 'anchor', a) for a in prepared_anchors]}")
     # ---------- Stage2A：主线优先组内选主 ----------
+    for _ri, _a in enumerate(prepared_anchors, start=1):
+        setattr(_a, "step2_anchor_rank", _ri)
     mainline_profile = build_stage2a_mainline_profile(
         label, prepared_anchors,
         query_vector=query_vector,
@@ -7647,6 +7677,16 @@ def stage2_generate_academic_terms(
             setattr(p, "reject_reason", str(_crj) if _crj is not None else "")
             setattr(p, "mainline_candidate", bool(getattr(cand, "mainline_candidate", False)))
             setattr(p, "primary_reason", str(getattr(cand, "primary_reason", "") or ""))
+            setattr(
+                p,
+                "anchor_final_score",
+                float(getattr(anchor, "final_anchor_score", 0.0) or 0.0),
+            )
+            setattr(
+                p,
+                "anchor_step2_rank",
+                int(getattr(anchor, "step2_anchor_rank", 999) or 999),
+            )
             primary_landings_list.append(p)
             _mainline_num = 0.7 if cand.role == "mainline" else (0.4 if cand.role == "side" else 0.0)
             evidence_table.append({

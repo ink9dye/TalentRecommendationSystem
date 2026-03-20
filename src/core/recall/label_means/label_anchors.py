@@ -143,7 +143,16 @@ def _is_task_like(term_text: str) -> bool:
 # ---------- 短语中心性（无硬编码词表，用于锚点重排） ----------
 PHRASE_SPECIFICITY_MIN_LEN = 2
 CONTEXT_WINDOW_CHAR = 120
-ANCHOR_PHRASE_WEIGHT_FLOOR = 0.2
+# 支撑项凸组合权重（与 backbone 做「带底座」合成，避免四因子连乘把主线锚压到 0.0x）
+ANCHOR_SUPPORT_W_SPEC = 0.30
+ANCHOR_SUPPORT_W_CTX = 0.25
+ANCHOR_SUPPORT_W_TASK = 0.25
+ANCHOR_SUPPORT_W_LOCAL = 0.20
+# final_anchor_score = backbone * (FLOOR_FRAC + SPREAD_FRAC * support_mean)，support_mean∈[0,1] → 乘子∈[FLOOR, FLOOR+SPREAD]
+ANCHOR_FINAL_BACKBONE_FLOOR_FRAC = 0.72
+ANCHOR_FINAL_SUPPORT_SPREAD_FRAC = 0.28
+# [Stage1-Step2 anchor collapse audit]：对照 collapse_ratio，排查「路径规划被压穿」类问题
+ANCHOR_COLLAPSE_AUDIT = True
 
 
 def compute_phrase_specificity(phrase: str, all_phrases: List[str]) -> float:
@@ -206,6 +215,31 @@ def compute_local_phrase_cluster_support(phrase: str, raw_text: str, cleaned_ter
     局部短语簇支持：与 context_richness 同源，表示相邻技能短语支持度。无词表。
     """
     return compute_phrase_context_richness(phrase, raw_text, cleaned_terms)
+
+
+def _print_stage1_step2_anchor_collapse_audit(rows: List[Dict[str, Any]], limit: int = 28) -> None:
+    """窄表：短语支撑均值 + 相对 backbone 的塌陷比，解释锚点序为何偏。"""
+    if not ANCHOR_COLLAPSE_AUDIT or not rows:
+        return
+    print(f"\n{'-' * 80}\n[Stage1-Step2 anchor collapse audit] JD 工业锚 · 凸组合 final（非四连乘）\n{'-' * 80}")
+    print(
+        f"  公式: final = bb × ({ANCHOR_FINAL_BACKBONE_FLOOR_FRAC:.2f} + "
+        f"{ANCHOR_FINAL_SUPPORT_SPREAD_FRAC:.2f} × support_mean); "
+        f"support_mean = {ANCHOR_SUPPORT_W_SPEC:.2f}·spec+{ANCHOR_SUPPORT_W_CTX:.2f}·ctx+"
+        f"{ANCHOR_SUPPORT_W_TASK:.2f}·task+{ANCHOR_SUPPORT_W_LOCAL:.2f}·local"
+    )
+    hdr = "rk | anchor           | bb    | spec | ctx  | task | loc  | smean | final | cratio"
+    print(hdr)
+    print("-" * len(hdr))
+    for i, row in enumerate(rows[:limit], start=1):
+        t = (row.get("term") or "")[:16]
+        print(
+            f"{i:2d} | {t:16} | {row.get('backbone_score', 0):5.2f} | "
+            f"{row.get('specificity', 0):4.2f} | {row.get('context_richness', 0):4.2f} | "
+            f"{row.get('taskness', 0):4.2f} | {row.get('local_cluster_support', 0):4.2f} | "
+            f"{row.get('support_mean', 0):5.2f} | {row.get('final_anchor_score', 0):5.2f} | "
+            f"{row.get('collapse_ratio', 0):5.2f}"
+        )
 
 
 def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None) -> Dict[str, Any]:
@@ -367,12 +401,19 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
             ctx = compute_phrase_context_richness(term, raw_text, all_phrases)
             task = compute_anchor_taskness(term, raw_text, all_phrases)
             local = compute_local_phrase_cluster_support(term, raw_text, all_phrases)
-        w = (ANCHOR_PHRASE_WEIGHT_FLOOR + (1.0 - ANCHOR_PHRASE_WEIGHT_FLOOR) * spec) * (
-            ANCHOR_PHRASE_WEIGHT_FLOOR + (1.0 - ANCHOR_PHRASE_WEIGHT_FLOOR) * ctx
-        ) * (ANCHOR_PHRASE_WEIGHT_FLOOR + (1.0 - ANCHOR_PHRASE_WEIGHT_FLOOR) * task) * (
-            ANCHOR_PHRASE_WEIGHT_FLOOR + (1.0 - ANCHOR_PHRASE_WEIGHT_FLOOR) * local
+        # 凸组合支撑均值 + backbone 底座：避免 (0.2+0.8·spec)×… 四连乘把主线锚整体打穿
+        support_mean = (
+            ANCHOR_SUPPORT_W_SPEC * spec
+            + ANCHOR_SUPPORT_W_CTX * ctx
+            + ANCHOR_SUPPORT_W_TASK * task
+            + ANCHOR_SUPPORT_W_LOCAL * local
         )
-        final_score = bb_score * w
+        spread = (
+            ANCHOR_FINAL_BACKBONE_FLOOR_FRAC
+            + ANCHOR_FINAL_SUPPORT_SPREAD_FRAC * support_mean
+        )
+        final_score = bb_score * spread
+        collapse_ratio = final_score / max(bb_score, 1e-6)
         anchor_scored_rows.append({
             "tid": r.get("vid"),
             "term": term or r.get("term"),
@@ -381,10 +422,14 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
             "context_richness": ctx,
             "taskness": task,
             "local_cluster_support": local,
+            "support_mean": support_mean,
+            "support_spread": spread,
+            "collapse_ratio": collapse_ratio,
             "final_anchor_score": final_score,
             "_row": r,
         })
     anchor_scored_rows.sort(key=lambda x: x["final_anchor_score"], reverse=True)
+    _print_stage1_step2_anchor_collapse_audit(anchor_scored_rows)
     top_n = int(getattr(label, "ANCHOR_FINAL_TOP_K", 20))
     rows = [x["_row"] for x in anchor_scored_rows[:top_n]]
     borderline_rejected = anchor_scored_rows[top_n : top_n + 10]
@@ -415,18 +460,20 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
     for term, reason, value in dropped_terms[:15]:
         debug_print(3, f"  {term[:30]} | {reason} | {value}", label)
 
-    debug_print(2, "[Step2 Anchor Score Breakdown] term | backbone | specificity | context_richness | taskness | local_cluster | final | rank", label)
+    debug_print(2, "[Step2 Anchor Score Breakdown] term | bb | spec | ctx | task | loc | smean | final | cratio | rank", label)
     for i, row in enumerate(anchor_scored_rows[:20], 1):
-        t = (row.get("term") or "")[:24]
+        t = (row.get("term") or "")[:22]
         debug_print(2, (
-            f"  {i:>2} {t:<24} | "
+            f"  {i:>2} {t:<22} | "
             f"bb={row.get('backbone_score', 0):.3f} | "
             f"spec={row.get('specificity', 0):.3f} | "
             f"ctx={row.get('context_richness', 0):.3f} | "
             f"task={row.get('taskness', 0):.3f} | "
-            f"cluster={row.get('local_cluster_support', 0):.3f} | "
+            f"loc={row.get('local_cluster_support', 0):.3f} | "
+            f"sm={row.get('support_mean', 0):.3f} | "
             f"final={row.get('final_anchor_score', 0):.3f} | "
-            f"rank={i}"
+            f"cr={row.get('collapse_ratio', 0):.3f} | "
+            f"rk={i}"
         ), label)
 
     debug_print(2, "[Step2 Borderline Rejected] term | final | reason", label)
@@ -453,6 +500,8 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
             "context_richness": x.get("context_richness"),
             "taskness": x.get("taskness"),
             "local_cluster_support": x.get("local_cluster_support"),
+            "support_mean": x.get("support_mean"),
+            "collapse_ratio": x.get("collapse_ratio"),
             "anchor_source": "skill_direct",
             "anchor_source_weight": 1.0,
         }

@@ -15,6 +15,9 @@ STAGE3_TOP_K = 20
 STAGE3_DETAIL_DEBUG = False  # 默认关闭重型逐词细表（可按需打开）
 # Stage3 role 因子：mainline primary 稳一点，dense/conditioned_vec/side 略降，避免 Motion controller > motion control
 STAGE3_MAINLINE_BOOST = 1.06
+# primary_expandable → stage3_bucket=core：原仅 identity≥0.95；加一条「非 conditioned_only + JD 对齐」结构化升舱（如 robot control）
+STAGE3_EXPANDABLE_CORE_IDENTITY_HARD = 0.95
+STAGE3_EXPANDABLE_CORE_JD_ALIGN_MIN = 0.50
 STAGE3_DENSE_PENALTY = 0.90
 STAGE3_CONDITIONED_PENALTY = 0.94
 STAGE3_SIDE_PENALTY = 0.95
@@ -34,6 +37,30 @@ PAPER_RECALL_MAX_TERMS = 12
 # Paper 入稿：统一分数相对截断（相对 Top1 与绝对下限取 max）；避免弱支线索性跟跑
 PAPER_RECALL_DYNAMIC_FLOOR_REL = 0.62
 PAPER_RECALL_DYNAMIC_FLOOR_ABS = 0.12
+# paper_readiness · 锚点先验（Stage3）：以 Step2 锚点分为「主证据」，名次只做轻平滑（避免 rank 主导把 robot control 等主线词打出 dynamic_floor）
+PAPER_READINESS_ANCHOR_SCORE_NORM = 1.20  # anchor_score_norm = clip(score / 此值, 0, 1)
+PAPER_READINESS_ANCHOR_PRIOR_W_SCORE = 0.88  # 先验里分值权重（主）
+PAPER_READINESS_ANCHOR_PRIOR_W_RANK = 0.12  # 先验里名次平滑权重（辅）
+PAPER_READINESS_ANCHOR_RANK_SMOOTH_LAMBDA = 0.04  # rank_smooth = 1/(1+λ·max(rank-1,0))
+PAPER_READINESS_ANCHOR_READINESS_BLEND_LO = 0.82  # readiness *= LO + HI * anchor_prior
+PAPER_READINESS_ANCHOR_READINESS_BLEND_HI = 0.18
+# core + 已命中主线 + 可扩：paper_readiness 保底（结构信号，非词表）；防「主线可扩却被 floor 误杀」
+PAPER_READINESS_CORE_MAINLINE_EXPAND_MIN = 0.78
+# Paper bridge：weak support 结构门（非词表拦词）。统一分只负责排序；是否进 paper 由本组常量做最后结构裁决。
+STAGE3_PAPER_SUPPORT_BLOCK_ENABLED = True
+STAGE3_PAPER_SUPPORT_MAX_ANCHOR_COUNT = 1
+STAGE3_PAPER_SUPPORT_MAX_MAINLINE_HITS = 1
+# 与 _paper_grounding_score 同尺度：低于则表示 grounding proxy 偏软，易混进「伪 support」
+STAGE3_PAPER_SUPPORT_MIN_GROUNDING = 0.62
+# 与 MIN_GROUNDING 联用：分不够高且 grounding 不够硬时，不能仅靠统一分混进 paper
+STAGE3_PAPER_SUPPORT_MIN_FINAL_SCORE = 0.30
+# conditioned-only 的 support 默认更严（易漂移）
+STAGE3_PAPER_SUPPORT_BLOCK_COND_ONLY = True
+# Paper：risky + 无主线命中 + 不可扩 + side/expansion 角色 — 仅靠 unified 分过线仍会混入（如 motion controller）
+STAGE3_PAPER_RISKY_SIDE_BLOCK_ENABLED = True
+STAGE3_PAPER_RISKY_SIDE_TERM_ROLES = frozenset(
+    {"primary_side", "dense_expansion", "cluster_expansion", "cooc_expansion"}
+)
 # Stage3 第二段 — 统一连续分权重（无 bucket / primary_bucket 条件乘子；调参只改标量）
 STAGE3_UNIFIED_W_SEED = 0.34
 STAGE3_UNIFIED_W_ANCHOR_ID = 0.18
@@ -74,6 +101,54 @@ STAGE3_DEBUG_FOCUS_TERMS: Set[str] = {
 
 # 全局共识因子默认值（无硬编码）；Stage3 已彻底移除 cluster 依赖
 STAGE3_CROSS_ANCHOR_DEFAULT = 1.0
+# tid 合并：多锚时 primary_bucket 取「最强证据」而非「单条最高 seed 分记录」整表覆盖，避免 anchor_count 与语义字段撕裂
+STAGE3_PRIMARY_BUCKET_MERGE_PRIORITY: Dict[str, int] = {
+    "primary_expandable": 5,
+    "primary_support_seed": 4,
+    "primary_support_keep": 3,
+    "primary_keep_no_expand": 3,
+    "risky_keep": 2,
+    "primary_fallback_keep_no_expand": 1,
+    "reject": 0,
+    "": 0,
+}
+STAGE3_TERM_ROLE_MERGE_PRIORITY: Dict[str, int] = {
+    "primary": 5,
+    "primary_side": 3,
+    "dense_expansion": 2,
+    "cluster_expansion": 2,
+    "cooc_expansion": 2,
+    "": 0,
+}
+# 多锚 tid 合并窄表：回答「是 Stage3 真判 risky 还是 merge 把 motion control 带歪」
+STAGE3_DUPLICATE_MERGE_AUDIT = True
+# primary_expandable 却未成 core：精调 bucket 时对照 identity / jd / cap
+STAGE3_CORE_MISS_AUDIT = True
+
+_STAGE3_MERGE_SKIP_KEYS = frozenset(
+    {
+        "records",
+        "parent_anchors",
+        "parent_primaries",
+        "source_types",
+        "term_roles",
+        "family_keys",
+    }
+)
+_STAGE3_MERGE_STRUCTURE_FIELDS = frozenset(
+    {
+        "primary_bucket",
+        "primary_reason",
+        "mainline_candidate",
+        "can_expand_local",
+        "fallback_primary",
+        "fallback_primary_all",
+        "role_in_anchor",
+        "term_role",
+        "can_expand",
+        "can_expand_from_2a",
+    }
+)
 
 
 def _stage3_normalized_source_types(rec: Dict[str, Any]) -> Set[str]:
@@ -179,10 +254,14 @@ def _compute_stage3_unified_continuous_score(rec: Dict[str, Any]) -> Tuple[float
     return unified, breakdown
 
 
-def _paper_recall_dynamic_floor(candidates: List[Dict[str, Any]]) -> float:
+def _paper_recall_dynamic_floor(
+    candidates: List[Dict[str, Any]],
+    score_key: str = "final_score",
+) -> float:
+    """Paper 动态下限：Top1(score_key)×REL 与 ABS 取 max。paper 选词可与 final_score 同尺度或改用 paper_select_score。"""
     if not candidates:
         return PAPER_RECALL_DYNAMIC_FLOOR_ABS
-    top = max(float(r.get("final_score") or 0.0) for r in candidates)
+    top = max(float(r.get(score_key) or 0.0) for r in candidates)
     return max(PAPER_RECALL_DYNAMIC_FLOOR_ABS, top * PAPER_RECALL_DYNAMIC_FLOOR_REL)
 
 
@@ -218,20 +297,133 @@ def _print_stage3_paper_cutoff_audit(
     floor: float,
     max_terms: int,
 ) -> None:
-    """入稿排名：分数 + family + 动态截断，一眼看到谁进/谁被 floor 或 family 刷掉。"""
+    """eligible 内按 paper 选词序：paper_select_score + family + 动态 floor，看谁进/谁被刷掉。"""
     if not STAGE3_PAPER_CUTOFF_AUDIT or not ordered:
         return
     print("\n" + "-" * 80)
-    print("[Stage3 paper cutoff] rank | term | final_score | family_key | selected | cutoff_reason")
-    print(f"  dynamic_floor={floor:.4f} max_terms={max_terms}")
+    print(
+        "[Stage3 paper cutoff] rank | term | final | p_ready | p_sel | family_key | selected | reason"
+    )
+    print(f"  dynamic_floor(on paper_select_score)={floor:.4f} max_terms={max_terms}")
     print("-" * 80)
     for i, rec in enumerate(ordered, start=1):
-        term = (rec.get("term") or "")[:26]
+        term = (rec.get("term") or "")[:22]
         fs = float(rec.get("final_score") or 0.0)
-        fk = str(rec.get("family_key") or "")[:22]
+        pr = float(rec.get("paper_readiness") or 0.0)
+        pss = float(rec.get("paper_select_score") or 0.0)
+        fk = str(rec.get("family_key") or "")[:18]
         sel = bool(rec.get("selected_for_paper", False))
         reason = str(rec.get("paper_cutoff_reason") or rec.get("select_reason") or "")
-        print(f"{i:4d} | {term:26} | {fs:11.4f} | {fk:22} | {str(sel):8} | {reason}")
+        print(
+            f"{i:4d} | {term:22} | {fs:5.3f} | {pr:5.3f} | {pss:5.3f} | {fk:18} | {str(sel):8} | {reason}"
+        )
+
+
+def _print_stage3_paper_selection_narrow_audit(ordered: List[Dict[str, Any]]) -> None:
+    """
+    [Stage3 paper selection audit] 窄表：回答「bonus 型词是否仍靠 final_score 抬进 paper」。
+    仅 eligible 内、顺序与真实选词一致（paper_select_score 降序）。
+    """
+    if not STAGE3_PAPER_CUTOFF_AUDIT or not ordered:
+        return
+    print("\n" + "-" * 80)
+    print("[Stage3 paper selection audit] eligible · structural ranking (no blocklist)")
+    print("-" * 80)
+    hdr = "term · fs · ready · p_sel · bucket · role · ml · anch · … · panch · a_sc · rk · outcome"
+    print(hdr)
+    print("-" * 90)
+    for rec in ordered:
+        term = (rec.get("term") or "")[:20]
+        fs = float(rec.get("final_score") or 0.0)
+        ready = float(rec.get("paper_readiness") or 0.0)
+        pss = float(rec.get("paper_select_score") or 0.0)
+        b = (rec.get("stage3_bucket") or "")[:6]
+        role = (rec.get("term_role") or "")[:10]
+        ml = int(rec.get("mainline_hits") or 0)
+        anch = int(rec.get("anchor_count") or 0)
+        exp = bool(rec.get("can_expand", False) or rec.get("can_expand_from_2a", False))
+        co = _stage3_is_conditioned_only(rec)
+        pg = float(rec.get("paper_grounding") or _paper_grounding_score(rec))
+        sel = bool(rec.get("selected_for_paper", False))
+        if sel:
+            outcome = str(rec.get("select_reason") or "selected")
+        else:
+            outcome = str(rec.get("paper_reject_reason") or rec.get("paper_cutoff_reason") or "")
+        pas = float(
+            rec.get("best_parent_anchor_final_score")
+            or rec.get("parent_anchor_final_score")
+            or 0.0
+        )
+        par = rec.get("best_parent_anchor_step2_rank")
+        if par is None:
+            par = rec.get("parent_anchor_step2_rank")
+        par_i = int(par) if par is not None else 0
+        panch = (rec.get("parent_anchor") or "")[:12]
+        if not panch and rec.get("parent_anchors"):
+            pa_list = rec.get("parent_anchors") or []
+            panch = str(pa_list[0])[:12] if pa_list else ""
+        print(
+            f"{term:20} | {fs:4.2f} | {ready:5.2f} | {pss:5.2f} | {b:6} | {role:10} | {ml:^2} | {anch:^4} | "
+            f"{str(exp)[:1]:^3} | {str(co)[:1]:^5} | {pg:4.2f} | {str(sel)[:1]:^3} | "
+            f"panch={panch:12} a_sc={pas:4.2f} r={par_i:^3} | {outcome[:20]}"
+        )
+
+
+def _print_stage3_paper_near_miss_audit(
+    ordered: List[Dict[str, Any]],
+    selected: List[Dict[str, Any]],
+    floor: float,
+) -> None:
+    """
+    未进 final_term_ids_for_paper 但 paper_select_score 贴近 floor 或末席入选分的 eligible 词。
+    """
+    if not STAGE3_PAPER_CUTOFF_AUDIT or not ordered:
+        return
+    sel_pss = [float(r.get("paper_select_score") or 0.0) for r in selected]
+    min_sel = min(sel_pss) if sel_pss else 0.0
+    fifth = float(selected[4].get("paper_select_score") or 0.0) if len(selected) >= 5 else 0.0
+    rows: List[Tuple[float, Dict[str, Any], str, float]] = []
+    for rec in ordered:
+        if rec.get("selected_for_paper"):
+            continue
+        pss = float(rec.get("paper_select_score") or 0.0)
+        near_ok = pss >= floor * 0.98
+        if min_sel > 0:
+            near_ok = near_ok or pss >= min_sel - 0.04
+        if len(selected) >= 5 and fifth > 0:
+            near_ok = near_ok or pss >= fifth - 0.04
+        if not near_ok:
+            continue
+        reason = str(rec.get("paper_reject_reason") or rec.get("paper_cutoff_reason") or "")
+        delta = (min_sel - pss) if min_sel > 0 else 0.0
+        rows.append((pss, rec, reason, delta))
+    if not rows:
+        return
+    rows.sort(key=lambda x: -x[0])
+    print("\n" + "-" * 80)
+    print("[Stage3 paper near-miss audit] eligible 未入选 · 贴近 floor/末席/top5 线")
+    print(
+        f"  floor={floor:.4f} min_selected_p_sel={min_sel:.4f} fifth_selected={fifth:.4f}"
+    )
+    print("-" * 80)
+    print("term                 | final | ready | p_sel  | Δ末席  | a_sc | rk | reject/cutoff")
+    print("-" * 80)
+    for pss, rec, reason, delta in rows[:24]:
+        t = (rec.get("term") or "")[:20]
+        fs = float(rec.get("final_score") or 0.0)
+        rd = float(rec.get("paper_readiness") or 0.0)
+        pas = float(
+            rec.get("best_parent_anchor_final_score")
+            or rec.get("parent_anchor_final_score")
+            or 0.0
+        )
+        pr = rec.get("best_parent_anchor_step2_rank")
+        if pr is None:
+            pr = rec.get("parent_anchor_step2_rank")
+        pr_i = int(pr) if pr is not None else 0
+        print(
+            f"{t:20} | {fs:5.3f} | {rd:5.3f} | {pss:6.3f} | {delta:+6.3f} | {pas:4.2f} | {pr_i:2d} | {reason[:36]}"
+        )
 
 
 def _print_stage3_support_contamination_summary(cands: List[Dict[str, Any]]) -> None:
@@ -263,21 +455,66 @@ def _print_stage3_support_contamination_summary(cands: List[Dict[str, Any]]) -> 
     for rec in suspicious:
         term = rec.get("term") or ""
         pg = _paper_grounding_score(rec)
+        gating = str(rec.get("paper_support_gate") or "")
         print(
             f"term={term!r} anchor_count={int(rec.get('anchor_count') or 0)} "
             f"mainline_hits={int(rec.get('mainline_hits') or 0)} "
             f"paper_grounding_proxy={pg:.3f} final_score={float(rec.get('final_score') or 0):.4f} "
+            f"paper_support_gate={gating!r} "
             f"decision=suspicious_support_term"
         )
+
+
+def _print_stage3_duplicate_merge_audit(merged: List[Dict[str, Any]]) -> None:
+    """多锚 tid：逐条列出各来源 raw 字段与合并后口径，定位 merge 是否盖掉强主线证据。"""
+    if not STAGE3_DUPLICATE_MERGE_AUDIT or not merged:
+        return
+    lines_printed = 0
+    for obj in merged:
+        n_anch = int(obj.get("anchor_count") or 0)
+        if n_anch < 2:
+            continue
+        term = (obj.get("term") or "").strip()
+        if lines_printed == 0:
+            print("\n" + "-" * 80)
+            print("[Stage3 duplicate merge audit] anchor_count>=2：raw 来源 vs 合并后 term 级语义")
+            print("-" * 80)
+        lines_printed += 1
+        recs = obj.get("records") or []
+        raw_pb = [((r.get("primary_bucket") or "")) for r in recs]
+        raw_roles = [((r.get("role_in_anchor") or "")) for r in recs]
+        raw_ce = [bool(r.get("can_expand") or r.get("can_expand_from_2a")) for r in recs]
+        print(f"term={term!r} tid={obj.get('tid')} records={len(recs)}")
+        print(f"  parent_anchors={obj.get('parent_anchors')!r}")
+        print(f"  primary_buckets_raw={raw_pb!r}")
+        print(f"  role_in_anchor_raw={raw_roles!r}")
+        print(f"  can_expand_raw={raw_ce!r}")
+        print(
+            f"  merged_primary_bucket={obj.get('primary_bucket')!r} "
+            f"merged_can_expand={bool(obj.get('can_expand'))} "
+            f"merged_role_in_anchor={obj.get('role_in_anchor')!r} "
+            f"merged_term_role={obj.get('term_role')!r}"
+        )
+        print(
+            f"  merge_source={obj.get('stage3_merge_source')!r} "
+            f"fallback_primary={bool(obj.get('fallback_primary'))}"
+        )
+    if lines_printed:
+        print("-" * 80 + "\n")
 
 
 def _merge_stage3_duplicates(raw_candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     按 tid 聚合同一词的多个候选，保留多来源结构信息，供 Stage3 分层与准入使用。
     合并后保留：anchor_count, evidence_count, family_keys, source_types, parent_anchors, parent_primaries,
-    mainline_hits, side_hits, best_stage2_score, best_anchor_identity, best_jd_align, best_context_continuity。
-    最佳 seed 条目的整表字段会随 `obj[k]=v` 写入（含 Stage2A 的 primary_bucket、primary_reason、
-    fallback_primary、mainline_candidate、can_expand_local 等），供 `_assign_stage3_bucket` / paper 门使用。
+    mainline_hits, side_hits、best_* 标量等。
+
+    **语义字段（term 级）**：`primary_bucket` / `primary_reason` 按 **STAGE3_PRIMARY_BUCKET_MERGE_PRIORITY** 取最强一条；
+    `mainline_candidate`、`can_expand_local`、`can_expand`、`can_expand_from_2a` 为来源间 **OR**；
+    `fallback_primary` 仅当 **每条来源** 均为 fallback 时为 True；
+    `role_in_anchor` **任一为 mainline 则 mainline**；`term_role` 按 **STAGE3_TERM_ROLE_MERGE_PRIORITY** 取最强。
+    其余字段仍来自 **seed 分最高** 的记录（同分则 **primary_bucket 优先级更高** 者优先），避免再出现
+    「anchor_count=2 但 primary_bucket 只剩 risky_keep」的继承撕裂。
     """
     bucket: Dict[int, Dict[str, Any]] = {}
     for rec in raw_candidates:
@@ -288,33 +525,45 @@ def _merge_stage3_duplicates(raw_candidates: List[Dict[str, Any]]) -> List[Dict[
             tid = int(tid)
         except (TypeError, ValueError):
             continue
-        obj = bucket.setdefault(tid, {
-            "tid": tid,
-            "term": rec.get("term") or "",
-            "records": [],
-            "best_identity_score": 0.0,
-            "best_seed_score": 0.0,
-            "best_anchor_identity": 0.0,
-            "best_jd_align": 0.0,
-            "best_context_continuity": 0.0,
-            "parent_anchors": set(),
-            "parent_primaries": set(),
-            "source_types": set(),
-            "term_roles": set(),
-            "family_keys": set(),
-            "anchor_count": 0,
-            "evidence_count": 0,
-            "mainline_hits": 0,
-            "side_hits": 0,
-            "has_primary_role": False,
-            "has_support_role": False,
-            "role_in_anchor": "",
-            "can_expand": False,
-            "retain_mode": "normal",
-            "polysemy_risk": 0.0,
-            "object_like_risk": 0.0,
-            "generic_risk": 0.0,
-        })
+        obj = bucket.setdefault(
+            tid,
+            {
+                "tid": tid,
+                "term": rec.get("term") or "",
+                "records": [],
+                "best_identity_score": 0.0,
+                "best_seed_score": 0.0,
+                "best_anchor_identity": 0.0,
+                "best_jd_align": 0.0,
+                "best_context_continuity": 0.0,
+                "parent_anchors": set(),
+                "parent_primaries": set(),
+                "source_types": set(),
+                "term_roles": set(),
+                "family_keys": set(),
+                "anchor_count": 0,
+                "evidence_count": 0,
+                "mainline_hits": 0,
+                "side_hits": 0,
+                "has_primary_role": False,
+                "has_support_role": False,
+                "role_in_anchor": "",
+                "can_expand": False,
+                "can_expand_from_2a": False,
+                "primary_bucket": "",
+                "primary_reason": "",
+                "mainline_candidate": False,
+                "can_expand_local": False,
+                "fallback_primary_all": True,
+                "term_role": "",
+                "retain_mode": "normal",
+                "polysemy_risk": 0.0,
+                "object_like_risk": 0.0,
+                "generic_risk": 0.0,
+                "_merge_best_seed_sc": -1.0,
+                "_merge_best_seed_rec": None,
+            },
+        )
         obj["records"].append(rec)
         ident = float(rec.get("identity_score") or rec.get("sim_score") or 0.0)
         obj["best_identity_score"] = max(obj["best_identity_score"], ident)
@@ -332,6 +581,14 @@ def _merge_stage3_duplicates(raw_candidates: List[Dict[str, Any]]) -> List[Dict[
         obj["polysemy_risk"] = max(obj.get("polysemy_risk", 0), float(rec.get("polysemy_risk") or 0))
         obj["object_like_risk"] = max(obj.get("object_like_risk", 0), float(rec.get("object_like_risk") or 0))
         obj["generic_risk"] = max(obj.get("generic_risk", 0), float(rec.get("generic_risk") or 0))
+        pafs = float(rec.get("parent_anchor_final_score") or 0.0)
+        if pafs > float(obj.get("best_parent_anchor_final_score") or 0.0):
+            obj["best_parent_anchor_final_score"] = pafs
+        rk_pa = int(rec.get("parent_anchor_step2_rank") or 0)
+        if rk_pa > 0:
+            prev_rk = obj.get("best_parent_anchor_step2_rank")
+            if prev_rk is None or rk_pa < int(prev_rk):
+                obj["best_parent_anchor_step2_rank"] = rk_pa
         pa = (rec.get("parent_anchor") or "").strip()
         pp = (rec.get("parent_primary") or "").strip()
         st = (rec.get("source_type") or rec.get("source") or rec.get("origin") or "").strip()
@@ -355,19 +612,70 @@ def _merge_stage3_duplicates(raw_candidates: List[Dict[str, Any]]) -> List[Dict[
             obj["has_support_role"] = True
         if rec.get("can_expand"):
             obj["can_expand"] = True
+        if rec.get("can_expand_from_2a"):
+            obj["can_expand_from_2a"] = True
+            obj["can_expand"] = True
         rm = (rec.get("retain_mode") or "normal").strip().lower()
         if rm == "normal":
             obj["retain_mode"] = "normal"
+
+        # ---- 结构语义：多源聚合，禁止被「单条 best seed」覆盖冲淡 ----
+        cur_pb = (rec.get("primary_bucket") or "").strip().lower()
+        best_pb = (obj.get("primary_bucket") or "").strip().lower()
+        if STAGE3_PRIMARY_BUCKET_MERGE_PRIORITY.get(cur_pb, 0) > STAGE3_PRIMARY_BUCKET_MERGE_PRIORITY.get(
+            best_pb, 0
+        ):
+            obj["primary_bucket"] = rec.get("primary_bucket") or ""
+            obj["primary_reason"] = rec.get("primary_reason") or obj.get("primary_reason") or ""
+
+        obj["mainline_candidate"] = bool(
+            obj.get("mainline_candidate", False) or rec.get("mainline_candidate", False)
+        )
+        obj["can_expand_local"] = bool(
+            obj.get("can_expand_local", False) or rec.get("can_expand_local", False)
+        )
+        obj["fallback_primary_all"] = bool(obj.get("fallback_primary_all", True)) and bool(
+            rec.get("fallback_primary", False)
+        )
+
+        cur_tr = (rec.get("term_role") or "").strip().lower()
+        prev_tr = (obj.get("term_role") or "").strip().lower()
+        if STAGE3_TERM_ROLE_MERGE_PRIORITY.get(cur_tr, 0) > STAGE3_TERM_ROLE_MERGE_PRIORITY.get(
+            prev_tr, 0
+        ):
+            obj["term_role"] = rec.get("term_role") or ""
+
         if role_anchor == "mainline":
             obj["role_in_anchor"] = "mainline"
-        elif not obj.get("role_in_anchor"):
-            obj["role_in_anchor"] = role_anchor or "side"
-        if seed_sc >= obj.get("best_seed_score", -1.0):
-            for k, v in rec.items():
-                if k not in ("records", "parent_anchors", "parent_primaries", "source_types", "term_roles", "family_keys"):
-                    obj[k] = v
-    merged = []
+        elif role_anchor and (obj.get("role_in_anchor") or "").strip().lower() != "mainline":
+            obj["role_in_anchor"] = rec.get("role_in_anchor") or role_anchor
+
+        prev_sc = float(obj.get("_merge_best_seed_sc", -1.0))
+        if seed_sc > prev_sc:
+            obj["_merge_best_seed_sc"] = seed_sc
+            obj["_merge_best_seed_rec"] = rec
+        elif seed_sc == prev_sc and seed_sc >= 0.0:
+            old = obj.get("_merge_best_seed_rec") or {}
+            old_pb = (old.get("primary_bucket") or "").strip().lower()
+            if STAGE3_PRIMARY_BUCKET_MERGE_PRIORITY.get(cur_pb, 0) > STAGE3_PRIMARY_BUCKET_MERGE_PRIORITY.get(
+                old_pb, 0
+            ):
+                obj["_merge_best_seed_rec"] = rec
+
+    merged: List[Dict[str, Any]] = []
     for tid, obj in bucket.items():
+        best_rec = obj.pop("_merge_best_seed_rec", None)
+        obj.pop("_merge_best_seed_sc", None)
+        if best_rec:
+            for k, v in best_rec.items():
+                if k in _STAGE3_MERGE_SKIP_KEYS or k in _STAGE3_MERGE_STRUCTURE_FIELDS:
+                    continue
+                obj[k] = v
+
+        obj["fallback_primary"] = bool(obj.get("fallback_primary_all", False))
+        obj.pop("fallback_primary_all", None)
+        obj["stage3_merge_source"] = "strongest_bucket_aggregate"
+
         obj["parent_anchors"] = sorted(obj["parent_anchors"])
         obj["parent_primaries"] = sorted(obj["parent_primaries"])
         obj["source_types"] = sorted(obj["source_types"])
@@ -382,6 +690,7 @@ def _merge_stage3_duplicates(raw_candidates: List[Dict[str, Any]]) -> List[Dict[
             obj["role_in_anchor"] = "side" if obj.get("side_hits", 0) > 0 else ""
         merged.append(obj)
     merged.sort(key=lambda x: float(x.get("best_seed_score") or 0.0), reverse=True)
+    _print_stage3_duplicate_merge_audit(merged)
     return merged
 
 
@@ -781,6 +1090,7 @@ def _assign_stage3_bucket(term: Dict[str, Any]) -> str:
     """
     term.pop("stage3_support_demote_reason", None)
     term.pop("stage3_core_cap_reason", None)
+    term.pop("stage3_core_miss_reason", None)
     anchor_count = int(term.get("anchor_count") or 0)
     if anchor_count < 1:
         anchor_count = 1
@@ -823,10 +1133,34 @@ def _assign_stage3_bucket(term: Dict[str, Any]) -> str:
     if primary_bucket == "risky_keep":
         return "risky"
 
-    # primary_expandable：强主线 → core（需 identity/证据）；否则仍 support
+    # primary_expandable：core = 主线+可扩 ∧ (identity 硬杠 ∨ 非纯 conditioned + JD 对齐)；否则 support 并写 miss 原因供审计
     if primary_bucket == "primary_expandable":
-        if mainline_hits >= 1 and can_expand and identity_factor >= 0.95:
-            return "core"
+        jd_align_core = float(
+            term.get("best_jd_align")
+            or term.get("jd_candidate_alignment")
+            or term.get("jd_align")
+            or ex.get("jd_align")
+            or ex.get("jd_candidate_alignment")
+            or 0.0
+        )
+        if mainline_hits >= 1 and can_expand:
+            if identity_factor >= STAGE3_EXPANDABLE_CORE_IDENTITY_HARD:
+                return _cap_core_if_conditioned_single_anchor("core")
+            if (
+                anchor_count >= 1
+                and (not conditioned_only)
+                and jd_align_core >= STAGE3_EXPANDABLE_CORE_JD_ALIGN_MIN
+            ):
+                return _cap_core_if_conditioned_single_anchor("core")
+        if not (mainline_hits >= 1 and can_expand):
+            term["stage3_core_miss_reason"] = "expandable_need_mainline_and_expand"
+        else:
+            if conditioned_only:
+                term["stage3_core_miss_reason"] = "conditioned_only_no_identity_bypass"
+            elif jd_align_core < STAGE3_EXPANDABLE_CORE_JD_ALIGN_MIN:
+                term["stage3_core_miss_reason"] = "identity_low_and_jd_below_bypass"
+            else:
+                term["stage3_core_miss_reason"] = "identity_below_expandable_core_bar"
         return "support"
 
     # primary_support_seed：可信 support；证据不足 → risky
@@ -1164,6 +1498,54 @@ def _print_stage3_support_risky_concise(cands: List[Dict[str, Any]], top_k: int 
         )
 
 
+def _print_stage3_core_miss_audit(cands: List[Dict[str, Any]], limit: int = 24) -> None:
+    """[Stage3 core-miss audit]：2A 已标 primary_expandable 但未落 stage3 core，便于对照 identity/jd/cap。"""
+    if not STAGE3_CORE_MISS_AUDIT or not cands:
+        return
+    rows: List[Dict[str, Any]] = []
+    for rec in cands:
+        pb = (rec.get("primary_bucket") or "").strip().lower()
+        sb = (rec.get("stage3_bucket") or "").strip().lower()
+        if pb == "primary_expandable" and sb != "core":
+            rows.append(rec)
+    if not rows:
+        return
+    rows.sort(key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
+    rows = rows[:limit]
+    print("\n" + "-" * 80)
+    print("[Stage3 core-miss audit] primary_expandable 但未 core（精调对照）")
+    print("-" * 80)
+    for rec in rows:
+        ex = rec.get("stage3_explain") or {}
+        ident = float(ex.get("identity_factor", 1.0) or 1.0)
+        jd_al = float(
+            rec.get("best_jd_align")
+            or rec.get("jd_candidate_alignment")
+            or rec.get("jd_align")
+            or ex.get("jd_align")
+            or 0.0
+        )
+        reason = (
+            rec.get("stage3_core_miss_reason")
+            or rec.get("stage3_core_cap_reason")
+            or ""
+        )
+        co = _stage3_is_conditioned_only(rec)
+        print(
+            f"term={rec.get('term')!r} primary_bucket={rec.get('primary_bucket')!r} "
+            f"stage3_bucket={rec.get('stage3_bucket')!r}"
+        )
+        print(
+            f"  mainline_hits={int(rec.get('mainline_hits') or 0)} can_expand="
+            f"{bool(rec.get('can_expand', False) or rec.get('can_expand_from_2a', False))} "
+            f"anchor_count={int(rec.get('anchor_count') or 0)} conditioned_only={co}"
+        )
+        print(
+            f"  identity_factor={ident:.3f} jd_align={jd_al:.3f} final_score="
+            f"{float(rec.get('final_score') or 0.0):.4f} core_miss_or_cap={reason!r}"
+        )
+
+
 def _print_stage3_to_paper_bridge(cands: List[Dict[str, Any]], top_k: int = 20) -> None:
     """
     [Stage3->Paper bridge]
@@ -1213,9 +1595,20 @@ def _print_paper_term_selection_audit(ordered: List[Dict[str, Any]], limit: int 
     for rec in ordered[:limit]:
         term = (rec.get("term") or "")[:48]
         fs = float(rec.get("final_score") or 0.0)
+        can_expand = bool(rec.get("can_expand", False) or rec.get("can_expand_from_2a", False))
+        fk_audit = rec.get("family_key") or build_family_key(rec)
         print(f"[paper_term_selection gate] term={term!r}")
         print(f"  bucket={rec.get('stage3_bucket')!r}")
+        print(f"  primary_bucket={rec.get('primary_bucket')!r}")
+        print(f"  term_role={rec.get('term_role')!r}")
         print(f"  final_score={fs:.4f}")
+        print(f"  family_key={fk_audit!r}")
+        print(f"  anchor_count={int(rec.get('anchor_count') or 0)}")
+        print(f"  mainline_hits={int(rec.get('mainline_hits') or 0)}")
+        print(f"  can_expand={can_expand}")
+        print(f"  paper_grounding={float(rec.get('paper_grounding') or 0.0):.4f}")
+        print(f"  risky_side_paper_block={bool(rec.get('risky_side_paper_block'))}")
+        print(f"  paper_support_gate={rec.get('paper_support_gate')!r}")
         print(f"  selected_for_paper={rec.get('selected_for_paper', False)}")
         print(f"  select_reason={rec.get('select_reason')!r}")
         print(f"  paper_reject_reason={repr(rec.get('paper_reject_reason') or '')}")
@@ -1223,11 +1616,8 @@ def _print_paper_term_selection_audit(ordered: List[Dict[str, Any]], limit: int 
         print(f"  reason_flags={rec.get('bucket_reason_flags') or []}")
         if rec.get("paper_final_score_need") is not None:
             print(f"  paper_final_score_need={float(rec.get('paper_final_score_need')):.4f}")
-        if rec.get("paper_grounding") is not None:
-            print(
-                f"  paper_grounding={float(rec.get('paper_grounding') or 0):.4f} "
-                f"need={rec.get('paper_grounding_need')!r} gate={rec.get('paper_support_gate')!r}"
-            )
+        if rec.get("paper_grounding_need") is not None:
+            print(f"  paper_grounding_need={rec.get('paper_grounding_need')!r}")
 
 
 def _paper_grounding_score(rec: Dict[str, Any]) -> float:
@@ -1248,6 +1638,79 @@ def _paper_grounding_score(rec: Dict[str, Any]) -> float:
     )
 
 
+def _apply_paper_readiness_for_recall(rec: Dict[str, Any]) -> None:
+    """
+    Paper 选词序专用乘子（不改 final_score）：stage3 结构字段 + **Step2 锚点主线强度**（无词表）。
+    - `best_parent_anchor_final_score`：tid 合并时对各来源 `parent_anchor_final_score` 取 max（对应 JD 里更强的工业锚）。
+    - 无分则 `best_parent_anchor_step2_rank`（Step2 列表名次，1 最强）→ 递减式 rank prior。
+    """
+    paper_readiness = 1.0
+    bucket = (rec.get("stage3_bucket") or "").strip().lower()
+    term_role = (rec.get("term_role") or "").strip().lower()
+    mainline_hits = int(rec.get("mainline_hits") or 0)
+    anchor_count = int(rec.get("anchor_count") or 0)
+    can_expand = bool(rec.get("can_expand", False) or rec.get("can_expand_from_2a", False))
+    conditioned_only = _stage3_is_conditioned_only(rec)
+    pg_raw = rec.get("paper_grounding")
+    paper_grounding = float(pg_raw) if pg_raw is not None else float(_paper_grounding_score(rec))
+
+    # 1) bucket 软分层：core 最稳，support 次之，risky 最弱（观测桶，非硬拒）
+    if bucket == "core":
+        paper_readiness *= 1.00
+    elif bucket == "support":
+        paper_readiness *= 0.86
+    else:
+        paper_readiness *= 0.72
+
+    # 2) 主线证据：命中越多越像「论文主检索词」
+    paper_readiness *= 0.88 + 0.10 * min(mainline_hits, 2)
+
+    # 3) 可扩性：能沿 Stage2A 主线继续扩的更偏主词而非纯 bonus
+    paper_readiness *= 1.00 if can_expand else 0.84
+
+    # 4) 多锚：跨锚更稳；单锚更易是旁枝/加分项
+    paper_readiness *= 0.90 + 0.06 * min(anchor_count, 2)
+
+    # 5) conditioned_only：已过单锚硬门者仍软压一层
+    if conditioned_only:
+        paper_readiness *= 0.80
+
+    # 6) role：side / expansion 不应轻易压过 primary
+    if term_role in {"primary_side", "dense_expansion", "cluster_expansion", "cooc_expansion"}:
+        paper_readiness *= 0.82
+
+    # 7) grounding proxy：越像可落 paper 项越保留
+    paper_readiness *= 0.82 + 0.18 * paper_grounding
+
+    # 8) 锚点主线先验：同结构下区分「背后锚是 JD 主轴」vs「弱锚/加分锚」（解决 ready 同化）
+    best_fs = float(
+        rec.get("best_parent_anchor_final_score")
+        or rec.get("parent_anchor_final_score")
+        or 0.0
+    )
+    if best_fs > 1e-6:
+        apn = max(
+            0.0,
+            min(1.0, best_fs / PAPER_READINESS_ANCHOR_SCORE_NORM),
+        )
+        anchor_prior_mult = PAPER_READINESS_ANCHOR_PRIOR_LO + PAPER_READINESS_ANCHOR_PRIOR_HI * apn
+    else:
+        ar = int(
+            rec.get("best_parent_anchor_step2_rank")
+            or rec.get("parent_anchor_step2_rank")
+            or 999
+        )
+        anchor_prior_mult = 1.0 / (
+            1.0 + PAPER_READINESS_ANCHOR_RANK_LAMBDA * max(0, ar - 1)
+        )
+    paper_readiness *= anchor_prior_mult
+    rec["paper_anchor_prior_mult"] = float(anchor_prior_mult)
+
+    paper_select_score = float(rec.get("final_score") or 0.0) * paper_readiness
+    rec["paper_readiness"] = float(paper_readiness)
+    rec["paper_select_score"] = float(paper_select_score)
+
+
 def select_terms_for_paper_recall(
     records: List[Dict[str, Any]],
     max_terms: int = 12,
@@ -1255,9 +1718,13 @@ def select_terms_for_paper_recall(
     """
     Paper 召回选词（重写）：
     - 仍阻断：conditioned_only + 单锚、fallback_primary（与 Stage2A 漂移锚对齐，纯安全网）。
-    - **不再**按 core/support/risky 三岔与 primary_support_* / paper_grounding 分层硬门选词；
-      全表按 **统一连续分 final_score** 降序，**family_key 去重** + **dynamic_floor** + **topN**。
-    - stage3_bucket 仅写入 observability / 下游软权重，不当「裁判」。
+    - **弱 support 结构门**（见 STAGE3_PAPER_SUPPORT_*）：在进 eligible 前拦截「support + primary_support_*」
+      且锚/主线/grounding/可扩/conditioned 结构薄弱 的词；统一分只管排序，本门管「该不该上 paper bridge」。
+    - **risky_side_block**（STAGE3_PAPER_RISKY_SIDE_*）：`stage3_bucket=risky` 且不可扩、无 mainline 命中、
+      **`term_role` 为 side/expansion** 的词不进 paper，避免 motion controller 类尾词靠分+floor 混入。
+    - **eligible 内主排序键**：`paper_select_score = final_score * paper_readiness`（readiness = 结构连乘 × **Step2 锚点分/名次先验**，无词表）；
+      仍 **family_key 去重** + **dynamic_floor（与 paper_select_score 同尺度）** + **topN**。
+    - `final_score` 仍为 Stage3 全局统一分；paper 侧分离「背后锚是否 JD 主轴」主要靠在 readiness 中显式吃进 **`best_parent_anchor_*`**。
     """
     if not records:
         return []
@@ -1288,6 +1755,7 @@ def select_terms_for_paper_recall(
         rec["select_reason"] = ""
         rec["paper_reject_reason"] = ""
         rec["paper_cutoff_reason"] = ""
+        rec["risky_side_paper_block"] = False
 
         if conditioned_only and anchor_count <= 1:
             rec["paper_reject_reason"] = "conditioned_only_single_anchor_block"
@@ -1299,19 +1767,83 @@ def select_terms_for_paper_recall(
             rec["paper_cutoff_reason"] = "fallback_primary_block"
             continue
 
+        # ---- weak support contamination：入 eligible 前的结构 gate（复用 _paper_grounding_score）----
+        paper_grounding = _paper_grounding_score(rec)
+        rec["paper_grounding"] = paper_grounding
+        bucket = (rec.get("stage3_bucket") or "").strip().lower()
+        pb = (rec.get("primary_bucket") or "").strip().lower()
+        anchor_count_gate = int(rec.get("anchor_count") or 0)
+        mainline_hits = int(rec.get("mainline_hits") or 0)
+        can_expand = bool(rec.get("can_expand", False) or rec.get("can_expand_from_2a", False))
+        conditioned_only_gate = _stage3_is_conditioned_only(rec)
+        final_score_gate = float(rec.get("final_score") or 0.0)
+        weak_support_contamination = (
+            STAGE3_PAPER_SUPPORT_BLOCK_ENABLED
+            and bucket == "support"
+            and pb in {"primary_support_seed", "primary_support_keep"}
+            and (
+                (
+                    anchor_count_gate <= STAGE3_PAPER_SUPPORT_MAX_ANCHOR_COUNT
+                    and mainline_hits <= STAGE3_PAPER_SUPPORT_MAX_MAINLINE_HITS
+                    and paper_grounding < STAGE3_PAPER_SUPPORT_MIN_GROUNDING
+                )
+                or ((not can_expand) and paper_grounding < STAGE3_PAPER_SUPPORT_MIN_GROUNDING)
+                or (
+                    STAGE3_PAPER_SUPPORT_BLOCK_COND_ONLY
+                    and conditioned_only_gate
+                    and anchor_count_gate <= 2
+                )
+                or (
+                    final_score_gate < STAGE3_PAPER_SUPPORT_MIN_FINAL_SCORE
+                    and paper_grounding < STAGE3_PAPER_SUPPORT_MIN_GROUNDING
+                )
+            )
+        )
+        if weak_support_contamination:
+            rec["paper_support_gate"] = "weak_support_contamination_block"
+            rec["paper_reject_reason"] = "weak_support_contamination_block"
+            rec["paper_cutoff_reason"] = "weak_support_contamination_block"
+            continue
+
+        # ---- risky side / expansion 尾词：非主线、无 ml、不可扩，仅靠分数+floor 会混进 paper_support ----
+        term_role_gate = (rec.get("term_role") or "").strip().lower()
+        risky_side_paper_block = (
+            STAGE3_PAPER_RISKY_SIDE_BLOCK_ENABLED
+            and bucket == "risky"
+            and (not can_expand)
+            and mainline_hits <= 0
+            and term_role_gate in STAGE3_PAPER_RISKY_SIDE_TERM_ROLES
+        )
+        rec["risky_side_paper_block"] = bool(risky_side_paper_block)
+        if risky_side_paper_block:
+            rec["paper_support_gate"] = "risky_side_block"
+            rec["paper_reject_reason"] = "risky_side_block"
+            rec["paper_cutoff_reason"] = "risky_side_block"
+            continue
+
+        rec["paper_support_gate"] = "pass"
+
         fk = rec.get("family_key") or build_family_key(rec)
         rec["family_key"] = fk
         eligible.append(rec)
 
-    floor = _paper_recall_dynamic_floor(eligible)
-    ordered = sorted(eligible, key=lambda r: float(r.get("final_score") or 0.0), reverse=True)
+    # eligible 内：结构 readiness × final_score → paper 赛道排序（与全局 final_score 解耦）
+    for rec in eligible:
+        _apply_paper_readiness_for_recall(rec)
+
+    floor = _paper_recall_dynamic_floor(eligible, score_key="paper_select_score")
+    ordered = sorted(
+        eligible,
+        key=lambda r: float(r.get("paper_select_score") or 0.0),
+        reverse=True,
+    )
 
     for rec in ordered:
-        fs = float(rec.get("final_score") or 0.0)
+        pss = float(rec.get("paper_select_score") or 0.0)
         fk = str(rec.get("family_key") or "")
         bucket = (rec.get("stage3_bucket") or "").strip().lower()
 
-        if fs < floor:
+        if pss < floor:
             rec["paper_reject_reason"] = "below_dynamic_floor"
             rec["paper_cutoff_reason"] = "below_dynamic_floor"
             continue
@@ -1322,8 +1854,8 @@ def select_terms_for_paper_recall(
             continue
 
         rec["selected_for_paper"] = True
-        rec["paper_cutoff_reason"] = "top_n_unified_score"
-        rec["select_reason"] = "unified_score_rank"
+        rec["paper_cutoff_reason"] = "top_n_paper_select_score"
+        rec["select_reason"] = "paper_select_score_rank"
         rec["retrieval_role"] = "paper_primary" if bucket == "core" else "paper_support"
         used_family.add(fk)
         selected.append(rec)
@@ -1339,13 +1871,16 @@ def select_terms_for_paper_recall(
 
     if STAGE3_AUDIT_DEBUG:
         _print_stage3_to_paper_bridge(records, top_k=20)
-    _print_stage3_paper_cutoff_audit(
-        sorted(records, key=lambda x: float(x.get("final_score") or 0.0), reverse=True),
-        floor,
-        max_terms,
-    )
+    # cutoff / narrow 表与真实选词序一致（eligible · paper_select_score）
+    _print_stage3_paper_cutoff_audit(ordered, floor, max_terms)
+    _print_stage3_paper_selection_narrow_audit(ordered)
+    _print_stage3_paper_near_miss_audit(ordered, selected, floor)
     _print_paper_term_selection_audit(
-        sorted(records, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
+        sorted(
+            records,
+            key=lambda x: float(x.get("paper_select_score") or x.get("final_score") or 0.0),
+            reverse=True,
+        )
     )
     _print_stage3_support_contamination_summary(records)
     return selected
@@ -1546,6 +2081,7 @@ def _run_stage3_dual_gate(
         _print_stage3_cross_anchor_audit(survivors, top_k=40)
         _print_stage3_support_subtype_audit(survivors, top_k=24)
         _print_stage3_support_risky_concise(survivors, top_k=20)
+        _print_stage3_core_miss_audit(survivors, limit=24)
 
     core_terms_list, support_terms_list, risky_terms_list = _bucket_stage3_terms(survivors)
     if STAGE3_BUCKET_FACTOR_DEBUG and (LABEL_PATH_TRACE or getattr(term_scoring, "STAGE3_DEBUG", False)):

@@ -145,17 +145,34 @@ def run_label_debug_cli() -> None:
 
                 top_contrib = db.get("top_terms_final_contrib") or []
                 if top_contrib:
-                    print(
-                        "【Top term 最终贡献表】term | tid | final_weight | main_role | role_penalty | paper_count_hit | top_paper_contrib | task_advantage"
-                    )
-                    for r in top_contrib[:20]:
-                        ta = r.get("task_advantage")
-                        ta_s = f"{ta:.3f}" if ta is not None else "-"
+                    paper_tid_set = {str(x) for x in (fcl.get("final_term_ids_for_paper") or [])}
+
+                    def _tid_in_paper_set(tid_val) -> bool:
+                        if tid_val is None:
+                            return False
+                        return str(tid_val) in paper_tid_set
+
+                    def _print_contrib_table(title: str, rows, limit: int = 20) -> None:
+                        if not rows:
+                            return
                         print(
-                            f"  {(r.get('term') or '')[:28]:28s} | {r.get('tid')} | {r.get('final_weight', 0):.4f} | "
-                            f"{(r.get('main_role') or '')[:12]:12s} | {r.get('role_penalty') or 0:.3f} | {r.get('paper_count_hit', 0)} | "
-                            f"{r.get('top_paper_contrib', 0):.6f} | {ta_s}"
+                            f"{title}term | tid | final_weight | main_role | role_penalty | paper_count_hit | top_paper_contrib | task_advantage"
                         )
+                        for r in rows[:limit]:
+                            ta = r.get("task_advantage")
+                            ta_s = f"{ta:.3f}" if ta is not None else "-"
+                            print(
+                                f"  {(r.get('term') or '')[:28]:28s} | {r.get('tid')} | {r.get('final_weight', 0):.4f} | "
+                                f"{(r.get('main_role') or '')[:12]:12s} | {r.get('role_penalty') or 0:.3f} | {r.get('paper_count_hit', 0)} | "
+                                f"{r.get('top_paper_contrib', 0):.6f} | {ta_s}"
+                            )
+
+                    in_paper = [r for r in top_contrib if _tid_in_paper_set(r.get("tid"))]
+                    not_in_paper = [r for r in top_contrib if not _tid_in_paper_set(r.get("tid"))]
+                    print("【Top term 最终贡献表】按是否进入 final_term_ids_for_paper 拆分（避免高分未入 paper 看起来像有效贡献）")
+                    _print_contrib_table("  [实际进论文检索] ", in_paper)
+                    # 批注：未进 paper 段只保留高分前 8 行，避免与主线诊断无关的长表。
+                    _print_contrib_table("  [Stage3/5 高分但未进论文检索] ", not_in_paper, limit=8)
 
                     # 学术 Top term 命运表：查看这些学术词在 Stage2/Stage3 各环节的流转情况
                     # 统一用 int 做 membership，避免 tid 为 str 而列表为 int（或反之）导致误判
@@ -222,30 +239,33 @@ def run_label_debug_cli() -> None:
                 a_count = db.get("author_count", 0)
                 print(f"【Step 4: 召回规模】参与检索学术词数: {vocab_count}  检索论文: {w_count}  锁定作者: {a_count}")
 
-                print("【Top20 作者来源】author_id | final_score | top_terms_by_contribution(前3) | best_paper | best_paper_terms")
-                for i, item in enumerate(db.get("top_samples", [])[:20], 1):
-                    aid = item.get("aid", "")
-                    score = item.get("score", 0)
-                    top_terms = item.get("top_terms_by_contribution", [])[:3]
-                    terms_s = ", ".join(f"{t}({c})" for t, c in top_terms) if top_terms else "-"
-                    tp = item.get("top_paper", {}) or {}
-                    best_title = (tp.get("title") or "")[:40]
-                    best_hits = ", ".join((tp.get("hits") or [])[:3])
-                    print(f"  #{i:2d} {aid} | {score:.4f} | {terms_s} | 《{best_title}》 | {best_hits}")
-
-                print("-" * 98)
-                print(f"{'排名':<6} | {'作者 ID':<14} | {'得分':<10} | {'代表作 (命中标签)'}")
-                print("-" * 98)
+                # 批注：合并原「Top20 作者来源」与第二块排名表，降噪且保留结构字段（struct× / st / mtp）。
+                print(
+                    "【Top 作者榜】# | author_id | score | struct× | st | papr | mtp | "
+                    "top_terms(前2) | 《代表作》 | hits"
+                )
+                print("-" * 110)
                 for i, item in enumerate(db.get("top_samples", [])[:30], 1):
                     aid = item.get("aid", "")
-                    score = item.get("score", 0)
-                    tp = item.get("top_paper", {}) or {}
-                    title = (tp.get("title") or "")[:45]
-                    hit_tags = ", ".join((tp.get("hits") or [])[:4])
+                    score = float(item.get("score", 0) or 0)
+                    sm = item.get("structure_mult_total")
+                    sm_s = f"{float(sm):.3f}" if sm is not None else "-"
+                    stc = item.get("strong_term_count_struct")
+                    stc_s = str(int(stc)) if stc is not None else "-"
+                    pcs = item.get("paper_count_struct")
+                    pcs_s = str(int(pcs)) if pcs is not None else "-"
+                    mtpv = item.get("multi_term_paper_count_struct")
+                    mtp_s = str(int(mtpv)) if mtpv is not None else "-"
                     top_terms = item.get("top_terms_by_contribution", [])[:2]
-                    src = ", ".join(f"{t}({c})" for t, c in top_terms) if top_terms else ""
-                    print(f"#{i:<5} | {aid:<14} | {score:.4f}    | 《{title}》 命中: {hit_tags}  来源: {src}")
-                print("-" * 98)
+                    terms_s = ", ".join(f"{t}({c})" for t, c in top_terms) if top_terms else "-"
+                    tp = item.get("top_paper", {}) or {}
+                    title = (tp.get("title") or "")[:42]
+                    hit_tags = ", ".join((tp.get("hits") or [])[:4])
+                    print(
+                        f"  #{i:<2} | {aid:<12} | {score:.4f} | {sm_s:>7} | {stc_s:>2} | {pcs_s:>4} | {mtp_s:>3} | "
+                        f"{terms_s[:28]:28s} | 《{title}》 | {hit_tags}"
+                    )
+                print("-" * 110)
                 print(f"[*] 诊断完成。全链路耗时: {search_time:.2f}ms")
             else:
                 # 仅人选列表（各阶段耗时已在 label_path.recall 中打印）

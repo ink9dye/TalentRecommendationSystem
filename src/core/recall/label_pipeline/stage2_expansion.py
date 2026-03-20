@@ -102,6 +102,15 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
         rec["stage2b_seed_tier"] = getattr(c, "stage2b_seed_tier", "none") or "none"
         rec["mainline_candidate"] = bool(getattr(c, "mainline_candidate", False))
         rec["primary_reason"] = getattr(c, "primary_reason", "") or ""
+        _pao = getattr(c, "parent_anchor_obj", None)
+        _fs_obj = float(getattr(_pao, "final_anchor_score", 0.0) or 0.0) if _pao is not None else 0.0
+        _fs_c = float(getattr(c, "parent_anchor_final_score", 0.0) or 0.0)
+        rec["parent_anchor_final_score"] = max(_fs_obj, _fs_c)
+        _rk_obj = int(getattr(_pao, "step2_anchor_rank", 0) or 0) if _pao is not None else 0
+        _rk_c = int(getattr(c, "parent_anchor_step2_rank", 0) or 0)
+        _rk = _rk_c if _rk_c > 0 else _rk_obj
+        if _rk > 0:
+            rec["parent_anchor_step2_rank"] = _rk
         out.append(rec)
     if LABEL_EXPANSION_DEBUG and out:
         for rec in out[:10]:

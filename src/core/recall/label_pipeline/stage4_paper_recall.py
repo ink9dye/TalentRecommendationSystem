@@ -12,7 +12,7 @@ from config import ABSTRACT_MAP_PATH, INDEX_DIR
 
 # 层级守卫：单 term 最多贡献论文数，避免泛词占满 paper 池
 TERM_MAX_PAPERS = 50
-# 单 term 对某作者总贡献占比上限（在 Stage5 / paper_scoring 中实现）
+# 单 term 对某作者总贡献占比上限（Stage5 `_apply_term_max_author_share_cap`；与 paper_scoring 无关）
 TERM_MAX_AUTHOR_SHARE = 0.25
 
 # 词侧熔断：degree_w/total_w 超过此比例的泛词在 Cypher 内过滤
@@ -30,8 +30,8 @@ STAGE4_JD_AUDIT_TOP_K = 3
 # 仅对「final_score 最高的前 K 个 paper_primary」打明细 jd audit（降噪）；True 则全量
 STAGE4_JD_AUDIT_PRIMARY_DETAIL_K = int(os.environ.get("STAGE4_JD_AUDIT_PRIMARY_DETAIL_K", "3"))
 STAGE4_JD_AUDIT_FULL = os.environ.get("STAGE4_JD_AUDIT_FULL", "").strip().lower() in ("1", "true", "yes")
-# overlap survival 审计最大行数（优先 survive_after_cap=True）
-STAGE4_OVERLAP_SURVIVAL_MAX_LINES = int(os.environ.get("STAGE4_OVERLAP_SURVIVAL_MAX_LINES", "30"))
+# overlap survival 审计最大行数（高分存活 + rank 靠前被淘汰项；降噪默认 12）
+STAGE4_OVERLAP_SURVIVAL_MAX_LINES = int(os.environ.get("STAGE4_OVERLAP_SURVIVAL_MAX_LINES", "12"))
 # 三级领域共识软乘子：词侧 vocabulary_topic_stats × JD field/subfield/topic 画像，不对论文硬筛
 STAGE4_HIERARCHY_CONSENSUS_ENABLED = os.environ.get("STAGE4_HIERARCHY_CONSENSUS_ENABLED", "1").strip().lower() not in (
     "0",
@@ -50,6 +50,10 @@ STAGE4_HIERARCHY_BONUS_BETA = float(os.environ.get("STAGE4_HIERARCHY_BONUS_BETA"
 STAGE4_HIERARCHY_BONUS_CLIP_LOW = float(os.environ.get("STAGE4_HIERARCHY_BONUS_CLIP_LOW", "0.82"))
 STAGE4_HIERARCHY_BONUS_CLIP_HIGH = float(os.environ.get("STAGE4_HIERARCHY_BONUS_CLIP_HIGH", "1.15"))
 STAGE4_HIERARCHY_DISTRIBUTION_TOP_N = int(os.environ.get("STAGE4_HIERARCHY_DISTRIBUTION_TOP_N", "10"))
+# False：只打 [Stage4 hierarchy bonus distribution] 分位数摘要，不逐条 top_boosted/top_penalized（与 consensus audit 防重复）
+STAGE4_HIERARCHY_BONUS_DISTRIBUTION_DETAIL = os.environ.get(
+    "STAGE4_HIERARCHY_BONUS_DISTRIBUTION_DETAIL", ""
+).strip().lower() in ("1", "true", "yes")
 # True：打印 author payload 逐条 multi-hit；False：仅保留汇总计数（默认）
 STAGE4_AUTHOR_PAYLOAD_AUDIT_VERBOSE = False
 
@@ -238,6 +242,8 @@ def _audit_hierarchy_bonus_distribution(dist_rows: List[Dict[str, Any]], top_n: 
         f"hierarchy_bonus min={float(np.min(bon)):.4f} p25={_pct(bon, 25):.4f} "
         f"p50={_pct(bon, 50):.4f} p75={_pct(bon, 75):.4f} max={float(np.max(bon)):.4f}"
     )
+    if not STAGE4_HIERARCHY_BONUS_DISTRIBUTION_DETAIL:
+        return
     _tn = max(0, top_n)
     boosted = sorted(dist_rows, key=lambda r: -float(r["bonus"]))[:_tn]
     penalized = sorted(dist_rows, key=lambda r: float(r["bonus"]))[:_tn]
@@ -694,7 +700,10 @@ def run_stage4(
         - 对象型词：grounding / paper 贡献 / local cap 略收紧
         """
         meta = _get_term_meta(vid)
+        term_lc = str(meta.get("term") or "").strip().lower()
         retrieval_role = str(meta.get("retrieval_role") or "").strip().lower()
+        if term_lc == "robot control":
+            retrieval_role = "paper_support"
         stage3_bucket = str(meta.get("stage3_bucket") or "").strip().lower()
         can_expand = bool(meta.get("can_expand", False))
         term_role = str(meta.get("term_role") or "").strip().lower()
@@ -740,6 +749,10 @@ def run_stage4(
             grounding_factor *= 0.96
         if bonus_risk > 0.35:
             paper_factor *= 0.96
+
+        # 与 term_retrieval_roles 覆盖一致：umbrella「robot control」额外压低 paper_factor，削弱进入 Stage5 前的单 term 论文分。
+        if term_lc == "robot control":
+            paper_factor = min(float(paper_factor), 0.68)
 
         return {
             # 下限放宽到 0.70，允许对象词 grounding_factor=0.72 生效
@@ -793,7 +806,18 @@ def run_stage4(
         return []
 
     # ---------- Python：recency、role_weight、grounding/off_topic、term_contrib，per-term 限流，再按 paper 聚合 ----------
-    term_retrieval_roles = term_retrieval_roles or {}
+    # 批注：Stage3 可能对「robot control」标 paper_primary；该词为控制类 umbrella，字面过宽。
+    # Stage4 侧覆盖为 paper_support，使 role_weight 与 hits 角色与 motion control 等细项区分，避免泛词 Primary 灌作者榜。
+    term_retrieval_roles = dict(term_retrieval_roles or {})
+    for _vid0 in v_ids:
+        try:
+            _vi = int(_vid0)
+        except (TypeError, ValueError):
+            continue
+        _m0 = _get_term_meta(_vi)
+        if str(_m0.get("term") or "").strip().lower() == "robot control":
+            term_retrieval_roles[_vi] = "paper_support"
+            term_retrieval_roles[str(_vi)] = "paper_support"
     by_term: Dict[int, List[tuple]] = defaultdict(list)
 
     # -------------------------
@@ -1066,7 +1090,7 @@ def run_stage4(
     # 断点 2：overlap 论文在各 term 的 cap 前后生存情况（默认限行长，优先 survive_after_cap）
     cross_term_overlap_pids = {pid for (_, _, inter) in overlap_pairs for pid in inter}
     print("\n[Stage4 overlap survival audit]")
-    survival_lines: List[tuple] = []
+    survival_entries: List[Dict[str, Any]] = []
     for vid, rows in term_rows_before_cap.items():
         term_name = str((_get_term_meta(vid) or {}).get("term") or vid)
         rows_sorted = sorted(rows, key=lambda x: float(x.get("final_paper_score") or 0.0), reverse=True)
@@ -1077,15 +1101,38 @@ def run_stage4(
                 continue
             sc = float(r.get("final_paper_score") or 0.0)
             surv = pid in top_after_cap
-            survival_lines.append((not surv, -sc, term_name, pid, rank, sc, surv))
-    survival_lines.sort()
-    for _k in survival_lines[: max(0, STAGE4_OVERLAP_SURVIVAL_MAX_LINES)]:
-        term_name, pid, rank, sc, surv = _k[2], _k[3], _k[4], _k[5], _k[6]
+            survival_entries.append(
+                {"term": term_name, "pid": pid, "rank": rank, "sc": sc, "surv": surv}
+            )
+    survived_high = [e for e in survival_entries if e["surv"]]
+    survived_high.sort(key=lambda e: -e["sc"])
+    danger_cut = [e for e in survival_entries if (not e["surv"]) and int(e["rank"]) <= 15]
+    danger_cut.sort(key=lambda e: (int(e["rank"]), -e["sc"]))
+    max_lines = max(0, STAGE4_OVERLAP_SURVIVAL_MAX_LINES)
+    picked: List[Dict[str, Any]] = []
+    seen_pk: Set[Tuple[str, str]] = set()
+    for e in survived_high:
+        if len(picked) >= max_lines:
+            break
+        pk = (e["pid"], e["term"])
+        if pk in seen_pk:
+            continue
+        seen_pk.add(pk)
+        picked.append(e)
+    for e in danger_cut:
+        if len(picked) >= max_lines:
+            break
+        pk = (e["pid"], e["term"])
+        if pk in seen_pk:
+            continue
+        seen_pk.add(pk)
+        picked.append(e)
+    for e in picked:
         print(
-            f"term='{term_name}' pid='{pid}' "
-            f"rank_before_cap={rank} "
-            f"score={sc:.3f} "
-            f"survive_after_cap={surv}"
+            f"term='{e['term']}' pid='{e['pid']}' "
+            f"rank_before_cap={e['rank']} "
+            f"score={float(e['sc']):.3f} "
+            f"survive_after_cap={e['surv']}"
         )
 
     # 按 wid 聚合：paper_score = Σ term_contrib，hits 合并为 canonical term 证据
@@ -1238,13 +1285,10 @@ def run_stage4(
                 }
             )
         _audit_hierarchy_bonus_distribution(dist_rows, STAGE4_HIERARCHY_DISTRIBUTION_TOP_N)
-        _by_before = sorted(hierarchy_audit_rows, key=lambda x: -x[0])[: max(0, STAGE4_HIERARCHY_AUDIT_TOP_BY_SCORE)]
         _by_delta = sorted(hierarchy_audit_rows, key=lambda x: -abs(x[1] - x[0]))[
             : max(0, STAGE4_HIERARCHY_AUDIT_TOP_BY_DELTA)
         ]
-        print("\n[Stage4 hierarchy consensus audit] top_by_paper_score_before")
-        for _i, (_bef, _aft, _wid, _rec, _bon, _det, _hits) in enumerate(_by_before, 1):
-            _print_hier_line("before", _i, _wid, _rec, _bef, _aft, _bon, _det, _hits)
+        # 批注：与 top_by_abs_score_delta 信息高度重叠时只保留后者，缩短日志。
         print("\n[Stage4 hierarchy consensus audit] top_by_abs_score_delta")
         for _i, (_bef, _aft, _wid, _rec, _bon, _det, _hits) in enumerate(_by_delta, 1):
             _print_hier_line("delta", _i, _wid, _rec, _bef, _aft, _bon, _det, _hits)
