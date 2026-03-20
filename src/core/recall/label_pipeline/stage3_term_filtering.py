@@ -38,14 +38,12 @@ PAPER_RECALL_MAX_TERMS = 12
 # Paper 入稿：统一分数相对截断（相对 Top1 与绝对下限取 max）；避免弱支线索性跟跑
 PAPER_RECALL_DYNAMIC_FLOOR_REL = 0.62
 PAPER_RECALL_DYNAMIC_FLOOR_ABS = 0.12
-# --- 大池词已入选后的「尾部补位」（不改 gate / unified / paper_select_score 公式；仅在主 cutoff 之后最多再塞 1~2 词）---
-# 典型动机：RL 等大池 core 仍可选用，但避免 final_term_ids 只剩极少数词；near-miss 的 core / primary_support_seed 可跟选 1~2 个。
+# --- 主 cutoff 之后的「尾部补位」（不改 gate / unified / paper_select_score 公式；最多再塞 1~2 词）---
+# 触发：已选词很少（≤3）或 **support 槽无人**（selected_support==0）；near-miss 带来 heterogeneity，避免 term set 过窄。
 PAPER_RECALL_TAIL_EXPAND_ENABLED = True
 PAPER_RECALL_TAIL_EXPAND_MAX_EXTRA = 2
 PAPER_RECALL_TAIL_EXPAND_DELTA_MAX = 0.045
 PAPER_RECALL_TAIL_EXPAND_REQUIRE_CORE_OR_SEED = True
-PAPER_RECALL_BIG_POOL_PAPERS_MIN = 120
-PAPER_RECALL_BIG_POOL_SELECTED_MIN = 1
 # paper_readiness · 锚点先验（Stage3）：以 Step2 锚点分为「主证据」，名次只做轻平滑（避免 rank 主导把 robot control 等主线词打出 dynamic_floor）
 PAPER_READINESS_ANCHOR_SCORE_NORM = 1.20  # anchor_score_norm = clip(score / 此值, 0, 1)
 PAPER_READINESS_ANCHOR_PRIOR_W_SCORE = 0.88  # 先验里分值权重（主）
@@ -55,6 +53,8 @@ PAPER_READINESS_ANCHOR_READINESS_BLEND_LO = 0.82  # readiness *= LO + HI * ancho
 PAPER_READINESS_ANCHOR_READINESS_BLEND_HI = 0.18
 # core + 已命中主线 + 可扩：paper_readiness 保底（结构信号，非词表）；防「主线可扩却被 floor 误杀」
 PAPER_READINESS_CORE_MAINLINE_EXPAND_MIN = 0.78
+# primary_support_seed + 主线 + 可扩 + 非 conditioned_only：较 core 略低的 readiness 底板，与 PAPER_SUPPORT_SEED_FACTOR 叠加后仍易竞争 paper
+PAPER_READINESS_SUPPORT_SEED_MAINLINE_EXPAND_MIN = 0.76
 # paper_select_score：在 final_score×paper_readiness 底分上 **加性轻注入**（仅 eligible 排序 + dynamic_floor；**不改 final_score**）
 # 直接吃 Stage2A `primary_bucket`、主线命中、可扩、`parent_anchor_*`，抬高 JD 主轴词、压低弱桶/无主线 — 无量词黑名单。
 PAPER_SELECT_SCORE_ANCHOR_NORM = 1.20
@@ -92,7 +92,7 @@ STAGE3_PAPER_SUPPORT_BLOCK_COND_ONLY = True
 SUPPORT_TO_PAPER_ENABLED = True
 SUPPORT_TO_PAPER_MAX = 3
 SUPPORT_TO_PAPER_MAX_FRAC = 1.0 / 3.0  # 入选 support 同时受「最多 SUPPORT_TO_PAPER_MAX」与「不超过 max_terms 的 1/3」约束
-PAPER_SUPPORT_SEED_FACTOR = 0.72  # primary_support_seed 软放行：乘入 paper_readiness（随后进 paper_select_score 底分）
+PAPER_SUPPORT_SEED_FACTOR = 0.82  # support_seed_soft_admit：乘 readiness（略抬高，避免 0.72 与连乘双压过狠）
 PAPER_SUPPORT_KEEP_FACTOR = 0.58  # primary_support_keep 且结构信号达标时软放行
 # core 未过 JD 全局主轴门（rk∨a_sc）：**不**再硬拒；降级 support_pool，乘 readiness 后进 `paper_select_score` 竞争（配额仍走 support 槽）
 PAPER_CORE_AXIS_NEAR_MISS_FACTOR = 0.72
@@ -2054,21 +2054,19 @@ def _apply_paper_recall_tail_expand(
     used_family: Set[str],
     floor: float,
     max_terms: int,
+    selected_support: int,
 ) -> int:
     """
-    主截断完成后：若已选词里出现「大池」命中（papers_before_filter 阈），从 near-miss 带再补 1~2 槽。
-    优先 core_axis_near_miss、再 support_seed，仍用 family 去重；不放宽 risky / fallback / conditioned_only。
+    主截断完成后：若 **词表过窄**（len(selected)≤3）或 **support 槽全空**（selected_support==0），
+    从 near-miss 带再补 ≤MAX_EXTRA 槽。**优先级**：`primary_support` seed + ml≥1 + 可扩 > `core_axis_near_miss_soft_admit` > 其余过选词。
+    仍 family 去重；不放宽 risky / fallback / conditioned_only。
     """
     if not PAPER_RECALL_TAIL_EXPAND_ENABLED or not ordered:
         return 0
-    cap_total = max_terms + int(PAPER_RECALL_TAIL_EXPAND_MAX_EXTRA)
-    selected_big_pool = [
-        x
-        for x in selected
-        if float(x.get("papers_before_filter") or 0) >= float(PAPER_RECALL_BIG_POOL_PAPERS_MIN)
-    ]
-    if len(selected_big_pool) < int(PAPER_RECALL_BIG_POOL_SELECTED_MIN):
+    need_tail_expand = len(selected) <= 3 or int(selected_support) <= 0
+    if not need_tail_expand:
         return 0
+    cap_total = max_terms + int(PAPER_RECALL_TAIL_EXPAND_MAX_EXTRA)
 
     tail_candidates: List[Dict[str, Any]] = []
     for rec in ordered:
@@ -2091,13 +2089,16 @@ def _apply_paper_recall_tail_expand(
             if not (bkt == "core" or pb == "primary_support_seed"):
                 continue
 
+        can_x = bool(rec.get("can_expand") or rec.get("can_expand_from_2a"))
+        ml = int(rec.get("mainline_hits") or 0)
         sup_rs = str(rec.get("paper_support_reason") or "")
-        if sup_rs.startswith("core_axis_near_miss"):
+        # 批注：先抢「真 seed+主线+可扩」，再抢主轴 near-miss 降级 core，最后才是其它 core/seed
+        if pb == "primary_support_seed" and ml >= 1 and can_x:
+            pri = 3
+        elif sup_rs.startswith("core_axis_near_miss"):
             pri = 2
-        elif sup_rs.startswith("support_seed"):
-            pri = 1
         else:
-            pri = 0
+            pri = 1
         rec["_tail_expand_priority"] = pri
         tail_candidates.append(rec)
 
@@ -2146,16 +2147,18 @@ def _print_stage3_tail_expand_audit(
     extra_n: int,
     floor: float,
     selected_before: int,
-    selected_big_pool_n: int,
+    need_tail_expand: bool,
+    selected_support: int,
 ) -> None:
     if not STAGE3_PAPER_CUTOFF_AUDIT:
         return
     print(
         f"\n[Stage3 tail expand audit] enabled={PAPER_RECALL_TAIL_EXPAND_ENABLED} "
+        f"trigger={need_tail_expand} (selected≤3 or support_lane_count==0) "
         f"extra_added={extra_n} floor={floor:.4f} selected_before={selected_before} "
-        f"big_pool_selected={selected_big_pool_n} "
-        f"(papers≥{PAPER_RECALL_BIG_POOL_PAPERS_MIN}, "
-        f"Δ≤{PAPER_RECALL_TAIL_EXPAND_DELTA_MAX}, max_extra={PAPER_RECALL_TAIL_EXPAND_MAX_EXTRA})"
+        f"selected_support_before={selected_support} "
+        f"Δ≤{PAPER_RECALL_TAIL_EXPAND_DELTA_MAX} max_extra={PAPER_RECALL_TAIL_EXPAND_MAX_EXTRA} "
+        f"p_order=seed+ml+exp(3)>core_axis_near_miss(2)>other(1)"
     )
 
 
@@ -2312,6 +2315,7 @@ def _apply_paper_readiness_for_recall(rec: Dict[str, Any]) -> None:
       `anchor_score_norm` 主导，`rank_smooth=1/(1+λ·max(rank-1,0))` 仅轻量调和；再
       `readiness *= (blend_lo + blend_hi * anchor_prior)`，避免旧版「无分时 rank 单路倒数」压穿 paper。
     - **core + mainline_hits≥1 + 可扩**：`paper_readiness` 不低于 **`PAPER_READINESS_CORE_MAINLINE_EXPAND_MIN`**，减轻 dynamic_floor 对主轴词的误杀。
+    - **primary_support_seed + mainline_hits≥1 + 可扩 + ¬conditioned_only**：不低于 **`PAPER_READINESS_SUPPORT_SEED_MAINLINE_EXPAND_MIN`**（随后在 step10 仍可 × **`PAPER_SUPPORT_SEED_FACTOR`**）。
     - **`paper_select_score`** 不在此函数内做简单乘法，而在写入 readiness 后交给 **`_compute_paper_select_score`**（底分×ready + Stage2 结构加性项）。
     """
     paper_readiness = 1.0
@@ -2389,6 +2393,19 @@ def _apply_paper_readiness_for_recall(rec: Dict[str, Any]) -> None:
     if bucket == "core" and mainline_hits >= 1 and can_expand:
         paper_readiness = max(paper_readiness, float(PAPER_READINESS_CORE_MAINLINE_EXPAND_MIN))
 
+    # 9b) primary_support_seed + 主线 + 可扩 + 非 conditioned_only：readiness 保底（与 core 同类结构信号；助 soft_admit / tail 竞争）
+    primary_bucket_rd = (rec.get("primary_bucket") or "").strip().lower()
+    if (
+        primary_bucket_rd == "primary_support_seed"
+        and mainline_hits >= 1
+        and can_expand
+        and not conditioned_only
+    ):
+        paper_readiness = max(
+            paper_readiness,
+            float(PAPER_READINESS_SUPPORT_SEED_MAINLINE_EXPAND_MIN),
+        )
+
     # 10) support 软放行：在 `select_terms_for_paper_recall` 已写入 `paper_support_factor`(<1) 时压低 readiness，再进入底分×bonus−pool
     psf = float(rec.get("paper_support_factor") or 1.0)
     if psf < 1.0 - 1e-9:
@@ -2418,9 +2435,9 @@ def select_terms_for_paper_recall(
       再 **`eligible.extend(support_pool)`**；最终 **`support_cap`** 对 **`paper_recall_quota_lane==support`** 计配额，
       **`retrieval_role`**：`primary` lane → `paper_primary`，否则 `paper_support`。
     - **排序**：`paper_select_score` = 底分 × readiness + 加性 bonus − 池惩罚；**family** + **dynamic_floor** + **topN**。
-    - **尾部补位**（**`PAPER_RECALL_TAIL_EXPAND_*`**）：主截断完成后，若已选词里 **`papers_before_filter≥BIG_POOL_MIN`** 至少 **`BIG_POOL_SELECTED_MIN`** 条，
-      从未入选的 **near-miss**（**`p_sel≥floor−Δ`**）中再补最多 **`TAIL_EXPAND_MAX_EXTRA`** 条 **core / primary_support_seed**（禁 risky / fallback / conditioned_only），
-      仍 **family** 去重；见 **`[Stage3 tail expand audit]`**。不修改 gate 与 `paper_select_score` 定义。
+    - **尾部补位**（**`PAPER_RECALL_TAIL_EXPAND_*`**）：主截断完成后，若 **`len(selected)≤3`** 或 **`selected_support==0`**，
+      从未入选 **near-miss**（**`p_sel≥floor−Δ`**）再补 **≤`TAIL_EXPAND_MAX_EXTRA`**；
+      **优先级**：**`primary_support_seed`∧ml≥1∧可扩** > **`core_axis_near_miss*`** > 其余过选股；见 **`[Stage3 tail expand audit]`**。不修改 gate 与 `paper_select_score` 定义。
     """
     if not records:
         return []
@@ -2725,21 +2742,14 @@ def select_terms_for_paper_recall(
         if len(selected) >= max_terms:
             break
 
-    # 大池词（如 RL）已进 final 时，主 cutoff 之后再补 1~2 个 near-miss core/seed，扩宽 term set；不动前置 gate 与 p_sel 公式。
+    # 词表过窄或 support 槽全空时，主 cutoff 之后再补 near-miss（见 PAPER_RECALL_TAIL_EXPAND_*）；不动 gate / p_sel 公式。
     selected_before_tail = len(selected)
-    selected_big_pool_n = len(
-        [
-            x
-            for x in selected
-            if float(x.get("papers_before_filter") or 0)
-            >= float(PAPER_RECALL_BIG_POOL_PAPERS_MIN)
-        ]
-    )
+    need_tail_expand = selected_before_tail <= 3 or int(selected_support) <= 0
     extra_tail = _apply_paper_recall_tail_expand(
-        selected, ordered, used_family, floor, max_terms
+        selected, ordered, used_family, floor, max_terms, selected_support
     )
     _print_stage3_tail_expand_audit(
-        extra_tail, floor, selected_before_tail, selected_big_pool_n
+        extra_tail, floor, selected_before_tail, need_tail_expand, selected_support
     )
 
     # 提前填满 max_terms 后，后续名次仅差一轮标注（便于 cutoff 表读因）

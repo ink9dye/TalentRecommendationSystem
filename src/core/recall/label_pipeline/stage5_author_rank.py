@@ -18,6 +18,15 @@ from src.core.recall.label_means.simple_factors import is_label_jd_title_gate_di
 
 # True：打印 [Stage5 support dominance audit]，看作者是否被 support 独狼论文抬榜
 STAGE5_SUPPORT_DOMINANCE_AUDIT = True
+# True：打印 [Stage5 support-only author penalty audit]（纯 support 贡献且无 primary 论文托底 → 作者分乘子）
+STAGE5_SUPPORT_ONLY_AUTHOR_PENALTY_ENABLED = True
+STAGE5_SUPPORT_ONLY_PENALTY_AUDIT = True
+# 条件：sup_only_papers≥1 ∧ sup_with_pri_papers==0 ∧ top_pri_c≈0；不动词级分、不碰 Stage3
+SUPPORT_ONLY_TOP_PRI_EPS = 1e-12
+SUPPORT_ONLY_SUP_SHARE_STRONG = 0.85
+SUPPORT_ONLY_SUP_SHARE_MILD = 0.65
+SUPPORT_ONLY_PENALTY_STRONG = 0.62
+SUPPORT_ONLY_PENALTY_MILD = 0.78
 # True：打印 [Stage5 term-cap audit]，确认单 term 作者占比上限是否作用在最终聚合前
 STAGE5_TERM_CAP_AUDIT = True
 # True：打印 [Stage5 author structure audit]（base×结构乘子→after，含分项 mult）
@@ -331,6 +340,102 @@ def aggregate_author_evidence_by_term_role(
     return out
 
 
+def _compute_author_support_only_metrics(
+    aid: str,
+    author_term_contrib: Dict[str, Dict[str, float]],
+    author_all_retained_works: Dict[str, List[Tuple[str, float]]],
+    paper_map: Dict[str, Dict[str, Any]],
+    debug_1: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    与 [Stage5 support dominance audit] 同源分解：term 侧 primary/support 份额 + 论文侧是否只有 support 命中。
+    供 support-only 作者惩罚与审计复用（避免两处规则漂移）。
+    """
+    atc = author_term_contrib.get(aid, {}) or {}
+    total = sum(float(v) for v in atc.values()) or 1e-12
+    pri_vals: List[float] = []
+    sup_vals: List[float] = []
+    for tid_s, c in atc.items():
+        c = float(c)
+        if c <= 0:
+            continue
+        rr = _retrieval_role_for_paper_term(debug_1, str(tid_s))
+        if rr == "paper_support":
+            sup_vals.append(c)
+        else:
+            pri_vals.append(c)
+    top_pri_c = max(pri_vals) if pri_vals else 0.0
+    top_sup_c = max(sup_vals) if sup_vals else 0.0
+    sup_sum = sum(sup_vals)
+    sup_share = float(sup_sum / total)
+
+    sup_only_papers = 0
+    sup_with_pri_papers = 0
+    for wid, piece in author_all_retained_works.get(aid, []):
+        if float(piece or 0.0) <= 0:
+            continue
+        info = paper_map.get(str(wid)) or paper_map.get(wid) or {}
+        hits = info.get("hits") or []
+        has_p = any(
+            (h.get("role") or "").strip().lower() == "paper_primary"
+            for h in hits
+            if isinstance(h, dict)
+        )
+        has_s = any(
+            (h.get("role") or "").strip().lower() == "paper_support"
+            for h in hits
+            if isinstance(h, dict)
+        )
+        if has_p:
+            sup_with_pri_papers += 1
+        elif has_s:
+            sup_only_papers += 1
+
+    return {
+        "sup_share": sup_share,
+        "top_pri_c": float(top_pri_c),
+        "top_sup_c": float(top_sup_c),
+        "sup_only_papers": int(sup_only_papers),
+        "sup_with_pri_papers": int(sup_with_pri_papers),
+    }
+
+
+def _support_only_author_penalty_value(m: Dict[str, Any]) -> float:
+    """论文级：仅有 support-only 篇、无 primary 篇；词级：几乎无 primary 贡献。否则 1.0。"""
+    if int(m.get("sup_only_papers") or 0) < 1:
+        return 1.0
+    if int(m.get("sup_with_pri_papers") or 0) != 0:
+        return 1.0
+    if float(m.get("top_pri_c") or 0.0) > SUPPORT_ONLY_TOP_PRI_EPS:
+        return 1.0
+    sup_share = float(m.get("sup_share") or 0.0)
+    if sup_share >= SUPPORT_ONLY_SUP_SHARE_STRONG:
+        return float(SUPPORT_ONLY_PENALTY_STRONG)
+    if sup_share >= SUPPORT_ONLY_SUP_SHARE_MILD:
+        return float(SUPPORT_ONLY_PENALTY_MILD)
+    return 1.0
+
+
+def _print_stage5_support_only_penalty_audit(rows: List[Dict[str, Any]], top_k: int = 25) -> None:
+    if not STAGE5_SUPPORT_ONLY_PENALTY_AUDIT or not rows:
+        return
+    print("\n" + "-" * 80)
+    print(
+        "[Stage5 support-only author penalty audit] "
+        "author_id | raw_score | sup_share | top_pri_c | sup_only_papers | "
+        "sup_with_pri_papers | penalty | after"
+    )
+    print("-" * 80)
+    sorted_rows = sorted(rows, key=lambda r: float(r.get("raw_score") or 0.0), reverse=True)[:top_k]
+    for r in sorted_rows:
+        print(
+            f"{str(r.get('aid')):16} | {float(r.get('raw_score') or 0.0):11.4f} | "
+            f"{float(r.get('sup_share') or 0.0):8.3f} | {float(r.get('top_pri_c') or 0.0):9.4f} | "
+            f"{int(r.get('sup_only_papers') or 0):^15} | {int(r.get('sup_with_pri_papers') or 0):^19} | "
+            f"{float(r.get('penalty') or 1.0):7.3f} | {float(r.get('after') or 0.0):11.4f}"
+        )
+
+
 def _retrieval_role_for_paper_term(debug_1: Dict[str, Any], tid_s: str) -> str:
     """Stage3 入 paper 的 retrieval_role（paper_primary / paper_support）；缺省偏保守记 primary。"""
     tr = debug_1.get("term_retrieval_roles") or {}
@@ -374,46 +479,17 @@ def _print_stage5_support_dominance_audit(
         aid = str(row.get("aid") or "")
         final_score = float(row.get("score") or 0.0)
         atc = author_term_contrib.get(aid, {}) or {}
-        total = sum(float(v) for v in atc.values()) or 1e-12
-        pri_vals: List[float] = []
-        sup_vals: List[float] = []
-        for tid_s, c in atc.items():
-            c = float(c)
-            if c <= 0:
-                continue
-            rr = _retrieval_role_for_paper_term(debug_1, str(tid_s))
-            if rr == "paper_support":
-                sup_vals.append(c)
-            else:
-                pri_vals.append(c)
-        top_pri = max(pri_vals) if pri_vals else 0.0
-        top_sup = max(sup_vals) if sup_vals else 0.0
-        sup_sum = sum(sup_vals)
-        sup_share = sup_sum / total
+        m = _compute_author_support_only_metrics(
+            aid, author_term_contrib, author_all_retained_works, paper_map, debug_1
+        )
+        top_pri = float(m["top_pri_c"])
+        top_sup = float(m["top_sup_c"])
+        sup_share = float(m["sup_share"])
+        sup_only = int(m["sup_only_papers"])
+        sup_with = int(m["sup_with_pri_papers"])
         dom_tid, dom_c = max(atc.items(), key=lambda x: float(x[1])) if atc else ("", 0.0)
         dom_term = term_map.get(str(dom_tid), str(dom_tid))[:32]
         dom_role = _retrieval_role_for_paper_term(debug_1, str(dom_tid))
-        sup_only = 0
-        sup_with = 0
-        for wid, piece in author_all_retained_works.get(aid, []):
-            if float(piece or 0.0) <= 0:
-                continue
-            info = paper_map.get(str(wid)) or paper_map.get(wid) or {}
-            hits = info.get("hits") or []
-            has_p = any(
-                (h.get("role") or "").strip().lower() == "paper_primary"
-                for h in hits
-                if isinstance(h, dict)
-            )
-            has_s = any(
-                (h.get("role") or "").strip().lower() == "paper_support"
-                for h in hits
-                if isinstance(h, dict)
-            )
-            if has_p:
-                sup_with += 1
-            elif has_s:
-                sup_only += 1
         print(
             f"{aid:16} | {final_score:11.4f} | {top_pri:9.4f} | {top_sup:9.4f} | {sup_share:8.3f} | "
             f"{sup_only:^15} | {sup_with:^18} | {dom_term!r} | {dom_role}"
@@ -435,7 +511,9 @@ def run_stage5(
 ) -> Tuple[List[str], Dict[str, Any]]:
     """
     阶段 5：作者打分与排序。论文贡献 → 作者×词矩阵 → 同词递减 → TERM_MAX_AUTHOR_SHARE → 时间权重
-    → 结构乘子（分立 structure_factor + st/paper/mtp 三连乘，强词阈 0.35·max）→ 新作比 → 归一化排序。
+    → 结构乘子（分立 structure_factor + st/paper/mtp 三连乘，强词阈 0.35·max）
+    → **support-only 作者乘子**（有 **sup_only** 论文、无 **primary 同框** 论文、**top_pri_c≈0** 且 **sup_share** 高时压分）
+    → 新作比 → 归一化排序。
     返回 (author_id_list, last_debug_info)。
     """
     score_map = score_map or {}
@@ -819,6 +897,7 @@ def run_stage5(
     # 每篇论文上有多少个非零 term（与 Stage4 multi-hit 对齐），供 multi_term_paper_count
     wid_n_terms = _wid_nonzero_term_counts(papers_for_agg)
     author_structure_audit: Dict[str, Dict[str, Any]] = {}
+    support_only_penalty_rows: List[Dict[str, Any]] = []
 
     if author_scores:
         years_by_author: Dict[str, List[Any]] = {}
@@ -852,6 +931,42 @@ def run_stage5(
             }
             author_structure_audit[aid_s] = out_rec
             term_cap_audit_records.setdefault(aid_s, {}).update(out_rec)
+
+        # 批注：结构乘子之后、新作比过滤与 max 归一化之前——只削「论文全是 support 线、词贡献几无 primary」的作者，不砍 term 分。
+        t_sup_pen0 = time.perf_counter()
+        if STAGE5_SUPPORT_ONLY_AUTHOR_PENALTY_ENABLED:
+            for aid in list(author_scores.keys()):
+                aid_s = str(aid)
+                m = _compute_author_support_only_metrics(
+                    aid_s,
+                    author_term_contrib,
+                    author_all_retained_works,
+                    paper_map,
+                    debug_1 or {},
+                )
+                pen = _support_only_author_penalty_value(m)
+                raw_before = float(author_scores[aid])
+                after = raw_before * float(pen)
+                author_scores[aid] = after
+                support_only_penalty_rows.append(
+                    {
+                        "aid": aid_s,
+                        "raw_score": raw_before,
+                        "sup_share": m["sup_share"],
+                        "top_pri_c": m["top_pri_c"],
+                        "sup_only_papers": m["sup_only_papers"],
+                        "sup_with_pri_papers": m["sup_with_pri_papers"],
+                        "penalty": pen,
+                        "after": after,
+                    }
+                )
+        stage5_sub_ms["support_only_author_penalty"] = (
+            (time.perf_counter() - t_sup_pen0) * 1000.0
+        )
+    else:
+        stage5_sub_ms["support_only_author_penalty"] = 0.0
+
+    _print_stage5_support_only_penalty_audit(support_only_penalty_rows)
 
     t6 = time.perf_counter()
     stage5_sub_ms["time_and_family"] = (t6 - t5) * 1000.0
