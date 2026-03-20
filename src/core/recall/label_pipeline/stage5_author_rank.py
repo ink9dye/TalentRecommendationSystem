@@ -16,8 +16,12 @@ from src.core.recall.works_to_authors import accumulate_author_scores
 from src.core.recall.label_means import paper_scoring
 from src.core.recall.label_means.simple_factors import is_label_jd_title_gate_disabled
 
-# True：打印 [Stage5 support dominance audit]，看作者是否被 support 独狼论文抬榜
-STAGE5_SUPPORT_DOMINANCE_AUDIT = True
+# True：打印 [Stage5 support dominance audit]；**默认 False**（主轴 paper_primary 主导时噪音大，可疑 support 再 env 打开）
+STAGE5_SUPPORT_DOMINANCE_AUDIT = os.environ.get("STAGE5_SUPPORT_DOMINANCE_AUDIT", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 # True：打印 [Stage5 support-only author penalty audit]（纯 support 贡献且无 primary 论文托底 → 作者分乘子）
 STAGE5_SUPPORT_ONLY_AUTHOR_PENALTY_ENABLED = True
 STAGE5_SUPPORT_ONLY_PENALTY_AUDIT = True

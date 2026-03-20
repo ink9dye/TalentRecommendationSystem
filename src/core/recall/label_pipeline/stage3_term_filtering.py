@@ -44,6 +44,14 @@ PAPER_RECALL_TAIL_EXPAND_ENABLED = True
 PAPER_RECALL_TAIL_EXPAND_MAX_EXTRA = 2
 PAPER_RECALL_TAIL_EXPAND_DELTA_MAX = 0.045
 PAPER_RECALL_TAIL_EXPAND_REQUIRE_CORE_OR_SEED = True
+# 主 cutoff 后「结构纠偏」：用略低于 floor 的 core near-miss 替换已入选的 weak support soft-admit（不碰 gate / p_sel 公式）
+PAPER_RECALL_CORE_NEAR_MISS_SWAP_MAX_BELOW_FLOOR = 0.02  # 仅 p_sel ∈ [floor−δ, floor) 的 core 可参与 swap-in
+PAPER_RECALL_SUPPORT_SWAP_SCORE_MARGIN = 0.03  # 仅当 in_psel ≥ out_psel − margin 时允许换位
+# paper 选词序（两段式）：强主轴 core 先于 bonus-like primary core，再及其余 eligible（不靠词表）
+PAPER_SELECT_STRONG_MAIN_AXIS_SCORE_MIN = 0.95
+PAPER_SELECT_STRONG_MAIN_AXIS_MAX_RANK = 6
+PAPER_SELECT_STRONG_MAIN_AXIS_ML_EXP_SCORE_MIN = 0.85
+PAPER_SELECT_STRONG_MAIN_AXIS_ML_EXP_MAX_RANK = 8
 # paper_readiness · 锚点先验（Stage3）：以 Step2 锚点分为「主证据」，名次只做轻平滑（避免 rank 主导把 robot control 等主线词打出 dynamic_floor）
 PAPER_READINESS_ANCHOR_SCORE_NORM = 1.20  # anchor_score_norm = clip(score / 此值, 0, 1)
 PAPER_READINESS_ANCHOR_PRIOR_W_SCORE = 0.88  # 先验里分值权重（主）
@@ -126,6 +134,8 @@ STAGE3_UNIFIED_W_OBJECT = 0.06
 # 与 select_terms_for_paper_recall 对齐的入稿闸门说明（逐项 term）
 STAGE3_PAPER_GATE_DEBUG = False  # 默认降噪；需要逐项 gate 时再开
 STAGE3_PAPER_CUTOFF_AUDIT = True  # [Stage3 paper cutoff] 排名与截断原因
+# 与 [Stage3 paper centrality audit] 重叠度高；默认关，需拆 p_sel_base/bonus 时再开
+STAGE3_ELIGIBLE_CORE_CLOSE_CALL_AUDIT = False
 STAGE3_SUPPORT_CONTAMINATION_AUDIT = True  # Stage3→4 之间：可疑 support 摘要
 STAGE3_UNIFIED_SCORE_DEBUG = True  # 连续分特征拆解（替代原「规则乘子」视角）
 # 默认只打 TopN（paper 瓶颈在看 eligible / support 软放行；unified 仅辅）
@@ -377,9 +387,9 @@ def _print_stage3_paper_cutoff_audit(
 def _print_stage3_paper_selection_narrow_audit(ordered: List[Dict[str, Any]]) -> None:
     """
     [Stage3 paper selection audit] 窄表：回答「bonus 型词是否仍靠 final_score 抬进 paper」。
-    仅 eligible 内、顺序与真实选词一致（paper_select_score 降序）。
+    与 cutoff 表重叠度高：**仅 STAGE3_DEBUG_FOCUS_TERMS 非空** 时打印命中行，避免双表刷屏。
     """
-    if not STAGE3_PAPER_CUTOFF_AUDIT or not ordered:
+    if not STAGE3_PAPER_CUTOFF_AUDIT or not ordered or not STAGE3_DEBUG_FOCUS_TERMS:
         return
     print("\n" + "-" * 80)
     print("[Stage3 paper selection audit] eligible · structural ranking (no blocklist)")
@@ -391,6 +401,8 @@ def _print_stage3_paper_selection_narrow_audit(ordered: List[Dict[str, Any]]) ->
     print(hdr)
     print("-" * 96)
     for rec in ordered:
+        if (rec.get("term") or "").strip() not in STAGE3_DEBUG_FOCUS_TERMS:
+            continue
         term = (rec.get("term") or "")[:18]
         fs = float(rec.get("final_score") or 0.0)
         ready = float(rec.get("paper_readiness") or 0.0)
@@ -577,6 +589,58 @@ def _print_stage3_paper_pool_penalty_audit(ordered: List[Dict[str, Any]], top_n:
         )
 
 
+def _print_stage3_paper_lane_tier_audit(ordered: List[Dict[str, Any]]) -> None:
+    """
+    [Stage3 paper lane tier audit]：强主轴 core / bonus_core / support_lane 等分层后的 **全局遍历序**
+    （与截断扫描顺序一致；非同 tier 内单纯按 p_sel 排序）。
+    """
+    if not STAGE3_PAPER_CUTOFF_AUDIT or not ordered:
+        return
+    print("\n" + "-" * 80)
+    print(
+        "[Stage3 paper lane tier audit] tier-order scan (strong_main_axis_core → bonus_core → …; "
+        f"thresholds a_sc≥{PAPER_SELECT_STRONG_MAIN_AXIS_SCORE_MIN} rk≤{PAPER_SELECT_STRONG_MAIN_AXIS_MAX_RANK} "
+        f"or ml+exp+a_sc≥{PAPER_SELECT_STRONG_MAIN_AXIS_ML_EXP_SCORE_MIN} rk≤{PAPER_SELECT_STRONG_MAIN_AXIS_ML_EXP_MAX_RANK})"
+    )
+    print("-" * 80)
+    print(
+        "term                  | tier                  | p_sel | a_sc | rk | ml | exp | lane   | parent_anchor"
+    )
+    print("-" * 80)
+    for rec in ordered:
+        term = str(rec.get("term") or "")[:22]
+        tier = str(rec.get("paper_select_lane_tier") or "")[:22]
+        psel = float(rec.get("paper_select_score") or 0.0)
+        a_sc, rk_i = _paper_parent_anchor_score_and_rank(rec)
+        ml = int(rec.get("mainline_hits") or 0)
+        ex = bool(rec.get("can_expand", False) or rec.get("can_expand_from_2a", False))
+        lane = str(rec.get("paper_recall_quota_lane") or "")[:7]
+        panch = str(rec.get("parent_anchor") or "")[:14]
+        if not panch and rec.get("parent_anchors"):
+            panch = str((rec.get("parent_anchors") or [""])[0])[:14]
+        print(
+            f"{term:22} | {tier:22} | {psel:5.3f} | {a_sc:4.2f} | {rk_i:2d} | {ml:^2} | "
+            f"{'T' if ex else 'F':^3} | {lane:7} | {panch:14}"
+        )
+
+
+def _print_stage3_paper_selected_composition_audit(selected: List[Dict[str, Any]]) -> None:
+    """[Stage3 paper selected composition]：最终入选按 paper_select_lane_tier 计数（含 tail 写入的 tier）。"""
+    if not STAGE3_PAPER_CUTOFF_AUDIT:
+        return
+    if not selected:
+        print("\n[Stage3 paper selected composition] selected_total=0")
+        return
+    bucket = defaultdict(int)
+    for rec in selected:
+        t = str(rec.get("paper_select_lane_tier") or "unknown")
+        bucket[t] += 1
+    parts = [f"{k}={bucket[k]}" for k in sorted(bucket.keys())]
+    print(
+        f"\n[Stage3 paper selected composition] selected_total={len(selected)} " + " ".join(parts)
+    )
+
+
 def _print_stage3_eligible_core_close_call_audit(
     ordered: List[Dict[str, Any]],
     top_n: int = 18,
@@ -585,7 +649,11 @@ def _print_stage3_eligible_core_close_call_audit(
     eligible 内 **stage3_bucket=core** 按 paper_select_score 名次截取：显式 p_sel_base / bonus / total，
     便于判断截断附近是底分还是加性项（含 anchor_score_bonus）在抬位。
     """
-    if not STAGE3_PAPER_CUTOFF_AUDIT or not ordered:
+    if (
+        not STAGE3_PAPER_CUTOFF_AUDIT
+        or not STAGE3_ELIGIBLE_CORE_CLOSE_CALL_AUDIT
+        or not ordered
+    ):
         return
     core_rows = [
         r
@@ -2048,6 +2116,51 @@ def _paper_gate_is_fallback_primary(rec: Dict[str, Any]) -> bool:
     return fb or pb == "primary_fallback_keep_no_expand" or pr == "anchor_core_fallback"
 
 
+def _paper_parent_anchor_score_and_rank(rec: Dict[str, Any]) -> Tuple[float, int]:
+    a_sc = float(
+        rec.get("best_parent_anchor_final_score")
+        or rec.get("parent_anchor_final_score")
+        or 0.0
+    )
+    prk = rec.get("best_parent_anchor_step2_rank")
+    if prk is None:
+        prk = rec.get("parent_anchor_step2_rank")
+    rk = int(prk) if prk is not None else 999
+    return a_sc, rk
+
+
+def _is_strong_main_axis_core(rec: Dict[str, Any]) -> bool:
+    """primary lane 的 core：父锚够强或「主线+可扩+父锚靠前」——先于 bonus-like core 参与截断。"""
+    if (rec.get("stage3_bucket") or "").strip().lower() != "core":
+        return False
+    if str(rec.get("paper_recall_quota_lane") or "") != "primary":
+        return False
+    a_sc, rk = _paper_parent_anchor_score_and_rank(rec)
+    ml = int(rec.get("mainline_hits") or 0)
+    ex = bool(rec.get("can_expand", False) or rec.get("can_expand_from_2a", False))
+    if a_sc >= float(PAPER_SELECT_STRONG_MAIN_AXIS_SCORE_MIN):
+        return True
+    if rk <= int(PAPER_SELECT_STRONG_MAIN_AXIS_MAX_RANK):
+        return True
+    if (
+        ml >= 1
+        and ex
+        and a_sc >= float(PAPER_SELECT_STRONG_MAIN_AXIS_ML_EXP_SCORE_MIN)
+        and rk <= int(PAPER_SELECT_STRONG_MAIN_AXIS_ML_EXP_MAX_RANK)
+    ):
+        return True
+    return False
+
+
+def _is_bonus_like_core(rec: Dict[str, Any]) -> bool:
+    """primary lane 但未达强主轴门槛的 core（如宽学术词）：只能在强主轴 core 之后按 p_sel 竞争。"""
+    if (rec.get("stage3_bucket") or "").strip().lower() != "core":
+        return False
+    if str(rec.get("paper_recall_quota_lane") or "") != "primary":
+        return False
+    return not _is_strong_main_axis_core(rec)
+
+
 def _apply_paper_recall_tail_expand(
     selected: List[Dict[str, Any]],
     ordered: List[Dict[str, Any]],
@@ -2057,8 +2170,11 @@ def _apply_paper_recall_tail_expand(
     selected_support: int,
 ) -> int:
     """
+    **[已弃用 / 未再调用]**：尾部补位已内联至 `select_terms_for_paper_recall`（core near-miss 先于 support soft-admit）。
+    保留本段仅供对照旧 **`tail_expand_after_big_pool_core`** 行为。
+
     主截断完成后：若 **词表过窄**（len(selected)≤3）或 **support 槽全空**（selected_support==0），
-    从 near-miss 带再补 ≤MAX_EXTRA 槽。**优先级**：`primary_support` seed + ml≥1 + 可扩 > `core_axis_near_miss_soft_admit` > 其余过选词。
+    从 near-miss 带再补 ≤MAX_EXTRA 槽。旧优先级：seed+ml+可扩 > core_axis_near_miss > 其余。
     仍 family 去重；不放宽 risky / fallback / conditioned_only。
     """
     if not PAPER_RECALL_TAIL_EXPAND_ENABLED or not ordered:
@@ -2143,6 +2259,27 @@ def _apply_paper_recall_tail_expand(
     return extra_n
 
 
+def _print_stage3_paper_swap_audit(
+    did_swap: bool,
+    swap_out_term: str,
+    swap_in_term: str,
+    out_psel: float,
+    in_psel: float,
+    floor: float,
+) -> None:
+    """主 cutoff 后 core near-miss ↔ suspicious support 换位的一行摘要（与 tail 触发无关）。"""
+    if not STAGE3_PAPER_CUTOFF_AUDIT:
+        return
+    delta = float(out_psel) - float(in_psel)
+    print(
+        f"\n[Stage3 paper swap audit] swapped={did_swap} "
+        f"out={swap_out_term!r} out_p_sel={out_psel:.3f} "
+        f"in={swap_in_term!r} in_p_sel={in_psel:.3f} "
+        f"delta={delta:+.3f} floor={floor:.3f} "
+        f"reason='core_near_miss_replace_support_soft_admit'"
+    )
+
+
 def _print_stage3_tail_expand_audit(
     extra_n: int,
     floor: float,
@@ -2158,7 +2295,7 @@ def _print_stage3_tail_expand_audit(
         f"extra_added={extra_n} floor={floor:.4f} selected_before={selected_before} "
         f"selected_support_before={selected_support} "
         f"Δ≤{PAPER_RECALL_TAIL_EXPAND_DELTA_MAX} max_extra={PAPER_RECALL_TAIL_EXPAND_MAX_EXTRA} "
-        f"p_order=seed+ml+exp(3)>core_axis_near_miss(2)>other(1)"
+        f"p_order=core_near_miss(1)>support_soft_admit(2)>other(3)"
     )
 
 
@@ -2434,10 +2571,14 @@ def select_terms_for_paper_recall(
     - **除过门 core 外**：凡未触上述硬挡者，**统一经 `support_pool` 合并**（干净 **support**、`risky` 保守 lanes、其它少见桶），
       再 **`eligible.extend(support_pool)`**；最终 **`support_cap`** 对 **`paper_recall_quota_lane==support`** 计配额，
       **`retrieval_role`**：`primary` lane → `paper_primary`，否则 `paper_support`。
-    - **排序**：`paper_select_score` = 底分 × readiness + 加性 bonus − 池惩罚；**family** + **dynamic_floor** + **topN**。
+    - **排序**：`paper_select_score` 仍 = 底分 × readiness + 加性 bonus − 池惩罚（**不改公式**）；**全局遍历序**为
+      **强主轴 core**（`PAPER_SELECT_STRONG_MAIN_AXIS_*`：父锚 **a_sc / rk** 或 **ml≥1∧可扩∧a_sc∧rk** 组合）→ **bonus-like primary core** → **其余 eligible**，
+      各段内再按 `paper_select_score` 降序；然后 **family** + **dynamic_floor** + **topN**。使宽学术 core 在贴主轴词之后竞争名额。
     - **尾部补位**（**`PAPER_RECALL_TAIL_EXPAND_*`**）：主截断完成后，若 **`len(selected)≤3`** 或 **`selected_support==0`**，
       从未入选 **near-miss**（**`p_sel≥floor−Δ`**）再补 **≤`TAIL_EXPAND_MAX_EXTRA`**；
-      **优先级**：**`primary_support_seed`∧ml≥1∧可扩** > **`core_axis_near_miss*`** > 其余过选股；见 **`[Stage3 tail expand audit]`**。不修改 gate 与 `paper_select_score` 定义。
+      **优先级**：**core** 且仅 **`below_dynamic_floor`** 的 near-miss（ml≥1∧可扩）**先于** weak support **软放行**（`support_*_soft_admit`），再及 **`PAPER_RECALL_TAIL_EXPAND_REQUIRE_CORE_OR_SEED`** 约束下的其余候选；
+      **`select_reason`/`paper_cutoff_reason`** 分记 **`tail_expand_core_near_miss`** / **`tail_expand_support_soft_admit`** / **`tail_expand_other`**。见 **`[Stage3 tail expand audit]`**。
+    - **主 cutoff 后、tail 前**：若存在 **略低于 floor 的可扩 core** 与 **已入选的 weak support soft-admit** 且分差在 **`PAPER_RECALL_SUPPORT_SWAP_SCORE_MARGIN`** 内，可 **一对一换位**（记 **`[Stage3 paper swap audit]`**、**`core_near_miss_replace_support_soft_admit`** / **`swapped_out_by_core_near_miss`**）。不修改 gate 与 `paper_select_score` 定义。
     """
     if not records:
         return []
@@ -2695,11 +2836,44 @@ def select_terms_for_paper_recall(
         _apply_paper_readiness_for_recall(rec)
 
     floor = _paper_recall_dynamic_floor(eligible, score_key="paper_select_score")
-    ordered = sorted(
-        eligible,
-        key=lambda r: float(r.get("paper_select_score") or 0.0),
+
+    # 两段式全局序：强主轴 primary core → bonus-like primary core → support / 其它（段内按 p_sel 降序）。
+    # 批注：不回调 _compute_paper_select_score；仅改「谁先接受 floor+family 扫描」，抑制宽 core 靠高分占位。
+    for rec in eligible:
+        if _is_strong_main_axis_core(rec):
+            rec["paper_select_lane_tier"] = "strong_main_axis_core"
+        elif _is_bonus_like_core(rec):
+            rec["paper_select_lane_tier"] = "bonus_core"
+        else:
+            lane_t = str(rec.get("paper_recall_quota_lane") or "")
+            if lane_t == "support":
+                rec["paper_select_lane_tier"] = "support_lane"
+            else:
+                rec["paper_select_lane_tier"] = "other_eligible"
+
+    _pss_desc = lambda r: float(r.get("paper_select_score") or 0.0)
+    strong_core = sorted(
+        [r for r in eligible if r.get("paper_select_lane_tier") == "strong_main_axis_core"],
+        key=_pss_desc,
         reverse=True,
     )
+    bonus_core = sorted(
+        [r for r in eligible if r.get("paper_select_lane_tier") == "bonus_core"],
+        key=_pss_desc,
+        reverse=True,
+    )
+    others = sorted(
+        [
+            r
+            for r in eligible
+            if r.get("paper_select_lane_tier") not in ("strong_main_axis_core", "bonus_core")
+        ],
+        key=_pss_desc,
+        reverse=True,
+    )
+    ordered = strong_core + bonus_core + others
+
+    _print_stage3_paper_lane_tier_audit(ordered)
     _print_stage3_paper_centrality_audit(ordered, top_n=12)
     _print_stage3_paper_pool_penalty_audit(ordered, top_n=16)
     _print_stage3_eligible_core_close_call_audit(ordered, top_n=18)
@@ -2742,12 +2916,241 @@ def select_terms_for_paper_recall(
         if len(selected) >= max_terms:
             break
 
-    # 词表过窄或 support 槽全空时，主 cutoff 之后再补 near-miss（见 PAPER_RECALL_TAIL_EXPAND_*）；不动 gate / p_sel 公式。
+    # ------------------------------------------------------------------
+    # 主 cutoff 之后、tail 之前：结构性纠偏（与 tail「selected≤3」触发无关）。
+    # 用「仅略低于 floor + 主线 + 可扩」的 core 替换最弱的「support 桶 + soft_admit」入选词，避免可疑 support 压过 core near-miss。
+    # ------------------------------------------------------------------
+    def _swap_eligible_core_near_miss(rec: Dict[str, Any]) -> bool:
+        if rec.get("selected_for_paper"):
+            return False
+        if (rec.get("stage3_bucket") or "").strip().lower() != "core":
+            return False
+        reason = str(rec.get("paper_cutoff_reason") or rec.get("paper_reject_reason") or "")
+        if "below_dynamic_floor" not in reason:
+            return False
+        if int(rec.get("mainline_hits") or 0) < 1:
+            return False
+        if not bool(rec.get("can_expand") or rec.get("can_expand_from_2a")):
+            return False
+        p_sel = float(rec.get("paper_select_score") or 0.0)
+        return p_sel >= float(floor) - float(PAPER_RECALL_CORE_NEAR_MISS_SWAP_MAX_BELOW_FLOOR)
+
+    def _swap_eligible_suspicious_support_selected(rec: Dict[str, Any]) -> bool:
+        if not rec.get("selected_for_paper"):
+            return False
+        if str(rec.get("paper_recall_quota_lane") or "") != "support":
+            return False
+        if (rec.get("stage3_bucket") or "").strip().lower() != "support":
+            return False
+        sup_reason = str(rec.get("paper_support_reason") or "")
+        sup_gate = str(rec.get("paper_support_gate") or "")
+        if sup_reason in {"support_seed_soft_admit", "support_keep_soft_admit"}:
+            return True
+        return sup_gate == "support_soft_admit"
+
+    core_nm_for_swap = sorted(
+        [r for r in ordered if _swap_eligible_core_near_miss(r)],
+        key=lambda x: (
+            float(x.get("paper_select_score") or 0.0),
+            float(x.get("final_score") or 0.0),
+            int(x.get("mainline_hits") or 0),
+            1 if bool(x.get("can_expand") or x.get("can_expand_from_2a")) else 0,
+        ),
+        reverse=True,
+    )
+    sup_soft_for_swap_out = sorted(
+        [r for r in selected if _swap_eligible_suspicious_support_selected(r)],
+        key=lambda x: (
+            float(x.get("paper_select_score") or 0.0),
+            float(x.get("final_score") or 0.0),
+        ),
+    )
+
+    did_swap = False
+    swap_out_term = ""
+    swap_in_term = ""
+    out_psel = 0.0
+    in_psel = 0.0
+    if core_nm_for_swap and sup_soft_for_swap_out:
+        swap_in = core_nm_for_swap[0]
+        swap_out = sup_soft_for_swap_out[0]
+        in_psel = float(swap_in.get("paper_select_score") or 0.0)
+        out_psel = float(swap_out.get("paper_select_score") or 0.0)
+        if in_psel >= out_psel - float(PAPER_RECALL_SUPPORT_SWAP_SCORE_MARGIN):
+            did_swap = True
+            swap_in_term = str(swap_in.get("term") or "")
+            swap_out_term = str(swap_out.get("term") or "")
+            fk_out = str(swap_out.get("family_key") or "").strip()
+            if fk_out:
+                used_family.discard(fk_out)
+            fk_in = str(swap_in.get("family_key") or "").strip()
+            if not fk_in:
+                fk_in = build_family_key(swap_in)
+                swap_in["family_key"] = fk_in
+            used_family.add(fk_in)
+
+            swap_out["selected_for_paper"] = False
+            swap_out["paper_reject_reason"] = "swapped_out_by_core_near_miss"
+            swap_out["paper_cutoff_reason"] = "swapped_out_by_core_near_miss"
+            swap_out["select_reason"] = "swapped_out_by_core_near_miss"
+
+            selected_support = max(0, int(selected_support) - 1)
+
+            swap_in["selected_for_paper"] = True
+            swap_in["paper_reject_reason"] = ""
+            swap_in["paper_cutoff_reason"] = "core_near_miss_replace_support_soft_admit"
+            swap_in["select_reason"] = "core_near_miss_replace_support_soft_admit"
+            swap_in["retrieval_role"] = "paper_primary"
+            swap_in["paper_recall_quota_lane"] = "primary"
+
+            selected.remove(swap_out)
+            selected.append(swap_in)
+
+    _print_stage3_paper_swap_audit(
+        did_swap, swap_out_term, swap_in_term, out_psel, in_psel, floor
+    )
+
+    # ------------------------------------------------------------------
+    # 尾部补位（内联）：触发条件与 PAPER_RECALL_TAIL_EXPAND_* 一致；不改前置 gate / unified / p_sel。
+    # 分层：① core 仅因 dynamic_floor 落选且主线+可扩 → 先补；② weak support 软放行 → 后补；
+    # ③ 其余 near-miss 殿后（仍受 REQUIRE_CORE_OR_SEED、risky/fallback/cond 过滤）。
+    # 全程 family 去重、support_cap、总长 cap_total=max_terms+MAX_EXTRA。
+    # ------------------------------------------------------------------
     selected_before_tail = len(selected)
     need_tail_expand = selected_before_tail <= 3 or int(selected_support) <= 0
-    extra_tail = _apply_paper_recall_tail_expand(
-        selected, ordered, used_family, floor, max_terms, selected_support
-    )
+    extra_tail = 0
+    if PAPER_RECALL_TAIL_EXPAND_ENABLED and ordered and need_tail_expand:
+        cap_total = max_terms + int(PAPER_RECALL_TAIL_EXPAND_MAX_EXTRA)
+        delta_max = float(PAPER_RECALL_TAIL_EXPAND_DELTA_MAX)
+
+        def _paper_tail_sort_key(r: Dict[str, Any]) -> Tuple[float, float, int, int]:
+            return (
+                float(r.get("paper_select_score") or 0.0),
+                float(r.get("final_score") or 0.0),
+                int(r.get("mainline_hits") or 0),
+                int(r.get("anchor_count") or 0),
+            )
+
+        core_near_miss: List[Dict[str, Any]] = []
+        support_soft_admit: List[Dict[str, Any]] = []
+        other_tail: List[Dict[str, Any]] = []
+
+        for rec in ordered:
+            if rec.get("selected_for_paper"):
+                continue
+            # 与历史 _apply_paper_recall_tail_expand 一致：禁 fallback_primary / conditioned_only / risky 借 near-miss 混入
+            if _paper_gate_is_fallback_primary(rec):
+                continue
+            if _stage3_is_conditioned_only(rec):
+                continue
+            if (rec.get("stage3_bucket") or "").strip().lower() == "risky":
+                continue
+
+            fk = str(rec.get("family_key") or "").strip()
+            if fk and fk in used_family:
+                continue
+
+            pss = float(rec.get("paper_select_score") or 0.0)
+            if pss < floor - delta_max:
+                continue
+
+            lane = str(rec.get("paper_recall_quota_lane") or "")
+            is_support_lane = lane == "support"
+            if is_support_lane and support_cap > 0 and selected_support >= support_cap:
+                continue
+
+            bkt = (rec.get("stage3_bucket") or "").strip().lower()
+            ml = int(rec.get("mainline_hits") or 0)
+            can_x = bool(rec.get("can_expand") or rec.get("can_expand_from_2a"))
+            cutoff_reason = str(rec.get("paper_cutoff_reason") or "")
+            sup_gate = str(rec.get("paper_support_gate") or "")
+            sup_reason = str(rec.get("paper_support_reason") or "")
+            pb = (rec.get("primary_bucket") or "").strip().lower()
+
+            # 第一层：core near-miss（主 cutoff 已标 below_dynamic_floor，结构可扩）
+            if (
+                bkt == "core"
+                and cutoff_reason == "below_dynamic_floor"
+                and ml >= 1
+                and can_x
+            ):
+                core_near_miss.append(rec)
+                continue
+
+            # 第二层：weak support 软放行（gate 统一为 support_soft_admit 时，以 paper_support_reason 区分 seed/keep）
+            if is_support_lane and (
+                sup_reason in {"support_seed_soft_admit", "support_keep_soft_admit"}
+                or sup_gate in {"support_seed_soft_admit", "support_keep_soft_admit"}
+            ):
+                support_soft_admit.append(rec)
+                continue
+
+            if PAPER_RECALL_TAIL_EXPAND_REQUIRE_CORE_OR_SEED:
+                if not (bkt == "core" or pb == "primary_support_seed"):
+                    continue
+            other_tail.append(rec)
+
+        core_near_miss.sort(key=_paper_tail_sort_key, reverse=True)
+        support_soft_admit.sort(key=_paper_tail_sort_key, reverse=True)
+        other_tail.sort(key=_paper_tail_sort_key, reverse=True)
+        tail_pool = core_near_miss + support_soft_admit + other_tail
+
+        for rec in tail_pool:
+            if extra_tail >= int(PAPER_RECALL_TAIL_EXPAND_MAX_EXTRA):
+                break
+            if len(selected) >= cap_total:
+                break
+
+            fam = str(rec.get("family_key") or "").strip()
+            if not fam:
+                fam = build_family_key(rec)
+                rec["family_key"] = fam
+            if fam in used_family:
+                continue
+
+            lane = str(rec.get("paper_recall_quota_lane") or "")
+            is_support_lane = lane == "support"
+            if is_support_lane and support_cap > 0 and selected_support >= support_cap:
+                continue
+
+            bkt = (rec.get("stage3_bucket") or "").strip().lower()
+            cutoff_reason = str(rec.get("paper_cutoff_reason") or "")
+            ml = int(rec.get("mainline_hits") or 0)
+            can_x = bool(rec.get("can_expand") or rec.get("can_expand_from_2a"))
+            sup_gate = str(rec.get("paper_support_gate") or "")
+            sup_reason = str(rec.get("paper_support_reason") or "")
+
+            rec["selected_for_paper"] = True
+            rec["paper_reject_reason"] = ""
+            rec["retrieval_role"] = "paper_primary" if lane == "primary" else "paper_support"
+
+            if (
+                bkt == "core"
+                and cutoff_reason == "below_dynamic_floor"
+                and ml >= 1
+                and can_x
+            ):
+                rec["paper_cutoff_reason"] = "tail_expand_core_near_miss"
+                rec["select_reason"] = "tail_expand_core_near_miss"
+                rec["paper_select_lane_tier"] = "tail_expand_core_near_miss"
+            elif sup_reason in {
+                "support_seed_soft_admit",
+                "support_keep_soft_admit",
+            } or sup_gate in {"support_seed_soft_admit", "support_keep_soft_admit"}:
+                rec["paper_cutoff_reason"] = "tail_expand_support_soft_admit"
+                rec["select_reason"] = "tail_expand_support_soft_admit"
+                rec["paper_select_lane_tier"] = "tail_expand_support_soft_admit"
+            else:
+                rec["paper_cutoff_reason"] = "tail_expand_other"
+                rec["select_reason"] = "tail_expand_other"
+                rec["paper_select_lane_tier"] = "tail_expand_other"
+
+            used_family.add(fam)
+            selected.append(rec)
+            if is_support_lane:
+                selected_support += 1
+            extra_tail += 1
+
     _print_stage3_tail_expand_audit(
         extra_tail, floor, selected_before_tail, need_tail_expand, selected_support
     )
@@ -2761,7 +3164,8 @@ def select_terms_for_paper_recall(
 
     if STAGE3_AUDIT_DEBUG:
         _print_stage3_to_paper_bridge(records, top_k=20)
-    # cutoff / narrow 表与真实选词序一致（eligible · paper_select_score）
+    _print_stage3_paper_selected_composition_audit(selected)
+    # cutoff / narrow 表：扫描序为 lane-tier 序；centrality 仍为全局 p_sel Top
     _print_stage3_paper_cutoff_audit(ordered, floor, max_terms)
     _print_stage3_paper_selection_narrow_audit(ordered)
     _print_stage3_paper_quota_audit(

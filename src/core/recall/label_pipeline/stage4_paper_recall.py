@@ -30,8 +30,8 @@ STAGE4_JD_AUDIT_TOP_K = 3
 # 仅对「final_score 最高的前 K 个 paper_primary」打明细 jd audit（降噪）；True 则全量
 STAGE4_JD_AUDIT_PRIMARY_DETAIL_K = int(os.environ.get("STAGE4_JD_AUDIT_PRIMARY_DETAIL_K", "3"))
 STAGE4_JD_AUDIT_FULL = os.environ.get("STAGE4_JD_AUDIT_FULL", "").strip().lower() in ("1", "true", "yes")
-# overlap survival 审计最大行数（高分存活 + rank 靠前被淘汰项；降噪默认 12）
-STAGE4_OVERLAP_SURVIVAL_MAX_LINES = int(os.environ.get("STAGE4_OVERLAP_SURVIVAL_MAX_LINES", "12"))
+# overlap survival 审计最大行数（高分存活 + rank 靠前被淘汰项；**默认 0 关闭**，问题已收窄到 term 级放大而非 overlap 有无）
+STAGE4_OVERLAP_SURVIVAL_MAX_LINES = int(os.environ.get("STAGE4_OVERLAP_SURVIVAL_MAX_LINES", "0"))
 # 三级领域共识软乘子：词侧 vocabulary_topic_stats × JD field/subfield/topic 画像，不对论文硬筛
 STAGE4_HIERARCHY_CONSENSUS_ENABLED = os.environ.get("STAGE4_HIERARCHY_CONSENSUS_ENABLED", "1").strip().lower() not in (
     "0",
@@ -50,6 +50,18 @@ STAGE4_HIERARCHY_BONUS_BETA = float(os.environ.get("STAGE4_HIERARCHY_BONUS_BETA"
 STAGE4_HIERARCHY_BONUS_CLIP_LOW = float(os.environ.get("STAGE4_HIERARCHY_BONUS_CLIP_LOW", "0.82"))
 STAGE4_HIERARCHY_BONUS_CLIP_HIGH = float(os.environ.get("STAGE4_HIERARCHY_BONUS_CLIP_HIGH", "1.15"))
 STAGE4_HIERARCHY_DISTRIBUTION_TOP_N = int(os.environ.get("STAGE4_HIERARCHY_DISTRIBUTION_TOP_N", "10"))
+# True：仅当 wid 命中里 **term_score×idf 加权** 有 ≥ 下列比例的 **Stage3·strong_main_axis_core** 时，才允许 hierarchy_bonus>1（与 bonus_core / support 解耦）
+STAGE4_HIERARCHY_BONUS_POSITIVE_MAIN_AXIS_ONLY = os.environ.get(
+    "STAGE4_HIERARCHY_BONUS_POSITIVE_MAIN_AXIS_ONLY", "1"
+).strip().lower() not in ("0", "false", "no")
+STAGE4_HIERARCHY_STRONG_AXIS_WEIGHT_FRAC = float(
+    os.environ.get("STAGE4_HIERARCHY_STRONG_AXIS_WEIGHT_FRAC", "0.20")
+)
+STAGE4_HIERARCHY_TERM_GROUP_AUDIT = os.environ.get("STAGE4_HIERARCHY_TERM_GROUP_AUDIT", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
 # False：只打 [Stage4 hierarchy bonus distribution] 分位数摘要，不逐条 top_boosted/top_penalized（与 consensus audit 防重复）
 STAGE4_HIERARCHY_BONUS_DISTRIBUTION_DETAIL = os.environ.get(
     "STAGE4_HIERARCHY_BONUS_DISTRIBUTION_DETAIL", ""
@@ -223,6 +235,144 @@ def _hierarchy_bonus_from_delta(delta: float, beta: float, lo: float, hi: float)
     return float(np.clip(1.0 + beta * delta, lo, hi))
 
 
+def _hits_carry_paper_lane_tier(
+    hits: List[Dict[str, Any]],
+    get_term_meta: Any,
+) -> bool:
+    """任一条 hit 的 term_meta 含非空 paper_select_lane_tier 则视为 Stage3 新路径（可启用主轴门控）。"""
+    for hit in hits or []:
+        if not isinstance(hit, dict):
+            continue
+        try:
+            tid = int(hit.get("vid"))
+        except (TypeError, ValueError):
+            continue
+        meta = get_term_meta(tid) or {}
+        if str(meta.get("paper_select_lane_tier") or "").strip():
+            return True
+    return False
+
+
+def _hierarchy_strong_axis_hit_weights(
+    hits: List[Dict[str, Any]],
+    get_term_meta: Any,
+) -> Tuple[float, float, float]:
+    """
+    返回 (strong_main_axis_core 的 Σ term_score×idf , 全 hit 总权, strong 占比)。
+    与 compute_hierarchy_consensus_for_paper 里权重定义一致。
+    """
+    total_w = 0.0
+    strong_w = 0.0
+    for hit in hits or []:
+        if not isinstance(hit, dict):
+            continue
+        try:
+            tid = int(hit.get("vid"))
+        except (TypeError, ValueError):
+            continue
+        ts = float(hit.get("term_score") or 0.0)
+        idf = float(hit.get("idf") or 0.0)
+        w = max(0.0, ts * idf)
+        total_w += w
+        meta = get_term_meta(tid) or {}
+        if str(meta.get("paper_select_lane_tier") or "").strip() == "strong_main_axis_core":
+            strong_w += w
+    frac = (strong_w / total_w) if total_w > 1e-12 else 0.0
+    return strong_w, total_w, float(frac)
+
+
+def _clip_hierarchy_bonus_by_main_axis_mass(
+    raw_bonus: float,
+    hits: List[Dict[str, Any]],
+    get_term_meta: Any,
+) -> Tuple[float, str, Dict[str, Any]]:
+    """
+    方案 B（Stage4）：**bonus_core / support** 等不给 **>1** 的正向 hierarchy 放大；仅当本 wid 的 consensus 证据里
+    **强主轴 core** 的加权占比 ≥ STAGE4_HIERARCHY_STRONG_AXIS_WEIGHT_FRAC 时保留原 clip 上沿。
+    无 paper_select_lane_tier 的旧 term_meta → 不截断（保持旧行为）。
+    """
+    if not STAGE4_HIERARCHY_BONUS_POSITIVE_MAIN_AXIS_ONLY:
+        return float(raw_bonus), "feature_off", {}
+    if not _hits_carry_paper_lane_tier(hits, get_term_meta):
+        return float(raw_bonus), "legacy_no_lane_tier_meta", {}
+    sw, tw, frac = _hierarchy_strong_axis_hit_weights(hits, get_term_meta)
+    extra = {
+        "hierarchy_strong_axis_w": round(sw, 6),
+        "hierarchy_hit_total_w": round(tw, 6),
+        "hierarchy_strong_axis_mass_frac": round(frac, 6),
+        "hierarchy_strong_axis_frac_gate": float(STAGE4_HIERARCHY_STRONG_AXIS_WEIGHT_FRAC),
+    }
+    if tw <= 1e-12:
+        return float(raw_bonus), "no_weighted_hits", extra
+    if frac >= float(STAGE4_HIERARCHY_STRONG_AXIS_WEIGHT_FRAC):
+        return float(raw_bonus), "allow_positive_boost", extra
+    capped = min(float(raw_bonus), 1.0)
+    return capped, ("capped_non_strong_axis_mass" if capped < raw_bonus else "no_positive_raw"), extra
+
+
+def _print_stage4_hierarchy_bonus_term_group_audit(
+    by_wid: Dict[str, Dict[str, Any]],
+    get_term_meta: Any,
+) -> None:
+    """
+    [Stage4 hierarchy bonus by term-group audit]：按 **vid** 汇总进入 wid 池的论文上的 mean consensus / mean bonus，
+    对照 Stage3 **paper_select_lane_tier** 与父锚强度，解释为何某 term 组级 bonus 偏高或偏低。
+    """
+    if not STAGE4_HIERARCHY_TERM_GROUP_AUDIT or not by_wid:
+        return
+    agg: Dict[int, Dict[str, float]] = defaultdict(
+        lambda: {"papers": 0.0, "sum_c": 0.0, "sum_b": 0.0, "sum_b_raw": 0.0}
+    )
+    for _rec in by_wid.values():
+        _det = _rec.get("hierarchy_consensus_detail") or {}
+        _cons = float(_det.get("hierarchy_consensus") or 0.0)
+        _b = float(_rec.get("hierarchy_consensus_bonus") or 1.0)
+        _b_raw = float(_det.get("hierarchy_bonus_raw", _b))
+        _seen: Set[int] = set()
+        for _h in _rec.get("hits") or []:
+            if not isinstance(_h, dict):
+                continue
+            try:
+                _vid = int(_h.get("vid"))
+            except (TypeError, ValueError):
+                continue
+            if _vid in _seen:
+                continue
+            _seen.add(_vid)
+            a = agg[_vid]
+            a["papers"] += 1.0
+            a["sum_c"] += _cons
+            a["sum_b"] += _b
+            a["sum_b_raw"] += _b_raw
+    if not agg:
+        return
+    print("\n" + "-" * 80)
+    print(
+        "[Stage4 hierarchy bonus by term-group audit] "
+        "term | tier | papers_in_pool | mean_cons | mean_bonus | mean_bonus_raw | "
+        "parent_anchor | pa_sc | rk | is_main_axis_core | tier_boost_note"
+    )
+    print("-" * 80)
+    for _vid in sorted(agg.keys(), key=lambda v: -agg[v]["sum_b"]):
+        meta = get_term_meta(_vid) or {}
+        term = str(meta.get("term") or _vid)[:28]
+        tier = str(meta.get("paper_select_lane_tier") or "-")[:22]
+        n = max(1.0, agg[_vid]["papers"])
+        mean_c = agg[_vid]["sum_c"] / n
+        mean_b = agg[_vid]["sum_b"] / n
+        mean_br = agg[_vid]["sum_b_raw"] / n
+        panch = str(meta.get("parent_anchor") or "")[:18]
+        pas = float(meta.get("parent_anchor_final_score") or 0.0)
+        prk = meta.get("parent_anchor_step2_rank")
+        rk_i = int(prk) if prk is not None else 999
+        is_mac = str(meta.get("paper_select_lane_tier") or "") == "strong_main_axis_core"
+        note = "mean_raw>mean ⇒ wid级正向被主轴门控截断" if mean_br > mean_b + 1e-4 else "-"
+        print(
+            f"{term:28} | {tier:22} | {int(n):^14} | {mean_c:9.4f} | {mean_b:10.4f} | {mean_br:14.4f} | "
+            f"{panch:18} | {pas:5.2f} | {rk_i:2d} | {str(is_mac):^17} | {note}"
+        )
+
+
 def _audit_hierarchy_bonus_distribution(dist_rows: List[Dict[str, Any]], top_n: int) -> None:
     if not dist_rows:
         return
@@ -312,7 +462,7 @@ def run_stage4(
     阶段 4：二层论文召回。用带权学术词沿 HAS_TOPIC 拉论文，按 paper_score 全局排序后截断。
 
     - 取消论文层 domain 硬过滤，改为软奖励（匹配则乘 DOMAIN_BONUS_MATCH，否则 1.0）。
-    - per-(vid,wid) 贡献链不变；按 wid 合并 hits 后乘 **hierarchy_consensus_bonus**（词侧 vocabulary_topic_stats 与 JD 三级 overlap 得 consensus；再相对**本批 wid 池** consensus **中位数**映射：clip(1+β·Δ, 默认 [0.82,1.15])，无硬过滤）。
+    - per-(vid,wid) 贡献链不变；按 wid 合并 hits 后乘 **hierarchy_consensus_bonus**（词侧 vocabulary_topic_stats 与 JD 三级 overlap 得 consensus；再相对**本批 wid 池** consensus **中位数**映射：clip(1+β·Δ, 默认 [0.82,1.15])，无硬过滤）。若 **term_meta** 含 **`paper_select_lane_tier`**（Stage3）：**仅当** 该 wid 上 **strong_main_axis_core** 的 Σ(term_score×idf) 占比 ≥ **`STAGE4_HIERARCHY_STRONG_AXIS_WEIGHT_FRAC`** 时才允许 bonus>1，否则 **cap 至 1.0**（bonus_core / support 不再吃组级正向放大）。见 **`[Stage4 hierarchy bonus by term-group audit]`**。
     - paper_score = Σ term_contrib × hierarchy_bonus（再全局排序截断），含 Stage3 词质量与 per-term 限流。
     - 词侧熔断放宽为 MELT_RATIO（默认 5%），避免合理词被误杀。
 
@@ -320,7 +470,7 @@ def run_stage4(
       - vocab_ids: 参与检索的词汇 ID（即 final_term_ids_for_paper）。
       - regex_str: 领域正则，用于计算 domain_bonus；为空则不奖励。
       - term_scores: vid -> Stage3 的 final_score；若为 None 则按 1.0 处理。
-      - term_meta: 可选，vid -> {term,parent_anchor,parent_primary,source_type,retrieval_role,...}，用于 Stage4 的 paper grounding 二次门控。
+      - term_meta: 可选，vid -> {term,parent_anchor,...,retrieval_role,**paper_select_lane_tier**,parent_anchor_final_score,rank,...}，用于 grounding 与 **hierarchy 正向 bonus 门控**（与 Stage3 **strong_main_axis_core** 对齐）。
       - jd_text: 可选，整段 JD 文本；用于 grounding 计算时的辅助关键词命中。
 
     返回: list of { 'aid': str, 'papers': [ { wid, hits, weight, title, year, domains }, ... ] }，供 Stage5 消费。
@@ -1087,9 +1237,8 @@ def run_stage4(
     for pid, terms in multi_candidates[:20]:
         print(f"  pid='{pid}' terms={terms}")
 
-    # 断点 2：overlap 论文在各 term 的 cap 前后生存情况（默认限行长，优先 survive_after_cap）
+    # 断点 2：overlap 论文在各 term 的 cap 前后生存情况（**默认关闭**：STAGE4_OVERLAP_SURVIVAL_MAX_LINES=0）
     cross_term_overlap_pids = {pid for (_, _, inter) in overlap_pairs for pid in inter}
-    print("\n[Stage4 overlap survival audit]")
     survival_entries: List[Dict[str, Any]] = []
     for vid, rows in term_rows_before_cap.items():
         term_name = str((_get_term_meta(vid) or {}).get("term") or vid)
@@ -1109,31 +1258,33 @@ def run_stage4(
     danger_cut = [e for e in survival_entries if (not e["surv"]) and int(e["rank"]) <= 15]
     danger_cut.sort(key=lambda e: (int(e["rank"]), -e["sc"]))
     max_lines = max(0, STAGE4_OVERLAP_SURVIVAL_MAX_LINES)
-    picked: List[Dict[str, Any]] = []
-    seen_pk: Set[Tuple[str, str]] = set()
-    for e in survived_high:
-        if len(picked) >= max_lines:
-            break
-        pk = (e["pid"], e["term"])
-        if pk in seen_pk:
-            continue
-        seen_pk.add(pk)
-        picked.append(e)
-    for e in danger_cut:
-        if len(picked) >= max_lines:
-            break
-        pk = (e["pid"], e["term"])
-        if pk in seen_pk:
-            continue
-        seen_pk.add(pk)
-        picked.append(e)
-    for e in picked:
-        print(
-            f"term='{e['term']}' pid='{e['pid']}' "
-            f"rank_before_cap={e['rank']} "
-            f"score={float(e['sc']):.3f} "
-            f"survive_after_cap={e['surv']}"
-        )
+    if max_lines > 0:
+        print("\n[Stage4 overlap survival audit]")
+        picked: List[Dict[str, Any]] = []
+        seen_pk: Set[Tuple[str, str]] = set()
+        for e in survived_high:
+            if len(picked) >= max_lines:
+                break
+            pk = (e["pid"], e["term"])
+            if pk in seen_pk:
+                continue
+            seen_pk.add(pk)
+            picked.append(e)
+        for e in danger_cut:
+            if len(picked) >= max_lines:
+                break
+            pk = (e["pid"], e["term"])
+            if pk in seen_pk:
+                continue
+            seen_pk.add(pk)
+            picked.append(e)
+        for e in picked:
+            print(
+                f"term='{e['term']}' pid='{e['pid']}' "
+                f"rank_before_cap={e['rank']} "
+                f"score={float(e['sc']):.3f} "
+                f"survive_after_cap={e['surv']}"
+            )
 
     # 按 wid 聚合：paper_score = Σ term_contrib，hits 合并为 canonical term 证据
     by_wid: Dict[str, Dict[str, Any]] = {}
@@ -1256,18 +1407,26 @@ def run_stage4(
         dist_rows: List[Dict[str, Any]] = []
         for _wid, _rec, _before, _hits, _cons, _det0 in _pre:
             _delta = float(_cons) - _median_c
-            _bonus = _hierarchy_bonus_from_delta(
+            _raw_bonus = _hierarchy_bonus_from_delta(
                 _delta,
                 STAGE4_HIERARCHY_BONUS_BETA,
                 STAGE4_HIERARCHY_BONUS_CLIP_LOW,
                 STAGE4_HIERARCHY_BONUS_CLIP_HIGH,
             )
+            # 批注：wid 级 consensus 已混合多词；仅当 strong_main_axis_core 的 hit 加权占比够高才保留 >1 正向 bonus，
+            # 避免 bonus_core（如 RL）凭 topic 重合在组级再被抬高。
+            _bonus, _tier_gate, _tier_extra = _clip_hierarchy_bonus_by_main_axis_mass(
+                _raw_bonus, _hits, _get_term_meta
+            )
             _after = _before * _bonus
             _det = {
                 **_det0,
+                **_tier_extra,
                 "median_consensus": round(_median_c, 6),
                 "beta": STAGE4_HIERARCHY_BONUS_BETA,
                 "delta_vs_median": round(_delta, 6),
+                "hierarchy_bonus_raw": round(_raw_bonus, 6),
+                "hierarchy_tier_boost_gate": _tier_gate,
                 "hierarchy_bonus": round(_bonus, 6),
             }
             _rec["paper_score"] = _after
@@ -1285,6 +1444,7 @@ def run_stage4(
                 }
             )
         _audit_hierarchy_bonus_distribution(dist_rows, STAGE4_HIERARCHY_DISTRIBUTION_TOP_N)
+        _print_stage4_hierarchy_bonus_term_group_audit(by_wid, _get_term_meta)
         _by_delta = sorted(hierarchy_audit_rows, key=lambda x: -abs(x[1] - x[0]))[
             : max(0, STAGE4_HIERARCHY_AUDIT_TOP_BY_DELTA)
         ]

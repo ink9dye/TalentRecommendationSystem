@@ -1762,6 +1762,15 @@ class LabelRecallPath:
                     "term_role": r.get("term_role"),
                     "can_expand": r.get("can_expand"),
                     "mainline_hits": int(r.get("mainline_hits") or 0),
+                    "paper_select_lane_tier": r.get("paper_select_lane_tier"),
+                    "parent_anchor_final_score": float(
+                        r.get("best_parent_anchor_final_score")
+                        or r.get("parent_anchor_final_score")
+                        or 0.0
+                    ),
+                    "parent_anchor_step2_rank": r.get("best_parent_anchor_step2_rank")
+                    if r.get("best_parent_anchor_step2_rank") is not None
+                    else r.get("parent_anchor_step2_rank"),
                     "object_like_penalty": (r.get("stage3_explain") or {}).get("object_like_penalty"),
                     "bonus_term_penalty": (r.get("stage3_explain") or {}).get("bonus_term_penalty"),
                     "generic_penalty": (r.get("stage3_explain") or {}).get("generic_penalty"),
