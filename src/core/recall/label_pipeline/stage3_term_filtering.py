@@ -47,7 +47,7 @@ PAPER_RECALL_TAIL_EXPAND_REQUIRE_CORE_OR_SEED = True
 # 主 cutoff 后「结构纠偏」：用略低于 floor 的 core near-miss 替换已入选的 weak support soft-admit（不碰 gate / p_sel 公式）
 PAPER_RECALL_CORE_NEAR_MISS_SWAP_MAX_BELOW_FLOOR = 0.02  # 仅 p_sel ∈ [floor−δ, floor) 的 core 可参与 swap-in
 PAPER_RECALL_SUPPORT_SWAP_SCORE_MARGIN = 0.03  # 仅当 in_psel ≥ out_psel − margin 时允许换位
-# paper 选词序（两段式）：强主轴 core 先于 bonus-like primary core，再及其余 eligible（不靠词表）
+# paper 选词 lane-tier 扫描序：强主轴 core → support_lane（含近失配）→ other_eligible → bonus-like primary core 殿后（不靠词表）
 PAPER_SELECT_STRONG_MAIN_AXIS_SCORE_MIN = 0.95
 PAPER_SELECT_STRONG_MAIN_AXIS_MAX_RANK = 6
 PAPER_SELECT_STRONG_MAIN_AXIS_ML_EXP_SCORE_MIN = 0.85
@@ -134,6 +134,8 @@ STAGE3_UNIFIED_W_OBJECT = 0.06
 # 与 select_terms_for_paper_recall 对齐的入稿闸门说明（逐项 term）
 STAGE3_PAPER_GATE_DEBUG = False  # 默认降噪；需要逐项 gate 时再开
 STAGE3_PAPER_CUTOFF_AUDIT = True  # [Stage3 paper cutoff] 排名与截断原因
+STAGE3_PAPER_LANE_FILL_AUDIT = True  # [Stage3 paper lane fill audit] 各 lane-tier 主 cutoff 实取名额 / support 余量
+STAGE3_BONUS_CORE_BLOCKED_AUDIT = True  # [Stage3 bonus-core audit] bonus_core 未入选原因与「被谁挤掉」
 # 与 [Stage3 paper centrality audit] 重叠度高；默认关，需拆 p_sel_base/bonus 时再开
 STAGE3_ELIGIBLE_CORE_CLOSE_CALL_AUDIT = False
 STAGE3_SUPPORT_CONTAMINATION_AUDIT = True  # Stage3→4 之间：可疑 support 摘要
@@ -591,15 +593,16 @@ def _print_stage3_paper_pool_penalty_audit(ordered: List[Dict[str, Any]], top_n:
 
 def _print_stage3_paper_lane_tier_audit(ordered: List[Dict[str, Any]]) -> None:
     """
-    [Stage3 paper lane tier audit]：强主轴 core / bonus_core / support_lane 等分层后的 **全局遍历序**
-    （与截断扫描顺序一致；非同 tier 内单纯按 p_sel 排序）。
+    [Stage3 paper lane tier audit]：strong / support_lane / other_eligible / bonus_core 分层后的 **全局遍历序**
+    （与截断扫描顺序一致；support_lane 段内 near_miss 先于普通 support，再按 p_sel）。
     """
     if not STAGE3_PAPER_CUTOFF_AUDIT or not ordered:
         return
     print("\n" + "-" * 80)
     print(
-        "[Stage3 paper lane tier audit] tier-order scan (strong_main_axis_core → bonus_core → …; "
-        f"thresholds a_sc≥{PAPER_SELECT_STRONG_MAIN_AXIS_SCORE_MIN} rk≤{PAPER_SELECT_STRONG_MAIN_AXIS_MAX_RANK} "
+        "[Stage3 paper lane tier audit] tier-order scan (strong_main_axis_core → support_lane[near_miss≻] → "
+        "other_eligible → bonus_core; "
+        f"strong thresholds a_sc≥{PAPER_SELECT_STRONG_MAIN_AXIS_SCORE_MIN} rk≤{PAPER_SELECT_STRONG_MAIN_AXIS_MAX_RANK} "
         f"or ml+exp+a_sc≥{PAPER_SELECT_STRONG_MAIN_AXIS_ML_EXP_SCORE_MIN} rk≤{PAPER_SELECT_STRONG_MAIN_AXIS_ML_EXP_MAX_RANK})"
     )
     print("-" * 80)
@@ -621,6 +624,105 @@ def _print_stage3_paper_lane_tier_audit(ordered: List[Dict[str, Any]]) -> None:
         print(
             f"{term:22} | {tier:22} | {psel:5.3f} | {a_sc:4.2f} | {rk_i:2d} | {ml:^2} | "
             f"{'T' if ex else 'F':^3} | {lane:7} | {panch:14}"
+        )
+
+
+def _format_stage3_blocked_by_terms(selected_terms: List[str], *, max_parts: int = 14) -> str:
+    if not selected_terms:
+        return "-"
+    parts = [t for t in selected_terms if t][:max_parts]
+    s = ", ".join(parts)
+    if len([t for t in selected_terms if t]) > max_parts:
+        s += ", …"
+    return s or "-"
+
+
+def _print_stage3_paper_lane_fill_audit(
+    selected: List[Dict[str, Any]],
+    support_lane_pool: List[Dict[str, Any]],
+    floor: float,
+    support_cap: int,
+    selected_support_count: int,
+    *,
+    phase: str,
+) -> None:
+    """主 cutoff 各 tier 实取数 + support 余量（验 bonus 殿后：若 bonus_core_taken>0 且 ge_floor 余量>0 则异常信号）。"""
+    if not STAGE3_PAPER_CUTOFF_AUDIT or not STAGE3_PAPER_LANE_FILL_AUDIT:
+        return
+    by_tier: Dict[str, int] = defaultdict(int)
+    for rec in selected:
+        by_tier[str(rec.get("paper_select_lane_tier") or "unknown")] += 1
+    sup_rem_ge_floor = 0
+    sup_not_sel_total = 0
+    fl = float(floor)
+    for r in support_lane_pool:
+        if r.get("selected_for_paper"):
+            continue
+        sup_not_sel_total += 1
+        if float(r.get("paper_select_score") or 0.0) >= fl - 1e-9:
+            sup_rem_ge_floor += 1
+    print("\n" + "-" * 80)
+    print(f"[Stage3 paper lane fill audit] phase={phase}")
+    print("-" * 80)
+    print(f"strong_main_axis_core={by_tier.get('strong_main_axis_core', 0)}")
+    print(f"support_lane_taken={by_tier.get('support_lane', 0)}")
+    print(f"other_eligible_taken={by_tier.get('other_eligible', 0)}")
+    print(f"bonus_core_taken={by_tier.get('bonus_core', 0)}")
+    print(
+        f"support_lane_remaining_candidates={sup_rem_ge_floor}  "
+        f"(support_lane 池未入选且 p_sel≥floor；not_selected_total={sup_not_sel_total})"
+    )
+    print(f"support_cap={support_cap} main_cutoff_selected_support={selected_support_count}")
+
+
+def _print_stage3_bonus_core_blocked_audit(
+    bonus_core_pool: List[Dict[str, Any]],
+    selected_term_list: List[str],
+    family_owner: Dict[str, str],
+    support_remaining_ge_floor: int,
+    *,
+    phase: str,
+) -> None:
+    """bonus_core 逐条：是否入选、截断原因、被当前已选词挤占（family 重复则给同族已选词）。"""
+    if not STAGE3_PAPER_CUTOFF_AUDIT or not STAGE3_BONUS_CORE_BLOCKED_AUDIT:
+        return
+    if not bonus_core_pool:
+        return
+    print("\n" + "-" * 80)
+    print(f"[Stage3 bonus-core audit] phase={phase}")
+    print("-" * 80)
+    print("term                  | p_sel | selected | blocked_by                      | reason")
+    print("-" * 80)
+    for rec in bonus_core_pool:
+        term = str(rec.get("term") or "")[:22]
+        pss = float(rec.get("paper_select_score") or 0.0)
+        sel = bool(rec.get("selected_for_paper"))
+        cutoff = str(rec.get("paper_cutoff_reason") or rec.get("paper_reject_reason") or "")
+        fk = str(rec.get("family_key") or "").strip()
+        if sel:
+            blocked_by = "-"
+            reason = "-"
+        elif cutoff == "below_dynamic_floor":
+            blocked_by = "-"
+            reason = "below_dynamic_floor"
+        elif cutoff in ("family_duplicate_block", "family_dup_or_below_cut"):
+            blocker = family_owner.get(fk, "") if fk else ""
+            blocked_by = (blocker or "?")[:30]
+            reason = "family_duplicate_block"
+        elif cutoff == "support_quota_full":
+            blocked_by = _format_stage3_blocked_by_terms(selected_term_list)
+            reason = "support_quota_full"
+        elif cutoff == "past_paper_recall_max_terms":
+            blocked_by = _format_stage3_blocked_by_terms(selected_term_list)
+            if support_remaining_ge_floor > 0:
+                reason = "support_lane_priority_not_filled"
+            else:
+                reason = "max_terms_exhausted"
+        else:
+            blocked_by = _format_stage3_blocked_by_terms(selected_term_list)
+            reason = cutoff or "unknown"
+        print(
+            f"{term:22} | {pss:5.3f} | {str(sel):5} | {blocked_by:31} | {reason}"
         )
 
 
@@ -2130,7 +2232,7 @@ def _paper_parent_anchor_score_and_rank(rec: Dict[str, Any]) -> Tuple[float, int
 
 
 def _is_strong_main_axis_core(rec: Dict[str, Any]) -> bool:
-    """primary lane 的 core：父锚够强或「主线+可扩+父锚靠前」——先于 bonus-like core 参与截断。"""
+    """primary lane 的 core：父锚够强或「主线+可扩+父锚靠前」——lane-tier 扫描序首段（先于 support_lane 与 bonus_core）。"""
     if (rec.get("stage3_bucket") or "").strip().lower() != "core":
         return False
     if str(rec.get("paper_recall_quota_lane") or "") != "primary":
@@ -2153,12 +2255,25 @@ def _is_strong_main_axis_core(rec: Dict[str, Any]) -> bool:
 
 
 def _is_bonus_like_core(rec: Dict[str, Any]) -> bool:
-    """primary lane 但未达强主轴门槛的 core（如宽学术词）：只能在强主轴 core 之后按 p_sel 竞争。"""
+    """primary lane 但未达强主轴门槛的 core（如宽学术词 / 方法学项）：lane-tier 全局序上在 support_lane 之后补位。"""
     if (rec.get("stage3_bucket") or "").strip().lower() != "core":
         return False
     if str(rec.get("paper_recall_quota_lane") or "") != "primary":
         return False
     return not _is_strong_main_axis_core(rec)
+
+
+def _paper_support_lane_scan_sort_key(rec: Dict[str, Any]) -> Tuple[int, float]:
+    """
+    support_lane 段内二级序：主轴近失配先进（JD 门双弱降级者），其余 support 随后；同级按 p_sel。
+    """
+    gate = str(rec.get("paper_support_gate") or "")
+    reason = str(rec.get("paper_support_reason") or "")
+    near_miss = (
+        gate == "core_axis_near_miss_soft_admit"
+        or reason == "core_axis_near_miss_soft_admit"
+    )
+    return (1 if near_miss else 0, float(rec.get("paper_select_score") or 0.0))
 
 
 def _apply_paper_recall_tail_expand(
@@ -2572,8 +2687,10 @@ def select_terms_for_paper_recall(
       再 **`eligible.extend(support_pool)`**；最终 **`support_cap`** 对 **`paper_recall_quota_lane==support`** 计配额，
       **`retrieval_role`**：`primary` lane → `paper_primary`，否则 `paper_support`。
     - **排序**：`paper_select_score` 仍 = 底分 × readiness + 加性 bonus − 池惩罚（**不改公式**）；**全局遍历序**为
-      **强主轴 core**（`PAPER_SELECT_STRONG_MAIN_AXIS_*`：父锚 **a_sc / rk** 或 **ml≥1∧可扩∧a_sc∧rk** 组合）→ **bonus-like primary core** → **其余 eligible**，
-      各段内再按 `paper_select_score` 降序；然后 **family** + **dynamic_floor** + **topN**。使宽学术 core 在贴主轴词之后竞争名额。
+      **强主轴 core**（`PAPER_SELECT_STRONG_MAIN_AXIS_*`：父锚 **a_sc / rk** 或 **ml≥1∧可扩∧a_sc∧rk** 组合）→ **`support_lane`**
+      （**`core_axis_near_miss_soft_admit` 先于** 同段其余 support；段内再按 `paper_select_score`）→ **`other_eligible`** → **bonus-like primary core（`bonus_core`）**，
+      最后一段**殿后**：仅在 strong + support + other 轮完后仍不满额时，宽 primary / 方法学项才补位，避免「稳定占一席准主轴」。
+      然后 **family** + **dynamic_floor** + **topN**。
     - **尾部补位**（**`PAPER_RECALL_TAIL_EXPAND_*`**）：主截断完成后，若 **`len(selected)≤3`** 或 **`selected_support==0`**，
       从未入选 **near-miss**（**`p_sel≥floor−Δ`**）再补 **≤`TAIL_EXPAND_MAX_EXTRA`**；
       **优先级**：**core** 且仅 **`below_dynamic_floor`** 的 near-miss（ml≥1∧可扩）**先于** weak support **软放行**（`support_*_soft_admit`），再及 **`PAPER_RECALL_TAIL_EXPAND_REQUIRE_CORE_OR_SEED`** 约束下的其余候选；
@@ -2837,8 +2954,9 @@ def select_terms_for_paper_recall(
 
     floor = _paper_recall_dynamic_floor(eligible, score_key="paper_select_score")
 
-    # 两段式全局序：强主轴 primary core → bonus-like primary core → support / 其它（段内按 p_sel 降序）。
-    # 批注：不回调 _compute_paper_select_score；仅改「谁先接受 floor+family 扫描」，抑制宽 core 靠高分占位。
+    # 四段式全局序：strong_main_axis_core → support_lane（段内 near_miss ≻）→ other_eligible → bonus_core（殿后）。
+    # 批注：不回调 _compute_paper_select_score；仅改「谁先接受 floor+family 扫描」。bonus_core 不再紧挨 strong，
+    # 避免 RL 等在 robotic arm / route planning 等仍处 support_lane 时抢先占满 paper 名额（与 Stage4 正向门控解耦）。
     for rec in eligible:
         if _is_strong_main_axis_core(rec):
             rec["paper_select_lane_tier"] = "strong_main_axis_core"
@@ -2862,16 +2980,21 @@ def select_terms_for_paper_recall(
         key=_pss_desc,
         reverse=True,
     )
-    others = sorted(
+    support_lane_tier = sorted(
+        [r for r in eligible if r.get("paper_select_lane_tier") == "support_lane"],
+        key=_paper_support_lane_scan_sort_key,
+        reverse=True,
+    )
+    other_eligible = sorted(
         [
             r
             for r in eligible
-            if r.get("paper_select_lane_tier") not in ("strong_main_axis_core", "bonus_core")
+            if r.get("paper_select_lane_tier") == "other_eligible"
         ],
         key=_pss_desc,
         reverse=True,
     )
-    ordered = strong_core + bonus_core + others
+    ordered = strong_core + support_lane_tier + other_eligible + bonus_core
 
     _print_stage3_paper_lane_tier_audit(ordered)
     _print_stage3_paper_centrality_audit(ordered, top_n=12)
@@ -2881,6 +3004,8 @@ def select_terms_for_paper_recall(
     support_cap = _support_to_paper_quota_cap(max_terms)
     selected_support = 0
     support_quota_full_cnt = 0
+    family_owner: Dict[str, str] = {}
+    selected_term_list: List[str] = []
     for rec in ordered:
         pss = float(rec.get("paper_select_score") or 0.0)
         fk = str(rec.get("family_key") or "")
@@ -2910,11 +3035,40 @@ def select_terms_for_paper_recall(
             "paper_primary" if lane == "primary" else "paper_support"
         )
         used_family.add(fk)
+        if fk.strip():
+            family_owner[fk] = str(rec.get("term") or "")
         selected.append(rec)
+        selected_term_list.append(str(rec.get("term") or ""))
         if counts_to_support_cap:
             selected_support += 1
         if len(selected) >= max_terms:
             break
+
+    # 主扫描因 max_terms 提前结束时，后续 ordered 条目标未赋值 cutoff，供 bonus / cutoff 表与审计一致。
+    for rec in ordered:
+        if rec.get("selected_for_paper"):
+            continue
+        if not rec.get("paper_cutoff_reason"):
+            rec["paper_reject_reason"] = "past_paper_recall_max_terms"
+            rec["paper_cutoff_reason"] = "past_paper_recall_max_terms"
+
+    support_rem_ge_floor = sum(
+        1
+        for r in support_lane_tier
+        if not r.get("selected_for_paper")
+        and float(r.get("paper_select_score") or 0.0) >= float(floor) - 1e-9
+    )
+    _print_stage3_paper_lane_fill_audit(
+        selected,
+        support_lane_tier,
+        floor,
+        support_cap,
+        selected_support,
+        phase="main_cutoff_pre_swap",
+    )
+    _print_stage3_bonus_core_blocked_audit(
+        bonus_core, selected_term_list, family_owner, support_rem_ge_floor, phase="main_cutoff_pre_swap"
+    )
 
     # ------------------------------------------------------------------
     # 主 cutoff 之后、tail 之前：结构性纠偏（与 tail「selected≤3」触发无关）。
