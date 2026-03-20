@@ -146,6 +146,7 @@ def run_label_debug_cli() -> None:
                 top_contrib = db.get("top_terms_final_contrib") or []
                 if top_contrib:
                     paper_tid_set = {str(x) for x in (fcl.get("final_term_ids_for_paper") or [])}
+                    _show_paper_contrib_cols = os.environ.get("STAGE5_TERM_CONTRIB_DEBUG") == "1"
 
                     def _tid_in_paper_set(tid_val) -> bool:
                         if tid_val is None:
@@ -155,17 +156,28 @@ def run_label_debug_cli() -> None:
                     def _print_contrib_table(title: str, rows, limit: int = 20) -> None:
                         if not rows:
                             return
-                        print(
-                            f"{title}term | tid | final_weight | main_role | role_penalty | paper_count_hit | top_paper_contrib | task_advantage"
-                        )
+                        if _show_paper_contrib_cols:
+                            print(
+                                f"{title}term | tid | final_weight | main_role | role_penalty | paper_count_hit | top_paper_contrib | task_advantage"
+                            )
+                        else:
+                            print(
+                                f"{title}term | tid | final_weight | main_role | role_penalty | task_advantage"
+                            )
                         for r in rows[:limit]:
                             ta = r.get("task_advantage")
                             ta_s = f"{ta:.3f}" if ta is not None else "-"
-                            print(
-                                f"  {(r.get('term') or '')[:28]:28s} | {r.get('tid')} | {r.get('final_weight', 0):.4f} | "
-                                f"{(r.get('main_role') or '')[:12]:12s} | {r.get('role_penalty') or 0:.3f} | {r.get('paper_count_hit', 0)} | "
-                                f"{r.get('top_paper_contrib', 0):.6f} | {ta_s}"
-                            )
+                            if _show_paper_contrib_cols:
+                                print(
+                                    f"  {(r.get('term') or '')[:28]:28s} | {r.get('tid')} | {r.get('final_weight', 0):.4f} | "
+                                    f"{(r.get('main_role') or '')[:12]:12s} | {r.get('role_penalty') or 0:.3f} | {r.get('paper_count_hit', 0)} | "
+                                    f"{r.get('top_paper_contrib', 0):.6f} | {ta_s}"
+                                )
+                            else:
+                                print(
+                                    f"  {(r.get('term') or '')[:28]:28s} | {r.get('tid')} | {r.get('final_weight', 0):.4f} | "
+                                    f"{(r.get('main_role') or '')[:12]:12s} | {r.get('role_penalty') or 0:.3f} | {ta_s}"
+                                )
 
                     in_paper = [r for r in top_contrib if _tid_in_paper_set(r.get("tid"))]
                     not_in_paper = [r for r in top_contrib if not _tid_in_paper_set(r.get("tid"))]
