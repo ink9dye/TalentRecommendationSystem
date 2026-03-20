@@ -438,7 +438,7 @@ def _collect_stage3_bucket_reason_flags(rec: Dict[str, Any]) -> List[str]:
     )
 
     is_locked_mainline = (
-        primary_bucket == "primary_keep_no_expand"
+        primary_bucket in ("primary_keep_no_expand", "primary_support_keep")
         or primary_reason == "usable_mainline_no_expand"
         or (mainline_candidate and (not can_expand_local))
     )
@@ -588,12 +588,11 @@ def _compute_stage3_risk_penalty(term: Dict[str, Any]) -> float:
 
 def _assign_stage3_bucket(term: Dict[str, Any]) -> str:
     """
-    Stage3 分桶（两函数硬门之一）：conditioned_only 永不得 core；并消费 Stage2A 透传语义。
-    - is_fallback_primary：fallback 保线词，默认 risky（与正常 primary 区分）。
-    - is_locked_mainline：primary_keep_no_expand / usable_mainline_no_expand 等「主线但不可扩」→ support，避免误伤 risky。
-    - has_mainline_support：强主线（mainline_hits≥1 或 can_expand）或 locked mainline。
+    Stage3 分桶：显式消费 Stage2A 五层 primary_bucket（expandable / support_seed / support_keep / risky_keep），
+    与 conditioned_only、fallback 正交；support 子类强度不同（seed 可信 > keep 保留 > risky_keep 已默认 risky）。
     """
     term.pop("stage3_support_demote_reason", None)
+    term.pop("stage3_core_cap_reason", None)
     anchor_count = int(term.get("anchor_count") or 0)
     if anchor_count < 1:
         anchor_count = 1
@@ -614,23 +613,55 @@ def _assign_stage3_bucket(term: Dict[str, Any]) -> str:
         or primary_reason == "anchor_core_fallback"
     )
 
-    is_locked_mainline = (
-        primary_bucket == "primary_keep_no_expand"
-        or primary_reason == "usable_mainline_no_expand"
-        or (mainline_candidate and (not can_expand_local))
-    )
-
-    strong_mainline_support = mainline_hits >= 1 or can_expand
-    has_mainline_support = strong_mainline_support or is_locked_mainline
-
     st = _stage3_normalized_source_types(term)
     has_similar = "similar_to" in st
     has_family = "family_landing" in st
     has_conditioned = "conditioned_vec" in st
     conditioned_only = bool(has_conditioned and (not has_similar) and (not has_family))
 
+    def _cap_core_if_conditioned_single_anchor(side: str) -> str:
+        """
+        单锚 + conditioned_only 不得挂 core：与 paper 硬门（conditioned_only_single_anchor_block）一致，
+        避免 rerank 表里显示 core、 downstream 却被挡的口径割裂。
+        """
+        if side == "core" and conditioned_only and anchor_count <= 1:
+            term["stage3_core_cap_reason"] = "conditioned_only_single_anchor"
+            return "support"
+        return side
+
     if is_fallback_primary:
         return "risky"
+
+    if primary_bucket == "risky_keep":
+        return "risky"
+
+    # primary_expandable：强主线 → core（需 identity/证据）；否则仍 support
+    if primary_bucket == "primary_expandable":
+        if mainline_hits >= 1 and can_expand and identity_factor >= 0.95:
+            return "core"
+        return "support"
+
+    # primary_support_seed：可信 support；证据不足 → risky
+    if primary_bucket == "primary_support_seed":
+        if mainline_hits >= 1 or can_expand:
+            return "support"
+        return "risky"
+
+    # primary_support_keep / 旧 primary_keep_no_expand：支线保留 support，默认可弱于 seed
+    if primary_bucket in ("primary_support_keep", "primary_keep_no_expand"):
+        if conditioned_only and anchor_count <= 1:
+            return "support" if (mainline_hits >= 1 or can_expand_local) else "risky"
+        return "support"
+
+    # ----- 无显式五层 bucket 时的回退链 -----
+    is_locked_mainline = (
+        primary_bucket in ("primary_keep_no_expand", "primary_support_keep")
+        or primary_reason == "usable_mainline_no_expand"
+        or (mainline_candidate and (not can_expand_local))
+    )
+
+    strong_mainline_support = mainline_hits >= 1 or can_expand
+    has_mainline_support = strong_mainline_support or is_locked_mainline
 
     if conditioned_only and anchor_count <= 1:
         return "support" if has_mainline_support else "risky"
@@ -646,7 +677,7 @@ def _assign_stage3_bucket(term: Dict[str, Any]) -> str:
         and identity_factor >= 0.95
     )
     if core_ok:
-        return "core"
+        return _cap_core_if_conditioned_single_anchor("core")
 
     bucket = "support" if has_mainline_support else "risky"
 
@@ -872,6 +903,43 @@ def _print_stage3_cross_anchor_audit(cands: List[Dict[str, Any]], top_k: int = 4
         )
 
 
+def _print_stage3_support_subtype_audit(cands: List[Dict[str, Any]], top_k: int = 24) -> None:
+    """
+    [Stage3 support subtype audit]
+    bucket=support 时拆 primary_support_seed / primary_support_keep / conditioned_only 等，与 stage3_build_score_map 乘子对齐排查。
+    """
+    if not STAGE3_AUDIT_DEBUG or not cands:
+        return
+    focus = [
+        c for c in cands
+        if (c.get("stage3_bucket") or "").strip().lower() == "support"
+    ]
+    focus = sorted(focus, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
+    focus = _stage3_audit_filter_rows(focus, top_k)
+    if not focus:
+        print("\n" + "-" * 80 + "\n[Stage3 support subtype audit] (no support rows / focus empty)\n" + "-" * 80)
+        return
+
+    print("\n" + "-" * 80)
+    print("[Stage3 support subtype audit]")
+    print("-" * 80)
+    print(
+        "term                     | stage3_bucket | primary_bucket       | cond_only | anch | ml_hits | can_exp | final"
+    )
+    for rec in focus:
+        term = (rec.get("term") or "")[:24]
+        sb = (rec.get("stage3_bucket") or "")[:12]
+        pb = (rec.get("primary_bucket") or "")[:20]
+        co = _stage3_is_conditioned_only(rec)
+        anch = int(rec.get("anchor_count") or 0)
+        ml = int(rec.get("mainline_hits") or 0)
+        ce = bool(rec.get("can_expand", False) or rec.get("can_expand_from_2a", False))
+        fs = float(rec.get("final_score") or 0.0)
+        print(
+            f"{term:24} | {sb:13} | {pb:20} | {str(co):^9} | {anch:^4} | {ml:^7} | {str(ce):^7} | {fs:.4f}"
+        )
+
+
 def _print_stage3_support_risky_concise(cands: List[Dict[str, Any]], top_k: int = 20) -> None:
     """[Stage3 support/risky concise] 只列 support / risky，快速扫可疑项。"""
     if not STAGE3_AUDIT_DEBUG or not cands:
@@ -966,6 +1034,31 @@ def _print_paper_term_selection_audit(ordered: List[Dict[str, Any]], limit: int 
         print(f"  paper_reject_reason={repr(rec.get('paper_reject_reason') or '')}")
         print(f"  retrieval_role={rec.get('retrieval_role')!r}")
         print(f"  reason_flags={rec.get('bucket_reason_flags') or []}")
+        if rec.get("paper_final_score_need") is not None:
+            print(f"  paper_final_score_need={float(rec.get('paper_final_score_need')):.4f}")
+        if rec.get("paper_grounding") is not None:
+            print(
+                f"  paper_grounding={float(rec.get('paper_grounding') or 0):.4f} "
+                f"need={rec.get('paper_grounding_need')!r} gate={rec.get('paper_support_gate')!r}"
+            )
+
+
+def _paper_grounding_score(rec: Dict[str, Any]) -> float:
+    """0~1：主线命中、跨锚、ptc、family 综合，供 support 入 paper 分层门槛。"""
+    ex = rec.get("stage3_explain") or {}
+    ptc = float(ex.get("path_topic_consistency") or 0.0)
+    fc = float(rec.get("family_centrality") or ex.get("family_centrality") or 0.0)
+    mh = int(rec.get("mainline_hits") or 0)
+    ac = int(rec.get("anchor_count") or 1)
+    return float(
+        min(
+            1.0,
+            0.18 * min(mh, 3)
+            + 0.06 * max(0, ac - 1)
+            + 0.44 * ptc
+            + 0.32 * fc,
+        )
+    )
 
 
 def select_terms_for_paper_recall(
@@ -976,7 +1069,7 @@ def select_terms_for_paper_recall(
     Paper 召回选词（两函数硬门之二）：
     - conditioned_only 且单锚 → 不进 paper（conditioned_only_single_anchor_block）。
     - fallback_primary（含 Stage2A primary_fallback / anchor_core_fallback）→ fallback_primary_block。
-    - core 直接入选；support 需要“主线 grounding + 语义质量”；risky 不进。
+    - core 直接入选；support 需要「按 primary_bucket 分层的 final_score 门槛 + 主线 grounded + risk + paper_grounding」；risky 不进。
     - 同 family_key 去重；遍历顺序 core→support→risky，同桶内按 final_score 降序。
     """
     if not records:
@@ -995,14 +1088,30 @@ def select_terms_for_paper_recall(
         """
         支撑词 paper 允许准入的“grounded support”门：
         - 避免 conditioned_only 抢占 paper 配额
-        - 需要交叉锚证据（anchor_count & mainline_hits）托住
-        - 用风险项做保守兜底（不再强依赖 context_continuity）
+        - 默认需要跨锚或双主线托住；**窄豁免**：`primary_support_seed` + 单锚 + `mainline_hits>=1` + `can_expand`
+          仍可进入后续 `paper_grounding`（与 2A 弱 seed 可信 support 对齐，不加宽 keep）
+        - primary_support_seed 与 primary_support_keep 使用不同 paper_grounding 下限
+        - **final_score 前置门按 primary_bucket 分层**（弱 seed 略宽），避免 grounding 已够仍被统一 0.46 拦死
+        - 写入 `paper_final_score_need`（本函数内适用的总分门槛）与落选时的 `paper_grounding` / `paper_grounding_need` / `paper_support_gate`
         """
         st = _stage3_normalized_source_types(rec)
         has_similar = "similar_to" in st
         has_family = "family_landing" in st
         has_conditioned = "conditioned_vec" in st
         conditioned_only = bool(has_conditioned and (not has_similar) and (not has_family))
+        pb = (rec.get("primary_bucket") or "").strip().lower()
+
+        def _stamp_support_paper_audit(gate: str) -> None:
+            """support 未过本函数某道门时打标，便于 paper audit 区分「没过 cross-anchor」还是「pg 不够」。"""
+            pg = _paper_grounding_score(rec)
+            rec["paper_grounding"] = pg
+            if pb == "primary_support_seed":
+                rec["paper_grounding_need"] = 0.18
+            elif pb in ("primary_support_keep", "primary_keep_no_expand"):
+                rec["paper_grounding_need"] = 0.26
+            else:
+                rec["paper_grounding_need"] = None
+            rec["paper_support_gate"] = gate
 
         # fallback 只保留，不进 paper
         if bool(rec.get("fallback_primary", False)):
@@ -1012,28 +1121,61 @@ def select_terms_for_paper_recall(
             return False
 
         final_score = float(rec.get("final_score") or 0.0)
-        if final_score < 0.46:
+        # 批注：须排在 grounded_support_ok / paper_grounding 之前，但口径随 2A 桶分层——仅放宽 primary_support_seed，keep/risky 等仍 0.46
+        if pb == "primary_support_seed":
+            final_score_need = 0.42
+        elif pb in ("primary_support_keep", "primary_keep_no_expand"):
+            final_score_need = 0.46
+        else:
+            final_score_need = 0.46
+        rec["paper_final_score_need"] = final_score_need
+        if final_score < final_score_need:
+            _stamp_support_paper_audit("final_score_floor")
             return False
 
         mainline_hits = int(rec.get("mainline_hits", 0) or 0)
         anchor_count = int(rec.get("anchor_count", 1) or 1)
+        can_expand = bool(rec.get("can_expand", False) or rec.get("can_expand_from_2a", False))
 
         grounded_support_ok = (
             (anchor_count >= 2 and mainline_hits >= 1)
             or (mainline_hits >= 2)
+            or (
+                pb == "primary_support_seed"
+                and mainline_hits >= 1
+                and can_expand
+            )
         )
         if not grounded_support_ok:
+            _stamp_support_paper_audit("grounded_support_ok")
             return False
 
         generic_risk = float(rec.get("generic_risk", 0.0) or 0.0)
         polysemy_risk = float(rec.get("polysemy_risk", 0.0) or 0.0)
         object_like_risk = float(rec.get("object_like_risk", 0.0) or 0.0)
 
-        return (
+        if not (
             generic_risk <= 0.75
             and object_like_risk <= 0.50
             and polysemy_risk <= 0.65
-        )
+        ):
+            _stamp_support_paper_audit("risk_caps")
+            return False
+
+        pg = _paper_grounding_score(rec)
+        rec["paper_grounding"] = pg
+        if pb == "primary_support_seed":
+            rec["paper_grounding_need"] = 0.18
+            if pg < 0.18:
+                rec["paper_support_gate"] = "paper_grounding"
+            return pg >= 0.18
+        if pb in ("primary_support_keep", "primary_keep_no_expand"):
+            rec["paper_grounding_need"] = 0.26
+            if pg < 0.26:
+                rec["paper_support_gate"] = "paper_grounding"
+            return pg >= 0.26
+        rec["paper_grounding_need"] = None
+        return True
 
     for rec in ordered:
         anchor_count = int(rec.get("anchor_count") or 1) or 1
@@ -1054,7 +1196,7 @@ def select_terms_for_paper_recall(
         )
 
         is_locked_mainline = (
-            primary_bucket == "primary_keep_no_expand"
+            primary_bucket in ("primary_keep_no_expand", "primary_support_keep")
             or primary_reason == "usable_mainline_no_expand"
             or (mainline_candidate and (not can_expand_local))
         )
@@ -1169,9 +1311,17 @@ def stage3_build_score_map(survivors: List[Dict[str, Any]]) -> List[Dict[str, An
         if "locked_mainline_no_expand" in reason_flags:
             score_mult *= 0.86
         if bucket == "risky":
-            score_mult *= 0.82
+            score_mult *= 0.72
         if group == "secondary_primary" and bucket != "core":
             score_mult *= 0.88
+
+        # B1. Stage2A 五层：同 bucket=support 内再分档（seed 略宽、keep 更弱）
+        pb = (rec.get("primary_bucket") or "").strip().lower()
+        if bucket == "support":
+            if pb == "primary_support_seed":
+                score_mult *= 0.92
+            elif pb in ("primary_support_keep", "primary_keep_no_expand"):
+                score_mult *= 0.82
 
         # B. conditioned_only：本次唯一重点加强
         # 单锚 conditioned_only 在排序阶段就要明显压低，避免 Robotics / Robot control 的侧翼词顶到前排
@@ -1275,10 +1425,13 @@ def stage3_build_score_map(survivors: List[Dict[str, Any]]) -> List[Dict[str, An
         print("\n" + "-" * 80)
         print("[Stage3 rerank summary]")
         print("-" * 80)
-        print("rank | term | bucket | conditioned_only | anchors | mainline_hits | can_expand | final")
+        print(
+            "rank | term | bucket | primary_bucket | cond_only | anch | ml_hits | can_exp | final"
+        )
         for i, rec in enumerate(survivors[:12], start=1):
             term = rec.get("term", "")
             bucket = rec.get("stage3_bucket", "")
+            pb_row = (rec.get("primary_bucket") or "")[:18]
             conditioned_only_row = _stage3_is_conditioned_only(rec)
             anchor_count_row = int(rec.get("anchor_count") or 1)
             mainline_hits_row = int(rec.get("mainline_hits") or 0)
@@ -1286,12 +1439,13 @@ def stage3_build_score_map(survivors: List[Dict[str, Any]]) -> List[Dict[str, An
             final_score = float(rec.get("final_score") or 0.0)
             print(
                 f"{i:>4} | "
-                f"{term[:28]:<28} | "
-                f"{str(bucket):<7} | "
-                f"{str(conditioned_only_row):<16} | "
-                f"{anchor_count_row:^7} | "
-                f"{mainline_hits_row:^13} | "
-                f"{str(can_expand_row):<10} | "
+                f"{term[:22]:<22} | "
+                f"{str(bucket):<6} | "
+                f"{pb_row:<18} | "
+                f"{str(conditioned_only_row):<9} | "
+                f"{anchor_count_row:^4} | "
+                f"{mainline_hits_row:^7} | "
+                f"{str(can_expand_row):<7} | "
                 f"{final_score:.4f}"
             )
 
@@ -1335,6 +1489,7 @@ def _run_stage3_dual_gate(
 
     jd_profile = getattr(recall, "jd_profile", None)
     active_domains = getattr(recall, "active_domain_set", None)
+    topic_gate_bypass_primary_like_count = 0
 
     for rec in merged_candidates:
         rec["family_key"] = rec.get("family_key") or build_family_key(rec)
@@ -1362,7 +1517,14 @@ def _run_stage3_dual_gate(
 
         primary_like = _is_primary_like(rec)
         if primary_like and label_trace:
-            print(f"[Stage3 topic_gate] bypass primary-like tid={rec.get('tid')} term={rec.get('term')!r}")
+            if STAGE3_DEBUG_FOCUS_TERMS:
+                _tk = (rec.get("term") or "").strip()
+                if _tk in STAGE3_DEBUG_FOCUS_TERMS:
+                    print(
+                        f"[Stage3 topic_gate] bypass primary-like tid={rec.get('tid')} term={rec.get('term')!r}"
+                    )
+            else:
+                topic_gate_bypass_primary_like_count += 1
         if not primary_like and not term_scoring.passes_topic_consistency(rec, None):
             rec["reject_reason"] = "topic_consistency"
             dropped_with_reason.append(rec)
@@ -1397,6 +1559,12 @@ def _run_stage3_dual_gate(
         rec["stage3_bucket"] = _assign_stage3_bucket(rec)
         survivors.append(rec)
 
+    if label_trace and topic_gate_bypass_primary_like_count and not STAGE3_DEBUG_FOCUS_TERMS:
+        print(
+            f"[Stage3 topic_gate] bypass primary-like count={topic_gate_bypass_primary_like_count} "
+            f"(明细仅 STAGE3_DEBUG_FOCUS_TERMS 非空时逐条打印)"
+        )
+
     survivors.sort(key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
     for i, rec in enumerate(survivors):
         rec["stage3_rank"] = i
@@ -1415,6 +1583,7 @@ def _run_stage3_dual_gate(
     if STAGE3_AUDIT_DEBUG:
         _print_stage3_final_adjust_audit(survivors, top_k=12)
         _print_stage3_cross_anchor_audit(survivors, top_k=40)
+        _print_stage3_support_subtype_audit(survivors, top_k=24)
         _print_stage3_support_risky_concise(survivors, top_k=20)
 
     core_terms_list, support_terms_list, risky_terms_list = _bucket_stage3_terms(survivors)

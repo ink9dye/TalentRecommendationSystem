@@ -22,6 +22,8 @@ DOMAIN_BONUS_NO_MATCH = 1.0
 
 # 全局 paper 池上限
 GLOBAL_PAPER_LIMIT = 2000
+# True：逐条打印 paper_map 合并；False：仅在多 hit 或 hit 条数异常变化时打印（降噪）
+STAGE4_PAPER_MAP_WRITE_VERBOSE = False
 
 
 def get_term_role_weight(term_retrieval_roles: Optional[Dict[int, str]], vid: int) -> float:
@@ -182,13 +184,26 @@ def run_stage4(
                 # RL 词必须更贴机器人/控制主轴，否则强压
                 off_topic_penalty *= 0.45
 
-        # route planning 相关额外约束：更像交通规划则压
+        # route planning 相关额外约束：交通/船舶/公交定制路线等压（略严于旧版 0.40）
         if "route planning" in term_text:
             if any(
                 kw in t
-                for kw in ["charging station", "traffic", "transportation", "vehicle", "bus", "rescue route", "ship"]
+                for kw in [
+                    "charging station",
+                    "traffic",
+                    "transportation",
+                    "vehicle",
+                    "bus",
+                    "rescue route",
+                    "ship",
+                    "shipping",
+                    "maritime",
+                    "expressway",
+                    "customized bus",
+                    "intelligent ship",
+                ]
             ):
-                off_topic_penalty *= 0.40
+                off_topic_penalty *= 0.32
 
         # robotic arm 相关额外约束：纯器件/结构而非控制也压一点
         if "robotic arm" in term_text:
@@ -206,6 +221,56 @@ def run_stage4(
                 ]
             ):
                 off_topic_penalty *= 0.60
+
+        # robot control：字面极泛，易误收「聊天/安全/LLM」类标题；对齐 RL/route/arm 的专项约束风格
+        if "robot control" in term_text:
+            pseudo_control_kw = [
+                "chat control",
+                "backdoor",
+                "safety",
+                "alignment",
+                "llm",
+                "large language",
+                "language model",
+                "prompt",
+                "gpt",
+            ]
+            if any(kw in t for kw in pseudo_control_kw):
+                off_topic_penalty *= 0.25
+            control_axis_keywords = [
+                "motion",
+                "manipulator",
+                "trajectory",
+                "locomotion",
+                "kinematics",
+                "dynamics",
+                "path planning",
+                "rehabilitation robot",
+                "mobile robot",
+                "quadruped",
+                "biped",
+                "humanoid",
+            ]
+            if not any((kw in t) or (kw in d) for kw in control_axis_keywords):
+                off_topic_penalty *= 0.55
+
+        # supervised learning：易混入通用 ML/自监督综述；无机器人/控制主轴则压
+        if "supervised learning" in term_text:
+            if not any(
+                kw in t or kw in d
+                for kw in [
+                    "robot",
+                    "robotic",
+                    "motion",
+                    "control",
+                    "manipulation",
+                    "reinforcement",
+                    "imitation learning",
+                    "trajectory",
+                    "locomotion",
+                ]
+            ):
+                off_topic_penalty *= 0.50
 
         # 提高词面命中权重，降低“只沾主轴泛词”论文的 grounding 分
         grounding = (0.55 * lexical_hit + 0.20 * anchor_axis_hit + 0.25 * jd_axis_match)
@@ -335,6 +400,24 @@ def run_stage4(
             * off_topic_penalty
             * term_paper_role_factor
         )
+
+        # 批注：Stage3 已把词分成 paper_primary / paper_support；support 过门后仍易吃「JD 高 + tg 低」。
+        # 不在硬门一刀砍死，而在分数上再压一档，避免与 core 词在 wid 聚合、作者榜里同台竞技。
+        meta_sr = _get_term_meta(vid)
+        retrieval_role_local = str(
+            meta_sr.get("retrieval_role")
+            or (term_retrieval_roles.get(vid) if term_retrieval_roles else None)
+            or (term_retrieval_roles.get(str(vid)) if term_retrieval_roles else None)
+            or ""
+        ).strip().lower()
+        if retrieval_role_local == "paper_support":
+            final_paper_score *= 0.85
+            if term_grounding < 0.10:
+                final_paper_score *= 0.25
+            elif term_grounding < 0.18:
+                final_paper_score *= 0.45
+            elif term_grounding < 0.28:
+                final_paper_score *= 0.70
 
         return {
             "term_grounding": term_grounding,
@@ -512,7 +595,7 @@ def run_stage4(
     # 调试断点：cap 前/后按 term 的论文行，用于 overlap 与生存性分析
     term_rows_before_cap: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     term_rows_after_cap: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-    # 审计用：按 term 收集进入 Stage4 评分链路的论文分解，便于定位 Stage4->Stage5 放大点
+    # 审计用：grounding 门控前、评分链路上的各行（非 cap 后 kept）；命名见 [Stage4 pre-gate paper score audit]
     term_kept_paper_audit: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     for r in rows:
         vid = int(r["vid"])
@@ -665,6 +748,23 @@ def run_stage4(
         # 批注：输出每个 term 在关键层级的数量，优先判断是 grounding 还是 cap 在砍样本。
         meta = _get_term_meta(vid)
         term_name = str(meta.get("term") or meta.get("anchor") or meta.get("parent_primary") or vid)
+        rr_audit = str(
+            meta.get("retrieval_role")
+            or term_retrieval_roles.get(vid)
+            or term_retrieval_roles.get(str(vid))
+            or ""
+        ).strip().lower()
+        if rr_audit == "paper_support" and kept_triples:
+            grounds = [float(x[4]) for x in kept_triples]
+            sec_n = sum(1 for x in kept_triples if str(x[3]) == "secondary")
+            print(
+                f"[Stage4 support grounding audit] term='{term_name}' "
+                f"kept_total={len(kept_triples)} "
+                f"tg_lt_0.10={sum(1 for g in grounds if g < 0.10)} "
+                f"tg_lt_0.18={sum(1 for g in grounds if g < 0.18)} "
+                f"tg_lt_0.28={sum(1 for g in grounds if g < 0.28)} "
+                f"secondary_hits={sec_n}"
+            )
         print(
             f"[Stage4 term stats] term='{term_name}' "
             f"raw={term_funnel_counts[vid].get('cypher_raw', 0)} "
@@ -916,15 +1016,14 @@ def run_stage4(
                 )
 
     # 精准审计块 1/3：
-    # [Stage4 kept paper score audit] 聚焦“论文分 -> 作者分”前的 paper_factor 分解，
-    # 用于判断是 Stage4 因子过松，还是 Stage5 聚合过度放大。
-    print("\n[Stage4 kept paper score audit]")
+    # [Stage4 pre-gate paper score audit] 收集于 grounding 门之前，行数 = pre_cap 前的 scored_rows，不是 cap 后 kept。
+    print("\n[Stage4 pre-gate paper score audit]")
     for vid in v_ids:
         meta = _get_term_meta(vid)
         term_name = str(meta.get("term") or meta.get("anchor") or meta.get("parent_primary") or vid)
         rows_audit = term_kept_paper_audit.get(vid, [])
         rows_audit.sort(key=lambda x: float(x.get("final_paper_score") or 0.0), reverse=True)
-        print(f"term='{term_name}' kept={len(rows_audit)}")
+        print(f"term='{term_name}' pre_gate_scored_rows={len(rows_audit)}")
         for i, p in enumerate(rows_audit[:10], 1):
             print(
                 f"[Stage4 jd audit] term='{term_name}' pid='{p.get('paper_id')}' "

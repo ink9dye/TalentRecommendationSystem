@@ -11,13 +11,17 @@ from src.core.recall.label_means.hierarchy_guard import get_retrieval_role_from_
 from src.core.recall.label_means.label_expansion import (
     PreparedAnchor,
     ExpandedTermCandidate,
+    LABEL_EXPANSION_DEBUG,
     _anchor_skills_to_prepared_anchors,
     stage2_generate_academic_terms,
 )
 
 
 def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict[str, Any]]:
-    """Stage2 -> Stage3：只传 5 个正交层级字段 + 必要标识；冗余字段仅入 _debug 供排查。"""
+    """
+    Stage2 -> Stage3：正交层级字段 + 必要标识；2A/2B 分桶结论须写顶层 dict，
+    Stage3 去重聚合才会把 winning rec 的键并入合并记录（仅 _debug 不会带上）。
+    """
     out = []
     for c in terms:
         rec = {
@@ -66,6 +70,15 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
             "cross_anchor_support": getattr(c, "cross_anchor_support", None),
             "seed_block_reason": getattr(c, "seed_block_reason", None),
             "has_family_evidence": getattr(c, "has_family_evidence", False),
+            # 与顶层同步，便于只开 _debug 时的离线对照
+            "primary_bucket": getattr(c, "primary_bucket", None) or "",
+            "can_expand_from_2a": bool(getattr(c, "can_expand_from_2a", False)),
+            "fallback_primary": bool(getattr(c, "fallback_primary", False)),
+            "admission_reason": getattr(c, "admission_reason", "") or "",
+            "reject_reason": getattr(c, "reject_reason", "") or "",
+            "stage2b_seed_tier": getattr(c, "stage2b_seed_tier", None) or "none",
+            "mainline_candidate": bool(getattr(c, "mainline_candidate", False)),
+            "primary_reason": getattr(c, "primary_reason", "") or "",
         }
         rec["retrieval_role"] = get_retrieval_role_from_term_role(c.term_role)
         # Stage3 分层与准入所需字段（顶层透传，便于 classify_stage3_entry_groups / check_stage3_admission）
@@ -78,7 +91,26 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
         rec["generic_risk"] = float(getattr(c, "generic_risk", 0) or 0)
         rec["context_continuity"] = float(getattr(c, "context_continuity", 0) or 0)
         rec["jd_candidate_alignment"] = float(getattr(c, "jd_candidate_alignment", 0.5) or getattr(c, "jd_align", 0.5) or 0.5)
+        # 批注：以下键必须在顶层 dict 中（不能只放在 _debug）；Stage3 去重合并只从 winning 行的
+        # 顶层键拷贝到聚合 rec，_support_grounded_enough 等读的是 primary_bucket 等字段。
+        rec["primary_bucket"] = getattr(c, "primary_bucket", "") or ""
+        rec["can_expand_from_2a"] = bool(getattr(c, "can_expand_from_2a", False))
+        rec["fallback_primary"] = bool(getattr(c, "fallback_primary", False))
+        rec["admission_reason"] = getattr(c, "admission_reason", "") or ""
+        rec["reject_reason"] = getattr(c, "reject_reason", "") or ""
+        rec["survive_primary"] = bool(getattr(c, "survive_primary", False))
+        rec["stage2b_seed_tier"] = getattr(c, "stage2b_seed_tier", "none") or "none"
+        rec["mainline_candidate"] = bool(getattr(c, "mainline_candidate", False))
+        rec["primary_reason"] = getattr(c, "primary_reason", "") or ""
         out.append(rec)
+    if LABEL_EXPANSION_DEBUG and out:
+        for rec in out[:10]:
+            print(
+                f"[Stage2->3 field audit] term={rec['term']!r} "
+                f"primary_bucket={rec.get('primary_bucket')!r} "
+                f"can_expand_from_2a={rec.get('can_expand_from_2a')!r} "
+                f"fallback_primary={rec.get('fallback_primary')!r}"
+            )
     return out
 
 

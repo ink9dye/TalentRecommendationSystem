@@ -553,6 +553,24 @@ def run_stage5(
     stage5_sub_ms["build_ranked_list"] = (t9 - t8) * 1000.0
 
     scored_authors.sort(key=lambda x: x["score"], reverse=True)
+    # 批注：看 Top 作者分数来自哪几篇论文（全局 paper_score vs 作者贡献份额），便于判断偏题是否 Stage4 混入。
+    paper_scores_by_wid_dbg = {p["wid"]: float(p["score"]) for p in papers_for_agg}
+    print("\n[Stage5 top-author paper provenance]")
+    for a in scored_authors[:20]:
+        aid = str(a.get("aid"))
+        works_sorted = sorted(
+            author_top_works.get(aid, []),
+            key=lambda x: float(x[1]),
+            reverse=True,
+        )
+        print(f"author={aid} final_score={float(a.get('score') or 0.0):.4f}")
+        for rank, (wid, author_piece) in enumerate(works_sorted[:3], 1):
+            ps = float(paper_scores_by_wid_dbg.get(wid, 0.0))
+            ht = paper_hit_terms.get(wid, [])
+            print(
+                f"  #{rank} wid={wid} paper_score={ps:.4f} author_piece={author_piece:.4f} hit_terms={ht}"
+            )
+
     sorted_terms = sorted(
         [(term_map.get(tid, ""), score_map.get(tid, 0.0)) for tid in score_map],
         key=lambda x: x[1],
