@@ -38,9 +38,6 @@ FEATURE_INDEX_PATH = os.path.join(INDEX_DIR, "feature_index.json")
 COLLAB_DB_PATH = os.path.join(INDEX_DIR, "scholar_collaboration.db")
 VOCAB_STATS_DB_PATH = os.path.join(INDEX_DIR, 'vocab_stats.db')
 
-# 论文标题向量离线索引（与 QueryEncoder 同空间，供 Stage5 JD 门控查表，缺失则在线 encode）
-WORK_TITLE_EMB_DB_PATH = os.path.join(INDEX_DIR, "work_title_embeddings.db")
-
 # QueryEncoder 共振词表快照（随主库 mtime 失效；首次运行从 DB 构建并写入）
 HARDCORE_LEXICON_SNAPSHOT_PATH = os.path.join(INDEX_DIR, "query_encoder_hardcore_lexicon.json")
 # 标签路领域向量快照（随 DOMAIN_MAP / SBERT config.json 失效；首次在 LabelRecallPath 内编码并写入）
@@ -227,7 +224,6 @@ CONFIG_DICT = {
     "BATCH_SIZE": 1000,
     "SBERT_DIR": SBERT_DIR,
     "SBERT_MODEL_NAME": SBERT_MODEL_NAME,
-    "WORK_TITLE_EMB_DB_PATH": WORK_TITLE_EMB_DB_PATH,
     "HARDCORE_LEXICON_SNAPSHOT_PATH": HARDCORE_LEXICON_SNAPSHOT_PATH,
     "LABEL_DOMAIN_VECTORS_NPZ_PATH": LABEL_DOMAIN_VECTORS_NPZ_PATH,
     "LABEL_DOMAIN_VECTORS_META_PATH": LABEL_DOMAIN_VECTORS_META_PATH,

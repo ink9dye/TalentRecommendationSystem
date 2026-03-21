@@ -14,7 +14,6 @@ from src.utils.time_features import (
 from src.utils.tools import get_decay_rate_for_domains as _get_decay_rate_for_domains
 from src.core.recall.works_to_authors import accumulate_author_scores
 from src.core.recall.label_means import paper_scoring
-from src.core.recall.label_means.simple_factors import is_label_jd_title_gate_disabled
 
 
 def _label_recall_stdout_enabled(recall: Any) -> bool:
@@ -677,53 +676,6 @@ def run_stage5(
     for wid, title, hits in multi_hit_rows[:20]:
         _p(f"  wid={wid} hits={hits} title='{title[:100]}'")
 
-    # 标题向量：供 JD 语义门控；LABEL_NO_JD_TITLE_GATE 开启时跳过（省 SQLite / encode）
-    wids = list(paper_map.keys())
-    paper_title_vec_by_wid: Dict[str, Any] = {}
-    paper_title_vec_by_title: Dict[str, Any] = {}
-    if not is_label_jd_title_gate_disabled():
-        enc = getattr(recall, "_query_encoder", None)
-        store = getattr(recall, "_work_title_emb_store", None)
-        if store is not None and wids:
-            paper_title_vec_by_wid.update(store.get_many([str(w) for w in wids]))
-
-        if enc is not None and paper_map:
-            missing = [w for w in wids if str(w) not in paper_title_vec_by_wid]
-            titles_unique: List[str] = []
-            seen_t: Set[str] = set()
-            for w in missing:
-                t = (paper_map[w].get("title") or "").strip()
-                if not t or t in seen_t:
-                    continue
-                seen_t.add(t)
-                titles_unique.append(t)
-            tm: Dict[str, Any] = {}
-            if titles_unique:
-                if hasattr(enc, "encode_batch"):
-                    batch_m = enc.encode_batch(titles_unique)
-                    tm = {
-                        titles_unique[i]: np.asarray(batch_m[i], dtype=np.float32).reshape(1, -1).copy()
-                        for i in range(len(titles_unique))
-                    }
-                else:
-                    for t in titles_unique:
-                        v, _ = enc.encode(t)
-                        if v is not None:
-                            tm[t] = np.asarray(v, dtype=np.float32).copy()
-            for w in missing:
-                t = (paper_map[w].get("title") or "").strip()
-                if t in tm:
-                    paper_title_vec_by_wid[str(w)] = tm[t]
-            for w in wids:
-                t = (paper_map[w].get("title") or "").strip()
-                if not t:
-                    continue
-                v = paper_title_vec_by_wid.get(str(w))
-                if v is not None:
-                    paper_title_vec_by_title[t] = v
-
-    context["paper_title_vec_by_wid"] = paper_title_vec_by_wid
-    context["paper_title_vec_by_title"] = paper_title_vec_by_title
     context["_proximity_cache"] = {}
 
     if os.environ.get("LABEL_PROFILE_STAGE5", "").strip() in ("1", "true", "yes"):

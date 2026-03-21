@@ -10,7 +10,6 @@ from src.core.recall.label_means.simple_factors import (
     survey_decay_factor,
     coverage_norm_factor,
     paper_cluster_bonus,
-    paper_jd_semantic_gate_factor,
 )
 
 # Stage4 轻量改造：term_role 权重，primary 权重大、expansion 适中/更低
@@ -240,26 +239,6 @@ def compute_contribution(
     )
     if _prof is not None:
         _prof["combine"] = _prof.get("combine", 0.0) + (time.perf_counter() - _t5) * 1000.0
-
-    # 7.5 paper-level JD semantic gate
-    if _prof is not None:
-        _t6 = time.perf_counter()
-    jd_vec = context.get("query_vector")
-    by_wid = context.get("paper_title_vec_by_wid") or {}
-    by_title = context.get("paper_title_vec_by_title") or {}
-    wid_s = str(paper.get("wid") or "")
-    paper_vec_pre = by_wid.get(wid_s)
-    if paper_vec_pre is None and raw_title:
-        paper_vec_pre = by_title.get(raw_title)
-    gate_factor = paper_jd_semantic_gate_factor(
-        raw_title,
-        jd_vec,
-        getattr(recall, "_query_encoder", None),
-        paper_vec_precomputed=paper_vec_pre,
-    )
-    score *= gate_factor
-    if _prof is not None:
-        _prof["gate"] = _prof.get("gate", 0.0) + (time.perf_counter() - _t6) * 1000.0
 
     return float(score), hit_terms, float(rank_score), term_weights, primary_count, supporting_count
 

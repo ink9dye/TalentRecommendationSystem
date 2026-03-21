@@ -11,8 +11,6 @@
 
 环境变量:
   LABEL_PROFILE_STAGE5=1  — 在服务端进程环境中设置后，单次 recall 会打印 paper_scoring 子项累计耗时。
-  LABEL_NO_JD_TITLE_GATE=1  — 关闭 Stage5「论文标题↔JD」余弦门控（gate 恒为 1.0，且不为门控 encode 标题）；启动时会打印一行提示。
-  交互 CLI（label_path.py）可在启动时选「关闭以加速」，等价于设置本变量。
 """
 from __future__ import annotations
 

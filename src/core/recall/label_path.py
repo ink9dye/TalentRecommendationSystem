@@ -52,8 +52,6 @@ from src.core.recall.label_means.simple_factors import (
     survey_decay_factor,
     coverage_norm_factor,
     paper_cluster_bonus,
-    paper_jd_semantic_gate_factor,
-    is_label_jd_title_gate_disabled,
 )
 from src.core.recall.label_means import advanced_metrics as label_means_adv, label_anchors, label_expansion
 from src.core.recall.label_means.infra import LabelMeansInfra
@@ -246,21 +244,6 @@ class LabelRecallPath:
             )
         except Exception:
             self.domain_detector = None
-
-        # 论文标题离线索引（可选）：存在 WORK_TITLE_EMB_DB_PATH 时加载
-        try:
-            from src.core.recall.label_means.work_title_emb_store import WorkTitleEmbeddingStore
-
-            self._work_title_emb_store = WorkTitleEmbeddingStore.open_optional()
-        except Exception:
-            self._work_title_emb_store = None
-
-        if is_label_jd_title_gate_disabled() and not self.silent:
-            print(
-                "[LabelRecallPath] LABEL_NO_JD_TITLE_GATE 已启用："
-                "论文标题↔JD 向量门控已关闭（gate=1.0，Stage5 不再为门控编码标题）",
-                flush=True,
-            )
 
     def _compute_cluster_task_factors(self, query_vector):
         """
@@ -1615,6 +1598,10 @@ class LabelRecallPath:
         stage3_term_filtering.STAGE3_DUPLICATE_MERGE_AUDIT = effective_verbose
         stage3_term_filtering.STAGE3_CORE_MISS_AUDIT = effective_verbose
 
+        enc = getattr(self, "_query_encoder", None)
+        if enc is not None and hasattr(enc, "clear_embed_dedup_cache"):
+            enc.clear_embed_dedup_cache()
+
         # 阶段 1：领域与锚点
         active_domain_set, regex_str, anchor_skills, debug_1 = self._stage1_domain_and_anchors(
             query_vector,
@@ -1916,7 +1903,7 @@ class LabelRecallPath:
             if len(final_term_ids_for_paper) > 30:
                 print(f"  ... 共 {len(final_term_ids_for_paper)} 条")
 
-        # 阶段 5：作者打分与排序（debug_1 中补上 regex_str、query_vector 供 last_debug_info 与 paper semantic gate）
+        # 阶段 5：作者打分与排序（debug_1 中补上 regex_str、query_vector 供 last_debug_info）
         debug_1["regex_str"] = regex_str
         debug_1["query_vector"] = query_vector
         # paper_scoring：support/primary 附着衰减、主 line 浅开关、Stage5 审计用

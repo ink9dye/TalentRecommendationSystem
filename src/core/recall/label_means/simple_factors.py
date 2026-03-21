@@ -1,17 +1,5 @@
 import math
-import os
-from typing import Iterable, Any, Optional
-
-import numpy as np
-
-
-def is_label_jd_title_gate_disabled() -> bool:
-    """
-    环境变量 LABEL_NO_JD_TITLE_GATE：为 1/true/yes/on 时关闭
-    「论文标题 ↔ JD」向量余弦门控（Stage5 paper_scoring 中 gate 恒为 1.0，且不 encode 标题）。
-    """
-    v = os.environ.get("LABEL_NO_JD_TITLE_GATE", "").strip().lower()
-    return v in ("1", "true", "yes", "on")
+from typing import Iterable, Any
 
 from src.utils.tools import apply_text_decay
 
@@ -48,50 +36,4 @@ def paper_cluster_bonus(cluster_ids: Iterable[Any]) -> float:
     cluster_ids = list(cluster_ids)
     cluster_count = len(cluster_ids)
     return math.log1p(cluster_count) if cluster_count > 0 else 1.0
-
-
-def paper_jd_semantic_gate_factor(
-    raw_title: str,
-    jd_vec,
-    encoder,
-    paper_vec_precomputed: Optional[np.ndarray] = None,
-) -> float:
-    """
-    论文标题与 JD 的语义相似度门控因子。
-    等价于 LabelRecallPath._paper_jd_semantic_gate_factor 中的逻辑：
-      - cos < 0.3 -> 0.1
-      - 0.3 <= cos < 0.5 -> 0.4
-      - 否则 1.0
-    paper_vec_precomputed: 与 encoder.encode(raw_title) 同分布的标题向量（可 batch 预计算），传入则不再 encode。
-
-    试验开关：环境变量 LABEL_NO_JD_TITLE_GATE=1（或 true/yes/on）时本函数恒返回 1.0，且不调用 encoder。
-    """
-    if is_label_jd_title_gate_disabled():
-        return 1.0
-    if jd_vec is None or not raw_title or encoder is None:
-        return 1.0
-    try:
-        if paper_vec_precomputed is not None:
-            paper_vec = paper_vec_precomputed
-            if getattr(paper_vec, "ndim", 0) == 1:
-                paper_vec = paper_vec.reshape(1, -1)
-        else:
-            paper_vec, _ = encoder.encode(raw_title)
-        if paper_vec is None or paper_vec.size == 0:
-            return 1.0
-        jd_flat = np.asarray(jd_vec, dtype=np.float32).flatten()
-        pf = np.asarray(paper_vec, dtype=np.float32).flatten()
-        jd_norm = np.linalg.norm(jd_flat)
-        pf_norm = np.linalg.norm(pf)
-        if jd_norm <= 1e-9 or pf_norm <= 1e-9:
-            return 1.0
-        cos = float(np.dot(jd_flat / jd_norm, pf / pf_norm))
-        cos = max(-1.0, min(1.0, cos))
-        if cos < 0.3:
-            return 0.1
-        if cos < 0.5:
-            return 0.4
-        return 1.0
-    except Exception:
-        return 1.0
 

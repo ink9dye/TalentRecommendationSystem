@@ -16,13 +16,6 @@ def run_label_debug_cli() -> None:
             "是否启用标签路详细打印？(y=详细打印  n=仅显示最后人选列表) [n]: "
         ).strip().lower()
         verbose = detail_choice in ("y", "yes", "1", "是")
-        gate_choice = input(
-            "标题↔JD 语义门控 (0=开启默认  1=关闭以加速) [0]: "
-        ).strip() or "0"
-        if gate_choice == "1":
-            os.environ["LABEL_NO_JD_TITLE_GATE"] = "1"
-        else:
-            os.environ.pop("LABEL_NO_JD_TITLE_GATE", None)
         l_path = LabelRecallPath(recall_limit=200, verbose=verbose, silent=False)
         encoder = l_path._query_encoder
 

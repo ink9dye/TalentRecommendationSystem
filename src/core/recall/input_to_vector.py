@@ -4,7 +4,7 @@ import sqlite3
 import re
 import time
 import collections
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -40,6 +40,8 @@ class QueryEncoder:
 
         print(f"[OK] 动态特征库就绪 (核心词条: {len(self.hardcore_lexicon)})")
         print(f"[*] 语义编码器就绪，耗时: {time.time() - start_load:.4f}s")
+        # 共振后文本 → (1, dim) 向量；与 lookup_or_encode / encode_cache 键一致，供 encode / batch 去重
+        self._embed_dedup_cache: Dict[str, np.ndarray] = {}
     def _build_dynamic_lexicon(self):
         """（保持原有的统计学过滤逻辑不变）"""
         lexicon = set()
@@ -78,6 +80,10 @@ class QueryEncoder:
             return f"{text} {resonance_string}"
         return text
 
+    def clear_embed_dedup_cache(self) -> None:
+        """单次召回入口清空，避免跨查询无限增长；键为共振后文本，与 encode/lookup 一致。"""
+        self._embed_dedup_cache.clear()
+
     def encode(self, text):
         """
         执行向量化（SentenceTransformer，与 build_vector_index 向量空间一致）
@@ -87,6 +93,9 @@ class QueryEncoder:
             return None, 0.0
 
         enhanced_text = self._apply_dynamic_resonance(text)
+        if enhanced_text in self._embed_dedup_cache:
+            return self._embed_dedup_cache[enhanced_text].copy(), 0.0
+
         start_encode = time.time()
 
         vector = self.model.encode(
@@ -96,6 +105,7 @@ class QueryEncoder:
         ).astype("float32")
 
         duration = time.time() - start_encode
+        self._embed_dedup_cache[enhanced_text] = vector
         return vector, duration
 
     def lookup_or_encode(self, text: str, cache: Dict[str, np.ndarray]) -> Optional[np.ndarray]:
@@ -107,7 +117,14 @@ class QueryEncoder:
             return None
         enhanced = self._apply_dynamic_resonance(text)
         if enhanced in cache:
-            return cache[enhanced]
+            vec = cache[enhanced]
+            if enhanced not in self._embed_dedup_cache:
+                self._embed_dedup_cache[enhanced] = vec
+            return vec
+        if enhanced in self._embed_dedup_cache:
+            vector = self._embed_dedup_cache[enhanced]
+            cache[enhanced] = vector
+            return vector
         start_encode = time.time()
         vector = self.model.encode(
             [enhanced],
@@ -116,22 +133,50 @@ class QueryEncoder:
         ).astype("float32")
         _ = time.time() - start_encode
         cache[enhanced] = vector
+        self._embed_dedup_cache[enhanced] = vector
         return vector
 
     def encode_batch(self, texts: List[str]) -> np.ndarray:
         """
         批量编码，每行与对同一字符串单独 encode 等价（同一共振与归一化）。
         返回 shape (n, dim) 的 float32；texts 为空时返回 shape (0, dim) 的空数组。
+        命中实例级 _embed_dedup_cache 时跳过该行前向；batch 内相同共振串只 forward 一次。
         """
         if not texts:
             dim = int(self.model.get_sentence_embedding_dimension())
             return np.zeros((0, dim), dtype=np.float32)
+        dim = int(self.model.get_sentence_embedding_dimension())
         enhanced = [self._apply_dynamic_resonance(t) for t in texts]
-        return self.model.encode(
-            enhanced,
+        n = len(enhanced)
+        out = np.zeros((n, dim), dtype=np.float32)
+        missing_indices: List[int] = []
+        missing_enh: List[str] = []
+        for i, e in enumerate(enhanced):
+            if e in self._embed_dedup_cache:
+                row = self._embed_dedup_cache[e]
+                out[i, :] = np.asarray(row, dtype=np.float32).reshape(-1)[:dim]
+            else:
+                missing_indices.append(i)
+                missing_enh.append(e)
+        if not missing_indices:
+            return out
+        unique_order: List[str] = []
+        seen: Set[str] = set()
+        for e in missing_enh:
+            if e not in seen:
+                seen.add(e)
+                unique_order.append(e)
+        batch_vecs = self.model.encode(
+            unique_order,
             normalize_embeddings=True,
             show_progress_bar=False,
-        ).astype("float32")
+        ).astype(np.float32)
+        for j, e in enumerate(unique_order):
+            self._embed_dedup_cache[e] = batch_vecs[j : j + 1].copy()
+        enh_to_row = {e: batch_vecs[j] for j, e in enumerate(unique_order)}
+        for idx, e in zip(missing_indices, missing_enh):
+            out[idx, :] = enh_to_row[e]
+        return out
 
 
 if __name__ == "__main__":
