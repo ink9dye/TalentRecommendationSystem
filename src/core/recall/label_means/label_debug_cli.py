@@ -12,8 +12,10 @@ LABEL_DEBUG_CLI_EXTRA_TABLES = False  # 学术词命运表/Stage3 来源回溯�
 def run_label_debug_cli() -> None:
     try:
         domain_choice = input("\n请选择领域编号 (0跳过): ").strip() or "0"
-        mode_choice = input("输出模式 (0=仅人选列表  1=完整诊断) [0]: ").strip() or "0"
-        verbose = mode_choice != "0"
+        detail_choice = input(
+            "是否启用标签路详细打印？(y=详细打印  n=仅显示最后人选列表) [n]: "
+        ).strip().lower()
+        verbose = detail_choice in ("y", "yes", "1", "是")
         gate_choice = input(
             "标题↔JD 语义门控 (0=开启默认  1=关闭以加速) [0]: "
         ).strip() or "0"
@@ -21,7 +23,7 @@ def run_label_debug_cli() -> None:
             os.environ["LABEL_NO_JD_TITLE_GATE"] = "1"
         else:
             os.environ.pop("LABEL_NO_JD_TITLE_GATE", None)
-        l_path = LabelRecallPath(recall_limit=200, verbose=verbose)
+        l_path = LabelRecallPath(recall_limit=200, verbose=verbose, silent=False)
         encoder = l_path._query_encoder
 
         while True:
@@ -280,7 +282,7 @@ def run_label_debug_cli() -> None:
                 print("-" * 110)
                 print(f"[*] 诊断完成。全链路耗时: {search_time:.2f}ms")
             else:
-                # 仅人选列表（各阶段耗时已在 label_path.recall 中打印）
+                # 仅人选列表（仍会在 recall 中打印 [Label 各阶段耗时] 与 S1～S5 子阶段耗时）
                 print(f"\n{'排名':<6} | {'作者 ID':<14} | {'得分':<10} | {'代表作 (命中标签)'}")
                 print("-" * 98)
                 for i, item in enumerate(db.get("top_samples", [])[:30], 1):

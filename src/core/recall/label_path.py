@@ -112,9 +112,11 @@ class RecallDebugInfo:
         self.stage4_sub_ms: Dict[str, float] = {}
 
 
-def _print_label_sub_stage_ms(stage_label: str, sub_ms: Optional[Dict[str, Any]] = None) -> None:
+def _print_label_sub_stage_ms(
+    stage_label: str, sub_ms: Optional[Dict[str, Any]] = None, do_print: bool = True
+) -> None:
     """打印单个大阶段内的子计时（毫秒）。sub_ms 为 {名称: 毫秒}。"""
-    if not sub_ms:
+    if not do_print or not sub_ms:
         return
     parts: list[str] = []
     for name, ms in sub_ms.items():
@@ -196,9 +198,11 @@ class LabelRecallPath:
     ANCHOR_GAIN = 0.65
     SPAN_PENALTY_EXPONENT = 0.35
 
-    def __init__(self, recall_limit=200, verbose=False):
+    def __init__(self, recall_limit=200, verbose=False, silent=False):
         self.recall_limit = recall_limit
         self.verbose = verbose
+        # total_recall 等场景：抑制标签路一切 stdout（含初始化与 Stage1～5）
+        self.silent = silent
         self.current_year = datetime.now().year
         # 统一调试信息容器：收拢原本散落的 _last_* 状态
         self.debug_info = RecallDebugInfo()
@@ -251,7 +255,7 @@ class LabelRecallPath:
         except Exception:
             self._work_title_emb_store = None
 
-        if is_label_jd_title_gate_disabled():
+        if is_label_jd_title_gate_disabled() and not self.silent:
             print(
                 "[LabelRecallPath] LABEL_NO_JD_TITLE_GATE 已启用："
                 "论文标题↔JD 向量门控已关闭（gate=1.0，Stage5 不再为门控编码标题）",
@@ -349,11 +353,12 @@ class LabelRecallPath:
             )
             if loaded is not None:
                 self.domain_vectors = loaded
-                print(
-                    f"[OK] 领域向量已从快照加载 (共 {len(self.domain_vectors)} 个) "
-                    f"path={LABEL_DOMAIN_VECTORS_NPZ_PATH}",
-                    flush=True,
-                )
+                if not self.silent:
+                    print(
+                        f"[OK] 领域向量已从快照加载 (共 {len(self.domain_vectors)} 个) "
+                        f"path={LABEL_DOMAIN_VECTORS_NPZ_PATH}",
+                        flush=True,
+                    )
                 return
 
             encoder = self._query_encoder
@@ -362,7 +367,8 @@ class LabelRecallPath:
                 if vec is not None and vec.size > 0:
                     self.domain_vectors[str(domain_id)] = np.asarray(vec.flatten(), dtype=np.float32)
             if self.domain_vectors:
-                print(f"[OK] 领域向量已构建 (共 {len(self.domain_vectors)} 个)，已写入快照", flush=True)
+                if not self.silent:
+                    print(f"[OK] 领域向量已构建 (共 {len(self.domain_vectors)} 个)，已写入快照", flush=True)
                 save_domain_vectors(
                     self.domain_vectors,
                     SBERT_DIR,
@@ -371,7 +377,8 @@ class LabelRecallPath:
                     LABEL_DOMAIN_VECTORS_META_PATH,
                 )
         except Exception as e:
-            print(f"[Warn] 领域向量构建失败: {e}，将退化为按候选领域顺序取前 3")
+            if not self.silent:
+                print(f"[Warn] 领域向量构建失败: {e}，将退化为按候选领域顺序取前 3")
 
     # --- 第一阶段：环境与领域探测 ---
     def _detect_domain_context(self, query_vector):
@@ -722,7 +729,7 @@ class LabelRecallPath:
 
         # 日志 2：簇扩展来源表（便于判断坏词由谁带进）
         self.debug_info.cluster_expansion_log = expansion_log
-        if self.verbose and expansion_log:
+        if self.verbose and not self.silent and expansion_log:
             print("\n【簇扩展来源表】term(tid) | seed_term(seed_vid) | sim_in_cluster | seed_sim | contrib")
             for entry in expansion_log[:50]:  # 最多 50 条
                 exp_term = term_map.get(entry["term_tid"], str(entry["term_tid"]))
@@ -1586,13 +1593,27 @@ class LabelRecallPath:
             return [], 0
         start_t = time.time()
 
-        # 统一由 verbose 控制各模块是否打印
+        # verbose 且非 silent 时打开各子模块调试输出；total_recall 使用 silent=True 时不打印标签路任何内容
+        effective_verbose = bool(self.verbose) and not bool(self.silent)
+        # 非 silent 时始终打印各阶段/总耗时；详细诊断（必查点、追踪等）仍仅 effective_verbose
+        show_timing = not bool(self.silent)
         from src.core.recall.label_means import label_expansion
-        label_expansion.LABEL_EXPANSION_DEBUG = self.verbose
-        label_expansion.STAGE2_VERBOSE_DEBUG = self.verbose
-        stage3_term_filtering.LABEL_PATH_TRACE = self.verbose
-        stage3_term_filtering.STAGE3_DETAIL_DEBUG = self.verbose
-        term_scoring.STAGE3_DEBUG = self.verbose
+        label_expansion.LABEL_EXPANSION_DEBUG = effective_verbose
+        label_expansion.STAGE2_VERBOSE_DEBUG = effective_verbose
+        stage3_term_filtering.LABEL_PATH_TRACE = effective_verbose
+        stage3_term_filtering.STAGE3_DETAIL_DEBUG = effective_verbose
+        term_scoring.STAGE3_DEBUG = effective_verbose
+        # Stage3 审计表与 rerank 摘要：与 CLI「详细打印」对齐，避免 verbose=n 仍刷屏
+        stage3_term_filtering.DEBUG_LABEL_PATH = effective_verbose
+        stage3_term_filtering.STAGE3_PAPER_CUTOFF_AUDIT = effective_verbose
+        stage3_term_filtering.STAGE3_PAPER_LANE_FILL_AUDIT = effective_verbose
+        stage3_term_filtering.STAGE3_BONUS_CORE_BLOCKED_AUDIT = effective_verbose
+        stage3_term_filtering.STAGE3_BONUS_CORE_READINESS_AUDIT = effective_verbose
+        stage3_term_filtering.STAGE3_SUPPORT_CONTAMINATION_AUDIT = effective_verbose
+        stage3_term_filtering.STAGE3_UNIFIED_SCORE_DEBUG = effective_verbose
+        stage3_term_filtering.STAGE3_AUDIT_DEBUG = effective_verbose
+        stage3_term_filtering.STAGE3_DUPLICATE_MERGE_AUDIT = effective_verbose
+        stage3_term_filtering.STAGE3_CORE_MISS_AUDIT = effective_verbose
 
         # 阶段 1：领域与锚点
         active_domain_set, regex_str, anchor_skills, debug_1 = self._stage1_domain_and_anchors(
@@ -1601,15 +1622,20 @@ class LabelRecallPath:
             semantic_query_text=semantic_query_text,
             domain_id=domain_id,
         )
-        _print_label_sub_stage_ms("S1", debug_1.get("stage1_sub_ms") if isinstance(debug_1, dict) else None)
+        _print_label_sub_stage_ms(
+            "S1",
+            debug_1.get("stage1_sub_ms") if isinstance(debug_1, dict) else None,
+            do_print=show_timing,
+        )
         checkpoints = []
         checkpoints.append({"stage": "S1", "anchors": len(anchor_skills or {}), "active_domains": len(active_domain_set or set()), "ok": bool(anchor_skills)})
         t_s1 = time.time()
         s1_ms = (t_s1 - start_t) * 1000
         if not anchor_skills:
             total_ms = (time.time() - start_t) * 1000
-            print(f"[Label 各阶段耗时] S1={s1_ms:.0f}ms 总={total_ms:.0f}ms")
-            _emit_label_pipeline_checkpoints(checkpoints, None, self.verbose)
+            if show_timing:
+                print(f"[Label 各阶段耗时] S1={s1_ms:.0f}ms 总={total_ms:.0f}ms")
+            _emit_label_pipeline_checkpoints(checkpoints, None, effective_verbose)
             self.last_debug_info = dict(debug_1) if isinstance(debug_1, dict) else {}
             self.last_debug_info["pipeline_checkpoints"] = checkpoints
             return [], total_ms
@@ -1629,8 +1655,9 @@ class LabelRecallPath:
         s2_ms = (t_s2 - t_s1) * 1000
         if not raw_candidates:
             total_ms = (time.time() - start_t) * 1000
-            print(f"[Label 各阶段耗时] S1={s1_ms:.0f}ms S2={s2_ms:.0f}ms 总={total_ms:.0f}ms")
-            _emit_label_pipeline_checkpoints(checkpoints, debug_1, self.verbose)
+            if show_timing:
+                print(f"[Label 各阶段耗时] S1={s1_ms:.0f}ms S2={s2_ms:.0f}ms 总={total_ms:.0f}ms")
+            _emit_label_pipeline_checkpoints(checkpoints, debug_1, effective_verbose)
             self.last_debug_info = dict(debug_1) if isinstance(debug_1, dict) else {}
             self.last_debug_info["pipeline_checkpoints"] = checkpoints
             return [], total_ms
@@ -1660,7 +1687,7 @@ class LabelRecallPath:
                 self.debug_info.similar_to_pass = from_raw
 
         # 标签路追踪：source anchor、similar_to 原始候选（便于定位从哪一步开始跑偏）
-        _label_trace = self.verbose or getattr(stage3_term_filtering, "LABEL_PATH_TRACE", False) or getattr(term_scoring, "STAGE3_DEBUG", False)
+        _label_trace = effective_verbose
         if _label_trace:
             na = len(anchor_skills or {})
             _keys = list(anchor_skills.keys())[:5] if anchor_skills else []
@@ -1825,7 +1852,9 @@ class LabelRecallPath:
             term_meta=term_meta_for_stage4,
             jd_text=semantic_query_text or query_text,
         )
-        _print_label_sub_stage_ms("S4", getattr(self.debug_info, "stage4_sub_ms", None) or {})
+        _print_label_sub_stage_ms(
+            "S4", getattr(self.debug_info, "stage4_sub_ms", None) or {}, do_print=show_timing
+        )
         n_papers = sum(len(p.get("papers") or []) for p in (author_papers_list or []))
         checkpoints.append({"stage": "S4", "authors": len(author_papers_list or []), "papers": n_papers, "ok": bool(author_papers_list)})
         t_s4 = time.time()
@@ -1904,9 +1933,12 @@ class LabelRecallPath:
         debug_1["pipeline_checkpoints"] = checkpoints
         if last_debug_info is not None:
             last_debug_info["pipeline_checkpoints"] = checkpoints
-        print(f"[Label 各阶段耗时] S1={s1_ms:.0f}ms S2={s2_ms:.0f}ms S3={s3_ms:.0f}ms S4={s4_ms:.0f}ms S5={s5_ms:.0f}ms 总={elapsed_ms:.0f}ms")
-        _print_label_sub_stage_ms("S5", (last_debug_info or {}).get("stage5_sub_ms"))
-        _emit_label_pipeline_checkpoints(checkpoints, debug_1, self.verbose)
+        if show_timing:
+            print(f"[Label 各阶段耗时] S1={s1_ms:.0f}ms S2={s2_ms:.0f}ms S3={s3_ms:.0f}ms S4={s4_ms:.0f}ms S5={s5_ms:.0f}ms 总={elapsed_ms:.0f}ms")
+        _print_label_sub_stage_ms(
+            "S5", (last_debug_info or {}).get("stage5_sub_ms"), do_print=show_timing
+        )
+        _emit_label_pipeline_checkpoints(checkpoints, debug_1, effective_verbose)
 
         author_list = (author_ids or [])[: self.recall_limit]
         meta_list = [

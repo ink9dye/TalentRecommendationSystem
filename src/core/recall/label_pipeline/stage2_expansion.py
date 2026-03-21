@@ -11,8 +11,6 @@ from src.core.recall.label_means.hierarchy_guard import get_retrieval_role_from_
 from src.core.recall.label_means.label_expansion import (
     PreparedAnchor,
     ExpandedTermCandidate,
-    LABEL_EXPANSION_DEBUG,
-    STAGE2_NOISY_DEBUG,
     _anchor_skills_to_prepared_anchors,
     stage2_generate_academic_terms,
 )
@@ -113,7 +111,9 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
         if _rk > 0:
             rec["parent_anchor_step2_rank"] = _rk
         out.append(rec)
-    if LABEL_EXPANSION_DEBUG and out:
+    # 须读 label_expansion 模块上的当前值：from ... import FLAG 会在 import 时绑定副本，
+    # recall() 内 label_expansion.LABEL_EXPANSION_DEBUG = ... 无法更新此处旧绑定。
+    if getattr(label_expansion, "LABEL_EXPANSION_DEBUG", False) and out:
         n = len(out)
         n_2a = sum(1 for r in out if r.get("can_expand_from_2a"))
         n_fb = sum(1 for r in out if r.get("fallback_primary"))
@@ -127,7 +127,7 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
             f"[Stage2->3 field audit] n={n} can_expand_from_2a={n_2a} fallback_primary={n_fb} "
             f"primary_bucket_top=[{pb_s}] （逐条前10需 STAGE2_NOISY_DEBUG）"
         )
-        if STAGE2_NOISY_DEBUG:
+        if getattr(label_expansion, "STAGE2_NOISY_DEBUG", False):
             for rec in out[:10]:
                 print(
                     f"  term={rec['term']!r} primary_bucket={rec.get('primary_bucket')!r} "

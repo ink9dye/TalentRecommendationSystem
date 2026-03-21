@@ -86,7 +86,7 @@ class TotalRecallSystem:
         print("[*] 正在初始化全量召回系统 (Training-Safe Mode)...", flush=True)
         self.encoder = QueryEncoder()
         self.v_path = VectorPath(recall_limit=k_vector)
-        self.l_path = LabelRecallPath(recall_limit=k_label)
+        self.l_path = LabelRecallPath(recall_limit=k_label, silent=True)
         self.c_path = CollaborativeRecallPath(recall_limit=k_collab)
         self.executor = ThreadPoolExecutor(max_workers=3)
         self.domain_detector = DomainDetector(self.l_path)

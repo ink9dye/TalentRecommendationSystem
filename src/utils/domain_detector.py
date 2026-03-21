@@ -1,4 +1,5 @@
 import collections
+import os
 from typing import Optional, Sequence, Tuple, Dict, Any
 
 from src.utils.domain_utils import DomainProcessor
@@ -46,6 +47,15 @@ class DomainDetector:
         self._total_job_count = (
             float(total_job_count) if total_job_count is not None and float(total_job_count) > 0 else None
         )
+
+    def _should_fetch_anchor_debug(self) -> bool:
+        """仅用于日志的 anchor_debug；默认跳过昂贵 Neo4j 聚合。"""
+        if os.environ.get("DOMAIN_DETECTOR_ANCHOR_DEBUG", "").strip().lower() in ("1", "true", "yes"):
+            return True
+        lp = self._label_path
+        if lp is None:
+            return False
+        return bool(getattr(lp, "verbose", False)) and not bool(getattr(lp, "silent", False))
 
     # ------------------------------------------------------------------
     # Job 空间领域探测与调试工具
@@ -265,7 +275,10 @@ class DomainDetector:
                     if self._total_job_count is not None
                     else float(len(self._job_id_map) or 1.0)
                 )
-                anchor_debug = self.get_anchor_debug_stats(job_ids, total_j=float(tj))
+                # get_anchor_debug_stats 含全图 cov_j 聚合，大图可耗时数秒；仅诊断需要时执行
+                anchor_debug: Dict[str, Any] = {}
+                if self._should_fetch_anchor_debug():
+                    anchor_debug = self.get_anchor_debug_stats(job_ids, total_j=float(tj))
                 stage1_debug = {
                     "source": "auto_job_space",
                     "job_ids": job_ids,

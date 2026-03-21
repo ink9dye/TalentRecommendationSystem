@@ -217,9 +217,15 @@ def compute_local_phrase_cluster_support(phrase: str, raw_text: str, cleaned_ter
     return compute_phrase_context_richness(phrase, raw_text, cleaned_terms)
 
 
-def _print_stage1_step2_anchor_collapse_audit(rows: List[Dict[str, Any]], limit: int = 28) -> None:
+def _print_stage1_step2_anchor_collapse_audit(
+    rows: List[Dict[str, Any]], label: Any = None, limit: int = 28
+) -> None:
     """窄表：短语支撑均值 + 相对 backbone 的塌陷比，解释锚点序为何偏。"""
     if not ANCHOR_COLLAPSE_AUDIT or not rows:
+        return
+    if label is not None and (
+        not getattr(label, "verbose", False) or getattr(label, "silent", False)
+    ):
         return
     print(f"\n{'-' * 80}\n[Stage1-Step2 anchor collapse audit] JD 工业锚 · 凸组合 final（非四连乘）\n{'-' * 80}")
     print(
@@ -429,7 +435,7 @@ def extract_anchor_skills(label, target_job_ids, query_vector=None, total_j=None
             "_row": r,
         })
     anchor_scored_rows.sort(key=lambda x: x["final_anchor_score"], reverse=True)
-    _print_stage1_step2_anchor_collapse_audit(anchor_scored_rows)
+    _print_stage1_step2_anchor_collapse_audit(anchor_scored_rows, label)
     top_n = int(getattr(label, "ANCHOR_FINAL_TOP_K", 20))
     rows = [x["_row"] for x in anchor_scored_rows[:top_n]]
     borderline_rejected = anchor_scored_rows[top_n : top_n + 10]
@@ -584,7 +590,7 @@ def encode_text_with_optional_cache(
 
 # S1 anchor_ctx：单次 encode_batch 过大时按块切分；每行仍走 QueryEncoder.encode_batch 路径，
 # 与「把 unique_raws 一次性传入 encode_batch」在 SentenceTransformer 下逐样本一致（无跨样本交互）。
-_ANCHOR_CTX_PREFILL_ENCODE_CHUNK = 64
+_ANCHOR_CTX_PREFILL_ENCODE_CHUNK = 128
 
 
 def prefill_encode_cache_for_anchor_ctx(

@@ -1856,6 +1856,10 @@ def _debug_print_stage3_input(raw_candidates: List[Dict[str, Any]]) -> None:
     """Stage3 输入：条数 + 前3样本，不打印全表。"""
     if not raw_candidates:
         return
+    stage3_debug = getattr(term_scoring, "STAGE3_DEBUG", False)
+    label_trace = LABEL_PATH_TRACE or stage3_debug
+    if not (label_trace or stage3_debug):
+        return
     sample = [(rec.get("term") or "", rec.get("source") or rec.get("origin") or "") for rec in raw_candidates[:3]]
     print(f"[stage3_input] 共 {len(raw_candidates)} 条 前3: {sample}")
 

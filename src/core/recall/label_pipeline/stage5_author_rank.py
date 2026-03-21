@@ -16,6 +16,14 @@ from src.core.recall.works_to_authors import accumulate_author_scores
 from src.core.recall.label_means import paper_scoring
 from src.core.recall.label_means.simple_factors import is_label_jd_title_gate_disabled
 
+
+def _label_recall_stdout_enabled(recall: Any) -> bool:
+    """标签路仅在 LabelRecallPath.verbose 且非 silent 时向 stdout 打印 Stage5 审计表。"""
+    if getattr(recall, "silent", False):
+        return False
+    return bool(getattr(recall, "verbose", False))
+
+
 # True：打印 [Stage5 support dominance audit]；**默认 False**（主轴 paper_primary 主导时噪音大，可疑 support 再 env 打开）
 STAGE5_SUPPORT_DOMINANCE_AUDIT = os.environ.get("STAGE5_SUPPORT_DOMINANCE_AUDIT", "").strip().lower() in (
     "1",
@@ -58,7 +66,10 @@ def _print_stage5_paper_fanout_audit(
     papers_for_agg: List[Dict[str, Any]],
     paper_hit_terms: Dict[str, List[str]],
     top_n: int = 20,
+    recall: Any = None,
 ) -> None:
+    if not _label_recall_stdout_enabled(recall):
+        return
     if not STAGE5_FANOUT_AUDIT or not papers_for_agg:
         return
     print("\n[Stage5 paper fanout audit]")
@@ -231,8 +242,11 @@ def _print_stage5_term_cap_audit(
     term_cap_audit: Dict[str, Dict[str, Any]],
     term_map: Dict[str, str],
     top_k: int = 25,
+    recall: Any = None,
 ) -> None:
     """一眼确认 TERM_MAX_AUTHOR_SHARE 是否参与重算作者 term 矩阵，而非仅写常量。"""
+    if not _label_recall_stdout_enabled(recall):
+        return
     if not STAGE5_TERM_CAP_AUDIT or not scored_authors:
         return
     print("\n" + "-" * 80)
@@ -264,11 +278,14 @@ def _print_stage5_author_structure_audit(
     scored_authors: List[Dict[str, Any]],
     author_structure_audit: Dict[str, Dict[str, Any]],
     top_k: int = 25,
+    recall: Any = None,
 ) -> None:
     """
     结构乘子施加前后：base_score（×时间权重后、结构前）、st/pc/mtp、单篇论文数、最佳篇命中词数、
     struct_f 与三项平滑 mult、struct_tot、after。用于判断 Top 是否仍被「单词单篇」统治。
     """
+    if not _label_recall_stdout_enabled(recall):
+        return
     if not STAGE5_AUTHOR_STRUCTURE_AUDIT or not scored_authors:
         return
     print("\n" + "-" * 80)
@@ -420,7 +437,11 @@ def _support_only_author_penalty_value(m: Dict[str, Any]) -> float:
     return 1.0
 
 
-def _print_stage5_support_only_penalty_audit(rows: List[Dict[str, Any]], top_k: int = 25) -> None:
+def _print_stage5_support_only_penalty_audit(
+    rows: List[Dict[str, Any]], top_k: int = 25, recall: Any = None
+) -> None:
+    if not _label_recall_stdout_enabled(recall):
+        return
     if not STAGE5_SUPPORT_ONLY_PENALTY_AUDIT or not rows:
         return
     print("\n" + "-" * 80)
@@ -465,11 +486,14 @@ def _print_stage5_support_dominance_audit(
     term_map: Dict[str, str],
     debug_1: Dict[str, Any],
     top_k: int = 25,
+    recall: Any = None,
 ) -> None:
     """
     看 Top 作者：总分里 primary vs support 分解、dominant term 角色、论文侧是否「独狼 support」结构。
     term 贡献来自 author_term_contrib（同词递减后、已做 TERM_MAX_AUTHOR_SHARE 截断、未乘时间权重）；final_score 为之后管线分。
     """
+    if not _label_recall_stdout_enabled(recall):
+        return
     if not STAGE5_SUPPORT_DOMINANCE_AUDIT or not scored_authors:
         return
     print("\n" + "-" * 80)
@@ -520,6 +544,12 @@ def run_stage5(
     → 新作比 → 归一化排序。
     返回 (author_id_list, last_debug_info)。
     """
+    _lp_out = bool(not getattr(recall, "silent", False) and getattr(recall, "verbose", False))
+
+    def _p(*args, **kwargs):
+        if _lp_out:
+            print(*args, **kwargs)
+
     score_map = score_map or {}
     term_map = term_map or {}
     active_domain_set = active_domain_set or set()
@@ -637,15 +667,15 @@ def run_stage5(
 
     t1 = time.perf_counter()
     stage5_sub_ms["merge_paper_map"] = (t1 - t0) * 1000.0
-    print("\n[Stage5 merged paper multi-hit audit]")
+    _p("\n[Stage5 merged paper multi-hit audit]")
     multi_hit_rows: List[Tuple[str, str, List[str]]] = []
     for wid, info in paper_map.items():
         hits = info.get("hits") or []
         if len(hits) >= 2:
             multi_hit_rows.append((wid, info.get("title") or "", list(hits)))
-    print(f"multi_hit_papers={len(multi_hit_rows)}")
+    _p(f"multi_hit_papers={len(multi_hit_rows)}")
     for wid, title, hits in multi_hit_rows[:20]:
-        print(f"  wid={wid} hits={hits} title='{title[:100]}'")
+        _p(f"  wid={wid} hits={hits} title='{title[:100]}'")
 
     # 标题向量：供 JD 语义门控；LABEL_NO_JD_TITLE_GATE 开启时跳过（省 SQLite / encode）
     wids = list(paper_map.keys())
@@ -743,21 +773,21 @@ def run_stage5(
 
     t2 = time.perf_counter()
     stage5_sub_ms["paper_contribution"] = (t2 - t1) * 1000.0
-    print("\n[Stage5 paper term_weights audit]")
+    _p("\n[Stage5 paper term_weights audit]")
     multi_term_weight_rows: List[Tuple[str, float, List[Tuple[str, float]]]] = []
     for p in papers_for_agg:
         tw = p.get("term_weights") or {}
         nz = [(tid, round(float(w), 6)) for tid, w in tw.items() if float(w) > 1e-9]
         if len(nz) >= 2:
             multi_term_weight_rows.append((p["wid"], float(p["score"]), nz[:10]))
-    print(f"multi_term_weight_papers={len(multi_term_weight_rows)}")
+    _p(f"multi_term_weight_papers={len(multi_term_weight_rows)}")
     for wid, score, nz in multi_term_weight_rows[:20]:
-        print(f"  wid={wid} score={score:.6f} term_weights={nz}")
+        _p(f"  wid={wid} score={score:.6f} term_weights={nz}")
 
     pc_prof = context.pop("_paper_contrib_prof", None)
     if isinstance(pc_prof, dict) and pc_prof:
         stage5_sub_ms["paper_contrib_detail_ms"] = {k: round(float(v), 2) for k, v in sorted(pc_prof.items())}
-        print(
+        _p(
             "[Label S5 paper_scoring 子项累计 ms] "
             + " ".join(f"{k}={round(float(v), 1)}ms" for k, v in sorted(pc_prof.items()))
         )
@@ -799,7 +829,7 @@ def run_stage5(
         p["score"] = s0 * float(fanout_factor)
     t3_fan = time.perf_counter()
     stage5_sub_ms["author_fanout_penalty"] = (t3_fan - t_fan0) * 1000.0
-    _print_stage5_paper_fanout_audit(papers_for_agg, paper_hit_terms)
+    _print_stage5_paper_fanout_audit(papers_for_agg, paper_hit_terms, recall=recall)
 
     agg_result = accumulate_author_scores(papers_for_agg, top_k_per_author=3)
     author_scores = agg_result.author_scores
@@ -970,7 +1000,7 @@ def run_stage5(
     else:
         stage5_sub_ms["support_only_author_penalty"] = 0.0
 
-    _print_stage5_support_only_penalty_audit(support_only_penalty_rows)
+    _print_stage5_support_only_penalty_audit(support_only_penalty_rows, recall=recall)
 
     t6 = time.perf_counter()
     stage5_sub_ms["time_and_family"] = (t6 - t5) * 1000.0
@@ -1068,8 +1098,8 @@ def run_stage5(
     stage5_sub_ms["build_ranked_list"] = (t9 - t8) * 1000.0
 
     scored_authors.sort(key=lambda x: x["score"], reverse=True)
-    _print_stage5_term_cap_audit(scored_authors, term_cap_audit_records, term_map, top_k=25)
-    _print_stage5_author_structure_audit(scored_authors, author_structure_audit, top_k=25)
+    _print_stage5_term_cap_audit(scored_authors, term_cap_audit_records, term_map, top_k=25, recall=recall)
+    _print_stage5_author_structure_audit(scored_authors, author_structure_audit, top_k=25, recall=recall)
     _print_stage5_support_dominance_audit(
         scored_authors,
         author_term_contrib,
@@ -1078,10 +1108,11 @@ def run_stage5(
         term_map,
         debug_1 or {},
         top_k=25,
+        recall=recall,
     )
     # 批注：看 Top 作者分数来自哪几篇论文（全局 paper_score vs 作者贡献份额），便于判断偏题是否 Stage4 混入。
     paper_scores_by_wid_dbg = {p["wid"]: float(p["score"]) for p in papers_for_agg}
-    print("\n[Stage5 top-author paper provenance]")
+    _p("\n[Stage5 top-author paper provenance]")
     for a in scored_authors[:20]:
         aid = str(a.get("aid"))
         works_sorted = sorted(
@@ -1089,11 +1120,11 @@ def run_stage5(
             key=lambda x: float(x[1]),
             reverse=True,
         )
-        print(f"author={aid} final_score={float(a.get('score') or 0.0):.4f}")
+        _p(f"author={aid} final_score={float(a.get('score') or 0.0):.4f}")
         for rank, (wid, author_piece) in enumerate(works_sorted[:3], 1):
             ps = float(paper_scores_by_wid_dbg.get(wid, 0.0))
             ht = paper_hit_terms.get(wid, [])
-            print(
+            _p(
                 f"  #{rank} wid={wid} paper_score={ps:.4f} author_piece={author_piece:.4f} hit_terms={ht}"
             )
 
@@ -1195,7 +1226,7 @@ def run_stage5(
                 }
             )
 
-    print("\n[Stage5 term->author contribution top] (top 4 paper terms × 5 authors/term)")
+    _p("\n[Stage5 term->author contribution top] (top 4 paper terms × 5 authors/term)")
     for tid in final_term_ids_for_paper[:4]:
         tid_s = str(tid)
         term_name = term_map.get(tid, "") or term_map.get(tid_s, "") or tid_s
@@ -1204,11 +1235,11 @@ def run_stage5(
             key=lambda x: float(x.get("term_contrib") or 0.0),
             reverse=True,
         )[:5]
-        print(f"term='{term_name}' authors={len(term_author_rows.get(term_name, []))}")
+        _p(f"term='{term_name}' authors={len(term_author_rows.get(term_name, []))}")
         for i, r in enumerate(rows, 1):
             total = max(float(r.get("author_total_score") or 0.0), 1e-9)
             share = float(r.get("term_contrib") or 0.0) / total
-            print(
+            _p(
                 f"  #{i} author={r.get('author_id')} "
                 f"term_contrib={float(r.get('term_contrib') or 0.0):.6f} "
                 f"paper_hits={int(r.get('paper_hits') or 0)} "
@@ -1220,7 +1251,7 @@ def run_stage5(
     # [Stage5 top-author term mix]
     # 目的：查看 Top 作者是否被单一 term 主导（dominant_share 是否过高）。
     # -------------------------
-    print("\n[Stage5 top-author term mix]")
+    _p("\n[Stage5 top-author term mix]")
     for a in scored_authors[:20]:
         aid = str(a.get("aid"))
         atc = author_term_contrib.get(aid, {})
@@ -1238,7 +1269,7 @@ def run_stage5(
         top3 = contribs[:3]
         mix = [f"{term}={v:.6f}({v/total:.2%})" for term, v in top3]
         dom_share = (top3[0][1] / total) if top3 else 0.0
-        print(
+        _p(
             f"author={aid} final={float(a.get('score') or 0.0):.4f} "
             f"papers={paper_count_dedup} multi_term_papers={mtp} "
             f"dominant_share={dom_share:.2%} top3={' | '.join(mix)}"

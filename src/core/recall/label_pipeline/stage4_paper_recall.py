@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
+from src.core.recall.label_means.label_anchors import canonical_jd_text_for_encode
 from src.core.recall.label_pipeline import stage1_domain_anchors as _stage1_anchors
 from src.utils.time_features import compute_paper_recency
 from config import ABSTRACT_MAP_PATH, INDEX_DIR
@@ -68,6 +69,72 @@ STAGE4_HIERARCHY_BONUS_DISTRIBUTION_DETAIL = os.environ.get(
 ).strip().lower() in ("1", "true", "yes")
 # True：打印 author payload 逐条 multi-hit；False：仅保留汇总计数（默认）
 STAGE4_AUTHOR_PAYLOAD_AUDIT_VERBOSE = False
+# 0：关闭。>0：每词沿 HAS_TOPIC 仅保留 year 降序前 N 篇（与 Python 侧 term_contrib 排序不同，可能改变结果；用于压行数时对照）
+STAGE4_LAYER1_PER_V_CAP = int(os.environ.get("STAGE4_LAYER1_PER_V_CAP", "0"))
+
+
+def _batch_jd_align_for_wids(
+    wids: Set[str],
+    paper_vecs: Any,
+    paper_id_to_row: Dict[str, int],
+    paper_norms: Optional[np.ndarray],
+    query_vec_1d: Optional[np.ndarray],
+    query_norm: float,
+) -> Dict[str, float]:
+    """
+    wid -> jd_align，与逐行 np.dot(pv,q)/(||pv||*||q||) 等价；对行索引去重后向量化。
+    """
+    out: Dict[str, float] = {}
+    if query_vec_1d is None or query_norm <= 1e-12:
+        return {w: 0.5 for w in wids}
+    if not isinstance(paper_vecs, np.ndarray) or paper_vecs.size == 0:
+        return {w: 0.5 for w in wids}
+    q = np.asarray(query_vec_1d, dtype=np.float32).flatten()
+    idx_to_wids: Dict[int, List[str]] = defaultdict(list)
+    for w in wids:
+        ri = paper_id_to_row.get(str(w))
+        if ri is None:
+            out[w] = 0.5
+            continue
+        try:
+            ri_i = int(ri)
+        except (TypeError, ValueError):
+            out[w] = 0.5
+            continue
+        if ri_i < 0 or ri_i >= len(paper_vecs):
+            out[w] = 0.5
+            continue
+        idx_to_wids[ri_i].append(w)
+    if not idx_to_wids:
+        return out
+    n_rows = int(paper_vecs.shape[0])
+    U = np.array(sorted(idx_to_wids.keys()), dtype=np.int64)
+    U = U[(U >= 0) & (U < n_rows)]
+    if U.size == 0:
+        for w in wids:
+            if w not in out:
+                out[w] = 0.5
+        return out
+    P = np.asarray(paper_vecs[U], dtype=np.float32)
+    if P.ndim == 1:
+        P = P.reshape(1, -1)
+    if paper_norms is not None and len(paper_norms) >= n_rows:
+        pn = np.asarray(paper_norms[U], dtype=np.float64)
+    else:
+        pn = np.linalg.norm(P, axis=1)
+    pn = np.where(pn <= 1e-12, 1e-12, pn)
+    dots = P @ q
+    cos = dots / (float(query_norm) * pn)
+    jda = np.clip(0.5 * (cos + 1.0), 0.0, 1.0)
+    for i, ri in enumerate(U):
+        ri_i = int(ri)
+        val = float(jda[i])
+        for ww in idx_to_wids[ri_i]:
+            out[ww] = val
+    for w in wids:
+        if w not in out:
+            out[w] = 0.5
+    return out
 
 
 def _normalize_topic_dist(raw: Any) -> Dict[str, float]:
@@ -313,12 +380,13 @@ def _clip_hierarchy_bonus_by_main_axis_mass(
 def _print_stage4_hierarchy_bonus_term_group_audit(
     by_wid: Dict[str, Dict[str, Any]],
     get_term_meta: Any,
+    audit_print: bool = True,
 ) -> None:
     """
     [Stage4 hierarchy bonus by term-group audit]：按 **vid** 汇总进入 wid 池的论文上的 mean consensus / mean bonus，
     对照 Stage3 **paper_select_lane_tier** 与父锚强度，解释为何某 term 组级 bonus 偏高或偏低。
     """
-    if not STAGE4_HIERARCHY_TERM_GROUP_AUDIT or not by_wid:
+    if not audit_print or not STAGE4_HIERARCHY_TERM_GROUP_AUDIT or not by_wid:
         return
     agg: Dict[int, Dict[str, float]] = defaultdict(
         lambda: {"papers": 0.0, "sum_c": 0.0, "sum_b": 0.0, "sum_b_raw": 0.0}
@@ -373,8 +441,10 @@ def _print_stage4_hierarchy_bonus_term_group_audit(
         )
 
 
-def _audit_hierarchy_bonus_distribution(dist_rows: List[Dict[str, Any]], top_n: int) -> None:
-    if not dist_rows:
+def _audit_hierarchy_bonus_distribution(
+    dist_rows: List[Dict[str, Any]], top_n: int, audit_print: bool = True
+) -> None:
+    if not audit_print or not dist_rows:
         return
     cons = np.array([float(r["consensus"]) for r in dist_rows], dtype=np.float64)
     bon = np.array([float(r["bonus"]) for r in dist_rows], dtype=np.float64)
@@ -422,7 +492,9 @@ def _jd_topic_profile_from_stage1(jd_src: Dict[str, Any]) -> Dict[str, Dict[str,
     }
 
 
-def _audit_jd_topic_profile(jd_topic_profile: Dict[str, Dict[str, float]]) -> None:
+def _audit_jd_topic_profile(jd_topic_profile: Dict[str, Dict[str, float]], audit_print: bool = True) -> None:
+    if not audit_print:
+        return
     jd_f = jd_topic_profile.get("field_dist") or {}
     jd_s = jd_topic_profile.get("subfield_dist") or {}
     jd_t = jd_topic_profile.get("topic_dist") or {}
@@ -476,6 +548,14 @@ def run_stage4(
     返回: list of { 'aid': str, 'papers': [ { wid, hits, weight, title, year, domains }, ... ] }，供 Stage5 消费。
     """
     di = getattr(recall, "debug_info", None)
+
+    _label_path_stdout = bool(
+        not getattr(recall, "silent", False) and getattr(recall, "verbose", False)
+    )
+
+    def _lp(*args, **kwargs):
+        if _label_path_stdout:
+            print(*args, **kwargs)
 
     def _merge_hits(old_hits: List[Dict[str, Any]], new_hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -711,9 +791,14 @@ def run_stage4(
 
         try:
             if os.path.exists(vec_path):
-                paper_vecs = np.load(vec_path)
+                paper_vecs = np.load(vec_path, mmap_mode="r")
         except Exception:
             paper_vecs = None
+            try:
+                if os.path.exists(vec_path):
+                    paper_vecs = np.load(vec_path)
+            except Exception:
+                paper_vecs = None
 
         try:
             if os.path.exists(map_path):
@@ -726,10 +811,13 @@ def run_stage4(
         except Exception:
             paper_id_to_row = {}
 
-        if isinstance(paper_vecs, np.ndarray) and paper_vecs.size > 0:
+        if isinstance(paper_vecs, np.ndarray) and paper_vecs.size > 0 and paper_vecs.ndim == 2:
             try:
-                paper_norms = np.linalg.norm(paper_vecs, axis=1)
-                paper_norms = np.where(paper_norms <= 1e-12, 1e-12, paper_norms)
+                if isinstance(paper_vecs, np.memmap):
+                    paper_norms = None
+                else:
+                    paper_norms = np.linalg.norm(paper_vecs, axis=1)
+                    paper_norms = np.where(paper_norms <= 1e-12, 1e-12, paper_norms)
             except Exception:
                 paper_norms = None
 
@@ -739,7 +827,7 @@ def run_stage4(
         setattr(recall, "_stage4_vec_ready", True)
 
         dim = int(paper_vecs.shape[1]) if isinstance(paper_vecs, np.ndarray) and paper_vecs.ndim == 2 else 0
-        print(f"[Stage4 vec ready] papers={len(paper_id_to_row)} dim={dim}")
+        _lp(f"[Stage4 vec ready] papers={len(paper_id_to_row)} dim={dim}")
 
     def _score_paper_for_term(
         vid: int,
@@ -753,6 +841,7 @@ def run_stage4(
         role_weight: float,
         query_vec_1d: Optional[np.ndarray],
         query_norm: float,
+        jd_align_pre: Optional[float] = None,
     ) -> Dict[str, float]:
         """
         Stage4 单篇打分（最小侵入版）：
@@ -769,29 +858,36 @@ def run_stage4(
         off_topic_penalty = float(ground["off_topic_penalty"])
         term_paper_role_factor = float(tt["paper_factor"])
 
-        # 默认中性值：向量缺失时不一票否决
+        # 默认中性值：向量缺失时不一票否决（jd_align_pre 由批处理与逐行等价）
         jd_align = 0.50
-        paper_vecs = getattr(recall, "_paper_abstract_vecs", None)
-        paper_id_to_row = getattr(recall, "_paper_id_to_row", {}) or {}
-        paper_norms = getattr(recall, "_paper_abstract_norms", None)
-        row_idx = paper_id_to_row.get(str(wid))
-        if (
-            row_idx is not None
-            and isinstance(paper_vecs, np.ndarray)
-            and isinstance(paper_norms, np.ndarray)
-            and query_vec_1d is not None
-            and query_norm > 1e-12
-            and 0 <= int(row_idx) < len(paper_vecs)
-            and int(row_idx) < len(paper_norms)
-        ):
-            try:
-                pv = np.asarray(paper_vecs[int(row_idx)], dtype=np.float32).flatten()
-                if pv.size == query_vec_1d.size:
-                    cos = float(np.dot(query_vec_1d, pv) / (query_norm * float(paper_norms[int(row_idx)])))
-                    jd_align = 0.5 * (cos + 1.0)
-                    jd_align = max(0.0, min(1.0, jd_align))
-            except Exception:
-                jd_align = 0.50
+        if jd_align_pre is not None:
+            jd_align = max(0.0, min(1.0, float(jd_align_pre)))
+        else:
+            paper_vecs = getattr(recall, "_paper_abstract_vecs", None)
+            paper_id_to_row = getattr(recall, "_paper_id_to_row", {}) or {}
+            paper_norms = getattr(recall, "_paper_abstract_norms", None)
+            row_idx = paper_id_to_row.get(str(wid))
+            if (
+                row_idx is not None
+                and isinstance(paper_vecs, np.ndarray)
+                and query_vec_1d is not None
+                and query_norm > 1e-12
+                and 0 <= int(row_idx) < len(paper_vecs)
+            ):
+                try:
+                    ri = int(row_idx)
+                    pv = np.asarray(paper_vecs[ri], dtype=np.float32).flatten()
+                    if pv.size == query_vec_1d.size:
+                        if paper_norms is not None and ri < len(paper_norms):
+                            pn = float(paper_norms[ri])
+                        else:
+                            pn = float(np.linalg.norm(pv))
+                        if pn > 1e-12:
+                            cos = float(np.dot(query_vec_1d, pv) / (query_norm * pn))
+                            jd_align = 0.5 * (cos + 1.0)
+                            jd_align = max(0.0, min(1.0, jd_align))
+                except Exception:
+                    jd_align = 0.50
 
         # 关键融合（最小修正）：
         # 1) term_grounding 继续当主轴
@@ -924,7 +1020,23 @@ def run_stage4(
     else:
         domain_bonus_expr = str(DOMAIN_BONUS_NO_MATCH)
 
-    cypher_layer1 = f"""
+    _layer1_cap = max(0, min(STAGE4_LAYER1_PER_V_CAP, 200000))
+    if _layer1_cap > 0:
+        cypher_layer1 = (
+            f"MATCH (v:Vocabulary) WHERE v.id IN $v_ids\n"
+            f"WITH v, count {{ (v)<-[:HAS_TOPIC]-() }} AS degree_w\n"
+            f"WHERE (degree_w * 1.0 / $total_w) < $melt_ratio\n"
+            f"WITH v, log10($total_w / (degree_w + 1)) AS idf_weight\n"
+            f"MATCH (v)<-[:HAS_TOPIC]-(w:Work)\n"
+            f"WITH v, w, idf_weight, {domain_bonus_expr} AS domain_bonus, w.year AS year,\n"
+            f"     coalesce(w.title, '') AS title, coalesce(w.domain_ids, '') AS domains\n"
+            f"ORDER BY v.id, coalesce(year, 0) DESC, w.id\n"
+            f"WITH v, idf_weight, collect({{w:w, db:domain_bonus, y:year, t:title, d:domains}})[0..{_layer1_cap}] AS items\n"
+            "UNWIND items AS it\n"
+            "RETURN v.id AS vid, it.w.id AS wid, idf_weight, it.db AS domain_bonus, it.y AS year, it.t AS title, it.d AS domains"
+        )
+    else:
+        cypher_layer1 = f"""
     MATCH (v:Vocabulary) WHERE v.id IN $v_ids
     WITH v, count {{ (v)<-[:HAS_TOPIC]-() }} AS degree_w
     WHERE (degree_w * 1.0 / $total_w) < $melt_ratio
@@ -949,6 +1061,12 @@ def run_stage4(
 
     t1 = time.perf_counter()
     sub_ms["cypher1"] = (t1 - t0) * 1000.0
+    _unique_w: Set[str] = set()
+    for _rr in rows:
+        if _rr.get("wid") is not None:
+            _unique_w.add(str(_rr.get("wid")))
+    sub_ms["cypher1_rows"] = float(len(rows))
+    sub_ms["cypher1_unique_wids"] = float(len(_unique_w))
 
     if not rows:
         sub_ms["total"] = (time.perf_counter() - t0) * 1000.0
@@ -1009,15 +1127,34 @@ def run_stage4(
     query_vec_1d: Optional[np.ndarray] = None
     query_norm: float = 0.0
     try:
-        enc = getattr(recall, "_query_encoder", None)
-        if enc is not None and jd_text:
-            qv, _ = enc.encode(jd_text)
-            if qv is not None:
-                query_vec_1d = np.asarray(qv, dtype=np.float32).flatten()
-                query_norm = float(np.linalg.norm(query_vec_1d))
+        cached = getattr(recall, "_jd_query_vec_1d", None)
+        if cached is not None:
+            query_vec_1d = np.asarray(cached, dtype=np.float32).flatten()
+            query_norm = float(np.linalg.norm(query_vec_1d))
     except Exception:
         query_vec_1d = None
         query_norm = 0.0
+    if (query_vec_1d is None or query_norm <= 1e-12) and jd_text:
+        try:
+            enc = getattr(recall, "_query_encoder", None)
+            if enc is not None:
+                jd_can = canonical_jd_text_for_encode(jd_text)
+                qv, _ = enc.encode(jd_can)
+                if qv is not None:
+                    query_vec_1d = np.asarray(qv, dtype=np.float32).flatten()
+                    query_norm = float(np.linalg.norm(query_vec_1d))
+        except Exception:
+            query_vec_1d = None
+            query_norm = 0.0
+
+    jd_align_map = _batch_jd_align_for_wids(
+        _unique_w,
+        getattr(recall, "_paper_abstract_vecs", None),
+        getattr(recall, "_paper_id_to_row", {}) or {},
+        getattr(recall, "_paper_abstract_norms", None),
+        query_vec_1d,
+        query_norm,
+    )
 
     term_capped_unique_wids: Dict[int, set] = defaultdict(set)
     wid_to_paper_meta: Dict[str, Dict[str, Any]] = {}  # wid -> {title, domains, year}
@@ -1060,6 +1197,7 @@ def run_stage4(
             role_weight=role_weight,
             query_vec_1d=query_vec_1d,
             query_norm=query_norm,
+            jd_align_pre=jd_align_map.get(wid),
         )
         term_contrib = float(score_detail["final_paper_score"])
         grounding = float(score_detail["term_grounding"])  # 硬门：先保证论文真的像这个 term
@@ -1187,7 +1325,7 @@ def run_stage4(
         if rr_audit == "paper_support" and kept_triples:
             grounds = [float(x[4]) for x in kept_triples]
             sec_n = sum(1 for x in kept_triples if str(x[3]) == "secondary")
-            print(
+            _lp(
                 f"[Stage4 support grounding audit] term='{term_name}' "
                 f"kept_total={len(kept_triples)} "
                 f"tg_lt_0.10={sum(1 for g in grounds if g < 0.10)} "
@@ -1195,7 +1333,7 @@ def run_stage4(
                 f"tg_lt_0.28={sum(1 for g in grounds if g < 0.28)} "
                 f"secondary_hits={sec_n}"
             )
-        print(
+        _lp(
             f"[Stage4 term stats] term='{term_name}' "
             f"raw={term_funnel_counts[vid].get('cypher_raw', 0)} "
             f"after_grounding={term_funnel_counts[vid].get('after_grounding_gate', 0)} "
@@ -1204,10 +1342,10 @@ def run_stage4(
         )
         rows_for_paper_map = kept_triples
         term = term_name
-        print(f"[Stage4 paper_map source] term='{term}' source_stage='after_cap' rows={len(rows_for_paper_map)}")
+        _lp(f"[Stage4 paper_map source] term='{term}' source_stage='after_cap' rows={len(rows_for_paper_map)}")
 
     # 断点 1：local cap 前的 cross-term overlap
-    print("\n[Stage4 overlap before local-cap]")
+    _lp("\n[Stage4 overlap before local-cap]")
     term_pid_map_before_local_cap: Dict[int, set] = {
         vid: {str(r.get("pid")) for r in rows if r.get("pid") is not None}
         for vid, rows in term_rows_before_cap.items()
@@ -1221,7 +1359,7 @@ def run_stage4(
                 continue
             name_a = str((_get_term_meta(vid_a) or {}).get("term") or vid_a)
             name_b = str((_get_term_meta(vid_b) or {}).get("term") or vid_b)
-            print(f"  {name_a} x {name_b} -> overlap={len(inter)} sample={inter[:10]}")
+            _lp(f"  {name_a} x {name_b} -> overlap={len(inter)} sample={inter[:10]}")
             overlap_pairs.append((vid_a, vid_b, inter))
 
     # 统计型打印：全局 multi-hit 潜力（cap 前）
@@ -1233,9 +1371,9 @@ def run_stage4(
             if pid:
                 pid_term_count[pid].add(term_name)
     multi_candidates = [(pid, sorted(list(ts))) for pid, ts in pid_term_count.items() if len(ts) >= 2]
-    print(f"\n[Stage4 multi-hit potential before cap] count={len(multi_candidates)}")
+    _lp(f"\n[Stage4 multi-hit potential before cap] count={len(multi_candidates)}")
     for pid, terms in multi_candidates[:20]:
-        print(f"  pid='{pid}' terms={terms}")
+        _lp(f"  pid='{pid}' terms={terms}")
 
     # 断点 2：overlap 论文在各 term 的 cap 前后生存情况（**默认关闭**：STAGE4_OVERLAP_SURVIVAL_MAX_LINES=0）
     cross_term_overlap_pids = {pid for (_, _, inter) in overlap_pairs for pid in inter}
@@ -1259,7 +1397,7 @@ def run_stage4(
     danger_cut.sort(key=lambda e: (int(e["rank"]), -e["sc"]))
     max_lines = max(0, STAGE4_OVERLAP_SURVIVAL_MAX_LINES)
     if max_lines > 0:
-        print("\n[Stage4 overlap survival audit]")
+        _lp("\n[Stage4 overlap survival audit]")
         picked: List[Dict[str, Any]] = []
         seen_pk: Set[Tuple[str, str]] = set()
         for e in survived_high:
@@ -1279,7 +1417,7 @@ def run_stage4(
             seen_pk.add(pk)
             picked.append(e)
         for e in picked:
-            print(
+            _lp(
                 f"term='{e['term']}' pid='{e['pid']}' "
                 f"rank_before_cap={e['rank']} "
                 f"score={float(e['sc']):.3f} "
@@ -1330,7 +1468,7 @@ def run_stage4(
         new_terms = [str(h.get("term") or h.get("vid") or "") for h in new_hits if isinstance(h, dict)]
         # 小样本调试：默认关；避免每条 wid 刷屏
         if STAGE4_PAPER_MAP_WRITE_VERBOSE:
-            print(
+            _lp(
                 f"[Stage4 paper_map write] wid='{wid}' "
                 f"incoming_term='{str(hit.get('term') or hit.get('vid') or '')}' "
                 f"old_hit_count={len(old_hits)} new_hit_count={len(new_hits)} "
@@ -1340,7 +1478,7 @@ def run_stage4(
     # ---------- wid 级：三级领域共识软乘子（词 vocabulary_topic_stats × JD 画像；论文无需三级领域）----------
     jd_src = getattr(getattr(recall, "_last_stage1_result", None), "jd_profile", None) or {}
     jd_topic_profile = _jd_topic_profile_from_stage1(jd_src)
-    _audit_jd_topic_profile(jd_topic_profile)
+    _audit_jd_topic_profile(jd_topic_profile, audit_print=_label_path_stdout)
     has_jd_hier = any(jd_topic_profile.get(k) for k in ("field_dist", "subfield_dist", "topic_dist"))
     all_hit_vids: Set[int] = set()
     for _rec0 in by_wid.values():
@@ -1358,7 +1496,7 @@ def run_stage4(
     }
 
     if STAGE4_TOPIC_META_COVERAGE_AUDIT:
-        print("\n[Stage4 topic-meta coverage audit]")
+        _lp("\n[Stage4 topic-meta coverage audit]")
         for _ctid in sorted(topic_load_tids):
             _tname = str((_get_term_meta(_ctid) or {}).get("term") or _ctid)
             _row = topic_map.get(_ctid)
@@ -1366,7 +1504,7 @@ def run_stage4(
             _src = _mm.get("source") if _row is not None else "missing"
             if not _src:
                 _src = "-"
-            print(
+            _lp(
                 f"term={_tname!r} tid={_ctid} topic_meta_found={_row is not None} source={_src} "
                 f"has_field_id={bool(_mm.get('field_id'))} has_subfield_id={bool(_mm.get('subfield_id'))} "
                 f"has_topic_id={bool(_mm.get('topic_id'))} has_field_dist={bool(_mm.get('field_dist'))} "
@@ -1385,7 +1523,7 @@ def run_stage4(
         _hits: List[Dict[str, Any]],
     ) -> None:
         _terms = [str(h.get("term") or h.get("vid") or "") for h in _hits if isinstance(h, dict)]
-        print(
+        _lp(
             f"{_tag} #{_i} pid={_wid!r} title={(str(_rec.get('title') or ''))[:80]!r} "
             f"hit_terms={_terms} "
             f"field_cons={_det.get('field_cons')} subfield_cons={_det.get('subfield_cons')} "
@@ -1443,13 +1581,17 @@ def run_stage4(
                     "paper_score_before": _before,
                 }
             )
-        _audit_hierarchy_bonus_distribution(dist_rows, STAGE4_HIERARCHY_DISTRIBUTION_TOP_N)
-        _print_stage4_hierarchy_bonus_term_group_audit(by_wid, _get_term_meta)
+        _audit_hierarchy_bonus_distribution(
+            dist_rows, STAGE4_HIERARCHY_DISTRIBUTION_TOP_N, audit_print=_label_path_stdout
+        )
+        _print_stage4_hierarchy_bonus_term_group_audit(
+            by_wid, _get_term_meta, audit_print=_label_path_stdout
+        )
         _by_delta = sorted(hierarchy_audit_rows, key=lambda x: -abs(x[1] - x[0]))[
             : max(0, STAGE4_HIERARCHY_AUDIT_TOP_BY_DELTA)
         ]
         # 批注：与 top_by_abs_score_delta 信息高度重叠时只保留后者，缩短日志。
-        print("\n[Stage4 hierarchy consensus audit] top_by_abs_score_delta")
+        _lp("\n[Stage4 hierarchy consensus audit] top_by_abs_score_delta")
         for _i, (_bef, _aft, _wid, _rec, _bon, _det, _hits) in enumerate(_by_delta, 1):
             _print_hier_line("delta", _i, _wid, _rec, _bef, _aft, _bon, _det, _hits)
     else:
@@ -1496,7 +1638,7 @@ def run_stage4(
             f = term_funnel_counts[vid]
             r = term_reject_reason_counts[vid]
 
-            print(
+            _lp(
                 f"[Stage4 term funnel] term='{term_name}' role='{role}' "
                 f"cypher_raw={f['cypher_raw']} "
                 f"after_year_filter={f['after_year_filter']} "
@@ -1507,7 +1649,7 @@ def run_stage4(
                 f"final_unique={f['final_unique']}"
             )
 
-            print(
+            _lp(
                 f"[Stage4 reject reason summary] term='{term_name}' "
                 f"low_grounding={r['low_grounding']} "
                 f"off_topic_penalty_too_low={r['off_topic_penalty_too_low']} "
@@ -1553,7 +1695,7 @@ def run_stage4(
                         penalty_val = g.get("off_topic_penalty", 1.0)
                     grounding = float(grounding_val or 0.0)
                     penalty = float(penalty_val or 1.0)
-                    print(
+                    _lp(
                         f"[Stage4 reject samples] term='{term_name}' "
                         f"pid='{wid}' title={title[:80]!r} reason='{reason}' "
                         f"grounding={grounding:.3f} penalty={penalty:.3f}"
@@ -1568,7 +1710,7 @@ def run_stage4(
                 meta3 = wid_to_paper_meta.get(w) or {"title": "", "domains": ""}
                 g = _compute_grounding_score(vid, meta3.get("title") or "", meta3.get("domains") or "")
                 final_score = float((by_wid.get(w) or {}).get("paper_score") or 0.0)
-                print(
+                _lp(
                     f"[Stage4 kept papers] term='{term_name}' rank={i} pid='{w}' "
                     f"grounding={float(g.get('grounding') or 0.0):.3f} "
                     f"penalty={float(g.get('off_topic_penalty') or 1.0):.3f} "
@@ -1590,7 +1732,7 @@ def run_stage4(
                 # 是否 low_grounding：看 grounding 是否低于阈值
                 gg = float(g.get("grounding") or 0.0)
                 reason = "low_grounding" if gg < PRIMARY_GROUNDING_MIN else "pruned_after_terms"
-                print(
+                _lp(
                     f"[Stage4 rejected papers] term='{term_name}' pid='{w}' reason='{reason}' "
                     f"grounding={float(g.get('grounding') or 0.0):.3f} "
                     f"penalty={float(g.get('off_topic_penalty') or 1.0):.3f} "
@@ -1599,7 +1741,7 @@ def run_stage4(
 
     # 精准审计块 1/3：
     # [Stage4 pre-gate paper score audit] 收集于 grounding 门之前，行数 = pre_cap 前的 scored_rows，不是 cap 后 kept。
-    print("\n[Stage4 pre-gate paper score audit]")
+    _lp("\n[Stage4 pre-gate paper score audit]")
     jd_audit_primary_vids: Set[int] = set()
     for _va in v_ids:
         _ma = _get_term_meta(_va)
@@ -1616,14 +1758,14 @@ def run_stage4(
         rows_audit = term_kept_paper_audit.get(vid, [])
         rows_audit.sort(key=lambda x: float(x.get("final_paper_score") or 0.0), reverse=True)
         detail_jd = bool(STAGE4_JD_AUDIT_FULL or vid in jd_audit_primary_detail_vids)
-        print(
+        _lp(
             f"term='{term_name}' pre_gate_scored_rows={len(rows_audit)} "
             f"jd_audit_detail={detail_jd}"
         )
         if not detail_jd:
             continue
         for i, p in enumerate(rows_audit[:STAGE4_JD_AUDIT_TOP_K], 1):
-            print(
+            _lp(
                 f"[Stage4 jd audit] #{i} term='{term_name}' pid='{p.get('paper_id')}' "
                 f"tg={float(p.get('term_grounding') or 0.0):.3f} "
                 f"jd={float(p.get('jd_align') or 0.5):.3f} "
@@ -1644,24 +1786,24 @@ def run_stage4(
         return []
 
     # 审计 1：确认 Stage4 内部 wid 聚合后确实存在 multi-hit 论文
-    print("\n[Stage4 merged wid multi-hit audit]")
+    _lp("\n[Stage4 merged wid multi-hit audit]")
     stage4_multi_hit_rows: List[tuple] = []
     for wid, rec in by_wid.items():
         hits = rec.get("hits") or []
         if len(hits) >= 2:
             terms = [str(h.get("term") or h.get("vid") or "") for h in hits if isinstance(h, dict)]
             stage4_multi_hit_rows.append((wid, rec.get("title") or "", terms))
-    print(f"multi_hit_papers={len(stage4_multi_hit_rows)}")
+    _lp(f"multi_hit_papers={len(stage4_multi_hit_rows)}")
     for wid, title, terms in stage4_multi_hit_rows[:20]:
-        print(f"  wid={wid} hit_terms={terms} title='{(title or '')[:100]}'")
+        _lp(f"  wid={wid} hit_terms={terms} title='{(title or '')[:100]}'")
     # 断点 4A：merged paper_map 细节（每条多 hit 明细）
-    print("\n[Stage4 merged wid multi-hit detail]")
+    _lp("\n[Stage4 merged wid multi-hit detail]")
     for wid, rec in by_wid.items():
         hits = rec.get("hits") or []
         if len(hits) < 2:
             continue
         terms = [str(h.get("term") or h.get("vid") or "") for h in hits if isinstance(h, dict)]
-        print(
+        _lp(
             f"wid='{wid}' hit_count={len(hits)} terms={terms} "
             f"title='{str(rec.get('title') or '')[:100]}'"
         )
@@ -1730,7 +1872,7 @@ def run_stage4(
     _save_sub(sub_ms)
 
     # 审计 2：multi-hit 计数；逐条明细默认关闭（污染已在 term 侧定位时优先看 Stage3）
-    print("\n[Stage4 author payload audit]")
+    _lp("\n[Stage4 author payload audit]")
     payload_multi_cnt = 0
     for rec in out:
         for p in rec.get("papers") or []:
@@ -1740,10 +1882,10 @@ def run_stage4(
                 if STAGE4_AUTHOR_PAYLOAD_AUDIT_VERBOSE:
                     aid = rec.get("aid")
                     terms = [str(h.get("term") or h.get("vid") or "") for h in hits if isinstance(h, dict)]
-                    print(f"aid={aid} wid={p.get('wid')} hit_terms={terms}")
-    print(f"author_payload_multi_hit_papers={payload_multi_cnt}")
+                    _lp(f"aid={aid} wid={p.get('wid')} hit_terms={terms}")
+    _lp(f"author_payload_multi_hit_papers={payload_multi_cnt}")
     if STAGE4_AUTHOR_PAYLOAD_AUDIT_VERBOSE:
-        print("\n[Stage4 author payload multi-hit detail]")
+        _lp("\n[Stage4 author payload multi-hit detail]")
         for rec in out:
             aid = rec.get("aid")
             for p in rec.get("papers") or []:
@@ -1751,5 +1893,5 @@ def run_stage4(
                 if len(hits) < 2:
                     continue
                 terms = [str(h.get("term") or h.get("vid") or "") for h in hits if isinstance(h, dict)]
-                print(f"aid='{aid}' wid='{p.get('wid')}' hit_count={len(hits)} terms={terms}")
+                _lp(f"aid='{aid}' wid='{p.get('wid')}' hit_count={len(hits)} terms={terms}")
     return out

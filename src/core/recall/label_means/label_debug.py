@@ -13,6 +13,9 @@ def debug_print(level: int, msg: str, label_or_recall=None) -> None:
     if verbose and level >= 1:
         print(msg)
         return
+    # 已传入 LabelRecallPath 且 verbose=False：不走全局 DEBUG_LABEL_PIPELINE，避免 CLI 选「非详细」仍刷屏
+    if label_or_recall is not None and not getattr(label_or_recall, "verbose", False):
+        return
     if not DEBUG_LABEL_PIPELINE or DEBUG_LABEL_PIPELINE_LEVEL < level:
         return
     print(msg)

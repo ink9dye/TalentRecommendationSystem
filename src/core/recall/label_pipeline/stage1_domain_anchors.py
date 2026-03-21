@@ -287,9 +287,14 @@ def run_stage1(
     jd_canonical = label_anchors.canonical_jd_text_for_encode(query_for_ctx)
     encoder = getattr(recall, "_query_encoder", None)
     jd_encode_cache: Dict[str, np.ndarray] = {}
+    setattr(recall, "_jd_query_vec_1d", None)
     if encoder and jd_canonical:
         try:
             encoder.lookup_or_encode(jd_canonical, jd_encode_cache)
+            enh = encoder._apply_dynamic_resonance(jd_canonical)
+            row = jd_encode_cache.get(enh)
+            if row is not None:
+                recall._jd_query_vec_1d = np.asarray(row, dtype=np.float32).flatten().copy()
         except Exception:
             pass
 
@@ -347,7 +352,7 @@ def run_stage1(
         info["anchor_type"] = label_anchors.classify_anchor_type(info.get("term") or "")
 
     # 调试：打印锚点及类型，便于排查
-    if getattr(recall, "verbose", False):
+    if getattr(recall, "verbose", False) and not getattr(recall, "silent", False):
         print("\n【Stage1 锚点类型】tid | term | anchor_type")
         for tid, info in anchor_skills.items():
             term = (info.get("term") or "")[:40]
