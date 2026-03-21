@@ -20,6 +20,7 @@ from src.infrastructure.database.kgat_ax.kgat_utils.log_helper import create_log
 from src.infrastructure.database.kgat_ax.kgat_utils.model_helper import save_model, early_stopping
 from src.infrastructure.database.kgat_ax.kgat_parser.parser_kgat import parse_kgat_args
 from config import KGATAX_TRAIN_DATA_DIR, DB_PATH
+from src.infrastructure.database.kgat_ax.pipeline_state import write_stage_done
 
 
 def check_args_and_env(args):
@@ -170,6 +171,7 @@ def train(args):
 
     Ks = eval(args.Ks)
 
+    last_epoch = None
     for epoch in range(start_epoch, args.n_epoch + 1):
         model.train()
         # 预加载全量学术特征到计算设备
@@ -281,7 +283,12 @@ def train(args):
 
             if stop:
                 logging.info(f"连续 {args.stopping_steps} 次评估未提升泛化性能，触发早停。")
+                last_epoch = epoch
                 break
+
+        last_epoch = epoch
+
+    write_stage_done(3, {"n_epoch": args.n_epoch, "finished_epoch": last_epoch})
 
 
 if __name__ == '__main__':

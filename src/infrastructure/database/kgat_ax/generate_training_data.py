@@ -583,3 +583,7 @@ if __name__ == "__main__":
 
     # 第三步：执行全量拓扑收割
     gen.generate_kg_topology(sampled_job_ids=trained_anchors)
+
+    from src.infrastructure.database.kgat_ax.pipeline_state import write_stage_done
+
+    write_stage_done(1)

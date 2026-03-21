@@ -3,6 +3,7 @@ import os
 import pandas as pd
 import time
 from config import KGATAX_TRAIN_DATA_DIR
+from src.infrastructure.database.kgat_ax.pipeline_state import write_stage_done
 
 
 class KGIndexBuilder:
@@ -35,6 +36,7 @@ class KGIndexBuilder:
                     if count > 0:
                         print(f"[*] 发现已存在的加权索引库 ({self.db_path})，包含 {count} 条数据。跳过构建。")
                         check_conn.close()
+                        write_stage_done(2, {"skipped": True, "reason": "existing_db"})
                         return
                 check_conn.close()
                 print("[*] 现有索引库版本过旧或损坏，准备重新构建...")
@@ -92,6 +94,7 @@ class KGIndexBuilder:
         print(f" - 总耗时: {duration:.2f} 秒")
 
         conn.close()
+        write_stage_done(2, {"skipped": False})
 
 def main():
     # 使用与您的训练生成器一致的输出目录

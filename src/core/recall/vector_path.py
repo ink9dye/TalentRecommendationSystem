@@ -11,6 +11,10 @@ from src.utils.tools import apply_text_decay, get_decay_rate_for_domains
 from src.utils.time_features import compute_paper_recency, compute_author_time_features
 from src.core.recall.works_to_authors import accumulate_author_scores
 
+# SQLite 单条语句绑定参数上限（常见编译为 999）；IN 列表过长会触发 OperationalError: too many SQL variables
+_SQLITE_MAX_VARS_PER_QUERY = 900
+
+
 class VectorPath:
     """
     向量路召回：实现基于 SBERT 的语义召回
@@ -177,16 +181,22 @@ class VectorPath:
             author_ids = agg_result.sorted_authors()
             if author_ids:
                 # 为每个作者收集其所有论文年份，用于计算 author-level activity & momentum
-                placeholders = ",".join(["?"] * len(author_ids))
-                year_rows = conn.execute(
-                    f"""
-                    SELECT a.author_id, w.year
-                    FROM authorships a
-                    JOIN works w ON a.work_id = w.work_id
-                    WHERE a.author_id IN ({placeholders})
-                    """,
-                    author_ids,
-                ).fetchall()
+                # 作者数可远超 SQLite 变量上限（多篇论文 × 多作者），需分批 IN 查询
+                year_rows = []
+                for off in range(0, len(author_ids), _SQLITE_MAX_VARS_PER_QUERY):
+                    batch = author_ids[off : off + _SQLITE_MAX_VARS_PER_QUERY]
+                    ph = ",".join(["?"] * len(batch))
+                    year_rows.extend(
+                        conn.execute(
+                            f"""
+                            SELECT a.author_id, w.year
+                            FROM authorships a
+                            JOIN works w ON a.work_id = w.work_id
+                            WHERE a.author_id IN ({ph})
+                            """,
+                            batch,
+                        ).fetchall()
+                    )
 
                 years_by_author = defaultdict(list)
                 for aid, year in year_rows:
