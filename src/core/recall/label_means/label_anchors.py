@@ -601,7 +601,7 @@ def prefill_encode_cache_for_anchor_ctx(
 ) -> None:
     """
     在 build_conditioned_anchor_representation 循环前，收集本 JD 下所有待编码短文本，
-    按「共振后字符串」去重后 encode_batch 写入 encode_cache（键与 lookup_or_encode 一致）。
+    按原文去重后 encode_batch 写入 encode_cache（键与 lookup_or_encode 一致）。
     数值与逐条 encode/lookup_or_encode 等价，显著减少 S1 anchor_ctx 的模型前向次数。
 
     注意：encode_cache 允许为空 dict（例如 JD 片段编码失败时）；仍会预填锚点/局部/共现串，
@@ -609,7 +609,7 @@ def prefill_encode_cache_for_anchor_ctx(
     """
     if encode_cache is None or not raw_text or not anchor_skills or encoder is None:
         return
-    if not hasattr(encoder, "encode_batch") or not hasattr(encoder, "_apply_dynamic_resonance"):
+    if not hasattr(encoder, "encode_batch"):
         return
 
     cleaned_list = [info.get("term") or "" for info in (anchor_skills or {}).values() if info.get("term")]
@@ -617,9 +617,8 @@ def prefill_encode_cache_for_anchor_ctx(
     if raw_text:
         jd_head = canonical_jd_text_for_encode(raw_text)
         if jd_head:
-            enh0 = encoder._apply_dynamic_resonance(jd_head)
             # 已在 Stage1 单次编码写入缓存时跳过 batch，避免 JD 再进 encode_batch
-            if enh0 not in encode_cache:
+            if jd_head not in encode_cache:
                 raws_ordered.append(jd_head)
 
     for _vid, info in anchor_skills.items():
@@ -639,16 +638,15 @@ def prefill_encode_cache_for_anchor_ctx(
         if co_terms:
             raws_ordered.append(" ; ".join(co_terms[:5])[:300])
 
-    # 按共振后文本去重，保持首次出现顺序（与逐条 encode 的缓存键一致）
+    # 按原文去重，保持首次出现顺序（与逐条 encode 的缓存键一致）
     unique_raws: List[str] = []
     seen_enh: Set[str] = set()
     for raw in raws_ordered:
         if not raw:
             continue
-        enh = encoder._apply_dynamic_resonance(raw)
-        if enh in seen_enh:
+        if raw in seen_enh:
             continue
-        seen_enh.add(enh)
+        seen_enh.add(raw)
         unique_raws.append(raw)
 
     if not unique_raws:
@@ -661,9 +659,8 @@ def prefill_encode_cache_for_anchor_ctx(
         if batch.shape[0] != len(chunk):
             return
         for i, raw in enumerate(chunk):
-            enh = encoder._apply_dynamic_resonance(raw)
             row = np.asarray(batch[i], dtype=np.float32).reshape(1, -1).copy()
-            encode_cache[enh] = row
+            encode_cache[raw] = row
 
 
 def build_conditioned_anchor_representation(

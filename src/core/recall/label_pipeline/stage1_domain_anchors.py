@@ -282,7 +282,7 @@ def run_stage1(
     _t0 = time.perf_counter()
     stage1_sub_ms["prep"] = (_t0 - _t_stage1) * 1000.0
 
-    # JD 与 anchor_ctx / supplement 共用同一段文本切片 + 单次编码（共振键写入 jd_encode_cache）
+    # JD 与 anchor_ctx / supplement 共用同一段文本切片 + 单次编码（原文键写入 jd_encode_cache）
     query_for_ctx = (semantic_query_text or query_text) or ""
     jd_canonical = label_anchors.canonical_jd_text_for_encode(query_for_ctx)
     encoder = getattr(recall, "_query_encoder", None)
@@ -291,8 +291,7 @@ def run_stage1(
     if encoder and jd_canonical:
         try:
             encoder.lookup_or_encode(jd_canonical, jd_encode_cache)
-            enh = encoder._apply_dynamic_resonance(jd_canonical)
-            row = jd_encode_cache.get(enh)
+            row = jd_encode_cache.get(jd_canonical)
             if row is not None:
                 recall._jd_query_vec_1d = np.asarray(row, dtype=np.float32).flatten().copy()
         except Exception:

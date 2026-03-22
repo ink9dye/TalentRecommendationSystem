@@ -314,6 +314,72 @@ class KGAT(nn.Module):
         all_embed = self.calc_cf_embeddings(aux_info_all)
         return torch.matmul(all_embed[user_ids], all_embed[item_ids].transpose(0, 1))
 
+    @staticmethod
+    def _sidecar_is_aligned_pair(features, B):
+        """
+        侧车是否为「逐样本对齐」形状：BPR 批次中每行一对 (job, author)，即 [B, n] 或 [B, 1, n]。
+        与 [B1, B2, n] 的全交叉矩阵区分（后者第二维为 B2>1）。
+        """
+        if features is None:
+            return False
+        if features.dim() == 2:
+            return features.size(0) == B
+        if features.dim() == 3:
+            return features.size(0) == B and features.size(1) == 1
+        return False
+
+    def _calc_score_v2_aligned_pair(
+        self,
+        graph_repr_u,
+        graph_repr_i,
+        author_aux_item,
+        recall_features,
+        interaction_features,
+    ):
+        """逐样本对齐：final_score 与各分项均为 [B]（trainer 的 BPR 批次）。"""
+        device = graph_repr_u.device
+        dtype = graph_repr_u.dtype
+        B = graph_repr_u.size(0)
+
+        def _squeeze_pair(feat):
+            return feat.squeeze(1) if feat.dim() == 3 else feat
+
+        rf = _squeeze_pair(recall_features) if recall_features is not None else None
+        iff = _squeeze_pair(interaction_features) if interaction_features is not None else None
+
+        zero_1d = torch.zeros(B, self.embed_dim, device=device, dtype=dtype)
+        if self.author_tower is not None and author_aux_item is not None:
+            author_repr_i = self.author_tower(author_aux_item)
+        else:
+            author_repr_i = zero_1d
+
+        if self.recall_tower is not None and rf is not None:
+            recall_repr = self.recall_tower(rf)
+        else:
+            recall_repr = zero_1d
+
+        if self.interaction_tower is not None and iff is not None:
+            interaction_repr = self.interaction_tower(iff)
+        else:
+            interaction_repr = zero_1d
+
+        fusion_input = torch.cat(
+            [graph_repr_u, graph_repr_i, author_repr_i, recall_repr, interaction_repr],
+            dim=-1,
+        )
+        final_score = self.fusion_mlp(fusion_input).squeeze(-1)
+        s_graph = (graph_repr_u * graph_repr_i).sum(dim=-1)
+        s_author = author_repr_i.sum(dim=-1)
+        s_recall = recall_repr.sum(dim=-1)
+        s_interaction = interaction_repr.sum(dim=-1)
+        return {
+            "final_score": final_score,
+            "s_graph": s_graph,
+            "s_author": s_author,
+            "s_recall": s_recall,
+            "s_interaction": s_interaction,
+        }
+
     def calc_score_v2(
         self,
         user_ids,
@@ -331,12 +397,12 @@ class KGAT(nn.Module):
             item_ids: [B2] 候选作者 id。
             aux_info_all: [n_total_nodes, n_aux_features] 全图 AX 特征（用于图塔）。
             author_aux_item: [B2, n_author_aux] 可选，候选作者的 12 维显式指标。
-            recall_features: [B1, B2, n_recall] 可选，每对 (job, author) 的召回来源特征。
-            interaction_features: [B1, B2, n_interaction] 可选，每对 (job, author) 的交叉特征。
+            recall_features: [B1, B2, n_recall] 或逐样本 [B, n_recall] / [B, 1, n_recall]（与 trainer 对齐）。
+            interaction_features: [B1, B2, n_interaction] 或逐样本对齐形状（同上）。
 
         返回：
-            dict: final_score [B1, B2], s_graph [B1, B2], s_author [B1, B2], s_recall [B1, B2], s_interaction [B1, B2]。
-        若未启用四分支或未传入额外特征，则退化为图塔点积，分项中缺失的用 0 填充。
+            dict: 全交叉模式为各张量 [B1, B2]；逐样本对齐模式为各张量 [B]（见 _calc_score_v2_aligned_pair）。
+            若未启用四分支或未传入额外特征，则退化为图塔点积，分项中缺失的用 0 填充。
         """
         device = self.entity_user_embed.weight.device
         all_embed = self.calc_cf_embeddings(aux_info_all)
@@ -345,6 +411,25 @@ class KGAT(nn.Module):
         graph_repr_u = graph_repr[user_ids]
         graph_repr_i = graph_repr[item_ids]
         B1, B2 = graph_repr_u.size(0), graph_repr_i.size(0)
+
+        # BPR 批次：侧车为每行一对 (u[i], item[i])，而非 B1×B2 全交叉；走逐样本融合。
+        if (
+            B1 == B2
+            and recall_features is not None
+            and self._sidecar_is_aligned_pair(recall_features, B1)
+            and (
+                interaction_features is None
+                or self.interaction_tower is None
+                or self._sidecar_is_aligned_pair(interaction_features, B1)
+            )
+        ):
+            return self._calc_score_v2_aligned_pair(
+                graph_repr_u,
+                graph_repr_i,
+                author_aux_item,
+                recall_features,
+                interaction_features,
+            )
 
         zero_embed = torch.zeros(B2, self.embed_dim, device=device, dtype=graph_repr.dtype)
         if self.author_tower is not None and author_aux_item is not None:

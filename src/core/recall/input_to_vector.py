@@ -1,21 +1,16 @@
 import os
 os.environ["HF_HUB_OFFLINE"] = "1"
-import sqlite3
-import re
 import time
-import collections
 from typing import Dict, List, Optional, Set
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from config import SBERT_DIR, DB_PATH, SBERT_MODEL_NAME, HARDCORE_LEXICON_SNAPSHOT_PATH
-from src.core.recall.label_means.label_encoder_snapshots import load_or_build_hardcore_lexicon
+from config import SBERT_DIR
 
 
 class QueryEncoder:
     """
     语义编码器：SentenceTransformer 版（与 build_vector_index 一致）
-    集成核心技术：【动态自共振增强 (Dynamic Resonance)】
     """
 
     def __init__(self):
@@ -32,56 +27,12 @@ class QueryEncoder:
         self.model.max_seq_length = 1024
         self.model.eval()
 
-        self.hardcore_lexicon = load_or_build_hardcore_lexicon(
-            DB_PATH,
-            HARDCORE_LEXICON_SNAPSHOT_PATH,
-            self._build_dynamic_lexicon,
-        )
-
-        print(f"[OK] 动态特征库就绪 (核心词条: {len(self.hardcore_lexicon)})")
         print(f"[*] 语义编码器就绪，耗时: {time.time() - start_load:.4f}s")
-        # 共振后文本 → (1, dim) 向量；与 lookup_or_encode / encode_cache 键一致，供 encode / batch 去重
+        # 原文 → (1, dim) 向量；与 lookup_or_encode / encode_cache 键一致，供 encode / batch 去重
         self._embed_dedup_cache: Dict[str, np.ndarray] = {}
-    def _build_dynamic_lexicon(self):
-        """（保持原有的统计学过滤逻辑不变）"""
-        lexicon = set()
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("SELECT skills FROM jobs WHERE skills IS NOT NULL")
-            all_skills_data = [row[0].lower() for row in cursor.fetchall()]
-            total_docs = len(all_skills_data)
-            all_words = []
-            for s in all_skills_data:
-                words = re.findall(r'[a-zA-Z\u4e00-\u9fa5]{2,}', s)
-                all_words.extend(words)
-            word_counts = collections.Counter(all_words)
-            cursor.execute("SELECT term FROM vocabulary")
-            vocab_terms = {row[0].strip().lower() for row in cursor.fetchall()}
-            upper_limit = total_docs * 0.03
-            lower_limit = 3
-            for word, freq in word_counts.items():
-                if word in vocab_terms:
-                    if lower_limit <= freq <= upper_limit:
-                        lexicon.add(word)
-            conn.close()
-        except Exception as e:
-            print(f"[Warning] 动态词库自动构建失败: {e}")
-        return lexicon
-
-    def _apply_dynamic_resonance(self, text):
-        """（保持原有的信号放大逻辑不变）"""
-        if not text or not self.hardcore_lexicon: return text
-        jd_words = re.findall(r'[a-zA-Z0-9\u4e00-\u9fa5]+', text.lower())
-        hit_terms = [w for w in jd_words if w in self.hardcore_lexicon]
-        if hit_terms:
-            unique_hits = list(set(hit_terms))
-            resonance_string = " ".join([f"{t} {t} {t}" for t in unique_hits])
-            return f"{text} {resonance_string}"
-        return text
 
     def clear_embed_dedup_cache(self) -> None:
-        """单次召回入口清空，避免跨查询无限增长；键为共振后文本，与 encode/lookup 一致。"""
+        """单次召回入口清空，避免跨查询无限增长；键为原文，与 encode/lookup 一致。"""
         self._embed_dedup_cache.clear()
 
     def encode(self, text):
@@ -92,90 +43,87 @@ class QueryEncoder:
         if not text:
             return None, 0.0
 
-        enhanced_text = self._apply_dynamic_resonance(text)
-        if enhanced_text in self._embed_dedup_cache:
-            return self._embed_dedup_cache[enhanced_text].copy(), 0.0
+        if text in self._embed_dedup_cache:
+            return self._embed_dedup_cache[text].copy(), 0.0
 
         start_encode = time.time()
 
         vector = self.model.encode(
-            [enhanced_text],
+            [text],
             normalize_embeddings=True,
             show_progress_bar=False
         ).astype("float32")
 
         duration = time.time() - start_encode
-        self._embed_dedup_cache[enhanced_text] = vector
+        self._embed_dedup_cache[text] = vector
         return vector, duration
 
     def lookup_or_encode(self, text: str, cache: Dict[str, np.ndarray]) -> Optional[np.ndarray]:
         """
-        同 encode 的文本预处理与模型行为，按「共振后字符串」去重缓存。
+        同 encode 的文本预处理与模型行为，按原文去重缓存。
         用于单条 JD 内多锚点/多论文标题复用，数值与未缓存的 encode 一致。
         """
         if not text:
             return None
-        enhanced = self._apply_dynamic_resonance(text)
-        if enhanced in cache:
-            vec = cache[enhanced]
-            if enhanced not in self._embed_dedup_cache:
-                self._embed_dedup_cache[enhanced] = vec
+        if text in cache:
+            vec = cache[text]
+            if text not in self._embed_dedup_cache:
+                self._embed_dedup_cache[text] = vec
             return vec
-        if enhanced in self._embed_dedup_cache:
-            vector = self._embed_dedup_cache[enhanced]
-            cache[enhanced] = vector
+        if text in self._embed_dedup_cache:
+            vector = self._embed_dedup_cache[text]
+            cache[text] = vector
             return vector
         start_encode = time.time()
         vector = self.model.encode(
-            [enhanced],
+            [text],
             normalize_embeddings=True,
             show_progress_bar=False,
         ).astype("float32")
         _ = time.time() - start_encode
-        cache[enhanced] = vector
-        self._embed_dedup_cache[enhanced] = vector
+        cache[text] = vector
+        self._embed_dedup_cache[text] = vector
         return vector
 
     def encode_batch(self, texts: List[str]) -> np.ndarray:
         """
-        批量编码，每行与对同一字符串单独 encode 等价（同一共振与归一化）。
+        批量编码，每行与对同一字符串单独 encode 等价（同一归一化）。
         返回 shape (n, dim) 的 float32；texts 为空时返回 shape (0, dim) 的空数组。
-        命中实例级 _embed_dedup_cache 时跳过该行前向；batch 内相同共振串只 forward 一次。
+        命中实例级 _embed_dedup_cache 时跳过该行前向；batch 内相同原文只 forward 一次。
         """
         if not texts:
             dim = int(self.model.get_sentence_embedding_dimension())
             return np.zeros((0, dim), dtype=np.float32)
         dim = int(self.model.get_sentence_embedding_dimension())
-        enhanced = [self._apply_dynamic_resonance(t) for t in texts]
-        n = len(enhanced)
+        n = len(texts)
         out = np.zeros((n, dim), dtype=np.float32)
         missing_indices: List[int] = []
-        missing_enh: List[str] = []
-        for i, e in enumerate(enhanced):
-            if e in self._embed_dedup_cache:
-                row = self._embed_dedup_cache[e]
+        missing_texts: List[str] = []
+        for i, t in enumerate(texts):
+            if t in self._embed_dedup_cache:
+                row = self._embed_dedup_cache[t]
                 out[i, :] = np.asarray(row, dtype=np.float32).reshape(-1)[:dim]
             else:
                 missing_indices.append(i)
-                missing_enh.append(e)
+                missing_texts.append(t)
         if not missing_indices:
             return out
         unique_order: List[str] = []
         seen: Set[str] = set()
-        for e in missing_enh:
-            if e not in seen:
-                seen.add(e)
-                unique_order.append(e)
+        for t in missing_texts:
+            if t not in seen:
+                seen.add(t)
+                unique_order.append(t)
         batch_vecs = self.model.encode(
             unique_order,
             normalize_embeddings=True,
             show_progress_bar=False,
         ).astype(np.float32)
-        for j, e in enumerate(unique_order):
-            self._embed_dedup_cache[e] = batch_vecs[j : j + 1].copy()
-        enh_to_row = {e: batch_vecs[j] for j, e in enumerate(unique_order)}
-        for idx, e in zip(missing_indices, missing_enh):
-            out[idx, :] = enh_to_row[e]
+        for j, t in enumerate(unique_order):
+            self._embed_dedup_cache[t] = batch_vecs[j : j + 1].copy()
+        text_to_row = {t: batch_vecs[j] for j, t in enumerate(unique_order)}
+        for idx, t in zip(missing_indices, missing_texts):
+            out[idx, :] = text_to_row[t]
         return out
 
 
@@ -183,7 +131,7 @@ if __name__ == "__main__":
     np.set_printoptions(threshold=np.inf, suppress=True)
     encoder = QueryEncoder()
     print("\n" + "=" * 60)
-    print("🚀 动态自共振编码器 (SentenceTransformer) 测试模式")
+    print("🚀 语义编码器 (SentenceTransformer) 测试模式")
     print("=" * 60)
 
     try:
@@ -196,7 +144,7 @@ if __name__ == "__main__":
             print(f"\n[处理结果]")
             print(f"- 耗时: {cost_s * 1000:.2f} ms")
             print(f"- 向量维度: {vec.shape}")
-            print(f"- 实际编码文本: {encoder._apply_dynamic_resonance(user_input)}")
+            print(f"- 实际编码文本: {user_input}")
             print("-" * 60)
     except KeyboardInterrupt:
         print("\n[!] 退出")
