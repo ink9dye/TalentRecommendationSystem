@@ -40,9 +40,9 @@ class WeightStrategy:
 
         # 贡献度基数计算：
         # 1. 初始权重为 1.0
-        # 2. 如果非字母排序且为第一作者，加成 0.2 (权重 1.2)
-        # 3. 如果是通讯作者，额外加成 0.2
-        contribution = 1.0 + (0.2 if is_alpha == 0 and pos_index == 1 else 0) + (0.2 if is_corr == 1 else 0)
+        # 2. 如果非字母排序且为第一作者，加成 0.5 (权重 1.5)
+        # 3. 如果是通讯作者，额外加成 0.5
+        contribution = 1.0 + (0.5 if is_alpha == 0 and pos_index == 1 else 0) + (0.5 if is_corr == 1 else 0)
 
         return round(contribution * time_weight, 4)
 

@@ -27,8 +27,8 @@ class WeightStrategy:
         time_weight = math.exp(-0.1 * delta_t)
 
         # 贡献度基数：考虑署名顺位与通讯作者加成 [cite: 2, 3]
-        # 第一作者(非字母排序)加 0.2，通讯作者加 0.2 [cite: 2]
-        contribution = 1.0 + (0.2 if is_alpha == 0 and pos_index == 1 else 0) + (0.2 if is_corr == 1 else 0)
+        # 第一作者(非字母排序)加 0.5，通讯作者加 0.5 [cite: 2]
+        contribution = 1.0 + (0.5 if is_alpha == 0 and pos_index == 1 else 0) + (0.5 if is_corr == 1 else 0)
 
         return round(contribution * time_weight, 4)
 
