@@ -2,7 +2,7 @@
 """
 薄转发层：保持 from src.utils.tools import ... 兼容，实际实现位于 utils 下独立模块。
 - 时序衰减：src.utils.decay
-- 技能清洗：src.utils.skill_clean
+- 技能清洗（extract_skills / normalize_skill 等）：src.utils.skill_clean
 - 句子残片过滤：src.utils.text_filters
 """
 

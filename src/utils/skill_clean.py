@@ -160,11 +160,84 @@ JD_HEADER_PREFIX = re.compile(
 # skill 标准化
 # -------------------------------------------------
 
+# 英文技术向 token：字母开头，可含数字与常见技术符号（避免把叙述词表当白名单）
+_TOKEN_TECH_SHAPED = re.compile(r"^[a-zA-Z][a-zA-Z0-9+\-./]*$")
+
+
+def _has_cjk(s: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", s))
+
+
+def _token_is_tech_shaped(tok: str) -> bool:
+    """形式特征：像技术词汇的英文 token（非停用词表）。"""
+    if len(tok) < 2 or len(tok) > 18:
+        return False
+    return bool(_TOKEN_TECH_SHAPED.match(tok))
+
+
+def _should_preserve_spaced_term_whole(term: str) -> bool:
+    """
+    短语保留优先：空格分隔的整体是否应作为一条技能保留，而不是拆子词或退化为首 token。
+
+    基于形式特征（token 数、长度、字符集、是否叙述残片），不写死具体技术名词。
+    """
+    if not term or " " not in term:
+        return False
+    # 中英混排或含中文的空格短语：整体保留，避免把「Python 开发」等拆碎
+    if _has_cjk(term):
+        return True
+    tokens = term.split()
+    # 2~5 个英文技术向 token：覆盖 motion control、robot arm control、isaac sim … framework 等整行产品名
+    if not (2 <= len(tokens) <= 5):
+        return False
+    if len(term) > 60:
+        return False
+    if not all(_token_is_tech_shaped(t) for t in tokens):
+        return False
+    if is_generic_jd_fragment(term):
+        return False
+    if is_sentence_fragment(term):
+        return False
+    return True
+
+
+def _should_degrade_long_spaced_term_to_first_token(term: str) -> bool:
+    """
+    仅在「明显不像可整体保留的短技术短语」的长串上，允许退化为首词。
+    用于替代原先「len>15 且含空格则一律首词」的强规则。
+    """
+    if not term or " " not in term:
+        return False
+    if _should_preserve_spaced_term_whole(term):
+        return False
+    tokens = term.split()
+    if _has_cjk(term):
+        return False
+    # 若仍符合「全技术向 token」且未过长，应由 preserve 整行保留，此处不退化
+    if (
+        2 <= len(tokens) <= 5
+        and len(term) <= 60
+        and all(_token_is_tech_shaped(t) for t in tokens)
+    ):
+        return False
+    # 叙述性长串：词数多、总长过大，或夹杂非技术形态的 token
+    if len(tokens) >= 6:
+        return True
+    if len(term) > 60:
+        return True
+    if len(tokens) >= 4 and not all(_token_is_tech_shaped(t) for t in tokens):
+        return True
+    if any(len(t) > 18 for t in tokens):
+        return True
+    return False
+
 
 def split_space_terms(term):
-    tokens = term.split()
-    if 3 <= len(tokens) <= 6 and all(len(t) <= 10 for t in tokens):
-        return tokens
+    """
+    短语保留优先：始终返回整段 term，不再按空格拆成多个子 skill。
+    旧版对 3~6 个短 token 一律拆分的策略已移除，避免子词覆盖原短语。
+    多词是否退化为首词仅在 extract_skills 中由 _should_degrade_* 判定。
+    """
     return [term]
 
 
@@ -242,7 +315,9 @@ def is_bad_skill(term: str):
         if not re.search(r'^[a-z\+]+[\d\.\+\-]+$', term, re.IGNORECASE):
             return True
     if len(term) > 25:
-        return True
+        # 与「短语保留优先」一致：已判定为可整体保留的英文多词技术短语，允许略超原 25 字上限
+        if not (" " in term and _should_preserve_spaced_term_whole(term) and len(term) <= 60):
+            return True
     if len(term) <= 1 and term not in SHORT_WHITELIST:
         return True
     if term.isdigit():
@@ -263,10 +338,12 @@ def extract_skills(text: str):
         term = normalize_skill(p)
         if not term:
             continue
+        # 删除「长英文多词只保留首 token」的强规则；仅对明显叙述长串退化为首词
         if len(term) > 15 and " " in term:
-            first_token = term.split()[0].strip()
-            if first_token and len(first_token) <= 20:
-                term = first_token
+            if _should_degrade_long_spaced_term_to_first_token(term):
+                first_token = term.split()[0].strip()
+                if first_token and len(first_token) <= 20:
+                    term = first_token
         for sub_term in split_space_terms(term):
             if is_bad_skill(sub_term):
                 continue
