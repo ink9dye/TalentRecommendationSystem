@@ -1366,8 +1366,9 @@ class LabelRecallPath:
 
     def _stage2_expand_academic_terms(self, anchor_skills, active_domain_set, regex_str, query_vector, query_text=None, jd_profile=None):
         """
-        阶段 2：学术词扩展。边路 + 语境向量路 + 簇扩展 + 共鸣/共现，返回候选列表（不计算最终词权）。
+        阶段 2：学术词扩展。边路 + 语境向量路 + 簇扩展 + 共鸣/共现（不计算最终词权）。
         传入 jd_profile 时启用层级守卫与泛词抑制。
+        返回 run_stage2 的结构化 dict；主链取 ["all_candidates"] 作为原 raw 列表语义。
         """
         return stage2_expansion.run_stage2(
             self,
@@ -1629,7 +1630,7 @@ class LabelRecallPath:
 
         # 阶段 2：学术词扩展（仅产出候选，不算权）；传入 jd_profile 供层级守卫
         jd_profile = getattr(self._last_stage1_result, "jd_profile", None) if getattr(self, "_last_stage1_result", None) else None
-        raw_candidates = self._stage2_expand_academic_terms(
+        stage2_output = self._stage2_expand_academic_terms(
             anchor_skills,
             active_domain_set,
             regex_str,
@@ -1637,6 +1638,7 @@ class LabelRecallPath:
             query_text=semantic_query_text or query_text,
             jd_profile=jd_profile,
         )
+        raw_candidates = stage2_output["all_candidates"]
         checkpoints.append({"stage": "S2", "raw_candidates": len(raw_candidates or []), "ok": bool(raw_candidates)})
         t_s2 = time.time()
         s2_ms = (t_s2 - t_s1) * 1000
