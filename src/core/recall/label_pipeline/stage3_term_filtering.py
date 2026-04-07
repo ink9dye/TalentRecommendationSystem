@@ -1,5 +1,5 @@
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any, Dict, List, Set, Tuple
 
 from src.core.recall.label_means import term_scoring
@@ -146,6 +146,12 @@ STAGE3_UNIFIED_W_DRIFT = 0.12
 STAGE3_UNIFIED_W_GENERIC = 0.08
 STAGE3_UNIFIED_W_POLY = 0.08
 STAGE3_UNIFIED_W_OBJECT = 0.06
+# Global Coherence Rerank：四分项主路径 + 小幅 legacy unified blend（TODO: 纯 GC 后将 STAGE3_GC_LEGACY_BLEND→0）
+STAGE3_GC_LEGACY_BLEND = 0.12
+STAGE3_GC_W_LOCAL_FIT = 0.38
+STAGE3_GC_W_CROSS = 0.34
+STAGE3_GC_W_BACKBONE = 0.28
+STAGE3_GC_W_RISK = 0.42
 # 与 select_terms_for_paper_recall 对齐的入稿闸门说明（逐项 term）
 STAGE3_PAPER_GATE_DEBUG = False  # 默认降噪；需要逐项 gate 时再开
 STAGE3_PAPER_CUTOFF_AUDIT = True  # [Stage3 paper cutoff] 排名与截断原因
@@ -232,6 +238,25 @@ _STAGE3_MERGE_STRUCTURE_FIELDS = frozenset(
         "can_expand",
         "can_expand_from_2a",
     }
+)
+# Representative 行仅填充「非语义 / 非聚合」字段；聚合语义见 source_evidence_list 与 *_summary
+_STAGE3_MERGE_NEVER_FROM_REPRESENTATIVE = (
+    _STAGE3_MERGE_SKIP_KEYS
+    | _STAGE3_MERGE_STRUCTURE_FIELDS
+    | frozenset(
+        {
+            "stage2_local_meta",
+            "source_evidence_list",
+            "stage2_local_meta_list",
+            "anchor_support_summary",
+            "provenance_summary",
+            "merge_debug_summary",
+            "primary_bucket_summary",
+            "role_in_anchor_set",
+            "anchor_role_distribution",
+            "term_role_distribution",
+        }
+    )
 )
 
 
@@ -338,6 +363,297 @@ def _compute_stage3_unified_continuous_score(rec: Dict[str, Any]) -> Tuple[float
     return unified, breakdown
 
 
+def _stage3_get_candidate_graph_from_recall(recall: Any) -> Dict[str, Any]:
+    ctx = getattr(recall, "_stage3_stage2_context", None) if recall is not None else None
+    if not isinstance(ctx, dict):
+        return {}
+    g = ctx.get("candidate_graph")
+    return g if isinstance(g, dict) else {}
+
+
+def _stage3_graph_cross_anchor_stats(tid: Any, graph: Dict[str, Any]) -> Tuple[int, float]:
+    """当前 tid 在 cross_anchor_support_edges 上的度数与 score_hint 均值（candidate_graph 消费入口）。"""
+    edges = graph.get("cross_anchor_support_edges") if graph else None
+    if not isinstance(edges, list) or tid is None:
+        return 0, 0.0
+    try:
+        t_int = int(tid)
+    except (TypeError, ValueError):
+        return 0, 0.0
+    hints: List[float] = []
+    for e in edges:
+        if not isinstance(e, dict):
+            continue
+        try:
+            st = int(e.get("src_tid"))
+            dt = int(e.get("dst_tid"))
+        except (TypeError, ValueError):
+            continue
+        if st == t_int or dt == t_int:
+            try:
+                hints.append(float(e.get("score_hint") or 0.0))
+            except (TypeError, ValueError):
+                hints.append(0.0)
+    if not hints:
+        return 0, 0.0
+    return len(hints), float(sum(hints) / len(hints))
+
+
+def _compute_stage3_local_fit(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """局部贴合：消费 source_evidence_list / explain / 弱 bucket 先验（不支配）。"""
+    notes: List[str] = []
+    ex = rec.get("stage3_explain") or {}
+    evid = list(rec.get("source_evidence_list") or [])
+    identities: List[float] = []
+    for e in evid:
+        if not isinstance(e, dict):
+            continue
+        identities.append(float(e.get("identity_score") or e.get("sim_score") or 0.0))
+    if not identities:
+        identities = [float(rec.get("best_identity_score") or rec.get("identity_score") or 0.0)]
+    mean_id = sum(identities) / len(identities)
+    max_id = max(identities)
+    seed = _stage3_clamp01(rec.get("best_seed_score") or rec.get("score"))
+    jd = _stage3_clamp01(rec.get("best_jd_align"))
+    ptc = _stage3_clamp01(ex.get("path_topic_consistency"))
+    qual = _stage3_clamp01(rec.get("quality_score"))
+    fc = _stage3_clamp01(rec.get("family_centrality") or ex.get("family_centrality"))
+    pbs = rec.get("primary_bucket_summary") or {}
+    derived = (pbs.get("derived_primary_bucket") or "").strip().lower()
+    pri = STAGE3_PRIMARY_BUCKET_MERGE_PRIORITY.get(derived, 0)
+    bucket_prior = 0.04 * (pri / 5.0)
+    core_fit = (
+        0.20 * _stage3_clamp01(mean_id)
+        + 0.16 * _stage3_clamp01(max_id)
+        + 0.14 * seed
+        + 0.16 * jd
+        + 0.16 * ptc
+        + 0.10 * qual
+        + 0.08 * fc
+    )
+    score = _stage3_clamp01(core_fit + bucket_prior)
+    if len(evid) >= 2:
+        score = _stage3_clamp01(score + 0.02)
+        notes.append("multi_source_evidence:+0.02")
+    notes.append("primary_bucket_prior_weak:max+0.04")
+    return {
+        "score": score,
+        "components": {
+            "evidence_rows": len(evid),
+            "identity_mean": mean_id,
+            "identity_max": max_id,
+            "seed_norm": seed,
+            "jd_align": jd,
+            "path_topic_consistency": ptc,
+            "quality_score": qual,
+            "family_centrality": fc,
+            "derived_primary_bucket": derived,
+            "bucket_prior_applied": bucket_prior,
+        },
+        "notes": notes,
+    }
+
+
+def _compute_stage3_cross_anchor_coherence(rec: Dict[str, Any], graph: Dict[str, Any]) -> Dict[str, Any]:
+    """跨锚一致性：anchor_support_summary + merge_debug + candidate_graph cross_anchor_support_edges。"""
+    notes: List[str] = []
+    adb = rec.get("anchor_support_summary") or {}
+    mdbg = rec.get("merge_debug_summary") or {}
+    ac = int(adb.get("anchor_count") or rec.get("anchor_count") or 1)
+    mac = int(adb.get("mainline_anchor_count") or 0)
+    eac = int(adb.get("expandable_anchor_count") or 0)
+    sac_only = int(adb.get("side_anchor_count") or 0)
+    side_only_global = bool(mdbg.get("cross_anchor_side_only"))
+    tid = rec.get("tid")
+    edge_n, edge_mean = _stage3_graph_cross_anchor_stats(tid, graph)
+    edge_boost = _stage3_clamp01(edge_mean) * min(1.0, edge_n / 3.0) if edge_n else 0.0
+
+    if ac <= 1:
+        score = _stage3_clamp01(0.38 + 0.28 * edge_boost)
+        notes.append("single_anchor:base+graph")
+    else:
+        mainline_ratio = mac / max(1, ac)
+        expand_ratio = eac / max(1, ac)
+        score = (
+            0.12
+            + 0.38 * _stage3_clamp01(mainline_ratio)
+            + 0.32 * _stage3_clamp01(expand_ratio)
+            + 0.18 * edge_boost
+        )
+        score = _stage3_clamp01(score)
+        notes.append("multi_anchor:mainline_ratio+expand_ratio+graph")
+
+    cross_pen = 0.0
+    if side_only_global:
+        cross_pen += 0.38
+        notes.append("cross_anchor_side_only_penalty:-0.38")
+    if sac_only >= 2 and mac == 0 and ac >= 2:
+        cross_pen += 0.14
+        notes.append("multi_side_only_anchors_penalty:-0.14")
+    score = _stage3_clamp01(score - cross_pen)
+    return {
+        "score": score,
+        "components": {
+            "anchor_count": ac,
+            "mainline_anchor_count": mac,
+            "expandable_anchor_count": eac,
+            "side_only_anchor_count": sac_only,
+            "cross_anchor_edge_count": edge_n,
+            "cross_anchor_edge_hint_mean": edge_mean,
+            "cross_anchor_side_only": side_only_global,
+            "cross_anchor_side_only_penalty": min(0.38, 0.38 if side_only_global else 0.0)
+            + (0.14 if (sac_only >= 2 and mac == 0 and ac >= 2) else 0.0),
+        },
+        "notes": notes,
+    }
+
+
+def _compute_stage3_backbone_alignment(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """主轴/JD 骨架贴合：mainline + expand + 多来源 parent anchor 统计 + 结构罚则。"""
+    notes: List[str] = []
+    ex = rec.get("stage3_explain") or {}
+    mh = int(rec.get("mainline_hits") or 0)
+    evid = list(rec.get("source_evidence_list") or [])
+    exp_local_frac = (
+        sum(1 for e in evid if isinstance(e, dict) and e.get("can_expand_local")) / max(1, len(evid))
+    )
+    can_ex = bool(rec.get("can_expand") or rec.get("can_expand_from_2a"))
+    try:
+        pas_raw = float(
+            rec.get("best_parent_anchor_final_score") or rec.get("parent_anchor_final_score") or 0.0
+        )
+    except (TypeError, ValueError):
+        pas_raw = 0.0
+    a_sc = _stage3_clamp01(pas_raw / 1.2)
+    rk = rec.get("best_parent_anchor_step2_rank")
+    try:
+        rk_i = int(rk) if rk is not None else 99
+    except (TypeError, ValueError):
+        rk_i = 99
+    rank_prior = _stage3_clamp01(1.0 / (1.0 + 0.12 * max(0, rk_i - 1)))
+    bb = (
+        0.28 * _stage3_clamp01(min(1.0, mh / 2.0))
+        + 0.24 * (1.0 if can_ex else 0.0)
+        + 0.18 * _stage3_clamp01(exp_local_frac)
+        + 0.18 * a_sc
+        + 0.12 * rank_prior
+    )
+    if _stage3_is_conditioned_only(rec):
+        bb = max(0.0, bb - 0.18)
+        notes.append("conditioned_only:-0.18")
+    flags = rec.get("bucket_reason_flags") or []
+    if "locked_mainline_no_expand" in flags:
+        bb = max(0.0, bb - 0.08)
+        notes.append("locked_mainline_no_expand:-0.08")
+    if "cross_anchor_but_side_only" in flags:
+        bb = max(0.0, bb - 0.12)
+        notes.append("cross_anchor_but_side_only:-0.12")
+    bb = _stage3_clamp01(bb)
+    return {
+        "score": bb,
+        "components": {
+            "mainline_hits": mh,
+            "expandable_support": float(can_ex),
+            "expand_local_fraction": exp_local_frac,
+            "anchor_score_prior": a_sc,
+            "anchor_rank_prior": rank_prior,
+            "best_parent_anchor_step2_rank": rk_i,
+        },
+        "notes": notes,
+    }
+
+
+def _compute_stage3_risk_penalty_dimension(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """风险 penalty 块：0~1，越高越差；显式混合冲突 / provenance / 结构信号。"""
+    notes: List[str] = []
+    gen = _stage3_clamp01(rec.get("generic_risk"))
+    poly = _stage3_clamp01(rec.get("polysemy_risk"))
+    obj = _stage3_clamp01(rec.get("object_like_risk"))
+    drift = _stage3_clamp01(rec.get("semantic_drift_risk"))
+    mdbg = rec.get("merge_debug_summary") or {}
+    prov = rec.get("provenance_summary") or {}
+
+    c_conflict = int(bool(mdbg.get("primary_bucket_conflict")))
+    c_tr = int(bool(mdbg.get("term_role_conflict")))
+    c_ria = int(bool(mdbg.get("role_in_anchor_conflict")))
+    c_ms = int(bool(mdbg.get("mainline_side_conflict")))
+    conflict_n = c_conflict + c_tr + c_ria + c_ms
+    conflict_penalty = min(0.34, 0.085 * conflict_n)
+    if c_conflict:
+        notes.append("bucket_conflict")
+    if c_ms:
+        notes.append("mainline_side_conflict")
+
+    ca_side_pen = 0.22 if mdbg.get("cross_anchor_side_only") else 0.0
+    single_path_pen = 0.12 if prov.get("single_path_multi_anchor_weak_signal") else 0.0
+    if prov.get("single_path_only") and int(prov.get("distinct_source_type_count") or 0) <= 1:
+        single_path_pen += 0.06
+        notes.append("single_path_narrow_provenance")
+
+    score = _stage3_clamp01(
+        0.20 * gen
+        + 0.18 * poly
+        + 0.18 * obj
+        + 0.16 * drift
+        + conflict_penalty
+        + ca_side_pen
+        + single_path_pen
+    )
+    return {
+        "score": score,
+        "components": {
+            "generic_risk": gen,
+            "polysemy_risk": poly,
+            "object_like_risk": obj,
+            "drift_risk": drift,
+            "conflict_penalty": conflict_penalty,
+            "single_path_penalty": single_path_pen,
+            "cross_anchor_side_only_penalty": ca_side_pen,
+            "conflict_event_count": conflict_n,
+        },
+        "notes": notes,
+    }
+
+
+def _build_stage3_global_coherence_score(rec: Dict[str, Any], recall: Any) -> Tuple[float, Dict[str, Any]]:
+    """
+    全局一致性主分：显式四分项 + 线性正项 + risk 扣分；再与 legacy unified 小幅 blend。
+    TODO(Stage3 GC): admission / paper lane 进一步读 stage3_score_breakdown。
+    """
+    graph = _stage3_get_candidate_graph_from_recall(recall)
+    lf = _compute_stage3_local_fit(rec)
+    cx = _compute_stage3_cross_anchor_coherence(rec, graph)
+    bb = _compute_stage3_backbone_alignment(rec)
+    rk = _compute_stage3_risk_penalty_dimension(rec)
+
+    pos = (
+        STAGE3_GC_W_LOCAL_FIT * float(lf["score"])
+        + STAGE3_GC_W_CROSS * float(cx["score"])
+        + STAGE3_GC_W_BACKBONE * float(bb["score"])
+    )
+    gc_core = float(pos) - STAGE3_GC_W_RISK * float(rk["score"])
+    gc_final = max(0.0, min(1.0, gc_core))
+
+    unified_legacy, uni_bd = _compute_stage3_unified_continuous_score(rec)
+    alpha = float(STAGE3_GC_LEGACY_BLEND)
+    final = max(0.0, min(1.0, (1.0 - alpha) * gc_final + alpha * unified_legacy))
+
+    breakdown: Dict[str, Any] = {
+        "local_fit": lf,
+        "cross_anchor_coherence": cx,
+        "backbone_alignment": bb,
+        "risk_penalty": rk,
+        "combined_positive": pos,
+        "gc_pre_blend": gc_final,
+        "legacy_unified_score": unified_legacy,
+        "legacy_unified_breakdown": uni_bd,
+        "blend_alpha_legacy": alpha,
+        "final_score": final,
+        "used_candidate_graph_cross_edges": bool(graph.get("cross_anchor_support_edges")),
+    }
+    return final, breakdown
+
+
 def _paper_recall_dynamic_floor(
     candidates: List[Dict[str, Any]],
     score_key: str = "final_score",
@@ -376,6 +692,69 @@ def _print_stage3_unified_breakdown(
             f"  risks: drift={bd.get('semantic_drift_risk', 0):.3f} generic={bd.get('generic_risk', 0):.3f} "
             f"poly={bd.get('polysemy_risk', 0):.3f} obj={bd.get('object_like_risk', 0):.3f} | "
             f"final={float(rec.get('final_score') or 0):.4f} bucket={rec.get('stage3_bucket')!r} (仅观测)"
+        )
+
+
+def _print_stage3_global_coherence_breakdown(
+    survivors: List[Dict[str, Any]],
+    top_k: int = STAGE3_UNIFIED_SCORE_DEBUG_TOP_K,
+) -> None:
+    """Global Coherence 四分项 + final（消费 merge aggregate + candidate_graph）。"""
+    if not STAGE3_UNIFIED_SCORE_DEBUG or not survivors:
+        return
+    rows = sorted(survivors, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
+    rows = _stage3_audit_filter_rows(rows, top_k)
+    if not rows:
+        return
+    print("\n" + "-" * 80)
+    print("[Stage3 global coherence breakdown] local_fit | cross_anchor | backbone | risk_pen | gc_pre | blend | final")
+    print("-" * 80)
+    for rec in rows:
+        sb = rec.get("stage3_score_breakdown") or {}
+        term = (rec.get("term") or "")[:26]
+        lf = float((sb.get("local_fit") or {}).get("score") or 0.0)
+        cx = float((sb.get("cross_anchor_coherence") or {}).get("score") or 0.0)
+        bb = float((sb.get("backbone_alignment") or {}).get("score") or 0.0)
+        rk = float((sb.get("risk_penalty") or {}).get("score") or 0.0)
+        gcp = float(sb.get("gc_pre_blend") or 0.0)
+        fin = float(rec.get("final_score") or 0.0)
+        graphed = sb.get("used_candidate_graph_cross_edges")
+        print(
+            f"term={term!r} | lf={lf:.3f} cx={cx:.3f} bb={bb:.3f} risk={rk:.3f} "
+            f"gc_pre={gcp:.3f} blend_α={sb.get('blend_alpha_legacy')} | final={fin:.4f} graph_x={graphed}"
+        )
+        adb = rec.get("anchor_support_summary") or {}
+        mdbg = rec.get("merge_debug_summary") or {}
+        print(
+            f"  aggregate_audit: anc={adb.get('anchor_count')} mac={adb.get('mainline_anchor_count')} "
+            f"eac={adb.get('expandable_anchor_count')} side_only_global={mdbg.get('cross_anchor_side_only')} "
+            f"prov_multi={ (rec.get('provenance_summary') or {}).get('multi_source')}"
+        )
+
+
+def _print_stage3_risky_coherence_audit(survivors: List[Dict[str, Any]], top_k: int = 12) -> None:
+    """risky 候选：为何 risky（GC 视角，非只看 bucket 名）。"""
+    if not STAGE3_AUDIT_DEBUG or not survivors:
+        return
+    risky = [r for r in survivors if (r.get("stage3_bucket") or "").strip().lower() == "risky"]
+    if not risky:
+        return
+    risky.sort(key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
+    print("\n" + "-" * 80)
+    print("[Stage3 risky coherence audit] term | final | risk块 | cross_side | conflicts | prov | reasons")
+    print("-" * 80)
+    for rec in risky[:top_k]:
+        term = (rec.get("term") or "")[:22]
+        fs = float(rec.get("final_score") or 0.0)
+        sb = rec.get("stage3_score_breakdown") or {}
+        rp = (sb.get("risk_penalty") or {}).get("components") or {}
+        mdbg = rec.get("merge_debug_summary") or {}
+        prov = rec.get("provenance_summary") or {}
+        reasons = rec.get("risk_reasons") or []
+        print(
+            f"{term!r} | final={fs:.3f} | risk_pen={float((sb.get('risk_penalty') or {}).get('score') or 0):.3f} "
+            f"| ca_side={mdbg.get('cross_anchor_side_only')} | "
+            f"conf={rp.get('conflict_event_count')} | narrow_1path={prov.get('single_path_only')} | {reasons}"
         )
 
 
@@ -1079,8 +1458,343 @@ def _print_stage3_support_contamination_summary(cands: List[Dict[str, Any]]) -> 
         )
 
 
+# --- Stage3 merge：multi-anchor evidence aggregation（非 winner-snapshot）---
+def _stage3_rec_bucket_norm(rec: Dict[str, Any]) -> str:
+    meta = rec.get("stage2_local_meta") or {}
+    return (meta.get("primary_bucket") or rec.get("primary_bucket") or "").strip().lower()
+
+
+def _stage3_merge_source_evidence_slice(rec: Dict[str, Any]) -> Dict[str, Any]:
+    meta = rec.get("stage2_local_meta") or {}
+    rf = rec.get("risk_flags")
+    if rf is None:
+        rf_list: List[Any] = []
+    elif isinstance(rf, list):
+        rf_list = rf
+    else:
+        rf_list = [rf]
+    st_raw = rec.get("source_type") or rec.get("source") or rec.get("origin") or ""
+    st = str(st_raw).strip().lower()
+    return {
+        "parent_anchor": (rec.get("parent_anchor") or "").strip(),
+        "anchor_term": (rec.get("parent_anchor") or "").strip(),
+        "candidate_source": str(st_raw).strip(),
+        "term_role_local": (rec.get("term_role") or "").strip(),
+        "identity_score": float(rec.get("identity_score") or rec.get("sim_score") or 0.0),
+        "sim_score": float(rec.get("sim_score") or rec.get("identity_score") or 0.0),
+        "retrieval_role": (rec.get("retrieval_role") or "").strip(),
+        "risk_flags": rf_list[:16],
+        "source_type": st,
+        "role_in_anchor": (rec.get("role_in_anchor") or "").strip().lower(),
+        "can_expand_local": bool(rec.get("can_expand_local")),
+        "primary_bucket_local": (meta.get("primary_bucket") or rec.get("primary_bucket") or "").strip(),
+    }
+
+
+def _stage3_merge_primary_bucket_summary(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    cnt: Counter = Counter()
+    for r in records:
+        k = _stage3_rec_bucket_norm(r)
+        cnt[k or ""] += 1
+    distribution = dict(sorted(cnt.items(), key=lambda x: (-x[1], x[0])))
+    nonempty = {bk: c for bk, c in cnt.items() if bk}
+    if nonempty:
+        derived = max(
+            nonempty.keys(),
+            key=lambda b: (STAGE3_PRIMARY_BUCKET_MERGE_PRIORITY.get(b, 0), nonempty[b]),
+        )
+    else:
+        derived = ""
+    return {"bucket_distribution": distribution, "derived_primary_bucket": derived}
+
+
+def _stage3_merge_pick_display_primary_bucket(records: List[Dict[str, Any]], derived_lower: str) -> str:
+    if not derived_lower:
+        return ""
+    for r in records:
+        if _stage3_rec_bucket_norm(r) == derived_lower:
+            meta = r.get("stage2_local_meta") or {}
+            pb = (meta.get("primary_bucket") or r.get("primary_bucket") or "").strip()
+            if pb:
+                return pb
+    return derived_lower
+
+
+def _stage3_merge_pick_primary_reason(records: List[Dict[str, Any]], derived_lower: str) -> str:
+    if not derived_lower:
+        return ""
+    for r in records:
+        if _stage3_rec_bucket_norm(r) == derived_lower:
+            pr = (r.get("primary_reason") or "").strip()
+            if pr:
+                return pr
+    return ""
+
+
+def _stage3_merge_anchor_support_summary(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    anchor_to_roles: Dict[str, Set[str]] = defaultdict(set)
+    expand_anchors: Set[str] = set()
+    for r in records:
+        pa = (r.get("parent_anchor") or "").strip()
+        ra = (r.get("role_in_anchor") or "").strip().lower()
+        if pa and ra:
+            anchor_to_roles[pa].add(ra)
+        ex = bool(r.get("can_expand") or r.get("can_expand_local") or r.get("can_expand_from_2a"))
+        if ex and pa:
+            expand_anchors.add(pa)
+    anchor_roles: Dict[str, str] = {}
+    for a, roles in anchor_to_roles.items():
+        if "mainline" in roles and "side" in roles:
+            anchor_roles[a] = "mixed"
+        elif "mainline" in roles:
+            anchor_roles[a] = "mainline"
+        elif "side" in roles:
+            anchor_roles[a] = "side"
+        else:
+            anchor_roles[a] = "other"
+    all_anchors = sorted(anchor_to_roles.keys())
+    mainline_anchor_count = len([a for a in anchor_to_roles if "mainline" in anchor_to_roles[a]])
+    side_anchor_count = len(
+        [a for a in anchor_to_roles if "mainline" not in anchor_to_roles[a] and "side" in anchor_to_roles[a]]
+    )
+    return {
+        "anchor_count": len(all_anchors),
+        "anchors": all_anchors,
+        "mainline_anchor_count": mainline_anchor_count,
+        "side_anchor_count": side_anchor_count,
+        "expandable_anchor_count": len(expand_anchors),
+        "anchor_roles": dict(sorted(anchor_roles.items())),
+    }
+
+
+def _stage3_merge_provenance_summary(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    cnt: Counter = Counter()
+    parent_nonempty = {
+        (r.get("parent_anchor") or "").strip()
+        for r in records
+        if (r.get("parent_anchor") or "").strip()
+    }
+    for r in records:
+        raw = r.get("source_type") or r.get("source") or r.get("origin") or ""
+        key = str(raw).strip().lower() or "__unknown__"
+        cnt[key] += 1
+    return {
+        "source_type_counts": dict(sorted(cnt.items(), key=lambda x: (-x[1], x[0]))),
+        "distinct_source_type_count": len(cnt),
+        "multi_source": len(cnt) > 1,
+        "single_path_only": len(cnt) <= 1,
+        "single_path_multi_anchor_weak_signal": bool(len(cnt) <= 1 and len(parent_nonempty) >= 2),
+    }
+
+
+def _stage3_merge_role_distribution(records: List[Dict[str, Any]]) -> Dict[str, int]:
+    cnt: Counter = Counter()
+    for r in records:
+        tr = (r.get("term_role") or "").strip().lower()
+        cnt[tr or ""] += 1
+    return dict(sorted(cnt.items(), key=lambda x: (-x[1], x[0])))
+
+
+def _stage3_merge_derived_term_role(
+    records: List[Dict[str, Any]],
+    term_role_distribution: Dict[str, int],
+) -> str:
+    has_mainline_evidence = any(
+        (r.get("role_in_anchor") or "").strip().lower() == "mainline" for r in records
+    )
+    has_primary_like = any(
+        (r.get("term_role") or "").strip().lower() == "primary"
+        or (r.get("source_type") or r.get("source") or r.get("origin") or "").strip().lower() == "similar_to"
+        for r in records
+    )
+    any_side = any((r.get("role_in_anchor") or "").strip().lower() == "side" for r in records)
+    all_side_or_empty = all(
+        (r.get("role_in_anchor") or "").strip().lower() in ("side", "") for r in records
+    )
+    if has_mainline_evidence or has_primary_like:
+        return "primary"
+    if any_side and all_side_or_empty and not has_mainline_evidence:
+        return "primary_side"
+    nonempty_roles = {k: v for k, v in term_role_distribution.items() if k}
+    if nonempty_roles:
+        return max(
+            nonempty_roles.keys(),
+            key=lambda k: (STAGE3_TERM_ROLE_MERGE_PRIORITY.get(k, 0), nonempty_roles[k]),
+        )
+    return ""
+
+
+def _stage3_merge_debug_summary(
+    records: List[Dict[str, Any]],
+    anchor_sup: Dict[str, Any],
+) -> Dict[str, Any]:
+    buckets = [_stage3_rec_bucket_norm(r) for r in records]
+    bucket_uniq = {b for b in buckets if b}
+    roles_tr = {(r.get("term_role") or "").strip().lower() for r in records}
+    roles_tr.discard("")
+    ra_roles = {
+        (r.get("role_in_anchor") or "").strip().lower()
+        for r in records
+        if (r.get("role_in_anchor") or "").strip()
+    }
+    expands = [bool(r.get("can_expand") or r.get("can_expand_local") or r.get("can_expand_from_2a")) for r in records]
+    has_t = any(expands)
+    has_f = any(not x for x in expands)
+    risk_union: Set[Any] = set()
+    for r in records:
+        rf = r.get("risk_flags")
+        if isinstance(rf, list):
+            risk_union.update(rf)
+        elif rf is not None:
+            risk_union.add(rf)
+    srcs = sorted(
+        {
+            str(r.get("source_type") or r.get("source") or r.get("origin") or "").strip()
+            for r in records
+            if (r.get("source_type") or r.get("source") or r.get("origin") or "").strip()
+        }
+    )
+    sh = sum(1 for r in records if (r.get("role_in_anchor") or "").strip().lower() == "side")
+    mac = int(anchor_sup.get("mainline_anchor_count") or 0)
+    ac = int(anchor_sup.get("anchor_count") or 0)
+    return {
+        "original_record_count": len(records),
+        "anchors": list(anchor_sup.get("anchors") or []),
+        "sources": srcs,
+        "primary_bucket_conflict": len(bucket_uniq) > 1,
+        "term_role_conflict": len(roles_tr) > 1,
+        "role_in_anchor_conflict": len(ra_roles) > 1,
+        "mainline_side_conflict": ("mainline" in ra_roles and "side" in ra_roles),
+        "can_expand_conflict": bool(has_t and has_f and len(records) > 1),
+        "cross_anchor_side_only": bool(ac >= 2 and mac == 0 and sh > 0),
+        "risk_flags_union": sorted(str(x) for x in risk_union),
+        "legacy_compatibility_mirror_fields": [
+            "primary_bucket",
+            "primary_reason",
+            "term_role",
+            "role_in_anchor",
+            "can_expand",
+            "can_expand_from_2a",
+            "can_expand_local",
+            "fallback_primary",
+            "mainline_candidate",
+        ],
+        "note": "TODO(Stage3 merge): legacy mirrors derived; global rerank 应消费 *_summary / *_list。",
+    }
+
+
+def _stage3_merge_has_primary_support_flags(records: List[Dict[str, Any]]) -> Tuple[bool, bool]:
+    hp = False
+    hs = False
+    for r in records:
+        tr = (r.get("term_role") or "").strip().lower()
+        st = (r.get("source_type") or r.get("source") or r.get("origin") or "").strip().lower()
+        if tr == "primary" or st == "similar_to":
+            hp = True
+        else:
+            hs = True
+    return hp, hs
+
+
+def _stage3_finalize_merged_candidate(obj: Dict[str, Any], representative_rec: Any) -> None:
+    """
+    单 tid 多来源 → 一条 merged record：证据聚合 + legacy compatibility mirror（derived，非 winner 单条语义）。
+    representative 仅补非语义字段；primary_bucket / term_role / can_expand 等一律由聚合推导。
+    """
+    records = list(obj.get("records") or [])
+    obj["source_evidence_list"] = [_stage3_merge_source_evidence_slice(r) for r in records]
+    obj["stage2_local_meta_list"] = [dict(r.get("stage2_local_meta") or {}) for r in records]
+
+    pb_summary = _stage3_merge_primary_bucket_summary(records)
+    derived_pb_lower = (pb_summary.get("derived_primary_bucket") or "").strip().lower()
+    anchor_sup = _stage3_merge_anchor_support_summary(records)
+    prov = _stage3_merge_provenance_summary(records)
+    term_role_dist = _stage3_merge_role_distribution(records)
+    dbg = _stage3_merge_debug_summary(records, anchor_sup)
+
+    role_ia_set = sorted(
+        {
+            (r.get("role_in_anchor") or "").strip().lower()
+            for r in records
+            if (r.get("role_in_anchor") or "").strip()
+        }
+    )
+    anchor_role_dist_flat: Dict[str, List[str]] = {}
+    for r in records:
+        pa = (r.get("parent_anchor") or "").strip()
+        ra = (r.get("role_in_anchor") or "").strip().lower()
+        if not pa or not ra:
+            continue
+        anchor_role_dist_flat.setdefault(pa, []).append(ra)
+    for pa in list(anchor_role_dist_flat.keys()):
+        anchor_role_dist_flat[pa] = sorted(set(anchor_role_dist_flat[pa]))
+
+    can_expand = any(
+        bool(r.get("can_expand") or r.get("can_expand_local") or r.get("can_expand_from_2a")) for r in records
+    )
+    can_expand_from_2a = any(bool(r.get("can_expand_from_2a")) for r in records)
+    can_expand_local = any(bool(r.get("can_expand_local")) for r in records)
+    mainline_candidate = any(bool(r.get("mainline_candidate")) for r in records)
+    fallback_primary = bool(obj.get("fallback_primary_all", False))
+
+    derived_term_role = _stage3_merge_derived_term_role(records, term_role_dist)
+    mh = sum(1 for r in records if (r.get("role_in_anchor") or "").strip().lower() == "mainline")
+    sh = sum(1 for r in records if (r.get("role_in_anchor") or "").strip().lower() == "side")
+    if mh > 0:
+        derived_role_in_anchor = "mainline"
+    elif sh > 0:
+        derived_role_in_anchor = "side"
+    else:
+        derived_role_in_anchor = ""
+
+    hp, hs = _stage3_merge_has_primary_support_flags(records)
+
+    if representative_rec:
+        for k, v in representative_rec.items():
+            if k in _STAGE3_MERGE_NEVER_FROM_REPRESENTATIVE:
+                continue
+            obj[k] = v
+
+    obj["primary_bucket_summary"] = pb_summary
+    obj["anchor_support_summary"] = anchor_sup
+    obj["provenance_summary"] = prov
+    obj["merge_debug_summary"] = dbg
+    obj["term_role_distribution"] = term_role_dist
+    obj["role_in_anchor_set"] = role_ia_set
+    obj["anchor_role_distribution"] = dict(sorted(anchor_role_dist_flat.items()))
+
+    obj["primary_bucket"] = _stage3_merge_pick_display_primary_bucket(records, derived_pb_lower)
+    obj["primary_reason"] = _stage3_merge_pick_primary_reason(records, derived_pb_lower)
+    obj["term_role"] = derived_term_role
+    obj["role_in_anchor"] = derived_role_in_anchor
+    obj["can_expand"] = can_expand
+    obj["can_expand_from_2a"] = can_expand_from_2a
+    obj["can_expand_local"] = can_expand_local
+    obj["mainline_candidate"] = mainline_candidate
+    obj["fallback_primary"] = fallback_primary
+    obj["has_primary_role"] = hp
+    obj["has_support_role"] = hs
+    obj["stage3_merge_source"] = "evidence_aggregate_v1"
+    # legacy 单字段：优先与 derived bucket 对齐的一条 meta，非 seed 冠军；完整证据见 stage2_local_meta_list
+    legacy_meta: Dict[str, Any] = {}
+    for r in records:
+        if _stage3_rec_bucket_norm(r) == derived_pb_lower:
+            m = r.get("stage2_local_meta")
+            if isinstance(m, dict) and m:
+                legacy_meta = dict(m)
+                break
+    if not legacy_meta:
+        for r in records:
+            m = r.get("stage2_local_meta")
+            if isinstance(m, dict) and m:
+                legacy_meta = dict(m)
+                break
+    obj["stage2_local_meta"] = legacy_meta
+    obj.pop("fallback_primary_all", None)
+
+
 def _print_stage3_duplicate_merge_audit(merged: List[Dict[str, Any]]) -> None:
-    """多锚 tid：逐条列出各来源 raw 字段与合并后口径，定位 merge 是否盖掉强主线证据。"""
+    """多锚 tid：raw 来源分布 vs 聚合摘要 vs legacy derived mirrors（非单胜者叙事）。"""
     if not STAGE3_DUPLICATE_MERGE_AUDIT or not merged:
         return
     lines_printed = 0
@@ -1091,23 +1805,55 @@ def _print_stage3_duplicate_merge_audit(merged: List[Dict[str, Any]]) -> None:
         term = (obj.get("term") or "").strip()
         if lines_printed == 0:
             print("\n" + "-" * 80)
-            print("[Stage3 duplicate merge audit] anchor_count>=2：raw 来源 vs 合并后 term 级语义")
+            print("[Stage3 duplicate merge audit] anchor_count>=2：来源分布 / 聚合摘要 / legacy mirror（derived）")
             print("-" * 80)
         lines_printed += 1
         recs = obj.get("records") or []
-        raw_pb = [((r.get("primary_bucket") or "")) for r in recs]
+        raw_pb = [_stage3_rec_bucket_norm(r) or (r.get("primary_bucket") or "") for r in recs]
         raw_roles = [((r.get("role_in_anchor") or "")) for r in recs]
-        raw_ce = [bool(r.get("can_expand") or r.get("can_expand_from_2a")) for r in recs]
+        raw_ce = [
+            bool(r.get("can_expand") or r.get("can_expand_local") or r.get("can_expand_from_2a"))
+            for r in recs
+        ]
+        pbs = obj.get("primary_bucket_summary") or {}
+        adb = obj.get("anchor_support_summary") or {}
+        mdbg = obj.get("merge_debug_summary") or {}
+        prov = obj.get("provenance_summary") or {}
         print(f"term={term!r} tid={obj.get('tid')} records={len(recs)}")
         print(f"  parent_anchors={obj.get('parent_anchors')!r}")
-        print(f"  primary_buckets_raw={raw_pb!r}")
+        print(f"  primary_buckets_raw(norm/meta)={raw_pb!r}")
         print(f"  role_in_anchor_raw={raw_roles!r}")
-        print(f"  can_expand_raw={raw_ce!r}")
+        print(f"  can_expand_raw(any local)={raw_ce!r}")
         print(
-            f"  merged_primary_bucket={obj.get('primary_bucket')!r} "
-            f"merged_can_expand={bool(obj.get('can_expand'))} "
-            f"merged_role_in_anchor={obj.get('role_in_anchor')!r} "
-            f"merged_term_role={obj.get('term_role')!r}"
+            f"  bucket_distribution={pbs.get('bucket_distribution')!r} "
+            f"derived_primary_bucket={pbs.get('derived_primary_bucket')!r}"
+        )
+        print(
+            f"  anchor_roles={adb.get('anchor_roles')!r} "
+            f"mainline_anchor_count={adb.get('mainline_anchor_count')} "
+            f"side_anchor_count={adb.get('side_anchor_count')} "
+            f"expandable_anchor_count={adb.get('expandable_anchor_count')}"
+        )
+        print(
+            f"  provenance source_type_counts={prov.get('source_type_counts')!r} "
+            f"multi_source={prov.get('multi_source')}"
+        )
+        print(
+            f"  term_role_distribution={obj.get('term_role_distribution')!r} "
+            f"role_in_anchor_set={obj.get('role_in_anchor_set')!r}"
+        )
+        print(
+            f"  merge_conflicts: bucket={mdbg.get('primary_bucket_conflict')} "
+            f"term_role={mdbg.get('term_role_conflict')} "
+            f"ria={mdbg.get('role_in_anchor_conflict')} "
+            f"mainline_side={mdbg.get('mainline_side_conflict')} "
+            f"cross_anchor_side_only={mdbg.get('cross_anchor_side_only')}"
+        )
+        print(
+            f"  legacy_mirror primary_bucket={obj.get('primary_bucket')!r} "
+            f"can_expand={bool(obj.get('can_expand'))} "
+            f"role_in_anchor={obj.get('role_in_anchor')!r} "
+            f"term_role={obj.get('term_role')!r}"
         )
         print(
             f"  merge_source={obj.get('stage3_merge_source')!r} "
@@ -1119,16 +1865,16 @@ def _print_stage3_duplicate_merge_audit(merged: List[Dict[str, Any]]) -> None:
 
 def _merge_stage3_duplicates(raw_candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    按 tid 聚合同一词的多个候选，保留多来源结构信息，供 Stage3 分层与准入使用。
-    合并后保留：anchor_count, evidence_count, family_keys, source_types, parent_anchors, parent_primaries,
-    mainline_hits, side_hits、best_* 标量等。
+    按 tid 聚合同一学术 candidate 的多条 Stage2 记录 → 单条 merged candidate（多锚证据聚合）。
 
-    **语义字段（term 级）**：`primary_bucket` / `primary_reason` 按 **STAGE3_PRIMARY_BUCKET_MERGE_PRIORITY** 取最强一条；
-    `mainline_candidate`、`can_expand_local`、`can_expand`、`can_expand_from_2a` 为来源间 **OR**；
-    `fallback_primary` 仅当 **每条来源** 均为 fallback 时为 True；
-    `role_in_anchor` **任一为 mainline 则 mainline**；`term_role` 按 **STAGE3_TERM_ROLE_MERGE_PRIORITY** 取最强。
-    其余字段仍来自 **seed 分最高** 的记录（同分则 **primary_bucket 优先级更高** 者优先），避免再出现
-    「anchor_count=2 但 primary_bucket 只剩 risky_keep」的继承撕裂。
+    TODO(Stage3 merge)：由 winner-snapshot 迁移为 evidence-aggregate。
+    - `source_evidence_list` / `stage2_local_meta_list` / `*_summary` 为后续 global coherence rerank 的主材料。
+    - 顶层 `primary_bucket` / `term_role` / `can_expand` / `role_in_anchor` 等为 **legacy compatibility mirror**，
+      一律由组内全体记录 **推导**，不再由单条 seed 冠军覆盖语义。
+    - 非语义标量（如 src_vids）仍可从 seed 分最高的 representative 行补齐（见 _STAGE3_MERGE_NEVER_FROM_REPRESENTATIVE）。
+
+    合并后主链仍消费：`anchor_count`, `evidence_count`, `family_keys`, `source_types`, `parent_anchors`,
+    `parent_primaries`, `mainline_hits`, `side_hits`, `best_*` 及上述 mirror 字段。
     """
     bucket: Dict[int, Dict[str, Any]] = {}
     for rec in raw_candidates:
@@ -1155,21 +1901,9 @@ def _merge_stage3_duplicates(raw_candidates: List[Dict[str, Any]]) -> List[Dict[
                 "source_types": set(),
                 "term_roles": set(),
                 "family_keys": set(),
-                "anchor_count": 0,
-                "evidence_count": 0,
                 "mainline_hits": 0,
                 "side_hits": 0,
-                "has_primary_role": False,
-                "has_support_role": False,
-                "role_in_anchor": "",
-                "can_expand": False,
-                "can_expand_from_2a": False,
-                "primary_bucket": "",
-                "primary_reason": "",
-                "mainline_candidate": False,
-                "can_expand_local": False,
                 "fallback_primary_all": True,
-                "term_role": "",
                 "retain_mode": "normal",
                 "polysemy_risk": 0.0,
                 "object_like_risk": 0.0,
@@ -1216,61 +1950,28 @@ def _merge_stage3_duplicates(raw_candidates: List[Dict[str, Any]]) -> List[Dict[
             obj["source_types"].add(st)
         if tr:
             obj["term_roles"].add(tr)
+        fk = rec.get("family_key")
+        if fk:
+            obj["family_keys"].add(str(fk))
         if role_anchor == "mainline":
             obj["mainline_hits"] = obj.get("mainline_hits", 0) + 1
         elif role_anchor:
             obj["side_hits"] = obj.get("side_hits", 0) + 1
-        if tr == "primary" or st == "similar_to":
-            obj["has_primary_role"] = True
-        else:
-            obj["has_support_role"] = True
-        if rec.get("can_expand"):
-            obj["can_expand"] = True
-        if rec.get("can_expand_from_2a"):
-            obj["can_expand_from_2a"] = True
-            obj["can_expand"] = True
         rm = (rec.get("retain_mode") or "normal").strip().lower()
         if rm == "normal":
             obj["retain_mode"] = "normal"
-
-        # ---- 结构语义：多源聚合，禁止被「单条 best seed」覆盖冲淡 ----
-        cur_pb = (rec.get("primary_bucket") or "").strip().lower()
-        best_pb = (obj.get("primary_bucket") or "").strip().lower()
-        if STAGE3_PRIMARY_BUCKET_MERGE_PRIORITY.get(cur_pb, 0) > STAGE3_PRIMARY_BUCKET_MERGE_PRIORITY.get(
-            best_pb, 0
-        ):
-            obj["primary_bucket"] = rec.get("primary_bucket") or ""
-            obj["primary_reason"] = rec.get("primary_reason") or obj.get("primary_reason") or ""
-
-        obj["mainline_candidate"] = bool(
-            obj.get("mainline_candidate", False) or rec.get("mainline_candidate", False)
-        )
-        obj["can_expand_local"] = bool(
-            obj.get("can_expand_local", False) or rec.get("can_expand_local", False)
-        )
         obj["fallback_primary_all"] = bool(obj.get("fallback_primary_all", True)) and bool(
             rec.get("fallback_primary", False)
         )
 
-        cur_tr = (rec.get("term_role") or "").strip().lower()
-        prev_tr = (obj.get("term_role") or "").strip().lower()
-        if STAGE3_TERM_ROLE_MERGE_PRIORITY.get(cur_tr, 0) > STAGE3_TERM_ROLE_MERGE_PRIORITY.get(
-            prev_tr, 0
-        ):
-            obj["term_role"] = rec.get("term_role") or ""
-
-        if role_anchor == "mainline":
-            obj["role_in_anchor"] = "mainline"
-        elif role_anchor and (obj.get("role_in_anchor") or "").strip().lower() != "mainline":
-            obj["role_in_anchor"] = rec.get("role_in_anchor") or role_anchor
-
+        cur_pb = _stage3_rec_bucket_norm(rec)
         prev_sc = float(obj.get("_merge_best_seed_sc", -1.0))
         if seed_sc > prev_sc:
             obj["_merge_best_seed_sc"] = seed_sc
             obj["_merge_best_seed_rec"] = rec
         elif seed_sc == prev_sc and seed_sc >= 0.0:
             old = obj.get("_merge_best_seed_rec") or {}
-            old_pb = (old.get("primary_bucket") or "").strip().lower()
+            old_pb = _stage3_rec_bucket_norm(old)
             if STAGE3_PRIMARY_BUCKET_MERGE_PRIORITY.get(cur_pb, 0) > STAGE3_PRIMARY_BUCKET_MERGE_PRIORITY.get(
                 old_pb, 0
             ):
@@ -1280,16 +1981,6 @@ def _merge_stage3_duplicates(raw_candidates: List[Dict[str, Any]]) -> List[Dict[
     for tid, obj in bucket.items():
         best_rec = obj.pop("_merge_best_seed_rec", None)
         obj.pop("_merge_best_seed_sc", None)
-        if best_rec:
-            for k, v in best_rec.items():
-                if k in _STAGE3_MERGE_SKIP_KEYS or k in _STAGE3_MERGE_STRUCTURE_FIELDS:
-                    continue
-                obj[k] = v
-
-        obj["fallback_primary"] = bool(obj.get("fallback_primary_all", False))
-        obj.pop("fallback_primary_all", None)
-        obj["stage3_merge_source"] = "strongest_bucket_aggregate"
-
         obj["parent_anchors"] = sorted(obj["parent_anchors"])
         obj["parent_primaries"] = sorted(obj["parent_primaries"])
         obj["source_types"] = sorted(obj["source_types"])
@@ -1298,10 +1989,7 @@ def _merge_stage3_duplicates(raw_candidates: List[Dict[str, Any]]) -> List[Dict[
         obj["anchor_count"] = len(obj["parent_anchors"])
         obj["evidence_count"] = len(obj["records"])
         obj["best_stage2_score"] = obj.get("best_stage2_score") or obj.get("best_seed_score") or 0.0
-        if not obj.get("role_in_anchor") and obj.get("mainline_hits", 0) > 0:
-            obj["role_in_anchor"] = "mainline"
-        if not obj.get("role_in_anchor"):
-            obj["role_in_anchor"] = "side" if obj.get("side_hits", 0) > 0 else ""
+        _stage3_finalize_merged_candidate(obj, best_rec)
         merged.append(obj)
     merged.sort(key=lambda x: float(x.get("best_seed_score") or 0.0), reverse=True)
     _print_stage3_duplicate_merge_audit(merged)
@@ -3590,25 +4278,34 @@ def select_terms_for_paper_recall(
     return selected
 
 
-def stage3_build_score_map(survivors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def stage3_build_score_map(survivors: List[Dict[str, Any]], recall: Any = None) -> List[Dict[str, Any]]:
     """
-    Stage3 第二段（重写）：**统一连续分**，取代原 bucket / primary_support_* / conditioned_only 链式乘子。
+    Stage3 第二段：**Global Coherence Rerank** 主分（四分项）+ 小幅 legacy unified blend；
+    `stage3_bucket` **仅在**本段 `final_score` 定稿后再赋值，仅作角色映射/观测。
 
-    - **已移除**：score_mult、按桶 cross_bonus、risky 额外乘子、support 子类分档等一切「走分支再乘」的逻辑。
-    - **保留观测**：`stage3_bucket` 仍由 `_assign_stage3_bucket` 写入，仅用于日志与下游 `paper_primary`/`paper_support` 软区分，**不**再决定能不能进 paper。
-    - **家族约束**：在统一分算完后调用 `_apply_family_role_constraints`，使 primary  Visibility 与连续分尺度一致。
-
-    `stage3_explain.mainline_risk_penalty` / `cross_anchor_score_bonus` 固定为 1.0，兼容依赖字段的旧表。
+    - **主路径**：`stage3_score_breakdown`（local_fit / cross_anchor_coherence / backbone_alignment / risk_penalty）
+      消费 merge 聚合字段与 `candidate_graph.cross_anchor_support_edges`（经 recall 透传）。
+    - **兼容**：`stage3_unified_breakdown` 仍为 legacy 连续分拆解；`mainline_risk_penalty` / `cross_anchor_score_bonus` 置 1.0 兼容旧表。
+    - **家族约束**：统一分算完后 `_apply_family_role_constraints`。
     """
     for rec in survivors:
+        rec["bucket_reason_flags"] = _collect_stage3_bucket_reason_flags(rec)
+
+    for rec in survivors:
         rec["_stage3_pre_adjust_score"] = float(rec.get("final_score") or 0.0)
-        unified, breakdown = _compute_stage3_unified_continuous_score(rec)
-        rec["final_score"] = unified
-        rec["stage3_unified_breakdown"] = breakdown
+        final, gc_bd = _build_stage3_global_coherence_score(rec, recall)
+        rec["final_score"] = final
+        rec["stage3_score_breakdown"] = gc_bd
+        rec["stage3_unified_breakdown"] = gc_bd.get("legacy_unified_breakdown") or {}
         ex = rec.get("stage3_explain") or {}
         ex["mainline_risk_penalty"] = 1.0
         ex["cross_anchor_score_bonus"] = 1.0
-        ex["unified_continuous_score"] = unified
+        ex["unified_continuous_score"] = float(gc_bd.get("legacy_unified_score") or 0.0)
+        ex["global_coherence_pre_blend"] = float(gc_bd.get("gc_pre_blend") or 0.0)
+        ex["local_fit_score"] = float((gc_bd.get("local_fit") or {}).get("score") or 0.0)
+        ex["cross_anchor_coherence_score"] = float((gc_bd.get("cross_anchor_coherence") or {}).get("score") or 0.0)
+        ex["backbone_alignment_score"] = float((gc_bd.get("backbone_alignment") or {}).get("score") or 0.0)
+        ex["risk_penalty_score"] = float((gc_bd.get("risk_penalty") or {}).get("score") or 0.0)
         ex["conditioned_only"] = _stage3_is_conditioned_only(rec)
         rec["stage3_explain"] = ex
 
@@ -3619,13 +4316,17 @@ def stage3_build_score_map(survivors: List[Dict[str, Any]]) -> List[Dict[str, An
     for i, rec in enumerate(survivors):
         rec["stage3_rank"] = i
         rec["bucket_reason_flags"] = _collect_stage3_bucket_reason_flags(rec)
+        rec["stage3_bucket"] = _assign_stage3_bucket(rec)
 
     if STAGE3_UNIFIED_SCORE_DEBUG:
         _print_stage3_unified_breakdown(survivors)
+        _print_stage3_global_coherence_breakdown(survivors)
+    if STAGE3_AUDIT_DEBUG:
+        _print_stage3_risky_coherence_audit(survivors)
 
     if DEBUG_LABEL_PATH:
         print("\n" + "-" * 80)
-        print("[Stage3 rerank summary] unified_continuous + family role constraint")
+        print("[Stage3 rerank summary] global_coherence + family role constraint (bucket post-hoc)")
         print("-" * 80)
         print(
             "rank | term | bucket | primary_bucket | cond_only | anch | ml_hits | can_exp | final"
@@ -3659,7 +4360,19 @@ def _run_stage3_dual_gate(
     raw_candidates: List[Dict[str, Any]],
     query_vector,
     anchor_vids=None,
-) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, float], Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str], List[Dict[str, Any]]]:
+) -> Tuple[
+    Dict[str, float],
+    Dict[str, str],
+    Dict[str, float],
+    Dict[str, str],
+    Dict[str, str],
+    Dict[str, str],
+    Dict[str, str],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+]:
     """
     Stage3 主流程：去重聚合 → 全局共识 → 轻硬过滤 + identity/topic gate → 唯一主分 score_term_record
     → family 角色约束 → risky/bucket → paper_terms 选词。彻底移除 cluster 依赖。
@@ -3758,7 +4471,6 @@ def _run_stage3_dual_gate(
         explain["role_factor"] = role_factor
         rec["stage3_explain"] = explain
         rec["reject_reason"] = ""
-        rec["stage3_bucket"] = _assign_stage3_bucket(rec)
         survivors.append(rec)
 
     if label_trace and topic_gate_bypass_primary_like_count and not STAGE3_DEBUG_FOCUS_TERMS:
@@ -3771,13 +4483,11 @@ def _run_stage3_dual_gate(
     for i, rec in enumerate(survivors):
         rec["stage3_rank"] = i
 
-    # 批注：家族 primary/support 微调挪入 stage3_build_score_map，与统一连续分同尺度叠代，避免「先乘规则链再压家族」双套逻辑
+    # 批注：家族 primary/support 微调挪入 stage3_build_score_map；stage3_bucket 仅在 GC 主分定稿后写入。
 
+    survivors = stage3_build_score_map(survivors, recall)
     for rec in survivors:
         rec["risk_reasons"] = _collect_risky_reasons(rec)
-        rec["bucket_reason_flags"] = _collect_stage3_bucket_reason_flags(rec)
-
-    survivors = stage3_build_score_map(survivors)
 
     # 窄表审计：final adjust → cross-anchor → support/risky（与 STAGE3_DEBUG_FOCUS_TERMS 配合可只看定点词）
     if STAGE3_AUDIT_DEBUG:
@@ -3859,8 +4569,48 @@ def _run_stage3_dual_gate(
         parent_anchor_map=parent_anchor_map,
         parent_primary_map=parent_primary_map,
     )
+    _g = _stage3_get_candidate_graph_from_recall(recall)
+    _xedges = _g.get("cross_anchor_support_edges") if isinstance(_g, dict) else None
+    recall._stage3_last_gc_report = {
+        "stage3_scoring_version": "global_coherence_four_block_v1",
+        "final_formula": (
+            "(1-α)*clamp(w_lf*lf+w_cx*cx+w_bb*bb - w_r*risk_pen,0,1) + α*legacy_unified; "
+            "bucket post-hoc after final_score"
+        ),
+        "alpha_legacy_blend": STAGE3_GC_LEGACY_BLEND,
+        "weights": {
+            "local_fit": STAGE3_GC_W_LOCAL_FIT,
+            "cross_anchor": STAGE3_GC_W_CROSS,
+            "backbone": STAGE3_GC_W_BACKBONE,
+            "risk_scale": STAGE3_GC_W_RISK,
+        },
+        "candidate_graph_cross_edges_non_empty": bool(isinstance(_xedges, list) and len(_xedges) > 0),
+        "aggregate_fields_consumed": [
+            "source_evidence_list",
+            "stage2_local_meta_list",
+            "anchor_support_summary",
+            "provenance_summary",
+            "primary_bucket_summary",
+            "merge_debug_summary",
+        ],
+        "survivor_count": len(survivors),
+    }
+    if getattr(recall, "debug_info", None) is not None:
+        recall.debug_info.stage3_last_gc_report = recall._stage3_last_gc_report  # type: ignore[attr-defined]
     recall.debug_info.dropped_with_reason = dropped_with_reason
-    return score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map, paper_terms
+    return (
+        score_map,
+        term_map,
+        idf_map,
+        term_role_map,
+        term_source_map,
+        parent_anchor_map,
+        parent_primary_map,
+        paper_terms,
+        core_terms_list,
+        support_terms_list,
+        risky_terms_list,
+    )
 
 
 def _debug_print_stage3_output(
@@ -3952,30 +4702,178 @@ def _debug_print_stage3_output(
             print(f"  ... 共 {len(paper_terms)} 条")
 
 
+def _stage2_candidate_graph_non_empty(candidate_graph: Dict[str, Any]) -> bool:
+    """True when Stage2 graph carries at least one non-empty edge bucket (attach-only signal; scoring may still ignore it)."""
+    if not candidate_graph:
+        return False
+    for key in (
+        "same_anchor_edges",
+        "cross_anchor_support_edges",
+        "family_edges",
+        "provenance_edges",
+    ):
+        edges = candidate_graph.get(key)
+        if isinstance(edges, list) and len(edges) > 0:
+            return True
+        if isinstance(edges, dict) and len(edges) > 0:
+            return True
+    return False
+
+
+def _legacy_selected_core_rows_from_maps(
+    score_map: Dict[str, float], term_map: Dict[str, str]
+) -> List[Dict[str, Any]]:
+    """TODO(Stage3 contract): legacy _calculate_final_weights has no buckets; approximate core list as sorted survivors."""
+    rows: List[Dict[str, Any]] = []
+    for tid_str, sc in sorted(score_map.items(), key=lambda x: -float(x[1] or 0.0)):
+        tid_raw: Any = tid_str
+        try:
+            tid_raw = int(tid_str)
+        except (TypeError, ValueError):
+            pass
+        rows.append(
+            {
+                "tid": tid_raw,
+                "term": term_map.get(tid_str, ""),
+                "final_score": float(sc or 0.0),
+            }
+        )
+    return rows
+
+
 def run_stage3(
     recall,
-    raw_candidates: List[Dict[str, Any]],
+    stage2_output: Dict[str, Any],
     query_vector,
     anchor_vids=None,
-) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, float], Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str], List[Dict[str, Any]]]:
+) -> Dict[str, Any]:
     """
-    阶段 3：词权重。
-    若候选含 term_role/identity_score（Stage2 新格式），走双闸门路径并返回 paper_terms（family 保送式选词）；否则走原有 _calculate_final_weights。
-    返回 score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map, paper_terms。
-    """
-    if not raw_candidates:
-        return {}, {}, {}, {}, {}, {}, {}, []
+    Stage3（Global Coherence Rerank）：消费 Stage2 结构化契约，返回结构化 dict。
 
-    use_dual_gate = (
+    TODO(Stage3 contract): 本版为「壳层契约迁移」，打分/合并/准入仍以既有实现为主；
+    candidate_graph / anchor_to_candidates 仅正式接入并下传，全局图重排留待后续迭代。
+
+    入参 stage2_output 须含：all_candidates, anchor_to_candidates, candidate_graph, stage2_report。
+
+    返回字段（稳定口径）：selected_core_terms, selected_support_terms, risky_terms,
+    paper_terms, global_coherence_report；另保留 score_map / term_map / … 供主链与 Stage4 薄适配。
+    """
+    # --- unpack stage2 output ---
+    if not isinstance(stage2_output, dict):
+        raise TypeError(
+            "run_stage3 expects stage2_output: dict (Stage2 contract), "
+            f"got {type(stage2_output).__name__}"
+        )
+    _required_keys = (
+        "all_candidates",
+        "anchor_to_candidates",
+        "candidate_graph",
+        "stage2_report",
+    )
+    _missing = [k for k in _required_keys if k not in stage2_output]
+    if _missing:
+        raise KeyError(
+            "stage2_output missing required Stage2 contract keys "
+            f"{_missing}; required={list(_required_keys)}"
+        )
+
+    all_candidates: List[Dict[str, Any]] = stage2_output["all_candidates"]
+    anchor_to_candidates: Dict[str, Any] = stage2_output["anchor_to_candidates"]
+    candidate_graph: Dict[str, Any] = stage2_output["candidate_graph"]
+    stage2_report: Dict[str, Any] = stage2_output["stage2_report"]
+
+    if not isinstance(all_candidates, list):
+        raise TypeError(
+            f"stage2_output['all_candidates'] must be list, got {type(all_candidates).__name__}"
+        )
+    if not isinstance(anchor_to_candidates, dict):
+        raise TypeError(
+            f"stage2_output['anchor_to_candidates'] must be dict, got {type(anchor_to_candidates).__name__}"
+        )
+    if not isinstance(candidate_graph, dict):
+        raise TypeError(
+            f"stage2_output['candidate_graph'] must be dict, got {type(candidate_graph).__name__}"
+        )
+    if not isinstance(stage2_report, dict):
+        raise TypeError(
+            f"stage2_output['stage2_report'] must be dict, got {type(stage2_report).__name__}"
+        )
+
+    graph_non_empty = _stage2_candidate_graph_non_empty(candidate_graph)
+    anchor_map_non_empty = bool(anchor_to_candidates)
+
+    # 向下透传（供后续 _merge_stage3_duplicates / global rerank 使用；本版不在此消费图结构）
+    _pass_through = {
+        "anchor_to_candidates": anchor_to_candidates,
+        "candidate_graph": candidate_graph,
+        "stage2_report": stage2_report,
+    }
+    setattr(recall, "_stage3_stage2_context", _pass_through)
+    if getattr(recall, "debug_info", None) is not None:
+        recall.debug_info.stage2_contract_pass_through = _pass_through  # type: ignore[attr-defined]
+
+    notes: List[str] = [
+        "TODO(Stage3 contract): shell migration; merge/rerank still legacy unless dual_gate path.",
+    ]
+    candidate_count_in = len(all_candidates)
+
+    if not all_candidates:
+        empty_report = {
+            "stage3_version": "contract_refactor_v1",
+            "candidate_count_in": 0,
+            "core_count": 0,
+            "support_count": 0,
+            "risky_count": 0,
+            "paper_term_count": 0,
+            "used_candidate_graph": graph_non_empty,
+            "used_anchor_to_candidates": anchor_map_non_empty,
+            "notes": notes + ["empty all_candidates"],
+            "stage3_scoring_meta": None,
+        }
+        return {
+            "selected_core_terms": [],
+            "selected_support_terms": [],
+            "risky_terms": [],
+            "paper_terms": [],
+            "global_coherence_report": empty_report,
+            "score_map": {},
+            "term_map": {},
+            "idf_map": {},
+            "term_role_map": {},
+            "term_source_map": {},
+            "parent_anchor_map": {},
+            "parent_primary_map": {},
+        }
+
+    # --- prepare candidates for stage3 ---
+    raw_candidates = all_candidates
+
+    use_dual_gate = bool(
         raw_candidates
         and ("term_role" in raw_candidates[0] or "identity_score" in raw_candidates[0])
     )
+    selected_core_terms: List[Dict[str, Any]] = []
+    selected_support_terms: List[Dict[str, Any]] = []
+    risky_terms: List[Dict[str, Any]] = []
     paper_terms: List[Dict[str, Any]] = []
+
+    # --- merge / filter / rerank with existing logic (temporary) ---
     if use_dual_gate:
-        score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map, paper_terms = _run_stage3_dual_gate(
-            recall, raw_candidates, query_vector, anchor_vids=anchor_vids
-        )
+        (
+            score_map,
+            term_map,
+            idf_map,
+            term_role_map,
+            term_source_map,
+            parent_anchor_map,
+            parent_primary_map,
+            paper_terms,
+            selected_core_terms,
+            selected_support_terms,
+            risky_terms,
+        ) = _run_stage3_dual_gate(recall, raw_candidates, query_vector, anchor_vids=anchor_vids)
     else:
+        recall._stage3_last_gc_report = None
         score_map, term_map, idf_map = recall._calculate_final_weights(
             raw_candidates, query_vector, anchor_vids=anchor_vids
         )
@@ -3983,6 +4881,11 @@ def run_stage3(
         term_source_map = {}
         parent_anchor_map = {}
         parent_primary_map = {}
+        # --- select core / support / risky（legacy：无 bucket，core≈全部加权幸存者，support/risky 空）---
+        selected_core_terms = _legacy_selected_core_rows_from_maps(score_map, term_map)
+        selected_support_terms = []
+        risky_terms = []
+        notes.append("legacy_path:_calculate_final_weights_no_stage3_buckets")
 
     # verbose 调试：Stage3 已移除 cluster 列，改用 anchor_count / evidence_count / family_centrality / path_topic_consistency / generic_penalty / cross_anchor_factor / retrieval_role
     if STAGE3_OBSERVABILITY_PANEL_DEBUG and recall.verbose and score_map and getattr(recall, "_last_tag_purity_debug", None):
@@ -4041,5 +4944,31 @@ def run_stage3(
                 f"gen={_f(d.get('generic_penalty'),6):>6}  cross={_f(d.get('cross_anchor_factor'),6):>6}  final={score_map.get(tid, 0.0):.6f}"
             )
 
-    return score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map, paper_terms
+    # --- build global_coherence_report & structured return ---
+    global_coherence_report: Dict[str, Any] = {
+        "stage3_version": "contract_refactor_v1",
+        "candidate_count_in": candidate_count_in,
+        "core_count": len(selected_core_terms),
+        "support_count": len(selected_support_terms),
+        "risky_count": len(risky_terms),
+        "paper_term_count": len(paper_terms),
+        "used_candidate_graph": graph_non_empty,
+        "used_anchor_to_candidates": anchor_map_non_empty,
+        "notes": notes,
+        "stage3_scoring_meta": getattr(recall, "_stage3_last_gc_report", None),
+    }
+    return {
+        "selected_core_terms": selected_core_terms,
+        "selected_support_terms": selected_support_terms,
+        "risky_terms": risky_terms,
+        "paper_terms": paper_terms,
+        "global_coherence_report": global_coherence_report,
+        "score_map": score_map,
+        "term_map": term_map,
+        "idf_map": idf_map,
+        "term_role_map": term_role_map,
+        "term_source_map": term_source_map,
+        "parent_anchor_map": parent_anchor_map,
+        "parent_primary_map": parent_primary_map,
+    }
 

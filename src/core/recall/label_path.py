@@ -1518,12 +1518,14 @@ class LabelRecallPath:
                 out[tid_str] = 0.80
         return out
 
-    def _stage3_word_weights(self, raw_candidates, query_vector, anchor_vids=None):
+    def _stage3_word_weights(self, stage2_output, query_vector, anchor_vids=None):
         """
-        阶段 3：词权重。统一走复杂公式（领域纯度、共鸣、语义守门、锚点距离门控等），无分支例外。
-        返回: (score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map)。
+        阶段 3：Global Coherence Rerank / 词权重。消费 Stage2 结构化输出 dict，返回 Stage3 结构化 dict
+        （含 selected_* / paper_terms / global_coherence_report 及 score_map 等薄兼容字段）。
         """
-        return stage3_term_filtering.run_stage3(self, raw_candidates, query_vector, anchor_vids=anchor_vids)
+        return stage3_term_filtering.run_stage3(
+            self, stage2_output, query_vector, anchor_vids=anchor_vids
+        )
 
     def _stage4_graph_search(
         self,
@@ -1749,16 +1751,21 @@ class LabelRecallPath:
                         "[Stage2A 双路来源] n=%s（逐行开 STAGE2_NOISY_DEBUG）" % len(breakdown)
                     )
 
-        # 阶段 3：词权重（统一走复杂公式，传入锚点 ID 供锚点距离门控）
+        # 阶段 3：词权重 / 全局一致性重排（结构化契约：吃 stage2_output、吐 dict）
         anchor_vids = [int(k) for k in anchor_skills.keys()] if anchor_skills else None
         stage3_out = self._stage3_word_weights(
-            raw_candidates, query_vector, anchor_vids=anchor_vids
+            stage2_output, query_vector, anchor_vids=anchor_vids
         )
-        if len(stage3_out) == 8:
-            score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map, paper_terms = stage3_out
-        else:
-            score_map, term_map, idf_map, term_role_map, term_source_map, parent_anchor_map, parent_primary_map = stage3_out
-            paper_terms = []
+        score_map = stage3_out["score_map"]
+        term_map = stage3_out["term_map"]
+        idf_map = stage3_out["idf_map"]
+        term_role_map = stage3_out["term_role_map"]
+        term_source_map = stage3_out["term_source_map"]
+        parent_anchor_map = stage3_out["parent_anchor_map"]
+        parent_primary_map = stage3_out["parent_primary_map"]
+        paper_terms = stage3_out["paper_terms"]
+        if isinstance(debug_1, dict):
+            debug_1["stage3_global_coherence_report"] = stage3_out.get("global_coherence_report")
         checkpoints.append({"stage": "S3", "score_map_terms": len(score_map or {}), "ok": bool(score_map)})
         t_s3 = time.time()
         s3_ms = (t_s3 - t_s2) * 1000

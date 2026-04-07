@@ -4,6 +4,48 @@
 
 ---
 
+## 零、实施状态快照（与当前代码对齐，便于对照计划勾选）
+
+> 下列条目随仓库演进更新；**Stage2 以第二节验收 2.7 为口径**。
+
+### 0.1 Stage1（与重构纲领相邻、主链已稳定的部分）
+
+| 项目 | 状态 | 现状说明 |
+|------|------|----------|
+| JD 早期粗分型 | **已完成** | `build_jd_coarse_roles_map` → `recall._jd_coarse_roles`，在 `extract_anchor_skills` 之前写入。 |
+| 锚点分层修正 | **已完成** | `refine_stage1_anchor_layers`：主/辅/上下文、`final_anchor_score`（向量补充封顶、context 帽）、`anchor_type` 流程化修正。 |
+| context_only 剥离 | **已完成** | `_strip_context_only_from_anchor_skills` → `recall._stage1_context_only_anchors`。 |
+| `jd_profile` 查询 | **已完成** | `build_jd_hierarchy_profile`：多锚点单次 `IN` + Python 侧每锚 top-k，等价原 per-anchor Cypher。 |
+| `Stage1Result` | **已完成** | `recall._last_stage1_result` 含 `jd_profile` 等，供调试与后续解耦。 |
+
+### 0.2 Stage2（第二节数据契约）
+
+| 第二节 / P0.1 要点 | 状态 | 现状说明 |
+|-------------------|------|----------|
+| **`run_stage2` 返回 `dict`** | **已完成** | 键：`all_candidates`、`anchor_to_candidates`、`candidate_graph`、`stage2_report`。 |
+| **主链消费方式** | **过渡期** | `LabelRecallPath.recall` 仅取 **`stage2_output["all_candidates"]`** 作为 Stage3 的 `raw_candidates`；**`candidate_graph` / 结构化 `anchor_to_candidates` 尚未接入 Stage3**。 |
+| **2.3 字段分层** | **大部分完成** | `_expanded_to_raw_candidates`：provisional 写入 **`stage2_local_meta`**；顶层为证据类字段 + **`risk_flags`**、`landing_confidence` / `expansion_confidence`。 |
+| **2.3 顶层禁止强 provisional** | **部分完成** | **仍保留 legacy 顶层镜像**（`primary_bucket`、`term_role` 等）以便 **`run_stage3` / `_merge_stage3_duplicates` 不改即跑**；与代码注释 TODO 一致，**待 Stage3 迁移后删除**。 |
+| **2.4 `anchor_to_candidates`** | **部分完成** | **`_organize_anchor_to_candidates`** 产出带 `landing_candidates` / `expansion_candidates` / `summary` 的节点视图；**分组键**优先 `anchor_id`，缺省回退 **`anchor_term` / `parent_anchor`**（与第二节「key 必须为 anchor_id」的严格版相比仍为**过渡实现**）。**Landing/expansion 槽位**由 **`_rec_goes_to_expansion_slot`** 近似归类，非 2A/2B 显式字段直通。 |
+| **2.5 `candidate_graph` MUV** | **已完成（首版）** | **`build_stage2_candidate_graph`**：四类边键齐全；门控与权重为保守近似，可非空（视数据而定）。 |
+| **2.6 `stage2_report`** | **最小版已完成** | **`_build_stage2_report_min`**：`anchor_count`、`candidate_count`、`landing_candidate_count`、`expansion_candidate_count`、`source_distribution`、`per_anchor_stats`、`graph_edge_counts`。**尚未包含** 第二节表格中的 **`risk_flag_distribution`**（可并入后续迭代）。 |
+| **2.7 验收 1–4** | **见上** | dict 与四键、分层与 meta 语义已落地；**验收 3 的「不得再作为顶层强逻辑」因兼容镜像未算完全净场**。 |
+| **2.7 验收 5–6** | **部分对齐** | **未**单独实现 **`topk_landing_per_anchor` 参数化截断**；槽位为近似 split。 |
+| **2.7 验收 8–9** | **已完成** | Stage2 不对外主契约输出 core/support/risky 分桶或终局 `paper_terms`。 |
+| **`convert_stage2_candidates_to_records` 重命名**（P1） | **未做** | 仍以 **`_expanded_to_raw_candidates`** 为名；旧名 wrapper 未加。 |
+
+### 0.3 Stage3 / Stage4（本文第四节 P0.2–P0.3 及以后）
+
+| 项目 | 状态 | 说明 |
+|------|------|------|
+| **`run_stage3` 消费 `candidate_graph`** | **未做** | 入参仍为平铺 `raw_candidates` 列表。 |
+| **`run_stage3` / `run_stage4` 返回 dict 契约** | **未做** | 仍为既有签名与返回值形态。 |
+| P1–P3（merge 重命名、审计迁出等） | **未做** | 按计划排队。 |
+
+**一句话**：**Stage2 的结构化出口与图/report 首版已在代码中落地**；**Stage3/4 仍按旧契约运行**，后续工作重点是 **去掉 Stage2 顶层镜像、让 Stage3 显式消费 dict + graph**，并完成 P0.2–P0.3。
+
+---
+
 ## 一、修改纲领
 
 ### 1.1 职责边界（三层模型）

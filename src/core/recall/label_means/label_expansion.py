@@ -3229,9 +3229,9 @@ def _finalize_stage2b_seed_tiers(
 ) -> Tuple[List["Stage2ACandidate"], List["Stage2ACandidate"], List["Stage2ACandidate"], List["Stage2ACandidate"]]:
     """
     2A 只负责分层；此处把 **Stage2B seed 资格**收紧为：
-    - primary_expandable → tier=strong（唯一强 seed）
+    - primary_expandable → tier=strong（可多 strong，2B 对每 seed 分别扩散）
     - primary_support_seed 且 **含 similar_to** 且非 conditioned-only → tier=weak；否则降级为 primary_support_keep，不给扩。
-    - 其余 tier=none，不可扩。
+    - 其余 tier=none，不可扩。最终主线由 Stage3 裁决。
     """
     for c in primary_expandable:
         c.stage2b_seed_tier = "strong"
@@ -3337,8 +3337,9 @@ def _stage2a_promote_strong_allowed(
     has_judge_expandable_stable: bool,
 ) -> Tuple[bool, str]:
     """
-    keep/seed → primary_expandable 的最后一跳：须组内 axis_consistency_seed 排名第 1、与第 2 名间隔够大，
-    且 judge 未已给出「稳定强 expandable」；否则交由 weak seed 或 sk，避免 2A 比 2B strong gate 更松。
+    仅影响 **升格到 primary_expandable** 的最后一跳（局部角色/优先级），不决定候选是否从 Stage2 输出中消失。
+    keep/seed → primary_expandable：须组内 axis_consistency_seed 排名第 1、与第 2 名间隔够大，
+    且 judge 未已给出「稳定强 expandable」；否则留在 seed/sk，交 Stage3 做全局裁决。
     """
     if w["group_rank"] != 1:
         return False, "not_group_top1"
@@ -3362,8 +3363,8 @@ def select_primary_per_anchor(
     - primary_support_keep：支线保留，不参与 2B 扩散
     - risky_keep：高风险弱保留，默认 weak_retain，不参与 2B
     - rejected：淘汰
-    **无 primary_expandable 时**：对 sd/sk/rk 做**极小家族保留**（每类最多 1 条，rk 仅当 sd 与 sk 皆空时兜底 1 条），
-    避免旧版「三桶合并只留全局一名」把整锚压成单点、 Stage3 无足够候选可重审；见 `[Stage2A no-expandable shrink audit]`。
+    **无 primary_expandable 时**：对 sd/sk/rk 做**分槽限额保留**（非清场：每类保留多条上限，rk 可留 0~1 条作证据），
+    避免旧版「只留一名 winner」把整锚压成单点；见 `[Stage2A no-expandable shrink audit]`。最终主线由 Stage3 裁决。
     兼容字段 primary_keep_no_expand = seed+support_keep+risky（旧逻辑消费并集）。
     """
     empty_out = {
@@ -3849,12 +3850,17 @@ def select_primary_per_anchor(
         primary_support_keep.sort(key=_rank_key, reverse=True)
         risky_keep.sort(key=_rank_key, reverse=True)
 
-        kept_seed = primary_support_seed[:1]
-        kept_keep = primary_support_keep[:1]
+        # 无 expandable：按槽限额保留多候选（非单胜者）；rk 在 sd/sk 存在时仍可留至多 1 条弱证据
+        _MAX_SD = 2
+        _MAX_SK = 2
+        _MAX_RK = 1
+        kept_seed = primary_support_seed[:_MAX_SD]
+        kept_keep = primary_support_keep[:_MAX_SK]
         if kept_seed or kept_keep:
-            kept_risky: List["Stage2ACandidate"] = []
-            policy = "keep_top1_seed + keep_top1_support_keep + risky_cleared_when_seed_or_keep"
-            why_risky = ""
+            risky_sorted = sorted(risky_keep, key=_rank_key, reverse=True)
+            kept_risky = risky_sorted[:_MAX_RK]
+            policy = f"quota_seed<={_MAX_SD}_sk<={_MAX_SK}_rk<={_MAX_RK}_when_sd_or_sk"
+            why_risky = "retain_top_risky_as_evidence" if kept_risky else ""
         else:
             kept_risky = risky_keep[:1]
             policy = "risky_only_fallback_1"
@@ -3865,8 +3871,8 @@ def select_primary_per_anchor(
         risky_keep = kept_risky
 
         if LABEL_EXPANSION_DEBUG:
-            top_sd_a = [getattr(x, "term", "") for x in primary_support_seed[:2]]
-            top_sk_a = [getattr(x, "term", "") for x in primary_support_keep[:2]]
+            top_sd_a = [getattr(x, "term", "") for x in primary_support_seed[:3]]
+            top_sk_a = [getattr(x, "term", "") for x in primary_support_keep[:3]]
             top_rk_a = [getattr(x, "term", "") for x in risky_keep[:2]]
             print(
                 f"[Stage2A no-expandable shrink audit] anchor={anchor_term_sel!r}\n"
@@ -4059,9 +4065,10 @@ def select_primary_per_anchor(
     for c in primary_expandable + primary_support_seed + primary_support_keep + risky_keep:
         _pre_reconcile_bucket_by_id[id(c)] = (getattr(c, "primary_bucket", None) or "").strip()
 
-    primary_expandable = _apply_conditioned_quota(primary_expandable, cap=1)
-    primary_support_seed = _apply_conditioned_quota(primary_support_seed, cap=1)
-    primary_support_keep = _apply_conditioned_quota(primary_support_keep, cap=1)
+    # conditioned_vec 来源：提高 cap，支持「小规模多 landing」共存；rk 仍最严（最终主线交 Stage3）
+    primary_expandable = _apply_conditioned_quota(primary_expandable, cap=2)
+    primary_support_seed = _apply_conditioned_quota(primary_support_seed, cap=2)
+    primary_support_keep = _apply_conditioned_quota(primary_support_keep, cap=2)
     risky_keep = _apply_conditioned_quota(risky_keep, cap=1)
 
     primary_expandable, primary_support_seed, primary_support_keep, risky_keep = _finalize_stage2b_seed_tiers(
@@ -4098,7 +4105,7 @@ def select_primary_per_anchor(
             f"support_keep={[x.term for x in primary_support_keep]} "
             f"risky_keep={[x.term for x in risky_keep]}"
         )
-        _w2b = [x.term for x in primary_expandable] + [x.term for x in primary_support_seed]
+        _seeds_2b = [x.term for x in primary_expandable] + [x.term for x in primary_support_seed]
         print(
             f"[Stage2A anchor bucket summary] anchor={anchor_term!r} "
             f"expandable_count={len(primary_expandable)} "
@@ -4106,7 +4113,21 @@ def select_primary_per_anchor(
             f"support_keep_count={len(primary_support_keep)} "
             f"risky_keep_count={len(risky_keep)} "
             f"rejected_count={len(rejected)} "
-            f"winner_for_stage2b={_w2b!r}"
+            f"seed_candidates_for_stage2b={_seeds_2b!r}"
+        )
+
+    if LABEL_EXPANSION_DEBUG:
+        _nland = (
+            len(primary_expandable)
+            + len(primary_support_seed)
+            + len(primary_support_keep)
+            + len(risky_keep)
+        )
+        print(
+            f"[Stage2A retain summary] anchor={anchor_term_sel!r} "
+            f"landing={_nland} "
+            f"expandable={len(primary_expandable)} support_seed={len(primary_support_seed)} "
+            f"support_keep={len(primary_support_keep)} risky_keep={len(risky_keep)}"
         )
 
     return {
@@ -7997,6 +8018,11 @@ def stage2_generate_academic_terms(
                     f"[Stage2B] anchor={anchor.anchor!r} carryover={len(carryover_terms)} "
                     f"seed_candidates=0 eligible_seeds=0 diffusion=0 merged={len(merged)}"
                 )
+                print(
+                    f"[Stage2B retain summary] anchor={getattr(anchor, 'anchor', '')!r} "
+                    f"seed_candidates_for_stage2b=0 eligible_seeds=0 expansion_evidence_added=0 "
+                    f"carryover={len(carryover_terms)} merged={len(merged)}"
+                )
             all_terms.extend(merged)
             continue
 
@@ -8116,6 +8142,12 @@ def stage2_generate_academic_terms(
         _stage2_header("Stage2B 本锚合并", "-")
         if LABEL_EXPANSION_DEBUG:
             print(f"[Stage2] 锚点 anchor={anchor.anchor!r} 本锚合并 +{len(merged)} 项 累计 {len(all_terms)} 项")
+            _exp_n = len(dense_list) + len(cluster_list) + len(cooc_list)
+            print(
+                f"[Stage2B retain summary] anchor={getattr(anchor, 'anchor', '')!r} "
+                f"seed_candidates_for_stage2b={len(seed_candidates)} eligible_seeds={eligible_seed_count} "
+                f"expansion_evidence_added={_exp_n} carryover={len(carryover_terms)} merged={len(merged)}"
+            )
     # 诊断：从 similar_to_raw_rows 聚合出 similar_to_agg；从最终 all_terms 中筛出 similar_to 来源的项写入 similar_to_pass
     if getattr(label, "debug_info", None) is not None:
         raw_rows = getattr(label.debug_info, "similar_to_raw_rows", None) or []
