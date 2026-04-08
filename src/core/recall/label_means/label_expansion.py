@@ -588,7 +588,7 @@ class LandingCandidate:
     surface_sim: Optional[float] = None      # 静态 similar_to 相似度
     conditioned_sim: Optional[float] = None # 动态 conditioned_vec 相似度
     context_gain: Optional[float] = None     # conditioned_sim - surface_proxy，上下文增益
-    # source_set 在 merge 时 setattr 写入，不在此定义
+    source_set: Optional[Set[str]] = None      # merge 后 similar_to | conditioned_vec | family_landing
 
     # ===== Stage2A 定性字段（collect_landing_candidates 补齐，供 admission/mainline 用） =====
     context_continuity: float = 0.0          # 连续分，非布尔
@@ -1909,6 +1909,11 @@ def _anchor_skills_to_prepared_anchors(label, anchor_skills: Dict[str, Any]) -> 
         co_anchor_terms = list(ctx.get("co_anchor_terms") or info.get("co_anchor_terms") or [])
         jd_snippet = str(info.get("jd_snippet") or ctx.get("jd_snippet") or "")
         surface_vec = _get_candidate_vec_for_mainline(label, vid)
+        if conditioned is None and surface_vec is not None:
+            try:
+                conditioned = np.asarray(surface_vec, dtype=np.float32).flatten().copy()
+            except Exception:
+                conditioned = None
         pa = PreparedAnchor(
             anchor=term,
             vid=vid,
@@ -2103,9 +2108,8 @@ def _retrieve_academic_terms_by_conditioned_vec(
     conditioned_top_k: Optional[int] = None,
 ) -> Tuple[List[LandingCandidate], Dict[int, Dict[str, float]]]:
     """
-    Stage2A 上下文纠偏：
-    - conditioned_vec 是辅助证据源，不应过度替代 similar_to。
-    - 独立门槛更高；无 similar_to 交叉支持时更保守（conditioned-only 需 sim>=0.82）。
+    Stage2A：conditioned_vec 正式候选源（与 similar_to 并列，经 merge 保留双路证据）。
+    - use_k 至少为 6；独立相似度门槛仍高于 similar_to；无 similar_to 交叉支持时 conditioned-only 更保守（sim>=0.82）。
     """
     if getattr(anchor, "conditioned_vec", None) is None:
         return [], {}
@@ -2120,7 +2124,7 @@ def _retrieve_academic_terms_by_conditioned_vec(
         faiss.normalize_L2(vec)
 
         use_k = int(conditioned_top_k) if conditioned_top_k is not None else STAGE2A_COLLECT_CONDITIONED_TOP_K
-        use_k = max(use_k, 4)  # 更保守，不再无脑升到 6+
+        use_k = max(use_k, 6)
 
         k = min(use_k, getattr(label.vocab_index, "ntotal", 100))
         if k <= 0:
@@ -2184,7 +2188,7 @@ def _retrieve_academic_terms_by_conditioned_vec(
         cand.context_sim = sim
         cand.context_supported = sim >= 0.80
         cand.context_gap = 0.0
-        cand.source_role = "auxiliary_evidence"
+        cand.source_role = "seed_candidate"
         setattr(cand, "conditioned_only", not has_similar_to_support)
         setattr(cand, "has_similar_to_support", has_similar_to_support)
 
@@ -5148,15 +5152,19 @@ def retrieve_family_landing_candidates(
     return out
 
 
-def compute_candidate_context_gain(cand: LandingCandidate) -> float:
-    """context_gain = conditioned_sim - surface_proxy；surface_proxy 优先 surface_sim，否则 semantic_score，否则 0。"""
-    cond = float(getattr(cand, "conditioned_sim", None) or 0.0)
-    surf = float(
-        getattr(cand, "surface_sim", None)
-        or getattr(cand, "semantic_score", 0.0)
-        or 0.0
-    )
-    return cond - surf
+def compute_candidate_context_gain(cand: Any) -> float:
+    """context_gain = conditioned_sim - surface_proxy；surface_proxy 优先 surface_sim，否则 semantic_score，否则 0。
+    若 conditioned_sim 为 None，则 context_gain = 0（不套用 0 当作条件化分数）。"""
+    cs = getattr(cand, "conditioned_sim", None)
+    if cs is None:
+        return 0.0
+    ss = getattr(cand, "surface_sim", None)
+    if ss is not None:
+        surf = float(ss)
+    else:
+        sem = getattr(cand, "semantic_score", None)
+        surf = float(sem) if sem is not None else 0.0
+    return float(cs) - surf
 
 
 def merge_landing_candidates_by_tid(candidates: List[LandingCandidate]) -> List[LandingCandidate]:
@@ -5243,6 +5251,11 @@ def collect_landing_candidates(
         cand.source_role = "seed_candidate"
     # 3) 按 tid merge，保留 surface_sim / conditioned_sim / source_set，merge 内已算 context_gain
     merged_list = merge_landing_candidates_by_tid(similar_to_candidates + context_neighbors + family_cands)
+    n_merged = len(merged_list)
+    dual_after_merge = sum(
+        1 for c in merged_list
+        if {"similar_to", "conditioned_vec"}.issubset(getattr(c, "source_set", None) or set())
+    )
     for c in merged_list:
         if c.vid in rerank_signals:
             sig = rerank_signals[c.vid]
@@ -5379,9 +5392,29 @@ def collect_landing_candidates(
             reasons.append("family_landing_support")
             setattr(c, "primary_eligibility_reasons", reasons)
     if LABEL_EXPANSION_DEBUG:
-        print(f"[Stage2A] collect_landing_candidates anchor={anchor.anchor!r} -> {len(cands)} 个候选" + (
-            f" 前3: {[c.term for c in cands[:3]]}" if cands else ""
-        ))
+        n_raw_sim = len(similar_to_candidates)
+        n_raw_ctx = len(context_neighbors)
+        dual_final = sum(
+            1 for c in cands
+            if {"similar_to", "conditioned_vec"}.issubset(getattr(c, "source_set", None) or set())
+        )
+        print(
+            f"[Stage2A landing source_distribution] anchor={anchor.anchor!r} "
+            f"similar_to={n_raw_sim} conditioned_vec={n_raw_ctx} merged_after_tid={n_merged} "
+            f"dual_source_after_merge={dual_after_merge} final_pool={len(cands)} dual_in_final={dual_final}"
+        )
+        print(
+            f"[Stage2A landing merge_counts] raw_similar_to={n_raw_sim} raw_conditioned_vec={n_raw_ctx} "
+            f"merged_candidate_count={n_merged}"
+        )
+        for i, c in enumerate(cands[:3], 1):
+            _sset = getattr(c, "source_set", None) or {getattr(c, "source", "") or ""} - {""}
+            print(
+                f"  [top{i}] term={c.term!r} source_set={_sset or getattr(c, 'source', '')} "
+                f"surface_sim={getattr(c, 'surface_sim', None)} "
+                f"conditioned_sim={getattr(c, 'conditioned_sim', None)} "
+                f"context_gain={getattr(c, 'context_gain', None)}"
+            )
     return cands
 
 
@@ -7476,6 +7509,13 @@ def merge_primary_and_support_terms(
         setattr(e, "stage2b_seed_tier", str(getattr(p, "stage2b_seed_tier", None) or "none"))
         setattr(e, "mainline_candidate", bool(getattr(p, "mainline_candidate", False)))
         setattr(e, "primary_reason", str(getattr(p, "primary_reason", "") or ""))
+        setattr(e, "surface_sim", getattr(p, "surface_sim", None))
+        setattr(e, "conditioned_sim", getattr(p, "conditioned_sim", None))
+        setattr(e, "context_gain", float(getattr(p, "context_gain", 0) or 0))
+        setattr(e, "source_set", getattr(p, "source_set", None))
+        setattr(e, "has_dynamic_support", bool(getattr(p, "has_dynamic_support", False)))
+        setattr(e, "has_static_support", bool(getattr(p, "has_static_support", False)))
+        setattr(e, "dual_support", bool(getattr(p, "dual_support", False)))
         setattr(
             e,
             "parent_anchor_final_score",
@@ -7791,6 +7831,11 @@ def stage2_generate_academic_terms(
             setattr(p, "semantic_score", float(getattr(cand, "semantic_score", 0) or 0))
             _cs = getattr(cand, "conditioned_sim", None)
             setattr(p, "conditioned_sim", float(_cs) if _cs is not None else None)
+            _surf = getattr(cand, "surface_sim", None)
+            setattr(p, "surface_sim", float(_surf) if _surf is not None else None)
+            setattr(p, "source_set", getattr(cand, "source_set", None))
+            setattr(p, "has_dynamic_support", bool(getattr(cand, "has_dynamic_support", False)))
+            setattr(p, "has_static_support", bool(getattr(cand, "has_static_support", False)))
             setattr(p, "dual_support", bool(getattr(cand, "dual_support", False)))
             setattr(p, "source_type", getattr(cand, "source_type", None) or getattr(cand, "source", "") or "")
             # Stage2A 审计字段 → PrimaryLanding → merge → raw_candidates 顶层（供 Stage3 分桶/连续分/paper 门）

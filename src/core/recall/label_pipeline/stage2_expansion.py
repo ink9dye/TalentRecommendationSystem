@@ -142,6 +142,13 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
             "stage2b_seed_tier": stage2_local_meta["stage2b_seed_tier"],
             "mainline_candidate": stage2_local_meta["mainline_candidate"],
             "primary_reason": stage2_local_meta["primary_reason"],
+            "surface_sim": getattr(c, "surface_sim", None),
+            "conditioned_sim": getattr(c, "conditioned_sim", None),
+            "context_gain": getattr(c, "context_gain", None),
+            "source_set": sorted(getattr(c, "source_set", None) or []),
+            "has_dynamic_support": getattr(c, "has_dynamic_support", None),
+            "has_static_support": getattr(c, "has_static_support", None),
+            "dual_support": getattr(c, "dual_support", None),
         }
 
         # --- TODO: remove legacy top-level mirror after Stage3 migration to stage2_local_meta ---
