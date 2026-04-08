@@ -349,40 +349,161 @@ class Stage1Result:
     jd_profile: Optional[Dict[str, Any]] = None  # domain/field/subfield/topic_weights, active_*, main_*
 
 
+def split_jd_segments(query_text: str) -> List[str]:
+    """按换行与句读切 JD 为短 segment，供 anchor-centric jd_snippet 使用。"""
+    if not query_text:
+        return []
+    parts = re.split(r"[\n\r]+|[。；;！!？?●•|]+", query_text)
+    return [p.strip() for p in parts if p and str(p).strip()]
+
+
+def patch_stage1_anchor_ctx_extras(
+    anchor_skills: Dict[str, Any],
+    jd_terms_cleaned_list: List[str],
+    raw_text: str,
+) -> None:
+    """
+    用 extract_skills 已清洗的 JD 短语补 local 提示，并做极简 co-anchor（同 segment / 共现）。
+    写入每项 _stage1_local_phrases / _stage1_co_anchor_terms，供 label_anchors 侧优先消费。
+    """
+    if not anchor_skills:
+        return
+    seen: Set[str] = set()
+    ordered_phrases: List[str] = []
+    for p in jd_terms_cleaned_list or []:
+        pl = (p or "").strip().lower()
+        if not pl or pl in seen:
+            continue
+        seen.add(pl)
+        ordered_phrases.append((p or "").strip())
+
+    text_l = (raw_text or "").lower()
+    pool: List[Tuple[str, Dict[str, Any], str]] = []
+    for vid, inf in anchor_skills.items():
+        if (inf or {}).get("is_context_only"):
+            continue
+        t = (inf.get("term") or "").strip()
+        if t:
+            pool.append((str(vid), inf, t))
+
+    for _vid, info, term in pool:
+        al = term.lower()
+        jd_snip = (info.get("jd_snippet") or "").strip()
+        jd_snip_l = jd_snip.lower()
+        local_cands: List[str] = []
+        for phrase in ordered_phrases:
+            pl = phrase.lower()
+            if pl == al:
+                continue
+            if al in pl or pl in al:
+                local_cands.append(phrase)
+            elif jd_snip_l and pl in jd_snip_l:
+                local_cands.append(phrase)
+        local_cands.sort(key=lambda x: len(x), reverse=True)
+        uniq: List[str] = []
+        useen: Set[str] = set()
+        for x in local_cands:
+            xl = x.lower()
+            if xl in useen:
+                continue
+            useen.add(xl)
+            uniq.append(x)
+            if len(uniq) >= 3:
+                break
+        info["_stage1_local_phrases"] = uniq
+
+    for vid, info, term in pool:
+        al = term.lower()
+        seg_a = (info.get("jd_snippet") or "").strip()
+        loc_a = (info.get("local_context") or "").lower()
+        phr_a = (info.get("phrase_context") or "").lower()
+        combo = (loc_a + " " + phr_a + " " + seg_a.lower()).strip()
+        pos_self = text_l.find(al)
+        scored: List[Tuple[int, int, float, str]] = []
+        for vid2, info2, term2 in pool:
+            if vid2 == vid:
+                continue
+            bl = term2.lower()
+            if bl == al:
+                continue
+            seg_b = (info2.get("jd_snippet") or "").strip()
+            same_seg = bool(seg_a and seg_b and seg_a == seg_b)
+            co_txt = bool(bl and (bl in combo or (seg_a and bl in seg_a.lower())))
+            if not (same_seg or co_txt):
+                continue
+            pos_o = text_l.find(bl)
+            dist = 99999
+            if pos_self >= 0 and pos_o >= 0:
+                dist = abs(pos_o - pos_self)
+            fin = float(info2.get("final_anchor_score") or 0.0)
+            tier = 0 if same_seg else 1
+            scored.append((tier, dist, -fin, term2))
+        scored.sort(key=lambda x: (x[0], x[1], x[2]))
+        info["_stage1_co_anchor_terms"] = [x[3] for x in scored[:3]]
+
+
 def attach_anchor_contexts(
     anchor_skills: Dict[str, Any],
     query_text: str,
     window: int = 10,
 ) -> None:
     """
-    为每个锚点增加 local_context（前后窗口字符）与 phrase_context（含该词的短语）。
-    原地修改 anchor_skills 中每项的 local_context / phrase_context。
+    为每个锚点增加 anchor-centric jd_snippet、local_context、phrase_context。
+    按换行/句读切 segment，优先最短命中 segment；段内取锚点短窗为 local_context。
+    原地修改 anchor_skills：jd_snippet / local_context / phrase_context。
     """
     if not query_text or not anchor_skills:
         return
-    # 按空格/标点切分为片段，便于取 phrase
-    segments = re.split(r"[\s,，。；;!?、]+", query_text)
+    segments = split_jd_segments(query_text)
+    if not segments:
+        segments = [query_text.strip()] if query_text.strip() else []
     text_lower = query_text.lower()
+    _max_snip = 200
+
     for _vid, info in anchor_skills.items():
         term = (info.get("term") or "").strip()
         if not term:
             info["local_context"] = ""
             info["phrase_context"] = ""
+            info["jd_snippet"] = ""
             continue
         term_lower = term.lower()
-        pos = text_lower.find(term_lower)
-        if pos >= 0:
-            start = max(0, pos - window)
-            end = min(len(query_text), pos + len(term) + window)
-            info["local_context"] = query_text[start:end].strip()
+        best_seg = ""
+        indexed = [(i, s) for i, s in enumerate(segments) if term_lower in s.lower()]
+        if indexed:
+            best_seg = min(indexed, key=lambda x: (len(x[1].strip()), x[0]))[1].strip()
         else:
-            info["local_context"] = query_text[: 80 + window].strip() if len(query_text) > 80 else query_text.strip()
-        phrase = ""
-        for seg in segments:
-            if term in seg or term_lower in seg.lower():
-                phrase = seg.strip()
-                break
-        info["phrase_context"] = phrase or info.get("local_context", "")[: 30]
+            pos = text_lower.find(term_lower)
+            if pos >= 0:
+                start = max(0, pos - 36)
+                end = min(len(query_text), pos + len(term) + 100)
+                best_seg = query_text[start:end].strip()
+                if len(best_seg) > _max_snip:
+                    cut = query_text[start : start + _max_snip]
+                    sp = cut.rfind(" ")
+                    best_seg = (cut[:sp] if sp > 20 else cut).strip()
+            else:
+                head = query_text[: min(120, len(query_text))].strip()
+                best_seg = head
+
+        if not best_seg:
+            info["jd_snippet"] = ""
+            info["local_context"] = ""
+            info["phrase_context"] = ""
+            continue
+
+        info["jd_snippet"] = best_seg[:_max_snip].strip()
+        seg_use = info["jd_snippet"]
+        seg_l = seg_use.lower()
+        pos_in_seg = seg_l.find(term_lower)
+        if pos_in_seg >= 0:
+            start = max(0, pos_in_seg - window)
+            end = min(len(seg_use), pos_in_seg + len(term) + window)
+            info["local_context"] = seg_use[start:end].strip()
+            info["phrase_context"] = seg_use.strip()[: min(180, len(seg_use))]
+        else:
+            info["local_context"] = seg_use[: min(80, len(seg_use))].strip()
+            info["phrase_context"] = seg_use.strip()[:120]
 
 
 def _batch_load_vocabulary_stats_for_tids(
@@ -595,11 +716,14 @@ def run_stage1(
     # 使用 extract_skills 保持与 JD 技能抽取链路一致，只在本次查询作用域内生效。
     text_for_skills = semantic_query_text or query_text
     jd_terms_cleaned = None
+    jd_terms_cleaned_list: List[str] = []
     if text_for_skills:
         try:
-            jd_terms_cleaned = {s.lower() for s in extract_skills(text_for_skills) if s}
+            jd_terms_cleaned_list = [s.strip() for s in extract_skills(text_for_skills) if s and str(s).strip()]
+            jd_terms_cleaned = {s.lower() for s in jd_terms_cleaned_list}
         except Exception:
             jd_terms_cleaned = None
+            jd_terms_cleaned_list = []
     # 每次调用都覆盖上一轮缓存，避免跨查询串扰
     setattr(recall, "_jd_cleaned_terms", jd_terms_cleaned)
     setattr(recall, "_jd_raw_text", text_for_skills or "")
@@ -732,6 +856,7 @@ def run_stage1(
 
     # 4) 锚点上下文化 + JD 四层领域画像（供 Stage2 层级守卫）
     attach_anchor_contexts(anchor_skills, query_for_ctx, window=12)
+    patch_stage1_anchor_ctx_extras(anchor_skills, jd_terms_cleaned_list, query_for_ctx)
     # 条件化锚点表示：泛锚点带 JD 上下文，供 Stage2A 用 conditioned_vec 做落点打分
     if encoder and query_for_ctx and anchor_skills:
         # 复用 supplement 前写入的 JD 共振缓存，prefill 内跳过 JD 的 encode_batch 重复项
@@ -771,7 +896,13 @@ def run_stage1(
                     info["jd_vec"] = ctx.get("jd_vec")
                     info["_anchor_ctx"] = ctx
                 if anchor_ctx_count < 10:
+                    _js = ctx.get("jd_snippet") or info.get("jd_snippet") or ""
+                    _lc = ctx.get("local_context") or info.get("local_context") or ""
+                    _pc = ctx.get("phrase_context") or info.get("phrase_context") or ""
                     debug_print(2, f"[Anchor Context] anchor={term!r}", recall)
+                    debug_print(2, f"  jd_snippet={_js[:120]!r}", recall)
+                    debug_print(2, f"  local_context={_lc[:120]!r}", recall)
+                    debug_print(2, f"  phrase_context={_pc[:120]!r}", recall)
                     debug_print(2, f"  local_phrases={ctx.get('local_phrases', [])[:8]}", recall)
                     debug_print(2, f"  co_anchor_terms={ctx.get('co_anchor_terms', [])[:8]}", recall)
                     debug_print(2, (
@@ -782,6 +913,55 @@ def run_stage1(
                     anchor_ctx_count += 1
             except Exception:
                 pass
+        stage1_ctx_summary: Dict[str, int] = {
+            "anchors_total": len(anchor_skills),
+            "anchors_with_jd_snippet": 0,
+            "anchors_with_local_phrases": 0,
+            "anchors_with_co_anchor_terms": 0,
+            "anchors_with_nonzero_w_local": 0,
+            "anchors_with_nonzero_w_co": 0,
+            "anchors_with_nonzero_w_jd": 0,
+        }
+        for _v, inf in anchor_skills.items():
+            ctxx = (inf or {}).get("_anchor_ctx") or {}
+            lp = ctxx.get("local_phrases") or (inf or {}).get("_stage1_local_phrases") or []
+            co = ctxx.get("co_anchor_terms") or (inf or {}).get("_stage1_co_anchor_terms") or []
+            if str((inf or {}).get("jd_snippet") or "").strip():
+                stage1_ctx_summary["anchors_with_jd_snippet"] += 1
+            if lp:
+                stage1_ctx_summary["anchors_with_local_phrases"] += 1
+            if co:
+                stage1_ctx_summary["anchors_with_co_anchor_terms"] += 1
+            if float(ctxx.get("w_local") or 0) > 0:
+                stage1_ctx_summary["anchors_with_nonzero_w_local"] += 1
+            if float(ctxx.get("w_co") or 0) > 0:
+                stage1_ctx_summary["anchors_with_nonzero_w_co"] += 1
+            if float(ctxx.get("w_jd") or 0) > 0:
+                stage1_ctx_summary["anchors_with_nonzero_w_jd"] += 1
+        if getattr(recall, "verbose", False) and not getattr(recall, "silent", False):
+            debug_print(2, f"[Stage1 anchor_ctx 汇总] {stage1_ctx_summary}", recall)
+    else:
+        stage1_ctx_summary = {
+            "anchors_total": len(anchor_skills) if anchor_skills else 0,
+            "anchors_with_jd_snippet": 0,
+            "anchors_with_local_phrases": 0,
+            "anchors_with_co_anchor_terms": 0,
+            "anchors_with_nonzero_w_local": 0,
+            "anchors_with_nonzero_w_co": 0,
+            "anchors_with_nonzero_w_jd": 0,
+        }
+        if anchor_skills:
+            for _v, inf in anchor_skills.items():
+                if str((inf or {}).get("jd_snippet") or "").strip():
+                    stage1_ctx_summary["anchors_with_jd_snippet"] += 1
+                lp = (inf or {}).get("_stage1_local_phrases") or []
+                co = (inf or {}).get("_stage1_co_anchor_terms") or []
+                if lp:
+                    stage1_ctx_summary["anchors_with_local_phrases"] += 1
+                if co:
+                    stage1_ctx_summary["anchors_with_co_anchor_terms"] += 1
+            if getattr(recall, "verbose", False) and not getattr(recall, "silent", False):
+                debug_print(2, f"[Stage1 anchor_ctx 汇总] {stage1_ctx_summary}", recall)
     _t4 = time.perf_counter()
     stage1_sub_ms["anchor_ctx"] = (_t4 - _t3) * 1000.0
     jd_profile = build_jd_hierarchy_profile(anchor_skills, query_for_ctx, recall)
@@ -798,6 +978,7 @@ def run_stage1(
         "anchor_skills": anchor_skills,
         "jd_profile": jd_profile,
         "stage1_sub_ms": stage1_sub_ms,
+        "stage1_ctx_summary": stage1_ctx_summary,
     }
     stage1_sub_ms["finalize"] = (time.perf_counter() - _t5) * 1000.0
     stage1_sub_ms["total"] = (time.perf_counter() - _t_stage1) * 1000.0

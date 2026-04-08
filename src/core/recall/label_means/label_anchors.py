@@ -955,6 +955,15 @@ def build_anchor_local_context(
     if not anchor_term or not raw_text:
         return []
     anchor_lower = anchor_term.strip().lower()
+    # Stage1：extract_skills 清洗短语补丁（见 patch_stage1_anchor_ctx_extras）
+    if anchor_skills and anchor_lower:
+        for _vid, inf in (anchor_skills or {}).items():
+            if (inf.get("term") or "").strip().lower() != anchor_lower:
+                continue
+            hinted = inf.get("_stage1_local_phrases") or []
+            if hinted:
+                return list(hinted)[:10]
+            break
     text_lower = raw_text.lower()
     pos = text_lower.find(anchor_lower)
     if pos < 0:
@@ -995,6 +1004,14 @@ def collect_co_anchor_terms(
     if not anchor_term or not raw_text or not selected_anchor_terms:
         return []
     anchor_lower = anchor_term.strip().lower()
+    if anchor_skills and anchor_lower:
+        for _vid, inf in (anchor_skills or {}).items():
+            if (inf.get("term") or "").strip().lower() != anchor_lower:
+                continue
+            hinted = inf.get("_stage1_co_anchor_terms") or []
+            if hinted:
+                return list(hinted)[:top_k]
+            break
     text_lower = raw_text.lower()
     pos = text_lower.find(anchor_lower)
     if pos < 0:
@@ -1129,16 +1146,31 @@ def build_conditioned_anchor_representation(
         "conditioned_vec": None,
         "local_phrases": [],
         "co_anchor_terms": [],
+        "jd_snippet": "",
+        "local_context": "",
+        "phrase_context": "",
     }
     if not anchor_term or not raw_text or encoder is None:
+        ai0 = anchor_info or {}
+        out["jd_snippet"] = str(ai0.get("jd_snippet") or "")
+        out["local_context"] = str(ai0.get("local_context") or "")
+        out["phrase_context"] = str(ai0.get("phrase_context") or "")
         return out
     cleaned_list = [info.get("term") or "" for info in (anchor_skills or {}).values() if info.get("term")]
     try:
         v_anchor_t = encode_text_with_optional_cache(encoder, anchor_term.strip()[:200], encode_cache)
         if v_anchor_t is None:
+            ai0 = anchor_info or {}
+            out["jd_snippet"] = str(ai0.get("jd_snippet") or "")
+            out["local_context"] = str(ai0.get("local_context") or "")
+            out["phrase_context"] = str(ai0.get("phrase_context") or "")
             return out
         v_anchor = np.asarray(v_anchor_t, dtype=np.float32).flatten()
     except Exception:
+        ai0 = anchor_info or {}
+        out["jd_snippet"] = str(ai0.get("jd_snippet") or "")
+        out["local_context"] = str(ai0.get("local_context") or "")
+        out["phrase_context"] = str(ai0.get("phrase_context") or "")
         return out
     if jd_vec_precomputed is not None:
         v_jd = np.asarray(jd_vec_precomputed, dtype=np.float32).flatten()
@@ -1155,6 +1187,10 @@ def build_conditioned_anchor_representation(
     co_terms = collect_co_anchor_terms(anchor_term, other_terms, raw_text, anchor_skills=anchor_skills)
     out["local_phrases"] = local_phrases
     out["co_anchor_terms"] = co_terms
+    ai = anchor_info or {}
+    out["jd_snippet"] = str(ai.get("jd_snippet") or "")
+    out["local_context"] = str(ai.get("local_context") or "")
+    out["phrase_context"] = str(ai.get("phrase_context") or "")
     try:
         if local_phrases:
             text_local = " ; ".join(local_phrases[:5])
@@ -1179,7 +1215,8 @@ def build_conditioned_anchor_representation(
     out["jd_vec"] = v_jd
     local_strength = min(1.0, len(local_phrases) / 5.0) if local_phrases else 0.0
     co_strength = min(1.0, len(co_terms) / 5.0) if co_terms else 0.0
-    if local_strength < 0.2 and co_strength < 0.2:
+    has_jd_snip = bool(str((anchor_info or {}).get("jd_snippet") or "").strip())
+    if local_strength < 0.2 and co_strength < 0.2 and not has_jd_snip:
         conditioned = np.asarray(v_anchor, dtype=np.float32).flatten()
         norm = np.linalg.norm(conditioned)
         if norm > 1e-9:
@@ -1192,6 +1229,12 @@ def build_conditioned_anchor_representation(
         w_a, w_l, w_c, w_j = CONDITIONED_W_ANCHOR_HIGH_SPEC, CONDITIONED_W_LOCAL_HIGH_SPEC, CONDITIONED_W_CO_HIGH_SPEC, CONDITIONED_W_JD_HIGH_SPEC
     else:
         w_a, w_l, w_c, w_j = CONDITIONED_W_ANCHOR_LOW_SPEC, CONDITIONED_W_LOCAL_LOW_SPEC, CONDITIONED_W_CO_LOW_SPEC, CONDITIONED_W_JD_LOW_SPEC
+    if local_phrases:
+        w_l = max(float(w_l), 0.06)
+    if co_terms:
+        w_c = max(float(w_c), 0.05)
+    if has_jd_snip:
+        w_j = max(float(w_j), 0.05)
     out["w_anchor"], out["w_local"], out["w_co"], out["w_jd"] = w_a, w_l, w_c, w_j
     conditioned = w_a * v_anchor + w_l * out["local_phrase_vec"] + w_c * out["co_anchor_vec"] + w_j * v_jd
     norm = np.linalg.norm(conditioned)
