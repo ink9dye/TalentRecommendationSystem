@@ -5589,6 +5589,29 @@ def run_stage3(
     graph_non_empty = _stage2_candidate_graph_non_empty(candidate_graph)
     anchor_map_non_empty = bool(anchor_to_candidates)
 
+    # --- Stage3 visible entry log (verification mouth) ---
+    # Keep this lightweight and contract-only: no scoring logic, no structural mutation.
+    try:
+        edge_counts = {k: len(v or []) for k, v in (candidate_graph or {}).items()}
+    except Exception:
+        edge_counts = {"_error": "edge_counts_failed"}
+    print(
+        "\n[stage3_input]",
+        {
+            "stage2_output_keys": sorted(list(stage2_output.keys())),
+            "all_candidates": len(all_candidates),
+            "anchors": len(anchor_to_candidates),
+            "candidate_graph_edge_counts": edge_counts,
+            "stage2_report_summary": {
+                "anchor_count": stage2_report.get("anchor_count"),
+                "candidate_count": stage2_report.get("candidate_count"),
+                "graph_edge_counts": stage2_report.get("graph_edge_counts"),
+            },
+            "graph_non_empty": graph_non_empty,
+            "anchor_map_non_empty": anchor_map_non_empty,
+        },
+    )
+
     # 向下透传（供后续 _merge_stage3_duplicates / global rerank 使用；本版不在此消费图结构）
     _pass_through = {
         "anchor_to_candidates": anchor_to_candidates,

@@ -11,7 +11,18 @@ _SQLITE_IN_CHUNK = 900
 from src.core.recall.label_means import label_anchors
 from src.core.recall.label_means.hierarchy_guard import parse_json_dist
 from src.core.recall.label_means.label_debug import debug_print
-from src.core.recall.label_means.label_anchors import _is_concrete_skill_phrase, _is_task_like, _load_abbr_keys
+from src.core.recall.label_means.label_anchors import (
+    _OBJECT_SLOT,
+    _TASK_CHAIN_SLOT,
+    _cjk_len,
+    _has_mainline_grounding,
+    _is_concrete_skill_phrase,
+    _is_research_side_branch_term,
+    _is_task_like,
+    _load_abbr_keys,
+    _term_looks_bg_platform,
+    allow_co_anchor_for_owner,
+)
 from src.utils.domain_utils import DomainProcessor
 from src.utils.tools import extract_skills
 
@@ -33,6 +44,8 @@ ANCHOR_ROLE_CONTEXT = "context_only_anchor"
 # 向量补锚相对主锚峰值的天花板（结构比例，非词表）
 SUPPLEMENT_TO_MAIN_SCORE_CAP_RATIO = 0.38
 CONTEXT_ANCHOR_MAX_SCORE_RATIO = 0.06
+# generic_risky 辅锚相对主锚峰值的上限（与 mx_primary 联动，拉开与 main 的分数带）
+GENERIC_RISKY_AUX_MAX_OF_MAIN_RATIO = 0.46
 
 # 偏好/资格/发表导向（结构：叙述性连接，非技术名词表）
 _PREF_QUAL_PATTERN = re.compile(
@@ -76,6 +89,49 @@ def _is_subsumed_fragment(term: str, all_terms: Set[str]) -> bool:
     return False
 
 
+def _is_object_carrier_without_task_chain(term: str) -> bool:
+    """仅对象/载体槽、同 phrase 内无显式任务链（控制/规划/估计等），偏背景对象类中长词。"""
+    t = str(term).strip()
+    if not _has_cjk(t):
+        return False
+    if _cjk_len(t) < 4:
+        return False
+    if not _OBJECT_SLOT.search(t):
+        return False
+    if _TASK_CHAIN_SLOT.search(t):
+        return False
+    return True
+
+
+def _is_compressed_two_cjk_plus_algo(term: str) -> bool:
+    """两字中文 + 「算法」的口语压缩壳（规控/运控 类等），不点名具体词。"""
+    t = str(term).strip()
+    if not t:
+        return False
+    return bool(re.match(r"^[\u4e00-\u9fff]{2}算法$", t))
+
+
+def _jd_has_richer_concrete_peer(term: str, all_terms: Set[str]) -> bool:
+    """JD 内存在更贴主线的 concrete 同伴（更长，或同长但非「两字+算法」壳）→ 压缩统称让位。"""
+    if not term or not all_terms:
+        return False
+    t = str(term).strip().lower()
+    shell = _is_compressed_two_cjk_plus_algo(term)
+    for u in all_terms:
+        ul = str(u).strip().lower()
+        if not ul or ul == t:
+            continue
+        if not _is_concrete_skill_phrase(ul):
+            continue
+        if len(ul) >= len(t) + 2:
+            return True
+        if len(ul) > len(t):
+            return True
+        if len(ul) == len(t) and shell and not _is_compressed_two_cjk_plus_algo(u):
+            return True
+    return False
+
+
 def coarse_classify_jd_term(term: str, all_terms: Set[str], raw_text: str) -> str:
     """
     阶段 A：对单条 JD 技能短语做轻量粗分型（形式 + 与全集相对位置），不依赖大词表。
@@ -99,9 +155,25 @@ def coarse_classify_jd_term(term: str, all_terms: Set[str], raw_text: str) -> st
     abbr_keys = _load_abbr_keys()
     ntok = len(t.split())
 
+    # 背景对象类：同条短语内只有机器人/臂等载体、无任务链，先于 concrete 拦截（避免「长度+机器人」误升为 core）
+    if _is_object_carrier_without_task_chain(term):
+        return JD_COARSE_GENERIC_RISKY
+
+    # 模糊统称：两字 + 算法且 JD 内已有更长 concrete 同伴 → 辅池
+    if _is_compressed_two_cjk_plus_algo(term) and _jd_has_richer_concrete_peer(term, all_terms):
+        return JD_COARSE_GENERIC_RISKY
+
     # 完整、可独立作主线的技术短语：优先 object_task / core，避免后置 rerank 才「救」回来
     if _is_concrete_skill_phrase(t):
         return JD_COARSE_OBJECT_TASK if _is_task_like(t) else JD_COARSE_CORE
+
+    # 研究侧向 / 学习尾 / hyphen 研究形 / 范式尾：非完整技能短语则偏 risky，不进 core 主池
+    if _is_research_side_branch_term(t):
+        return JD_COARSE_GENERIC_RISKY
+
+    # 背景载体 / 平台形（结构尾缀）→ 工具/框架或背景辅池
+    if _term_looks_bg_platform(term):
+        return JD_COARSE_TOOL_FW
 
     # 极短 CJK（多为碎片或高歧义双字）
     if _has_cjk(t) and len(t) <= 2:
@@ -113,6 +185,8 @@ def coarse_classify_jd_term(term: str, all_terms: Set[str], raw_text: str) -> st
 
     # 多词英文
     if ntok >= 2 and not _has_cjk(t):
+        if _is_research_side_branch_term(t):
+            return JD_COARSE_GENERIC_RISKY
         if _is_task_like(t):
             return JD_COARSE_OBJECT_TASK
         # 非任务向的多词 ASCII（常为平台/产品名）
@@ -122,6 +196,8 @@ def coarse_classify_jd_term(term: str, all_terms: Set[str], raw_text: str) -> st
 
     # 单词英文
     if ntok == 1 and not _has_cjk(t):
+        if _is_research_side_branch_term(t):
+            return JD_COARSE_GENERIC_RISKY
         if t in abbr_keys and len(t) <= 5:
             return JD_COARSE_TOOL_FW
         if _EN_SINGLE_TECH.match(t) and not _is_task_like(t):
@@ -132,10 +208,15 @@ def coarse_classify_jd_term(term: str, all_terms: Set[str], raw_text: str) -> st
             return JD_COARSE_OBJECT_TASK
         return JD_COARSE_CORE
 
-    # 中文或其它
+    # 中文：任务词 / 主线槽 / 中长完整链 → 主竞争池；否则偏 risky，避免泛背景抢 main
     if _has_cjk(t):
-        if len(t) >= 4:
-            return JD_COARSE_OBJECT_TASK if _is_task_like(t) else JD_COARSE_CORE
+        cjk_n = _cjk_len(t)
+        if cjk_n >= 4:
+            if _is_task_like(t):
+                return JD_COARSE_OBJECT_TASK
+            if _has_mainline_grounding(t):
+                return JD_COARSE_CORE
+            return JD_COARSE_GENERIC_RISKY
         return JD_COARSE_GENERIC_RISKY
 
     return JD_COARSE_CORE
@@ -175,9 +256,18 @@ def refine_stage1_anchor_layers(
 
         coarse = jd_coarse_roles.get(tl) or coarse_classify_jd_term(term, terms_set, raw_text)
 
-        # 图谱与 JD 粗分偶发标成 risky：完整技能短语拉回主池
+        # 图谱与 JD 粗分偶发标成 risky：完整技能短语拉回主池（背景对象壳 / 有更长同伴的统称 ×算法 不升格）
         if coarse == JD_COARSE_GENERIC_RISKY and _is_concrete_skill_phrase(term):
-            coarse = JD_COARSE_OBJECT_TASK if _is_task_like(term) else JD_COARSE_CORE
+            if (
+                _is_object_carrier_without_task_chain(term)
+                or (
+                    _is_compressed_two_cjk_plus_algo(term)
+                    and _jd_has_richer_concrete_peer(term, terms_set)
+                )
+            ):
+                pass
+            else:
+                coarse = JD_COARSE_OBJECT_TASK if _is_task_like(term) else JD_COARSE_CORE
 
         if source_kind == "jd_vector_supplement":
             if coarse in (JD_COARSE_CORE, JD_COARSE_OBJECT_TASK):
@@ -186,6 +276,20 @@ def refine_stage1_anchor_layers(
                 pass
             else:
                 coarse = JD_COARSE_GENERIC_RISKY
+
+        # REQUIRE 图：粗分偶发把侧向/平台留在 core/object_task，在此硬收口
+        if source_kind == "jd_require_skill_graph":
+            if coarse in (JD_COARSE_CORE, JD_COARSE_OBJECT_TASK):
+                if _is_research_side_branch_term(term):
+                    coarse = JD_COARSE_GENERIC_RISKY
+                elif _term_looks_bg_platform(term):
+                    coarse = JD_COARSE_TOOL_FW
+                elif _is_object_carrier_without_task_chain(term):
+                    coarse = JD_COARSE_GENERIC_RISKY
+                elif _is_compressed_two_cjk_plus_algo(term) and _jd_has_richer_concrete_peer(
+                    term, terms_set
+                ):
+                    coarse = JD_COARSE_GENERIC_RISKY
 
         primary_ok = (
             source_kind != "jd_vector_supplement"
@@ -199,7 +303,18 @@ def refine_stage1_anchor_layers(
         if coarse == JD_COARSE_GENERIC_RISKY:
             primary_ok = False
 
-        if coarse in (JD_COARSE_VENUE_PREF, JD_COARSE_NOISE):
+        spec = float((info or {}).get("specificity") or 0.55)
+        # 极泛 + 被长句包住的碎片：仅作条件化上下文，剥离主锚池
+        ctx_only_generic = (
+            source_kind == "jd_require_skill_graph"
+            and coarse == JD_COARSE_GENERIC_RISKY
+            and (
+                (spec < 0.33 and _is_subsumed_fragment(tl, terms_set))
+                or spec < 0.24
+            )
+        )
+
+        if coarse in (JD_COARSE_VENUE_PREF, JD_COARSE_NOISE) or ctx_only_generic:
             role = ANCHOR_ROLE_CONTEXT
         elif coarse == JD_COARSE_GENERIC_RISKY or coarse == JD_COARSE_TOOL_FW or source_kind == "jd_vector_supplement":
             role = ANCHOR_ROLE_AUX
@@ -207,6 +322,11 @@ def refine_stage1_anchor_layers(
             role = ANCHOR_ROLE_MAIN
         else:
             role = ANCHOR_ROLE_AUX
+
+        # 向量补锚：强制辅层，永不抬 main（与 coarse 映射一致，双保险）
+        if source_kind == "jd_vector_supplement":
+            role = ANCHOR_ROLE_AUX
+            primary_ok = False
 
         if role == ANCHOR_ROLE_CONTEXT:
             priority = 0.08
@@ -271,6 +391,20 @@ def refine_stage1_anchor_layers(
             info["supplement_score_cap"] = cap
         elif role == ANCHOR_ROLE_CONTEXT:
             info["final_anchor_score"] = min(base_ordered, mx_primary * CONTEXT_ANCHOR_MAX_SCORE_RATIO)
+        elif (
+            role == ANCHOR_ROLE_AUX
+            and coarse == JD_COARSE_GENERIC_RISKY
+            and source_kind == "jd_require_skill_graph"
+        ):
+            spec = float((info or {}).get("specificity") or 0.55)
+            phrases = list(terms_set)
+            fac = label_anchors._compute_mainline_rerank_factors(
+                term, raw_text, phrases, coarse, spec
+            )
+            agm = float(fac.get("aux_generic_compression_mult") or 1.0)
+            info["aux_generic_compression_mult"] = agm
+            capped = mx_primary * GENERIC_RISKY_AUX_MAX_OF_MAIN_RATIO
+            info["final_anchor_score"] = min(base_ordered * agm, capped)
         else:
             info["final_anchor_score"] = base_ordered
 
@@ -311,7 +445,13 @@ def _strip_context_only_from_anchor_skills(
         return
     for k in ctx_only:
         del anchor_skills[k]
-    setattr(recall, "_stage1_context_only_anchors", ctx_only)
+    prev = getattr(recall, "_stage1_context_only_anchors", None)
+    if isinstance(prev, dict) and prev:
+        merged = dict(prev)
+        merged.update(ctx_only)
+        setattr(recall, "_stage1_context_only_anchors", merged)
+    else:
+        setattr(recall, "_stage1_context_only_anchors", ctx_only)
 
 
 def _refine_anchor_type_for_layer(
@@ -357,6 +497,191 @@ def split_jd_segments(query_text: str) -> List[str]:
     return [p.strip() for p in parts if p and str(p).strip()]
 
 
+# 岗位描述里常见的「标题/职责壳」尾缀（不含「模块」等具体交付物尾词，避免误伤可区分短语）
+_LOCAL_TITLE_SHELL_TAIL = re.compile(
+    r"(研发|开发|实现|优化|调优|验证|构建|调研|沉淀|集成)$"
+)
+
+
+def _local_phrase_has_task_chain(phrase: str) -> bool:
+    """短语内是否命中任务链槽（控制/规划/估计等），用于 local 排序加权。"""
+    return bool(phrase and _TASK_CHAIN_SLOT.search(phrase))
+
+
+def _local_phrase_looks_title_shell(phrase: str) -> bool:
+    """
+    结构像「职责标题句」：较长中文 + 多「与」并列 + 或典型尾缀。
+    这类 phrase 多个 anchor 共用时段落区分度差，应压低或剔除。
+    """
+    t = (phrase or "").strip()
+    if not t:
+        return False
+    cjk_n = _cjk_len(t)
+    if cjk_n < 8:
+        return False
+    if t.count("与") >= 2:
+        return True
+    if _LOCAL_TITLE_SHELL_TAIL.search(t):
+        return True
+    return False
+
+
+def _local_phrase_object_only_short(phrase: str) -> bool:
+    """仅对象/载体、无任务链且很短（如单独「机器人」），热共现时几乎无区分度。"""
+    t = (phrase or "").strip()
+    if not t:
+        return False
+    if _TASK_CHAIN_SLOT.search(t):
+        return False
+    if not _OBJECT_SLOT.search(t):
+        return False
+    return _cjk_len(t) <= 4
+
+
+def _should_block_local_phrase_for_anchor(
+    anchor_term: str,
+    phrase: str,
+    phrase_anchor_freq: int,
+    pool_n: int,
+    owner_is_main: bool,
+) -> bool:
+    """
+    local phrase 轻量硬门：明显热泛、标题壳、纯对象短词、锚点内超短子串 — 不进最终 selected_local。
+    结构规则为主，不维护大词表。
+    """
+    pl = (phrase or "").strip().lower()
+    al = (anchor_term or "").strip().lower()
+    if not pl:
+        return True
+    if len(pl) <= 2:
+        return True
+
+    thr_share = max(3, int(0.34 * max(pool_n, 1)))
+    # 跨多锚点共享的极短泛片段且无任务链槽 → 直接挡（如「控制」「机器人」反复出现）
+    if phrase_anchor_freq >= thr_share and len(pl) <= 5 and not _local_phrase_has_task_chain(phrase):
+        return True
+
+    if _local_phrase_object_only_short(phrase) and phrase_anchor_freq >= 2:
+        return True
+
+    if _local_phrase_looks_title_shell(phrase) and phrase_anchor_freq >= 2 and pool_n >= 3:
+        if owner_is_main:
+            return True
+        if phrase_anchor_freq >= max(4, int(0.42 * max(pool_n, 1))):
+            return True
+
+    # 长锚点内的超短子串 + 已被多锚共享：信息增量极低（如 运动控制 ⊃ 控制）
+    if (
+        len(al) >= len(pl) + 3
+        and len(pl) <= 4
+        and pl in al
+        and phrase_anchor_freq >= 2
+        and not _local_phrase_has_task_chain(phrase)
+    ):
+        return True
+
+    return False
+
+
+def _score_local_phrase_for_anchor(
+    anchor_l: str,
+    phrase: str,
+    jd_snip_l: str,
+    phrase_anchor_freq: int,
+    pool_n: int,
+    owner_is_main: bool = False,
+) -> Tuple[float, str]:
+    """
+    轻量打分：贴锚点优先，压低跨锚点复用的长模板短语。
+    phrase_anchor_freq：本 JD 内有多少个锚点把该短语纳入 local 候选（去模板化用）。
+    返回 (score, debug_reason)；reason 仅在触发泛热弱贴合惩罚时为 \"hot_generic_penalty\"。
+    """
+    pl = (phrase or "").strip().lower()
+    if not anchor_l or not pl:
+        return -1e9, ""
+    literal_fit = anchor_l in pl or pl in anchor_l
+    s = 0.0
+    if anchor_l in pl:
+        s += 120.0
+    elif pl in anchor_l:
+        s += 95.0
+    else:
+        # 字符级重叠（偏 CJK / 拉丁混合）
+        sa, sb = set(anchor_l), set(pl)
+        s += 18.0 * (len(sa & sb) / max(len(sa), 1))
+        # 2-gram 命中
+        if len(anchor_l) >= 2 and len(pl) >= 2:
+            ga = {anchor_l[i : i + 2] for i in range(len(anchor_l) - 1)}
+            gb = {pl[i : i + 2] for i in range(len(pl) - 1)}
+            s += 8.0 * min(6, len(ga & gb))
+    if jd_snip_l and pl in jd_snip_l:
+        s += 45.0
+
+    # --- 任务链具体短语加权：更可区分、利于 Stage2A landing ---
+    if _local_phrase_has_task_chain(phrase):
+        s += 28.0 + min(22.0, 2.2 * max(0, _cjk_len(phrase) - 4))
+        if _OBJECT_SLOT.search(phrase):
+            s += 12.0
+
+    # 过长泛化句惩罚（岗位公共大句）
+    excess = max(0, len(phrase) - 26)
+    s -= min(35.0, excess * 0.55)
+
+    # 标题壳：多锚共用时段落模板感强，主锚侧额外下压
+    if _local_phrase_looks_title_shell(phrase):
+        s -= 22.0 + min(38.0, float(phrase_anchor_freq) * 9.0)
+        if owner_is_main:
+            s -= 18.0
+
+    # 纯对象短词（无任务链）：字面再贴也偏泛
+    if _local_phrase_object_only_short(phrase):
+        s -= 35.0 + min(30.0, float(phrase_anchor_freq) * 7.0)
+
+    # 被多数锚点同时捞进候选 → 更强跨锚共享惩罚（热泛模板）
+    if pool_n >= 3 and phrase_anchor_freq > 1:
+        hot = phrase_anchor_freq - max(1, int(0.22 * pool_n))
+        if hot > 0:
+            s -= min(55.0, 8.0 + hot * 8.2)
+    if pool_n >= 4 and phrase_anchor_freq >= max(3, int(0.30 * pool_n)):
+        s -= min(42.0, 12.0 + (phrase_anchor_freq - 2) * 5.5)
+
+    # 字面「短语 ⊂ 锚点」且短语极短：子串信息增量低，易为「控制」「机器人」类
+    if literal_fit and pl in anchor_l and len(pl) <= 4 and len(anchor_l) >= len(pl) + 3:
+        s -= 40.0 + min(25.0, float(phrase_anchor_freq) * 6.0)
+
+    reason = ""
+    # 泛热短词 + 弱字面贴合：额外下压（不压仍含锚点/被锚点包含的长贴边短语）
+    if not literal_fit and pool_n >= 3:
+        sa, sb = set(anchor_l), set(pl)
+        char_share = len(sa & sb) / max(len(sa), 1)
+        bi = 0
+        if len(anchor_l) >= 2 and len(pl) >= 2:
+            ga = {anchor_l[i : i + 2] for i in range(len(anchor_l) - 1)}
+            gb = {pl[i : i + 2] for i in range(len(pl) - 1)}
+            bi = len(ga & gb)
+        weak_overlap = char_share < 0.36 and bi <= 1
+        # 短、泛：少字符或少 token，且排除明显长技术句
+        short_phrase = len(pl) <= 6 or (len(pl) <= 8 and " " not in pl)
+        if len(pl) >= 14:
+            short_phrase = False
+        thr_hot = max(2, int(0.26 * pool_n))
+        hot_cross = phrase_anchor_freq >= thr_hot
+        if short_phrase and hot_cross and weak_overlap:
+            pen = min(
+                78.0,
+                26.0
+                + max(0, phrase_anchor_freq - thr_hot) * 9.5
+                + max(0, 6 - len(pl)) * 4.5,
+            )
+            s -= pen
+            reason = "hot_generic_penalty"
+
+    if not _local_phrase_has_task_chain(phrase) and phrase_anchor_freq >= 2 and len(pl) <= 6:
+        s -= min(24.0, 6.0 * phrase_anchor_freq)
+
+    return s, reason
+
+
 def patch_stage1_anchor_ctx_extras(
     anchor_skills: Dict[str, Any],
     jd_terms_cleaned_list: List[str],
@@ -386,7 +711,18 @@ def patch_stage1_anchor_ctx_extras(
         if t:
             pool.append((str(vid), inf, t))
 
-    for _vid, info, term in pool:
+    pool_n = len(pool)
+    # 全池主锚峰值分：供共锚 gate 做相对阈值（弱 aux 不反哺主锚 conditioning）
+    pool_max_main_final = 0.0
+    for _vid0, inf0, _t0 in pool:
+        if (inf0 or {}).get("anchor_role") == ANCHOR_ROLE_MAIN or (inf0 or {}).get(
+            "is_primary_eligible"
+        ):
+            pool_max_main_final = max(
+                pool_max_main_final, float((inf0 or {}).get("final_anchor_score") or 0.0)
+            )
+    per_local_cands: Dict[str, List[str]] = {}
+    for vid, info, term in pool:
         al = term.lower()
         jd_snip = (info.get("jd_snippet") or "").strip()
         jd_snip_l = jd_snip.lower()
@@ -399,19 +735,77 @@ def patch_stage1_anchor_ctx_extras(
                 local_cands.append(phrase)
             elif jd_snip_l and pl in jd_snip_l:
                 local_cands.append(phrase)
-        local_cands.sort(key=lambda x: len(x), reverse=True)
+        per_local_cands[vid] = local_cands
+
+    phrase_pick_freq: Dict[str, int] = {}
+    for _vid, cands in per_local_cands.items():
+        for ph in cands:
+            k = ph.strip().lower()
+            phrase_pick_freq[k] = phrase_pick_freq.get(k, 0) + 1
+
+    for vid, info, term in pool:
+        al = term.lower()
+        jd_snip = (info.get("jd_snippet") or "").strip()
+        jd_snip_l = jd_snip.lower()
+        local_cands = per_local_cands.get(vid) or []
+        owner_is_main = (info or {}).get("anchor_role") == ANCHOR_ROLE_MAIN or (info or {}).get(
+            "is_primary_eligible"
+        )
+        ranked = sorted(
+            local_cands,
+            key=lambda ph: (
+                -_score_local_phrase_for_anchor(
+                    al,
+                    ph,
+                    jd_snip_l,
+                    phrase_pick_freq.get(ph.strip().lower(), 0),
+                    pool_n,
+                    owner_is_main=owner_is_main,
+                )[0],
+                -len(ph),
+            ),
+        )
         uniq: List[str] = []
+        scores_dbg: List[Tuple[str, float, str]] = []
         useen: Set[str] = set()
-        for x in local_cands:
-            xl = x.lower()
-            if xl in useen:
+        local_limit = 2 if owner_is_main else 3
+        for ph in ranked:
+            xl = ph.strip().lower()
+            if not xl or xl in useen:
+                continue
+            pf = phrase_pick_freq.get(xl, 0)
+            # 二次硬门：热泛/标题壳/超短子串不进 selected_local（主锚更严）
+            if _should_block_local_phrase_for_anchor(term, ph, pf, pool_n, owner_is_main):
                 continue
             useen.add(xl)
-            uniq.append(x)
-            if len(uniq) >= 3:
+            sc, rsn = _score_local_phrase_for_anchor(
+                al, ph, jd_snip_l, pf, pool_n, owner_is_main=owner_is_main
+            )
+            uniq.append(ph)
+            scores_dbg.append((ph, round(sc, 2), rsn or ""))
+            if len(uniq) >= local_limit:
                 break
-        info["_stage1_local_phrases"] = uniq
 
+        # 主锚：若第二条明显弱于第一条（分差大或第二条仍偏标题壳/无任务链），宁只留一条更硬的 local
+        if owner_is_main and len(uniq) >= 2:
+            top_sc = scores_dbg[0][1]
+            second_sc = scores_dbg[1][1]
+            ph1 = uniq[1]
+            weak_second = (top_sc - second_sc) >= 22.0 or (
+                not _local_phrase_has_task_chain(ph1)
+                and (
+                    _local_phrase_looks_title_shell(ph1)
+                    or phrase_pick_freq.get(ph1.strip().lower(), 0) >= max(3, int(0.30 * pool_n))
+                )
+            )
+            if weak_second:
+                uniq = uniq[:1]
+                scores_dbg = scores_dbg[:1]
+
+        info["_stage1_local_phrases"] = uniq
+        info["_stage1_local_phrase_scores"] = scores_dbg
+
+    per_co_scored: Dict[str, List[Tuple[int, int, float, str]]] = {}
     for vid, info, term in pool:
         al = term.lower()
         seg_a = (info.get("jd_snippet") or "").strip()
@@ -439,7 +833,60 @@ def patch_stage1_anchor_ctx_extras(
             tier = 0 if same_seg else 1
             scored.append((tier, dist, -fin, term2))
         scored.sort(key=lambda x: (x[0], x[1], x[2]))
-        info["_stage1_co_anchor_terms"] = [x[3] for x in scored[:3]]
+        per_co_scored[vid] = scored
+
+    co_top_freq: Dict[str, int] = {}
+    for _v, rows in per_co_scored.items():
+        for x in rows[:5]:
+            k = x[3].strip().lower()
+            co_top_freq[k] = co_top_freq.get(k, 0) + 1
+
+    term_to_meta: Dict[str, Dict[str, Any]] = {}
+    for _v2, inf2, t2 in pool:
+        term_to_meta[t2.strip().lower()] = inf2
+
+    for vid, info, term in pool:
+        al = term.lower()
+        scored = list(per_co_scored.get(vid) or [])
+        # 共锚准入：剔除 generic_risky+aux、对象壳、双字+算法壳等，避免弱辅污染主锚 Stage2A conditioning
+        scored_f: List[Tuple[int, int, float, str]] = []
+        for row in scored:
+            t_other = row[3]
+            bl = t_other.strip().lower()
+            om = term_to_meta.get(bl)
+            if allow_co_anchor_for_owner(
+                info, term, om, t_other, pool_max_main_final
+            ):
+                scored_f.append(row)
+        scored = scored_f
+        sal = set(al) if al else set()
+        owner_is_main = (info or {}).get("anchor_role") == ANCHOR_ROLE_MAIN or (info or {}).get(
+            "is_primary_eligible"
+        )
+
+        def _co_sort_key(x: Tuple[int, int, float, str]) -> Tuple[int, int, int, int, float, int, float]:
+            """同段/距离优先；其次少滥用；再主线槽交集；再其它 main；最后分高。"""
+            tier, dist, neg_fin, t2 = x[0], x[1], x[2], x[3]
+            tl = t2.strip().lower()
+            heat = co_top_freq.get(tl, 0)
+            overuse = max(0, heat - max(2, int(0.38 * pool_n))) if pool_n >= 4 else max(0, heat - 2)
+            prox = len(sal & set(tl)) if tl else 0
+            om2 = term_to_meta.get(tl) or {}
+            cand_main = 1 if (om2 or {}).get("anchor_role") == ANCHOR_ROLE_MAIN else 0
+            chain_olap = 0
+            if _TASK_CHAIN_SLOT.search(al) and _TASK_CHAIN_SLOT.search(tl):
+                if set(_TASK_CHAIN_SLOT.findall(al)) & set(_TASK_CHAIN_SLOT.findall(tl)):
+                    chain_olap = 1
+            # tier↑, dist↓, overuse↓, chain_olap↑, cand_main↑, prox↑, fin↑
+            return (tier, dist, overuse, -chain_olap, -cand_main, -prox, neg_fin)
+
+        scored.sort(key=_co_sort_key)
+        co_limit = 2 if owner_is_main else 3
+        picked = scored[:co_limit]
+        info["_stage1_co_anchor_terms"] = [x[3] for x in picked]
+        info["_stage1_co_anchor_rank_reason"] = ",".join(
+            f"{x[3]}:{co_top_freq.get(x[3].strip().lower(), 0)}" for x in picked
+        )
 
 
 def attach_anchor_contexts(
@@ -459,6 +906,7 @@ def attach_anchor_contexts(
         segments = [query_text.strip()] if query_text.strip() else []
     text_lower = query_text.lower()
     _max_snip = 200
+    _jd_snip_tight = 84
 
     for _vid, info in anchor_skills.items():
         term = (info.get("term") or "").strip()
@@ -492,18 +940,33 @@ def attach_anchor_contexts(
             info["phrase_context"] = ""
             continue
 
-        info["jd_snippet"] = best_seg[:_max_snip].strip()
-        seg_use = info["jd_snippet"]
+        seg_use = best_seg[:_max_snip].strip()
         seg_l = seg_use.lower()
         pos_in_seg = seg_l.find(term_lower)
+        if len(seg_use) > _jd_snip_tight and pos_in_seg >= 0:
+            inner = _jd_snip_tight - len(term)
+            lp = inner // 2
+            rp = inner - lp
+            a = max(0, pos_in_seg - lp)
+            b = min(len(seg_use), pos_in_seg + len(term) + rp)
+            seg_use = seg_use[a:b].strip()
+            if len(seg_use) > _jd_snip_tight:
+                seg_use = seg_use[:_jd_snip_tight].strip()
+            seg_l = seg_use.lower()
+            pos_in_seg = seg_l.find(term_lower)
+        elif len(seg_use) > _jd_snip_tight:
+            seg_use = seg_use[:_jd_snip_tight].strip()
+            seg_l = seg_use.lower()
+            pos_in_seg = seg_l.find(term_lower)
+        info["jd_snippet"] = seg_use
         if pos_in_seg >= 0:
             start = max(0, pos_in_seg - window)
             end = min(len(seg_use), pos_in_seg + len(term) + window)
             info["local_context"] = seg_use[start:end].strip()
-            info["phrase_context"] = seg_use.strip()[: min(180, len(seg_use))]
+            info["phrase_context"] = seg_use.strip()[: min(96, len(seg_use))]
         else:
-            info["local_context"] = seg_use[: min(80, len(seg_use))].strip()
-            info["phrase_context"] = seg_use.strip()[:120]
+            info["local_context"] = seg_use[: min(56, len(seg_use))].strip()
+            info["phrase_context"] = seg_use.strip()[:72]
 
 
 def _batch_load_vocabulary_stats_for_tids(
@@ -904,6 +1367,7 @@ def run_stage1(
                     debug_print(2, f"  local_context={_lc[:120]!r}", recall)
                     debug_print(2, f"  phrase_context={_pc[:120]!r}", recall)
                     debug_print(2, f"  local_phrases={ctx.get('local_phrases', [])[:8]}", recall)
+                    debug_print(2, f"  local_phrase_scores={info.get('_stage1_local_phrase_scores')}", recall)
                     debug_print(2, f"  co_anchor_terms={ctx.get('co_anchor_terms', [])[:8]}", recall)
                     debug_print(2, (
                         "  weights="

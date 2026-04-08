@@ -160,6 +160,92 @@ _JCR_CORE = "core_concept_candidate"
 _JCR_OBJECT_TASK = "object_or_task_candidate"
 _JCR_TOOL_FW = "tool_or_framework_candidate"
 _JCR_GENERIC_RISKY = "generic_risky_candidate"
+# 与 stage1_domain_anchors.ANCHOR_ROLE_* 字符串一致（避免循环 import）
+_ANCHOR_ROLE_MAIN_STR = "main_anchor_candidate"
+_ANCHOR_ROLE_AUX_STR = "aux_anchor_candidate"
+
+
+def _co_ctx_object_carrier_no_taskchain(term: str) -> bool:
+    """对象/臂体/机器人等载体且同条内无显式任务链（与 Stage1 粗分对齐，略放宽到 3 字以覆盖「机械臂」）。"""
+    t = (term or "").strip()
+    if not t:
+        return False
+    cjk = len(_CJK_RE.findall(t))
+    if cjk < 3:
+        return False
+    return bool(_OBJECT_SLOT.search(t) and not _TASK_CHAIN_SLOT.search(t))
+
+
+def _co_ctx_two_cjk_algo_shell(term: str) -> bool:
+    """两字 +「算法」压缩壳：不进入共锚反哺（与 Stage1 umbrella 一致）。"""
+    t = (term or "").strip()
+    if not t:
+        return False
+    return bool(re.match(r"^[\u4e00-\u9fff]{2}算法$", t))
+
+
+def allow_co_anchor_for_owner(
+    owner_meta: Optional[Dict[str, Any]],
+    owner_term: str,
+    cand_meta: Optional[Dict[str, Any]],
+    cand_term: str,
+    pool_max_main_final: float,
+) -> bool:
+    """
+    共锚（co-anchor）准入：主锚的 conditioned 文本只用「主线相容」同伴，不把弱 aux / 泛词反哺回主向量。
+    结构信号：coarse/role/final/spec/aux 压缩倍数；不依赖具体词黑名单。
+    """
+    om = owner_meta or {}
+    cm = cand_meta or {}
+    ct = (cand_term or "").strip()
+    ctl = ct.lower()
+    if not ctl:
+        return False
+    owner_main = om.get("anchor_role") == _ANCHOR_ROLE_MAIN_STR or bool(om.get("is_primary_eligible"))
+    cr = cm.get("coarse_jd_role")
+    ar = cm.get("anchor_role")
+    cfin = float(cm.get("final_anchor_score") or 0.0)
+    ofin = float(om.get("final_anchor_score") or 0.0)
+    agm = cm.get("aux_generic_compression_mult")
+    agm_f = float(agm) if agm is not None else 1.0
+    spec = float(cm.get("specificity") or 0.55)
+
+    # 1) 双字+算法壳、对象载体无任务链：永不进共锚（避免规控/运控/具身类载体污染 conditioning）
+    if _co_ctx_two_cjk_algo_shell(ct):
+        return False
+    if _co_ctx_object_carrier_no_taskchain(ct):
+        return False
+
+    # 2) generic_risky + aux：第二梯队弱辅，不向主锚共锚侧反哺
+    if cr == _JCR_GENERIC_RISKY and ar == _ANCHOR_ROLE_AUX_STR:
+        if owner_main:
+            return False
+        if ofin > 1e-9 and cfin < ofin * 0.48:
+            return False
+
+    # 3) Stage1 已打很低的 aux 压缩倍数：接近噪声侧，不参与主锚共锚
+    if owner_main and agm is not None and agm_f < 0.66:
+        return False
+
+    # 4) 相对主锚池峰值与相对当前锚：过低的同伴不共锚（弱尾不回流）
+    if owner_main:
+        if pool_max_main_final > 1e-9 and cfin < pool_max_main_final * 0.40:
+            return False
+        if ofin > 1e-9 and cfin < ofin * 0.34:
+            return False
+        if ar == _ANCHOR_ROLE_AUX_STR and spec < 0.41:
+            return False
+
+    # 5) 研究侧向 / 范式尾等：主锚不接受非 main 的侧向词做共锚（除非候选自身是 main）
+    if owner_main and ar != _ANCHOR_ROLE_MAIN_STR:
+        if _is_research_side_branch_term(ct) and not bool(cm.get("is_primary_eligible")):
+            return False
+
+    # 6) 极短、低特异性 aux：偏「端到端」类泛共现，主锚侧默认剔除
+    if owner_main and ar == _ANCHOR_ROLE_AUX_STR and _cjk_len(ct) <= 3 and spec < 0.44:
+        return False
+
+    return True
 
 
 def _lookup_coarse_for_graph_term(term: str, jd_coarse_roles: Dict[str, str]) -> Optional[str]:
@@ -169,11 +255,33 @@ def _lookup_coarse_for_graph_term(term: str, jd_coarse_roles: Dict[str, str]) ->
     tl = (term or "").strip().lower()
     if not tl:
         return None
-    if tl in jd_coarse_roles:
-        v = jd_coarse_roles[tl]
+
+    def _object_carrier_graph(tl0: str) -> bool:
+        t0 = (tl0 or "").strip()
+        if not _has_cjk_chars(t0):
+            return False
+        if len(_CJK_RE.findall(t0)) < 4:
+            return False
+        return bool(_OBJECT_SLOT.search(t0) and not _TASK_CHAIN_SLOT.search(t0))
+
+    def _finalize(v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
         if v == _JCR_GENERIC_RISKY and _is_concrete_skill_phrase(tl):
+            if _object_carrier_graph(tl):
+                return _JCR_GENERIC_RISKY
             return _JCR_OBJECT_TASK if _is_task_like(tl) else _JCR_CORE
+        if v in (_JCR_CORE, _JCR_OBJECT_TASK):
+            if _object_carrier_graph(tl):
+                return _JCR_GENERIC_RISKY
+            if _is_research_side_branch_term(tl):
+                return _JCR_GENERIC_RISKY
+            if _term_looks_bg_platform(tl):
+                return _JCR_TOOL_FW
         return v
+
+    if tl in jd_coarse_roles:
+        return _finalize(jd_coarse_roles[tl])
     best_k, best_v = None, None
     best_len = -1
     for k, v in jd_coarse_roles.items():
@@ -183,9 +291,7 @@ def _lookup_coarse_for_graph_term(term: str, jd_coarse_roles: Dict[str, str]) ->
             best_k, best_v, best_len = k, v, len(k)
         elif k in tl and len(k) > best_len:
             best_k, best_v, best_len = k, v, len(k)
-    if best_v == _JCR_GENERIC_RISKY and _is_concrete_skill_phrase(tl):
-        return _JCR_OBJECT_TASK if _is_task_like(tl) else _JCR_CORE
-    return best_v
+    return _finalize(best_v)
 
 
 def _competition_tier_from_coarse(coarse: Optional[str]) -> int:
@@ -248,6 +354,17 @@ _TASK_CHAIN_SLOT = re.compile(
 # 研究取向 / 范式尾词（侧向技术，非黑名单）
 _RESEARCH_FLAVOR_TAIL = re.compile(r"(智能|范式|理论)$")
 _HYPHEN_RESEARCH_STYLE = re.compile(r"-(based|centric|oriented|agnostic|driven)$", re.I)
+# 背景载体 / 平台形尾缀（结构，非领域技术黑名单）
+_BG_PLATFORM_CJK = re.compile(r"(平台|生态|基础设施|中间件|云原生)$")
+_BG_PLATFORM_EN = re.compile(r"(platform|stack|ecosystem|middleware)$", re.I)
+
+
+def _term_looks_bg_platform(term: str) -> bool:
+    if not term or not str(term).strip():
+        return False
+    t = str(term).strip()
+    tl = t.lower()
+    return bool(_BG_PLATFORM_CJK.search(t) or _BG_PLATFORM_EN.search(tl))
 
 
 def _has_cjk_chars(s: str) -> bool:
@@ -372,11 +489,41 @@ def _compute_mainline_rerank_factors(
     sub_raw = _is_subsumed_by_longer_jd_phrase(tl, all_phrases)
     learning_tail = bool(_LEARNING_OR_RL_TOPIC_TAIL.search(tll))
     short_en_algo = bool(re.match(r"^[a-z]{2,5}$", tll))
+    hyphen_style = bool(_HYPHEN_RESEARCH_STYLE.search(tll))
+    after_bonus = _term_after_bonus_section(tl, raw_text)
+    obj_task_slots = bool(_OBJECT_SLOT.search(tl) and _TASK_CHAIN_SLOT.search(tl))
+    # 背景对象壳：短语内仅有对象/载体、无任务链（与 stage1 coarse 对齐）
+    obj_carrier_no_task = bool(
+        _OBJECT_SLOT.search(tl) and not _TASK_CHAIN_SLOT.search(tl) and cjk >= 4
+    )
+    # 两字 + 「算法」且 JD 已有更长 concrete 同伴 → 统称压缩叫法
+    compressed_two_algo = bool(re.match(r"^[\u4e00-\u9fff]{2}算法$", tll))
+
+    def _has_richer_concrete_peer_local() -> bool:
+        tt = tll
+        shell = compressed_two_algo
+        for p in all_phrases:
+            pl = (p or "").strip().lower()
+            if not pl or pl == tt:
+                continue
+            if not _is_concrete_skill_phrase(pl):
+                continue
+            if len(pl) >= len(tt) + 2:
+                return True
+            if len(pl) > len(tt):
+                return True
+            if len(pl) == len(tt) and shell and not bool(
+                re.match(r"^[\u4e00-\u9fff]{2}算法$", pl)
+            ):
+                return True
+        return False
+
+    umbrella_peer = compressed_two_algo and _has_richer_concrete_peer_local()
 
     # 子串冗余：仅对非完整短语生效（可解释字段）
     subsumed_risky_penalty = 0.0
     if sub_raw and coarse in (_JCR_CORE, _JCR_OBJECT_TASK):
-        subsumed_risky_penalty = 0.22 if not concrete else 0.0
+        subsumed_risky_penalty = (0.30 if specificity < 0.45 else 0.26) if not concrete else 0.0
 
     # --- generic_main_penalty：主池内偏泛；完整技能短语大幅减轻 ---
     g_pen = 0.0
@@ -388,30 +535,47 @@ def _compute_mainline_rerank_factors(
         elif cjk == 3:
             g_pen = max(g_pen, 0.26)
         elif cjk >= 4 and cjk <= 5 and learning_tail and not concrete:
-            g_pen = max(g_pen, 0.28)
+            g_pen = max(g_pen, 0.32)
         if ntok == 1 and re.match(r"^[a-z]+$", tll) and len(tll) <= 9:
             g_pen = max(g_pen, 0.28)
         if learning_tail and cjk <= 8 and not concrete:
-            g_pen = max(g_pen, 0.22)
+            g_pen = max(g_pen, 0.28)
+        if hyphen_style and not concrete:
+            g_pen = max(g_pen, 0.26)
         if sub_raw and not concrete:
-            g_pen = max(g_pen, 0.16)
+            g_pen = max(g_pen, 0.22)
         if specificity < 0.52 and not concrete:
             g_pen = max(g_pen, 0.1)
+        if specificity < 0.44 and not concrete and not grounded:
+            g_pen = max(g_pen, 0.18)
         if short_en_algo and not grounded:
             g_pen = max(g_pen, 0.22)
-    g_pen = min(0.48, g_pen)
+    # 背景对象壳 / 压缩统称：即使 broad grounding（如仅命中「机器人」）也压 tier0
+    if coarse in (_JCR_CORE, _JCR_OBJECT_TASK):
+        if obj_carrier_no_task:
+            g_pen = max(g_pen, 0.38)
+        if umbrella_peer:
+            g_pen = max(g_pen, 0.34)
+    g_pen = min(0.52, g_pen)
 
     # 对象+任务绑定 bonus（分型前移的数值影子）
     object_task_bonus = 0.0
-    if concrete or (_OBJECT_SLOT.search(tl) and _TASK_CHAIN_SLOT.search(tl)):
-        object_task_bonus = min(0.18, 0.06 + 0.04 * min(3, len(_MOTION_MAINLINE_SLOTS.findall(tl))))
+    if concrete or obj_task_slots:
+        base_ot = 0.06 + 0.04 * min(3, len(_MOTION_MAINLINE_SLOTS.findall(tl)))
+        if obj_task_slots and not concrete:
+            base_ot += 0.035
+        object_task_bonus = min(0.20, base_ot)
 
     # mainline_bonus：槽位命中
     ml_b = 0.0
     if grounded:
         n_hits = len(_MOTION_MAINLINE_SLOTS.findall(tl))
         ml_b = min(0.2, 0.055 * max(1, n_hits))
-    ml_b = min(0.22, ml_b + object_task_bonus * 0.85)
+        if obj_task_slots:
+            ml_b += 0.04
+        if obj_carrier_no_task and coarse in (_JCR_CORE, _JCR_OBJECT_TASK):
+            ml_b *= 0.52
+    ml_b = min(0.24, ml_b + object_task_bonus * 0.92)
 
     # concrete_phrase_bonus：具体短语优先（与 coarse 一致）
     concrete_phrase_bonus = 0.0
@@ -422,30 +586,58 @@ def _compute_mainline_rerank_factors(
     c_b += 0.028 * min(ntok, 5)
     if cjk >= 6:
         c_b += 0.04
-    c_b = min(0.26, c_b)
+    if concrete and grounded:
+        c_b += 0.03
+    c_b = min(0.28, c_b)
 
     # --- side_branch_penalty：加分段 / 研究风格 / RL 话题无落地 ---
     sb_p = 0.0
-    if _term_after_bonus_section(tl, raw_text):
-        sb_p = max(sb_p, 0.28)
+    if after_bonus:
+        sb_p = max(sb_p, 0.36 if (not grounded and not concrete) else 0.30)
     if research_side:
-        sb_p = max(sb_p, 0.32)
+        sb_p = max(sb_p, 0.36)
     if not grounded and learning_tail and not concrete:
-        sb_p = max(sb_p, 0.26)
+        sb_p = max(sb_p, 0.30)
+    if not grounded and hyphen_style and not concrete:
+        sb_p = max(sb_p, 0.28)
     if not grounded and short_en_algo:
-        sb_p = max(sb_p, 0.22)
+        sb_p = max(sb_p, 0.24)
+    if not grounded and not concrete and sub_raw:
+        sb_p = max(sb_p, 0.18)
     if coarse in (_JCR_CORE, _JCR_OBJECT_TASK) and concrete:
         sb_p *= 0.45
+    if umbrella_peer:
+        sb_p = max(sb_p, 0.26)
+    if obj_carrier_no_task and coarse in (_JCR_CORE, _JCR_OBJECT_TASK):
+        sb_p = max(sb_p, 0.22)
     sb_p = min(0.48, sb_p)
 
-    eff_g = min(0.5, g_pen + subsumed_risky_penalty * 0.85)
+    eff_g = min(0.58, g_pen + subsumed_risky_penalty * 0.85)
 
     composite_mult = (
         (1.0 - eff_g)
-        * (1.0 + min(0.24, ml_b))
+        * (1.0 + min(0.26, ml_b))
         * (1.0 - min(0.48, sb_p))
-        * (1.0 + min(0.26, c_b))
+        * (1.0 + min(0.30, c_b))
     )
+
+    # generic_risky 辅锚：在 refine 中叠乘，与 main 拉开第二梯队（结构压缩，非删词）
+    aux_generic_compression_mult = 1.0
+    if coarse == _JCR_GENERIC_RISKY:
+        m = 0.81
+        if not _TASK_CHAIN_SLOT.search(tl):
+            m *= 0.93
+        if _OBJECT_SLOT.search(tl) and not _TASK_CHAIN_SLOT.search(tl):
+            m *= 0.90
+        if cjk <= 3 and not _TASK_CHAIN_SLOT.search(tl):
+            m *= 0.89
+        if re.search(r"(抑制|减振|隔振)", tll) and not re.search(
+            r"(控制|规划|估计|轨迹)", tll
+        ):
+            m *= 0.88
+        if cjk <= 2 and "仿真" in tl and "仿真到" not in tl:
+            m *= 0.86
+        aux_generic_compression_mult = max(0.50, min(0.97, m))
     return {
         "generic_main_penalty": g_pen,
         "subsumed_risky_penalty": subsumed_risky_penalty,
@@ -455,6 +647,9 @@ def _compute_mainline_rerank_factors(
         "side_branch_penalty": sb_p,
         "concreteness_bonus": c_b,
         "composite_mult": composite_mult,
+        "background_object_penalty_flag": 1.0 if obj_carrier_no_task else 0.0,
+        "umbrella_algo_peer_flag": 1.0 if umbrella_peer else 0.0,
+        "aux_generic_compression_mult": aux_generic_compression_mult,
     }
 
 
@@ -1022,6 +1217,15 @@ def collect_co_anchor_terms(
     meta_map = _build_term_meta_lower(anchor_skills)
     cur_meta = meta_map.get(anchor_lower) if anchor_skills else None
     cur_gr = (cur_meta or {}).get("coarse_jd_role") == _JCR_GENERIC_RISKY
+    pool_max_main = 0.0
+    if anchor_skills:
+        for _v, inf in anchor_skills.items():
+            if (inf or {}).get("anchor_role") == _ANCHOR_ROLE_MAIN_STR or (inf or {}).get(
+                "is_primary_eligible"
+            ):
+                pool_max_main = max(
+                    pool_max_main, float((inf or {}).get("final_anchor_score") or 0.0)
+                )
     out = []
     for t in selected_anchor_terms:
         if not t or t.strip().lower() == anchor_lower:
@@ -1034,7 +1238,23 @@ def collect_co_anchor_terms(
             continue
         if cur_gr and (om or {}).get("coarse_jd_role") == _JCR_GENERIC_RISKY:
             continue
+        if anchor_skills and not allow_co_anchor_for_owner(
+            cur_meta, anchor_term, om, t.strip(), pool_max_main
+        ):
+            continue
         out.append(t.strip())
+
+    # 主线相容优先：其它 main → 任务链槽有交集 → 分高
+    def _co_window_rank(t: str) -> Tuple[int, int, float]:
+        m = meta_map.get(t.strip().lower()) or {}
+        pri = 0 if m.get("anchor_role") == _ANCHOR_ROLE_MAIN_STR else 1
+        olap = 0
+        if _TASK_CHAIN_SLOT.search(anchor_lower) and _TASK_CHAIN_SLOT.search(t.lower()):
+            if set(_TASK_CHAIN_SLOT.findall(anchor_lower)) & set(_TASK_CHAIN_SLOT.findall(t.lower())):
+                olap = 1
+        return (pri, -olap, float(m.get("final_anchor_score") or 0.0))
+
+    out.sort(key=_co_window_rank)
     return out[:top_k]
 
 
