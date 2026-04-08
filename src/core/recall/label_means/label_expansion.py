@@ -336,6 +336,10 @@ CONDITIONED_VEC_TOP_K = 12        # 每锚点 conditioned_vec 检索学术词 to
 STAGE2A_COLLECT_BASE_TOP_K = 8   # base 视角取 6～8，严判在后
 STAGE2A_COLLECT_CONDITIONED_TOP_K = 8
 STAGE2A_COLLECT_CONDITIONED_TOP_K_RESCUE = 12  # similar_to 空池或极弱时 conditioned_vec 多拿几条
+# 综述式收缩：conditioned 以「局部分数 + 极弱池少量补召回」为主，不做第二主召回器
+CONDITIONED_SUPPLEMENT_MAX = 3
+STAGE2A_SIMILAR_TO_WEAK_MAX_N = 2
+STAGE2A_SIMILAR_TO_WEAK_SIM = 0.79
 STAGE2A_FAMILY_LANDING_TOP_K = 6  # canonical_academic_like 锚点 family 先手补池条数
 # 动力学/运动学/仿真等锚点 → 轻量 family 查询词（补池用，不保送 mainline）
 CANONICAL_ACADEMIC_ANCHOR_FAMILY_QUERIES: Dict[str, List[str]] = {
@@ -546,7 +550,22 @@ class PreparedAnchor:
     co_anchor_terms: List[str] = field(default_factory=list)
     jd_snippet: str = ""
     surface_vec: Optional[np.ndarray] = None   # 裸词向量（vocab 或 encode(anchor)）
-    # conditioned_vec 已在上方；此处不重复
+    conditioned_text: str = ""                 # mention+局部上下文，用于编码 conditioned_vec（可观测）
+    conditioning_mode: str = "unknown"         # real_context_encoded | precomputed_stage1 | fallback_surface
+    surface_text: str = ""                     # 与词面对齐的 surface 字符串（通常等于 anchor）
+    surface_conditioned_cosine: Optional[float] = None  # 观测用：surface_vec 与 conditioned_vec 余弦
+    light_conditioned_text: str = ""  # 轻量条件化句，用于 retrieval backoff 二次编码（非 surface 拷贝）
+
+
+@dataclass
+class ConditionedTextBundle:
+    """强/轻两路局部文本 + 实际参与拼接的片段（可观测、可调试）。"""
+    strong_text: str
+    light_text: str
+    selected_local_phrases: List[str]
+    selected_co_anchor_terms: List[str]
+    selected_jd_window: str
+    selected_hints: List[str]
 
 
 @dataclass
@@ -1863,11 +1882,12 @@ def check_seed_eligibility(
             return _fail("strong_seed_axis_low")
         return _ok()
 
-    # ---------- weak：轴更严 + 风险上限；conditioned_only 一律不扩 ----------
+    # ---------- weak：轴更严 + 风险上限；conditioned_only 改为软惩罚，不交前置一票否决 ----------
     if seed_tier == "weak":
         if conditioned_only_seed:
-            _weak_seed_audit(False, "conditioned_only_weak_seed")
-            return _fail("conditioned_only_weak_seed")
+            seed_score = max(0.0, seed_score - 0.12)
+            setattr(p, "seed_evidence_soft", True)
+            setattr(p, "seed_soft_penalty", "conditioned_only_soft")
         if seed_score < SEED_SCORE_MIN_WEAK:
             _weak_seed_audit(False, "weak_seed_score_low")
             return _fail("weak_seed_score_low")
@@ -1884,9 +1904,317 @@ def check_seed_eligibility(
     return _fail("tier_none")
 
 
-def _anchor_skills_to_prepared_anchors(label, anchor_skills: Dict[str, Any]) -> List[PreparedAnchor]:
+def normalize_anchor_context_tokens(phrases: Optional[List[str]], max_items: int = 8) -> List[str]:
+    """去重、截断 mention 邻域短语，保持顺序。"""
+    seen: Set[str] = set()
+    out: List[str] = []
+    for p in phrases or []:
+        t = (p or "").strip()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _is_short_cn_style_anchor(anchor_term: str) -> bool:
+    """短、偏任务/领域口语的中文锚点：更依赖 local/co/jd 上下文（Learning to Link：mention 局部窗口）。"""
+    s = (anchor_term or "").strip()
+    if not s or len(s) > 12:
+        return False
+    n_cjk = sum(1 for c in s if "\u4e00" <= c <= "\u9fff")
+    return n_cjk >= max(1, len(s) // 2)
+
+
+# 强条件化：局部窗上限（Learning to Link：mention 邻域，非全文主题）
+_STRONG_CONDITIONED_MAX_CHARS = 260
+_LIGHT_CONDITIONED_MAX_CHARS = 120
+_MENTION_SPAN_EACH = 44
+
+
+def _jd_snippet_around_mention(jd_snippet: str, anchor_term: str, max_chars: int = 88) -> str:
+    """JD 中围绕锚词的短窗；默认明显短于旧版，避免「大段摘要」向量。"""
+    s = (jd_snippet or "").strip().replace("\n", " ")
+    if not s:
+        return ""
+    if anchor_term and anchor_term in s:
+        i = s.index(anchor_term)
+        half = max(24, max_chars // 2)
+        lo = max(0, i - half // 2)
+        hi = min(len(s), i + len(anchor_term) + half)
+        frag = s[lo:hi].strip()
+        return frag[:max_chars]
+    return s[: min(max_chars, 72)]
+
+
+def _query_text_window(query_text: Optional[str], anchor_term: str, max_chars: int = 96) -> str:
+    """query 中围绕锚词的短窗；不再默认返回整段前缀长窗。"""
+    if not query_text or not (query_text or "").strip():
+        return ""
+    q = query_text.strip().replace("\n", " ")
+    if anchor_term and anchor_term in q:
+        i = q.index(anchor_term)
+        lo = max(0, i - _MENTION_SPAN_EACH)
+        hi = min(len(q), i + len(anchor_term) + _MENTION_SPAN_EACH)
+        return q[lo:hi].strip()[:max_chars]
+    return ""
+
+
+def _best_mention_window(jd_snippet: str, query_text: Optional[str], anchor_term: str, max_total: int = 96) -> str:
+    """
+    当 local_phrases 为空时，仅从 jd_snippet / query_text 中取锚词邻近短窗。
+    找不到锚词出现位置时不拼长段全局描述（避免锚间同质化）。
+    """
+    at = (anchor_term or "").strip()
+    if not at:
+        return ""
+    for src in ((jd_snippet or "").strip().replace("\n", " "), (query_text or "").strip().replace("\n", " ")):
+        if not src or at not in src:
+            continue
+        i = src.index(at)
+        lo = max(0, i - _MENTION_SPAN_EACH)
+        hi = min(len(src), i + len(at) + _MENTION_SPAN_EACH)
+        return src[lo:hi][:max_total]
+    return ""
+
+
+def _truncate_conditioned_text(text: str, max_chars: int, anchor_term: str) -> str:
+    """超长时截断：优先保留锚词行与前几行局部证据。"""
+    t = (text or "").strip()
+    if len(t) <= max_chars:
+        return t
+    lines = [ln for ln in t.split("\n") if ln.strip()]
+    if not lines:
+        return (anchor_term or "")[:max_chars]
+    out_lines: List[str] = []
+    n = 0
+    for ln in lines:
+        if n + len(ln) + 1 > max_chars:
+            break
+        out_lines.append(ln)
+        n += len(ln) + 1
+    joined = "\n".join(out_lines)
+    if len(joined) <= max_chars:
+        return joined
+    return joined[:max_chars]
+
+
+def _extract_latin_alnum_hints(*chunks: str, max_hints: int = 14) -> List[str]:
+    """从轻量字符型规则抽取英文/数字术语，无人工词典（feature-rich 局部证据）。"""
+    bag: List[str] = []
+    seen: Set[str] = set()
+    pat = re.compile(r"[A-Za-z][A-Za-z0-9]+(?:[\s\-_/][A-Za-z0-9]+){0,5}")
+    for ch in chunks:
+        if not ch:
+            continue
+        for m in pat.finditer(ch):
+            w = m.group(0).strip()
+            if len(w) < 3:
+                continue
+            key = w.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            bag.append(w)
+            if len(bag) >= max_hints:
+                return bag
+    return bag
+
+
+def _conditioned_text_substantial_vs_anchor(anchor_term: str, full_text: str) -> bool:
+    """是否比裸锚点多出可编码的局部语境（避免无意义重复 encode）。"""
+    a = (anchor_term or "").strip()
+    f = (full_text or "").strip()
+    if len(f) <= len(a) + 4:
+        return False
+    if f.startswith(a):
+        rest = f[len(a) :].strip()
+        return len(rest) > 4
+    return len(f) > len(a) + 4
+
+
+def build_light_conditioned_anchor_text(
+    anchor_term: str,
+    selected_local: List[str],
+    selected_hints: List[str],
+    mention_window: str,
+) -> str:
+    """
+    轻量条件化句：仅锚词 + 至多一条局部/mention 窗 + 一条英文 hint，用于 FAISS backoff。
+    非 surface 拷贝；与强向量区分，贴近索引邻域。
+    """
+    at = (anchor_term or "").strip()
+    if not at:
+        return ""
+    parts: List[str] = [at]
+    if selected_local:
+        parts.append(selected_local[0])
+    else:
+        mw = (mention_window or "").strip()
+        if len(mw) > 6:
+            parts.append(mw[:72])
+    if selected_hints:
+        parts.append(selected_hints[0])
+    s = " ".join(p for p in parts if p).strip()
+    return s[:_LIGHT_CONDITIONED_MAX_CHARS]
+
+
+def build_conditioned_anchor_text_variants(
+    anchor_term: str,
+    local_phrases: Optional[List[str]] = None,
+    co_anchor_terms: Optional[List[str]] = None,
+    jd_snippet: str = "",
+    query_text: Optional[str] = None,
+) -> ConditionedTextBundle:
+    """
+    强/轻两路 + 实际选用片段。短文本优先；不默认拼整段 JD/query。
+    local/co 缺省时用 mention 短窗补局部，仍不灌长段主题。
+    """
+    anchor_term = (anchor_term or "").strip()
+    if not anchor_term:
+        return ConditionedTextBundle(
+            strong_text="",
+            light_text="",
+            selected_local_phrases=[],
+            selected_co_anchor_terms=[],
+            selected_jd_window="",
+            selected_hints=[],
+        )
+    short_cn = _is_short_cn_style_anchor(anchor_term)
+    n_loc = 2 if not short_cn else 2
+    n_co = 2 if not short_cn else 2
+    loc_all = normalize_anchor_context_tokens(local_phrases, 8)
+    co_all = normalize_anchor_context_tokens(co_anchor_terms, 8)
+    loc_pick = loc_all[:n_loc]
+    co_pick = co_all[:n_co]
+
+    jd_tight = _jd_snippet_around_mention(jd_snippet, anchor_term, max_chars=88)
+    q_tight = _query_text_window(query_text, anchor_term, max_chars=96)
+    mention_win = _best_mention_window(jd_snippet, query_text, anchor_term, max_total=96)
+    selected_jd_window = jd_tight or mention_win or q_tight
+    if selected_jd_window:
+        selected_jd_window = selected_jd_window.strip()[:120]
+
+    latin_src = " ".join(
+        [
+            selected_jd_window,
+            " ".join(loc_pick),
+            " ".join(co_pick),
+            (jd_snippet or "")[:120],
+            (query_text or "")[:120],
+        ]
+    )
+    hints = _extract_latin_alnum_hints(latin_src, max_hints=6)
+    selected_hints = hints[:3]
+
+    lines: List[str] = [anchor_term]
+    if loc_pick:
+        lines.append(" ".join(loc_pick))
+    if co_pick:
+        lines.append(" ".join(co_pick))
+    if selected_jd_window:
+        lines.append(selected_jd_window[:120])
+    if selected_hints:
+        lines.append(" ".join(selected_hints))
+
+    strong = _truncate_conditioned_text("\n".join(x for x in lines if x), _STRONG_CONDITIONED_MAX_CHARS, anchor_term)
+    light = build_light_conditioned_anchor_text(anchor_term, loc_pick, selected_hints, mention_win or selected_jd_window)
+    return ConditionedTextBundle(
+        strong_text=strong,
+        light_text=light,
+        selected_local_phrases=list(loc_pick),
+        selected_co_anchor_terms=list(co_pick),
+        selected_jd_window=(selected_jd_window or "")[:160],
+        selected_hints=list(selected_hints),
+    )
+
+
+def build_conditioned_anchor_text(
+    anchor_term: str,
+    local_phrases: Optional[List[str]] = None,
+    co_anchor_terms: Optional[List[str]] = None,
+    jd_snippet: str = "",
+    query_text: Optional[str] = None,
+) -> str:
+    """兼容入口：返回强条件化短文本。"""
+    return build_conditioned_anchor_text_variants(
+        anchor_term,
+        local_phrases=local_phrases,
+        co_anchor_terms=co_anchor_terms,
+        jd_snippet=jd_snippet,
+        query_text=query_text,
+    ).strong_text
+
+
+def _vec_cosine_debug(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]:
+    if a is None or b is None:
+        return None
+    try:
+        x = np.asarray(a, dtype=np.float64).flatten()
+        y = np.asarray(b, dtype=np.float64).flatten()
+        if x.size != y.size or x.size == 0:
+            return None
+        nx, ny = np.linalg.norm(x), np.linalg.norm(y)
+        if nx < 1e-12 or ny < 1e-12:
+            return None
+        return float(np.dot(x, y) / (nx * ny))
+    except Exception:
+        return None
+
+
+def build_conditioned_anchor_vec(
+    label: Any,
+    anchor_term: str,
+    conditioned_text: str,
+    surface_vec: Optional[np.ndarray],
+    stage1_conditioned_vec: Optional[np.ndarray],
+) -> Tuple[Optional[np.ndarray], str, Optional[float]]:
+    """
+    生成 conditioned_vec：优先对 conditioned_text 用 QueryEncoder（与词表索引同空间）；
+    失败或无语境时依次尝试 Stage1 预计算向量、最后才 surface 回退。
+    返回 (vec, conditioning_mode, surface_conditioned_cosine)。
+    """
+    enc = getattr(label, "_query_encoder", None)
+    out_vec: Optional[np.ndarray] = None
+    mode = "fallback_surface"
+    cos_sc: Optional[float] = None
+
+    if enc is not None and conditioned_text and _conditioned_text_substantial_vs_anchor(anchor_term, conditioned_text):
+        try:
+            raw, _dur = enc.encode(conditioned_text)
+            if raw is not None:
+                out_vec = np.asarray(raw, dtype=np.float32).flatten()
+                mode = "real_context_encoded"
+        except Exception:
+            out_vec = None
+
+    if out_vec is None and stage1_conditioned_vec is not None:
+        try:
+            out_vec = np.asarray(stage1_conditioned_vec, dtype=np.float32).flatten()
+            mode = "precomputed_stage1"
+        except Exception:
+            out_vec = None
+
+    if out_vec is None and surface_vec is not None:
+        try:
+            out_vec = np.asarray(surface_vec, dtype=np.float32).flatten().copy()
+            mode = "fallback_surface"
+        except Exception:
+            out_vec = None
+
+    cos_sc = _vec_cosine_debug(surface_vec, out_vec)
+    return out_vec, mode, cos_sc
+
+
+def _anchor_skills_to_prepared_anchors(
+    label,
+    anchor_skills: Dict[str, Any],
+    query_text: Optional[str] = None,
+) -> List[PreparedAnchor]:
     """将现有 anchor_skills (vid -> {term, anchor_type, conditioned_vec?, _anchor_ctx?, ...}) 转为 List[PreparedAnchor]。
-    补全 local_phrases / co_anchor_terms / jd_snippet / surface_vec / conditioned_vec，供 2A 上下文条件化检索与 context_gain 用。
+    conditioned_vec：优先由 mention+局部上下文文本经 QueryEncoder 得到（真正条件化）；仅缺语境或编码失败时用 Stage1 向量或 surface 回退并打标。
     """
     load_vocab_meta(label)
     out = []
@@ -1899,9 +2227,11 @@ def _anchor_skills_to_prepared_anchors(label, anchor_skills: Dict[str, Any]) -> 
         if not term:
             continue
         anchor_type = (info.get("anchor_type") or "unknown").strip().lower()
-        conditioned = info.get("conditioned_vec")
-        if conditioned is not None and hasattr(conditioned, "__len__"):
-            conditioned = np.asarray(conditioned, dtype=np.float32).flatten()
+        stage1_conditioned = info.get("conditioned_vec")
+        if stage1_conditioned is not None and hasattr(stage1_conditioned, "__len__"):
+            stage1_conditioned = np.asarray(stage1_conditioned, dtype=np.float32).flatten()
+        else:
+            stage1_conditioned = None
         source_type = (info.get("anchor_source") or "skill_direct").strip()
         source_weight = float(info.get("anchor_source_weight", 1.0))
         ctx = info.get("_anchor_ctx") or {}
@@ -1909,29 +2239,62 @@ def _anchor_skills_to_prepared_anchors(label, anchor_skills: Dict[str, Any]) -> 
         co_anchor_terms = list(ctx.get("co_anchor_terms") or info.get("co_anchor_terms") or [])
         jd_snippet = str(info.get("jd_snippet") or ctx.get("jd_snippet") or "")
         surface_vec = _get_candidate_vec_for_mainline(label, vid)
-        if conditioned is None and surface_vec is not None:
-            try:
-                conditioned = np.asarray(surface_vec, dtype=np.float32).flatten().copy()
-            except Exception:
-                conditioned = None
+        bundle = build_conditioned_anchor_text_variants(
+            term,
+            local_phrases=local_phrases,
+            co_anchor_terms=co_anchor_terms,
+            jd_snippet=jd_snippet,
+            query_text=query_text,
+        )
+        conditioned_text = bundle.strong_text
+        conditioned_vec, conditioning_mode, cos_sc = build_conditioned_anchor_vec(
+            label,
+            term,
+            conditioned_text,
+            surface_vec,
+            stage1_conditioned,
+        )
         pa = PreparedAnchor(
             anchor=term,
             vid=vid,
             anchor_type=anchor_type,
             expanded_forms=[term],
-            conditioned_vec=conditioned,
+            conditioned_vec=conditioned_vec,
             source_type=source_type,
             source_weight=source_weight,
             local_phrases=local_phrases,
             co_anchor_terms=co_anchor_terms,
             jd_snippet=jd_snippet,
             surface_vec=surface_vec,
+            conditioned_text=conditioned_text,
+            conditioning_mode=conditioning_mode,
+            surface_text=term,
+            surface_conditioned_cosine=cos_sc,
+            light_conditioned_text=bundle.light_text,
         )
+        setattr(pa, "conditioned_is_fallback", conditioning_mode == "fallback_surface")
+        setattr(pa, "conditioned_text_selected_local", bundle.selected_local_phrases)
+        setattr(pa, "conditioned_text_selected_co", bundle.selected_co_anchor_terms)
+        setattr(pa, "conditioned_text_selected_jd_window", bundle.selected_jd_window)
+        setattr(pa, "conditioned_text_selected_hints", bundle.selected_hints)
         if info.get("final_anchor_score") is not None:
             try:
                 setattr(pa, "final_anchor_score", float(info.get("final_anchor_score")))
             except (TypeError, ValueError):
                 setattr(pa, "final_anchor_score", 0.0)
+        if LABEL_EXPANSION_DEBUG:
+            print(
+                f"[Stage2A conditioning] anchor={term!r} mode={conditioning_mode} "
+                f"conditioned_is_fallback={getattr(pa, 'conditioned_is_fallback', False)}\n"
+                f"  surface_text={term!r}\n"
+                f"  conditioned_text={conditioned_text[:260]!r}{'...' if len(conditioned_text) > 260 else ''}\n"
+                f"  light_conditioned_text={bundle.light_text!r}\n"
+                f"  selected_local_phrases={bundle.selected_local_phrases!r}\n"
+                f"  selected_co_anchor_terms={bundle.selected_co_anchor_terms!r}\n"
+                f"  selected_jd_window={bundle.selected_jd_window!r}\n"
+                f"  selected_hints={bundle.selected_hints!r}\n"
+                f"  surface_conditioned_cosine={cos_sc}"
+            )
         out.append(pa)
     return out
 
@@ -2097,48 +2460,40 @@ def retrieve_academic_term_by_similar_to(
     return out
 
 
-def _retrieve_academic_terms_by_conditioned_vec(
-    label,
+def _faiss_conditioned_neighbors_once(
+    label: Any,
     anchor: PreparedAnchor,
-    similar_to_candidates: Optional[List[LandingCandidate]] = None,
-    active_domain_set: Optional[Set[int]] = None,
-    jd_field_ids: Optional[Set[str]] = None,
-    jd_subfield_ids: Optional[Set[str]] = None,
-    jd_topic_ids: Optional[Set[str]] = None,
-    conditioned_top_k: Optional[int] = None,
-) -> Tuple[List[LandingCandidate], Dict[int, Dict[str, float]]]:
+    vec_flat: np.ndarray,
+    similar_to_candidates: List[LandingCandidate],
+    conditioned_top_k: Optional[int],
+    active_domain_set: Optional[Set[int]],
+    jd_field_ids: Optional[Set[str]],
+    jd_subfield_ids: Optional[Set[str]],
+    jd_topic_ids: Optional[Set[str]],
+    retrieval_tier: str,
+) -> Tuple[List[LandingCandidate], Dict[int, float], int, int]:
     """
-    Stage2A：conditioned_vec 正式候选源（与 similar_to 并列，经 merge 保留双路证据）。
-    - use_k 至少为 6；独立相似度门槛仍高于 similar_to；无 similar_to 交叉支持时 conditioned-only 更保守（sim>=0.82）。
+    单次 FAISS + 与本轮既有相同的过滤链。
+    返回 (neighbors, score_map, raw_prefilter_hits, postfilter_hits)。
+    raw_prefilter_hits：通过 sim 门槛与词表类型、尚未做 domain 过滤的条数。
+    postfilter_hits：最终入池条数。
     """
-    if getattr(anchor, "conditioned_vec", None) is None:
-        return [], {}
-    if not getattr(label, "vocab_index", None) or not getattr(label, "_vocab_meta", None):
-        return [], {}
-    load_vocab_meta(label)
-    try:
-        vec = np.asarray(anchor.conditioned_vec, dtype=np.float32).flatten()
-        if vec.size == 0:
-            return [], {}
-        vec = vec.reshape(1, -1)
-        faiss.normalize_L2(vec)
-
-        use_k = int(conditioned_top_k) if conditioned_top_k is not None else STAGE2A_COLLECT_CONDITIONED_TOP_K
-        use_k = max(use_k, 6)
-
-        k = min(use_k, getattr(label.vocab_index, "ntotal", 100))
-        if k <= 0:
-            return [], {}
-        scores, ids = label.vocab_index.search(vec, k)
-    except Exception:
-        return [], {}
-
     context_neighbors: List[LandingCandidate] = []
     context_score_map: Dict[int, float] = {}
-
-    similar_to_candidates = similar_to_candidates or []
     similar_to_vids = {int(c.vid) for c in similar_to_candidates if getattr(c, "vid", None) is not None}
-
+    vec = np.asarray(vec_flat, dtype=np.float32).flatten()
+    if vec.size == 0:
+        return [], {}, 0, 0
+    vec = vec.reshape(1, -1)
+    faiss.normalize_L2(vec)
+    use_k = int(conditioned_top_k) if conditioned_top_k is not None else STAGE2A_COLLECT_CONDITIONED_TOP_K
+    use_k = max(use_k, 6)
+    k = min(use_k, getattr(label.vocab_index, "ntotal", 100))
+    if k <= 0:
+        return [], {}, 0, 0
+    scores, ids = label.vocab_index.search(vec, k)
+    conditioned_min_sim = max(SIMILAR_TO_MIN_SCORE, 0.78)
+    raw_prefilter = 0
     for score, tid in zip(scores[0], ids[0]):
         try:
             tid = int(tid)
@@ -2151,14 +2506,10 @@ def _retrieve_academic_terms_by_conditioned_vec(
         vocab_type = meta[1] or ""
         if vocab_type not in ("concept", "keyword") and vocab_type:
             continue
-
         sim = max(0.0, min(1.0, float(score)))
-
-        # conditioned_vec 独立门槛更高
-        conditioned_min_sim = max(SIMILAR_TO_MIN_SCORE, 0.78)
         if sim < conditioned_min_sim:
             continue
-
+        raw_prefilter += 1
         ok, _ = _term_in_active_domains_with_reason(
             label, tid,
             active_domain_set=active_domain_set,
@@ -2168,12 +2519,9 @@ def _retrieve_academic_terms_by_conditioned_vec(
         )
         if not ok:
             continue
-
-        # 无 similar_to 交叉支持时更保守，避免纯向量像直接强入池
         has_similar_to_support = tid in similar_to_vids
         if not has_similar_to_support and sim < 0.82:
             continue
-
         cand = LandingCandidate(
             vid=tid,
             term=term,
@@ -2191,9 +2539,100 @@ def _retrieve_academic_terms_by_conditioned_vec(
         cand.source_role = "seed_candidate"
         setattr(cand, "conditioned_only", not has_similar_to_support)
         setattr(cand, "has_similar_to_support", has_similar_to_support)
-
+        setattr(cand, "conditioned_retrieval_tier", retrieval_tier)
         context_neighbors.append(cand)
         context_score_map[tid] = sim
+    return context_neighbors, context_score_map, raw_prefilter, len(context_neighbors)
+
+
+def _retrieve_academic_terms_by_conditioned_vec(
+    label,
+    anchor: PreparedAnchor,
+    similar_to_candidates: Optional[List[LandingCandidate]] = None,
+    active_domain_set: Optional[Set[int]] = None,
+    jd_field_ids: Optional[Set[str]] = None,
+    jd_subfield_ids: Optional[Set[str]] = None,
+    jd_topic_ids: Optional[Set[str]] = None,
+    conditioned_top_k: Optional[int] = None,
+) -> Tuple[List[LandingCandidate], Dict[int, Dict[str, float]]]:
+    """
+    Legacy / 调试：独立 FAISS conditioned 召回 + backoff。主流程已改为 collect 内 **点积局部分数 + 限量 supplement**。
+    """
+    similar_to_candidates = similar_to_candidates or []
+    if getattr(anchor, "conditioned_vec", None) is None:
+        return [], {}
+    if not getattr(label, "vocab_index", None) or not getattr(label, "_vocab_meta", None):
+        return [], {}
+    load_vocab_meta(label)
+
+    strong_vec = np.asarray(anchor.conditioned_vec, dtype=np.float32).flatten()
+    strong_raw_pre = 0
+    strong_post = 0
+    light_raw_pre = 0
+    light_post = 0
+    retrieval_mode = "fallback_none"
+
+    try:
+        nbr, smap, sr_pre, sr_post = _faiss_conditioned_neighbors_once(
+            label,
+            anchor,
+            strong_vec,
+            similar_to_candidates,
+            conditioned_top_k,
+            active_domain_set,
+            jd_field_ids,
+            jd_subfield_ids,
+            jd_topic_ids,
+            "strong",
+        )
+        strong_raw_pre, strong_post = sr_pre, sr_post
+        context_neighbors = nbr
+        context_score_map = smap
+    except Exception:
+        context_neighbors = []
+        context_score_map = {}
+
+    if context_neighbors:
+        retrieval_mode = "strong_conditioned"
+    else:
+        lt = (getattr(anchor, "light_conditioned_text", None) or "").strip()
+        enc = getattr(label, "_query_encoder", None)
+        at = (getattr(anchor, "anchor", "") or "").strip()
+        if (
+            enc is not None
+            and lt
+            and at
+            and _conditioned_text_substantial_vs_anchor(at, lt)
+        ):
+            try:
+                raw_lv, _ = enc.encode(lt)
+                if raw_lv is not None:
+                    lv = np.asarray(raw_lv, dtype=np.float32).flatten()
+                    nbr2, smap2, lr_pre, lr_post = _faiss_conditioned_neighbors_once(
+                        label,
+                        anchor,
+                        lv,
+                        similar_to_candidates,
+                        conditioned_top_k,
+                        active_domain_set,
+                        jd_field_ids,
+                        jd_subfield_ids,
+                        jd_topic_ids,
+                        "light_backoff",
+                    )
+                    light_raw_pre, light_post = lr_pre, lr_post
+                    if nbr2:
+                        context_neighbors = nbr2
+                        context_score_map = smap2
+                        retrieval_mode = "light_conditioned_backoff"
+            except Exception:
+                pass
+
+    setattr(anchor, "_cond_strong_raw_hits", strong_raw_pre)
+    setattr(anchor, "_cond_strong_postfilter_hits", strong_post)
+    setattr(anchor, "_cond_light_raw_hits", light_raw_pre)
+    setattr(anchor, "_cond_light_postfilter_hits", light_post)
+    setattr(anchor, "conditioned_retrieval_mode", retrieval_mode)
 
     rerank_signals: Dict[int, Dict[str, float]] = {}
     for cand in similar_to_candidates:
@@ -2204,9 +2643,16 @@ def _retrieve_academic_terms_by_conditioned_vec(
             "context_gap": max(0.0, float(getattr(cand, "semantic_score", 0.0) or 0.0) - ctx_sim),
         }
 
+    if LABEL_EXPANSION_DEBUG:
+        print(
+            f"[Stage2A conditioned_retrieval] anchor={getattr(anchor, 'anchor', '')!r} "
+            f"conditioned_retrieval_mode={retrieval_mode!r}\n"
+            f"  strong_conditioned_raw_hits={strong_raw_pre} strong_conditioned_postfilter_hits={strong_post}\n"
+            f"  light_conditioned_raw_hits={light_raw_pre} light_conditioned_postfilter_hits={light_post}"
+        )
     if LABEL_EXPANSION_DEBUG and STAGE2_NOISY_DEBUG and context_neighbors:
         print(
-            f"[Stage2A] conditioned_vec 上下文纠偏 anchor={getattr(anchor, 'anchor', '')!r} -> "
+            f"[Stage2A] conditioned_vec 命中 anchor={getattr(anchor, 'anchor', '')!r} -> "
             f"{len(context_neighbors)} 个 前3: {[c.term for c in context_neighbors[:3]]}"
         )
     return context_neighbors, rerank_signals
@@ -2937,6 +3383,7 @@ def judge_primary_and_expandability(
             "bad_branch": True,
             "can_expand_from_2a": False,
         }
+        _stage2a_enrich_light_judge_snapshot(snap_bad, "reject", c)
         return "reject", "bad_branch", snap_bad
 
     static_sim = float(getattr(c, "semantic_score", 0.0) or 0.0)
@@ -2996,7 +3443,9 @@ def judge_primary_and_expandability(
         snap0["source_type"] = (getattr(c, "source_type", None) or getattr(c, "source", "") or "").strip().lower()
         # 无完整 primary 证据但仍有静态/弱相关：高风险保留，供 Stage3 降权（非直接 reject）
         if float(best_sim) >= STAGE2A_RISKY_KEEP_MIN_BEST_SIM:
+            _stage2a_enrich_light_judge_snapshot(snap0, "risky_keep", c)
             return "risky_keep", "weak_line_not_primary", snap0
+        _stage2a_enrich_light_judge_snapshot(snap0, "reject", c)
         return "reject", "not_primary_enough", snap0
 
     # ---------- primary_ok 之后：主线一致性（axis）分桶，替代旧 expand/weak_seed 分叉 ----------
@@ -3115,6 +3564,7 @@ def judge_primary_and_expandability(
             bucket, reason = "primary_support_keep", "no_real_ctx_demote_seed"
         snap_axis["can_expand_from_2a"] = False
 
+    _stage2a_enrich_light_judge_snapshot(snap_axis, bucket, c)
     return bucket, reason, snap_axis
 
 
@@ -3245,14 +3695,23 @@ def _finalize_stage2b_seed_tiers(
     new_seed: List["Stage2ACandidate"] = []
     for c in primary_support_seed:
         ss = _stage2a_source_type_set(c)
-        if _stage2a_is_conditioned_only_for_seed(c) or "similar_to" not in ss:
+        # 综述收缩：conditioned-only 不再硬降级为 keep，保留弱 seed + 软标记，全局一致性交 Stage3
+        if _stage2a_is_conditioned_only_for_seed(c):
+            c.stage2b_seed_tier = "weak"
+            c.can_expand_from_2a = True
+            c.can_expand = True
+            setattr(c, "seed_evidence_soft", True)
+            setattr(c, "legacy_seed_note", "compatibility: conditioned-only weak seed — TODO Stage3 collective filter")
+            new_seed.append(c)
+            continue
+        if "similar_to" not in ss:
             c.primary_bucket = "primary_support_keep"
             c.stage2b_seed_tier = "none"
             c.can_expand = False
             c.can_expand_from_2a = False
             c.role_in_anchor = "side"
             c.role = "side"
-            setattr(c, "seed_downgrade_reason", "weak_seed_requires_similar_to_not_conditioned_only")
+            setattr(c, "seed_downgrade_reason", "weak_seed_requires_similar_to")
             primary_support_keep.append(c)
         else:
             c.stage2b_seed_tier = "weak"
@@ -3359,17 +3818,9 @@ def select_primary_per_anchor(
     candidates: List["Stage2ACandidate"],
 ) -> Dict[str, List["Stage2ACandidate"]]:
     """
-    Stage2A 组内选主（五层落点版，见 README）：
-    - judge_primary_and_expandability 给出 axis 初桶后，本函数做 **final bucket reconcile**（两阶段）：
-      先按锚点组收集候选再算 **组内排名**；**keep_promote_strong_mainline / seed_promote_to_expandable** 还须 **axis_consistency_seed≥SEED_AXIS_CONSISTENCY_STRONG_MIN** 且 **组内第 1 名**、**与第 2 名 axis 间隔≥STAGE2A_PROMOTE_MIN_AXIS_GAP**、且 **judge 未已产出稳定强 expandable**（否则旁枝不再二次抬 strong），与 Stage2B strong gate 口径一致。
-    - primary_expandable：强主线 + 强 seed（stage2b_seed_tier=strong）
-    - primary_support_seed：主线近邻弱 seed（can_expand_from_2a=True，tier=weak）
-    - primary_support_keep：支线保留，不参与 2B 扩散
-    - risky_keep：高风险弱保留，默认 weak_retain，不参与 2B
-    - rejected：淘汰
-    **无 primary_expandable 时**：对 sd/sk/rk 做**分槽限额保留**（非清场：每类保留多条上限，rk 可留 0~1 条作证据），
-    避免旧版「只留一名 winner」把整锚压成单点；见 `[Stage2A no-expandable shrink audit]`。最终主线由 Stage3 裁决。
-    兼容字段 primary_keep_no_expand = seed+support_keep+risky（旧逻辑消费并集）。
+    Stage2A 组内选主：**新三层** candidate_core / candidate_support / candidate_noise（见返回键）+
+    **legacy 五层桶**（primary_expandable 等，Stage3 迁移前保留）。
+    综述式收缩：仍以 feature 与相对排序为主，细粒度 promote/reconcile 降噪（见 STAGE2_NOISY_DEBUG）。
     """
     empty_out = {
         "primary_expandable": [],
@@ -3378,6 +3829,9 @@ def select_primary_per_anchor(
         "risky_keep": [],
         "primary_keep_no_expand": [],
         "rejected": [],
+        "candidate_core": [],
+        "candidate_support": [],
+        "candidate_noise": [],
     }
     if not candidates:
         return empty_out
@@ -3680,7 +4134,7 @@ def select_primary_per_anchor(
                 else:
                     p_snap["can_expand_from_2a"] = False
 
-        if LABEL_EXPANSION_DEBUG and w["pre_bucket"] in ("primary_support_keep", "primary_support_seed"):
+        if LABEL_EXPANSION_DEBUG and STAGE2_NOISY_DEBUG and w["pre_bucket"] in ("primary_support_keep", "primary_support_seed"):
             if strong_expandable_ok and _strong_axis_ok:
                 _p_ok, _p_blk = _stage2a_promote_strong_allowed(
                     w, axis_gap_ok=axis_gap_ok, has_judge_expandable_stable=has_judge_expandable_stable
@@ -4134,6 +4588,22 @@ def select_primary_per_anchor(
             f"support_keep={len(primary_support_keep)} risky_keep={len(risky_keep)}"
         )
 
+    for c in primary_expandable:
+        setattr(c, "candidate_layer", "candidate_core")
+        setattr(c, "candidate_layer_note", "legacy: primary_bucket kept for Stage3 compat; prefer candidate_layer")
+    for c in primary_support_seed + primary_support_keep + risky_keep:
+        setattr(c, "candidate_layer", "candidate_support")
+    for c in rejected:
+        setattr(c, "candidate_layer", "candidate_noise")
+
+    if LABEL_EXPANSION_DEBUG:
+        print(
+            f"[Stage2A candidate_layer_summary] anchor={anchor_term_sel!r} "
+            f"core_count={len(primary_expandable)} "
+            f"support_count={len(primary_support_seed) + len(primary_support_keep) + len(risky_keep)} "
+            f"noise_count={len(rejected)}"
+        )
+
     return {
         "primary_expandable": primary_expandable,
         "primary_support_seed": primary_support_seed,
@@ -4141,6 +4611,9 @@ def select_primary_per_anchor(
         "risky_keep": risky_keep,
         "primary_keep_no_expand": primary_keep_no_expand,
         "rejected": rejected,
+        "candidate_core": primary_expandable,
+        "candidate_support": primary_support_seed + primary_support_keep + risky_keep,
+        "candidate_noise": rejected,
     }
 
 
@@ -5201,6 +5674,132 @@ def merge_landing_candidates_by_tid(candidates: List[LandingCandidate]) -> List[
     return out
 
 
+def _conditioned_rerank_signals_dot_product(
+    label: Any,
+    anchor: PreparedAnchor,
+    similar_to_candidates: List[LandingCandidate],
+) -> Dict[int, Dict[str, float]]:
+    """
+    用 conditioned_vec 与词表向量的点积为 similar_to 候选补局部证据（非独立 FAISS 主召回）。
+    对应 Learning to Link：mention 条件用于候选区分，而非第二套召回主链。
+    """
+    out: Dict[int, Dict[str, float]] = {}
+    cv = getattr(anchor, "conditioned_vec", None)
+    if cv is None or not similar_to_candidates:
+        for cand in similar_to_candidates:
+            out[cand.vid] = {"context_sim": 0.0, "context_supported": 0.0, "context_gap": 1.0}
+        return out
+    cv = np.asarray(cv, dtype=np.float32).flatten()
+    nv = float(np.linalg.norm(cv))
+    if nv < 1e-9:
+        for cand in similar_to_candidates:
+            out[cand.vid] = {"context_sim": 0.0, "context_supported": 0.0, "context_gap": 1.0}
+        return out
+    cv = cv / nv
+    for cand in similar_to_candidates:
+        ev = _get_candidate_vec_for_mainline(label, cand.vid)
+        static_sim = float(getattr(cand, "semantic_score", 0) or 0)
+        if ev is None:
+            out[cand.vid] = {"context_sim": 0.0, "context_supported": 0.0, "context_gap": max(0.0, static_sim)}
+            continue
+        ev = np.asarray(ev, dtype=np.float32).flatten()
+        ne = float(np.linalg.norm(ev))
+        cos = float(np.dot(cv, ev / ne)) if ne > 1e-9 else 0.0
+        cos = max(0.0, min(1.0, cos))
+        ctx_gap = max(0.0, static_sim - cos)
+        out[cand.vid] = {
+            "context_sim": cos,
+            "context_supported": 1.0 if cos >= 0.80 else 0.0,
+            "context_gap": ctx_gap,
+        }
+    return out
+
+
+def _similar_to_pool_needs_conditioned_supplement(cands: List[LandingCandidate]) -> bool:
+    """空池或极弱（≤2 条且最高分低于阈值）时允许 conditioned 少量补召回。"""
+    if not cands:
+        return True
+    if len(cands) > STAGE2A_SIMILAR_TO_WEAK_MAX_N:
+        return False
+    best = max(float(getattr(c, "semantic_score", 0) or 0) for c in cands)
+    return best < STAGE2A_SIMILAR_TO_WEAK_SIM
+
+
+def _retrieve_conditioned_supplement_capped(
+    label: Any,
+    anchor: PreparedAnchor,
+    similar_to_candidates: List[LandingCandidate],
+    active_domain_set: Optional[Set[int]],
+    jd_field_ids: Optional[Set[str]],
+    jd_subfield_ids: Optional[Set[str]],
+    jd_topic_ids: Optional[Set[str]],
+    conditioned_top_k: Optional[int],
+    cap: int = CONDITIONED_SUPPLEMENT_MAX,
+) -> Tuple[List[LandingCandidate], Dict[int, float], str]:
+    """
+    仅在弱/空 similar_to 时调用；最多 cap 条；强向量先试，失败再轻句编码（与 2.1 backoff 同 spirit）。
+    """
+    if getattr(anchor, "conditioned_vec", None) is None:
+        setattr(anchor, "conditioned_retrieval_mode", "supplement_skipped_no_vec")
+        return [], {}, "supplement_skipped_no_vec"
+    if not getattr(label, "vocab_index", None):
+        return [], {}, "supplement_skipped_no_index"
+    load_vocab_meta(label)
+    strong_vec = np.asarray(anchor.conditioned_vec, dtype=np.float32).flatten()
+    nbr, smap, sr_pre, sr_post = _faiss_conditioned_neighbors_once(
+        label, anchor, strong_vec, similar_to_candidates,
+        conditioned_top_k, active_domain_set, jd_field_ids, jd_subfield_ids, jd_topic_ids,
+        "supplement_strong",
+    )
+    setattr(anchor, "_cond_strong_raw_hits", sr_pre)
+    setattr(anchor, "_cond_strong_postfilter_hits", sr_post)
+    setattr(anchor, "_cond_light_raw_hits", 0)
+    setattr(anchor, "_cond_light_postfilter_hits", 0)
+    nbr = nbr[:cap]
+    mode = "supplement_strong" if nbr else "supplement_strong_empty"
+    if not nbr:
+        enc = getattr(label, "_query_encoder", None)
+        lt = (getattr(anchor, "light_conditioned_text", None) or "").strip()
+        at = (getattr(anchor, "anchor", "") or "").strip()
+        if enc and lt and at and _conditioned_text_substantial_vs_anchor(at, lt):
+            try:
+                raw_lv, _ = enc.encode(lt)
+                if raw_lv is not None:
+                    lv = np.asarray(raw_lv, dtype=np.float32).flatten()
+                    nbr2, smap2, lr_pre, lr_post = _faiss_conditioned_neighbors_once(
+                        label, anchor, lv, similar_to_candidates,
+                        conditioned_top_k, active_domain_set, jd_field_ids, jd_subfield_ids, jd_topic_ids,
+                        "supplement_light",
+                    )
+                    setattr(anchor, "_cond_light_raw_hits", lr_pre)
+                    setattr(anchor, "_cond_light_postfilter_hits", lr_post)
+                    nbr = nbr2[:cap]
+                    smap = smap2
+                    mode = "supplement_light_backoff" if nbr else "supplement_light_empty"
+            except Exception:
+                pass
+    if not nbr:
+        setattr(anchor, "conditioned_retrieval_mode", mode)
+        return [], {}, mode
+    setattr(anchor, "conditioned_retrieval_mode", mode)
+    return nbr, smap, mode
+
+
+def _stage2a_enrich_light_judge_snapshot(snap: Dict[str, Any], bucket: str, c: Any) -> None:
+    """轻量 meta（Stage3 / 全局一致性前置）；非终审桶。legacy 五层桶仍由上层写入。"""
+    gr = float(getattr(c, "generic_risk", 0) or 0)
+    pr = float(getattr(c, "polysemy_risk", 0) or 0)
+    orisk = float(getattr(c, "object_like_risk", 0) or 0)
+    if gr > 0.52 or pr > 0.55 or orisk > 0.45:
+        snap["risk_level"] = "high"
+    elif gr > 0.32 or pr > 0.30:
+        snap["risk_level"] = "medium"
+    else:
+        snap["risk_level"] = "low"
+    snap["is_core_like"] = bucket == "primary_expandable"
+    snap["is_expand_suggested"] = bucket in ("primary_expandable", "primary_support_seed")
+
+
 def collect_landing_candidates(
     label,
     anchor: PreparedAnchor,
@@ -5212,9 +5811,10 @@ def collect_landing_candidates(
     query_vector=None,
 ) -> List[LandingCandidate]:
     """
-    Stage2A：两路正式证据 similar_to + conditioned_vec，family_landing 仅在两路都很弱时补池且不参与主脑。
+    Stage2A：主召回 similar_to；conditioned_vec 以点积为 similar_to 补局部证据；仅在空/弱池时少量 FAISS 补召回；
+    family 仅空池弱保底（非主来源）。综述：候选生成优先，强裁决后移 Stage3。
     """
-    # 1) 两路正式证据
+    # 1) 主召回 + conditioned 局部分数（非第二套主 FAISS）
     similar_to_candidates = retrieve_academic_term_by_similar_to(
         label, anchor,
         active_domain_set=active_domain_set,
@@ -5223,20 +5823,33 @@ def collect_landing_candidates(
         jd_topic_ids=jd_topic_ids,
         top_k=STAGE2A_COLLECT_BASE_TOP_K,
     )
-    ctx_top_k = max(6, STAGE2A_COLLECT_CONDITIONED_TOP_K)
-    context_neighbors, rerank_signals = _retrieve_academic_terms_by_conditioned_vec(
-        label, anchor,
-        similar_to_candidates=similar_to_candidates,
-        active_domain_set=active_domain_set,
-        jd_field_ids=jd_field_ids,
-        jd_subfield_ids=jd_subfield_ids,
-        jd_topic_ids=jd_topic_ids,
-        conditioned_top_k=ctx_top_k,
-    )
-    # 2) family_landing 仅在两路都很弱时少量补
+    setattr(anchor, "conditioned_used_for_scoring", bool(getattr(anchor, "conditioned_vec", None) is not None))
+    setattr(anchor, "conditioned_used_for_supplement", False)
+    rerank_signals = _conditioned_rerank_signals_dot_product(label, anchor, similar_to_candidates)
+
+    context_neighbors: List[LandingCandidate] = []
+    if not _similar_to_pool_needs_conditioned_supplement(similar_to_candidates):
+        setattr(anchor, "conditioned_retrieval_mode", "scoring_only_dot_product")
+        setattr(anchor, "_cond_strong_raw_hits", 0)
+        setattr(anchor, "_cond_strong_postfilter_hits", 0)
+        setattr(anchor, "_cond_light_raw_hits", 0)
+        setattr(anchor, "_cond_light_postfilter_hits", 0)
+    if _similar_to_pool_needs_conditioned_supplement(similar_to_candidates):
+        ctx_top_k = max(6, STAGE2A_COLLECT_CONDITIONED_TOP_K)
+        context_neighbors, _, _sup_mode = _retrieve_conditioned_supplement_capped(
+            label, anchor, similar_to_candidates,
+            active_domain_set=active_domain_set,
+            jd_field_ids=jd_field_ids,
+            jd_subfield_ids=jd_subfield_ids,
+            jd_topic_ids=jd_topic_ids,
+            conditioned_top_k=ctx_top_k,
+            cap=CONDITIONED_SUPPLEMENT_MAX,
+        )
+        setattr(anchor, "conditioned_used_for_supplement", len(context_neighbors) > 0)
+    # 2) family：仅「仍无任何候选」时的弱保底（弱边 / 证据后移，不当主召回）
     family_cands: List[LandingCandidate] = []
-    if len(similar_to_candidates) + len(context_neighbors) <= 2 and _is_canonical_academic_like_anchor(anchor):
-        family_cands = retrieve_family_landing_candidates(label, anchor, top_k=STAGE2A_FAMILY_LANDING_TOP_K)
+    if len(similar_to_candidates) + len(context_neighbors) == 0 and _is_canonical_academic_like_anchor(anchor):
+        family_cands = retrieve_family_landing_candidates(label, anchor, top_k=min(3, STAGE2A_FAMILY_LANDING_TOP_K))
         for c in family_cands:
             setattr(c, "family_fallback_only", True)
             setattr(c, "default_expand_block_reason", "family_fallback_no_expand")
@@ -5399,9 +6012,24 @@ def collect_landing_candidates(
             if {"similar_to", "conditioned_vec"}.issubset(getattr(c, "source_set", None) or set())
         )
         print(
+            f"[Stage2A candidate_generation_summary] anchor={anchor.anchor!r} "
+            f"similar_to_count={n_raw_sim} conditioned_supplement_count={n_raw_ctx} "
+            f"family_fallback_count={len(family_cands)} final_candidate_count={len(cands)} "
+            f"conditioned_used_for_scoring={getattr(anchor, 'conditioned_used_for_scoring', False)} "
+            f"conditioned_used_for_supplement={getattr(anchor, 'conditioned_used_for_supplement', False)}"
+        )
+        print(
             f"[Stage2A landing source_distribution] anchor={anchor.anchor!r} "
             f"similar_to={n_raw_sim} conditioned_vec={n_raw_ctx} merged_after_tid={n_merged} "
             f"dual_source_after_merge={dual_after_merge} final_pool={len(cands)} dual_in_final={dual_final}"
+        )
+        print(
+            f"[Stage2A landing anchor_ctx] conditioning_mode={getattr(anchor, 'conditioning_mode', '')!r} "
+            f"conditioned_is_fallback={getattr(anchor, 'conditioned_is_fallback', False)} "
+            f"surface_conditioned_cosine={getattr(anchor, 'surface_conditioned_cosine', None)} "
+            f"conditioned_retrieval_mode={getattr(anchor, 'conditioned_retrieval_mode', '')!r} "
+            f"strong_raw/post={getattr(anchor, '_cond_strong_raw_hits', None)}/{getattr(anchor, '_cond_strong_postfilter_hits', None)} "
+            f"light_raw/post={getattr(anchor, '_cond_light_raw_hits', None)}/{getattr(anchor, '_cond_light_postfilter_hits', None)}"
         )
         print(
             f"[Stage2A landing merge_counts] raw_similar_to={n_raw_sim} raw_conditioned_vec={n_raw_ctx} "
@@ -5413,7 +6041,9 @@ def collect_landing_candidates(
                 f"  [top{i}] term={c.term!r} source_set={_sset or getattr(c, 'source', '')} "
                 f"surface_sim={getattr(c, 'surface_sim', None)} "
                 f"conditioned_sim={getattr(c, 'conditioned_sim', None)} "
-                f"context_gain={getattr(c, 'context_gain', None)}"
+                f"context_gain={getattr(c, 'context_gain', None)} "
+                f"conditioned_is_fallback={getattr(anchor, 'conditioned_is_fallback', False)} "
+                f"conditioned_retrieval_tier={getattr(c, 'conditioned_retrieval_tier', None)}"
             )
     return cands
 

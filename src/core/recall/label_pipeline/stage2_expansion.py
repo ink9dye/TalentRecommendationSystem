@@ -654,7 +654,7 @@ def run_stage2(
 
     返回结构化 dict（run_stage2 返回契约改造；all_candidates 仍为原 _expanded_to_raw_candidates 列表语义）。
     """
-    prepared_anchors = _anchor_skills_to_prepared_anchors(recall, anchor_skills)
+    prepared_anchors = _anchor_skills_to_prepared_anchors(recall, anchor_skills, query_text=query_text)
     if not prepared_anchors:
         _eg = _empty_candidate_graph()
         out: Dict[str, Any] = {
