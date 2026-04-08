@@ -4162,6 +4162,19 @@ def select_primary_per_anchor(
         "candidate_noise": [],
     }
     if not candidates:
+        # landing_state 闭环（空候选也必须可观测）：避免 fallback-only / empty anchor 没有 landing summary
+        anchor_term_sel = getattr(anchor, "anchor", "") or ""
+        stage2_mode = (getattr(anchor, "stage2_process_mode", "") or "").strip()
+        setattr(anchor, "landing_state", "empty_landing")
+        setattr(anchor, "landing_reason", "no_candidates_generated")
+        setattr(anchor, "candidate_generated_count", 0)
+        setattr(anchor, "landing_kept_count", 0)
+        if LABEL_EXPANSION_DEBUG:
+            print(
+                f"[Stage2A landing summary] anchor={anchor_term_sel!r} stage2_process_mode={stage2_mode!r} "
+                f"candidate_generated_count=0 landing_kept_count=0 landing_state='empty_landing' "
+                f"landing_reason='no_candidates_generated'"
+            )
         return empty_out
 
     primary_expandable: List["Stage2ACandidate"] = []
@@ -5066,6 +5079,40 @@ def select_primary_per_anchor(
             # aux：有保留但不强认落点；无则 empty
             landing_state = "weak_landing" if landing_kept_count > 0 else "empty_landing"
             landing_reason = "aux_kept_some_evidence" if landing_kept_count > 0 else "aux_no_evidence"
+
+    # main_strong 放行：当 normal retrieval 的 top1 足够贴锚且风险不过高、对齐充分时，赋予 good_landing 身份
+    # 仅改变 landing_state/landing_reason（可解释），不改 Stage2A 主排序公式与候选生成逻辑。
+    if stage2_mode == "main_strong_process" and (not family_only) and kept_all:
+        def _top1_sim(c: "Stage2ACandidate") -> float:
+            # 优先使用静态相似（similar_to），缺失则用 semantic_score/conditioned_sim 的可用值
+            v = getattr(c, "semantic_score", None)
+            if v is None:
+                v = getattr(c, "surface_sim", None)
+            if v is None:
+                v = getattr(c, "conditioned_sim", None)
+            try:
+                return float(v or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        top1 = max(kept_all, key=_top1_sim)
+        sim1 = _top1_sim(top1)
+        gen1 = float(getattr(top1, "generic_risk", 0.0) or 0.0)
+        poly1 = float(getattr(top1, "polysemy_risk", 0.0) or 0.0)
+        obj1 = float(getattr(top1, "object_like_risk", 0.0) or 0.0)
+        jd1 = float(getattr(top1, "jd_align", 0.0) or 0.0)
+        fam1 = float(getattr(top1, "family_match", 0.0) or getattr(top1, "anchor_identity_score", 0.0) or 0.0)
+
+        top1_ok = bool(
+            sim1 >= 0.85
+            and gen1 <= 0.55
+            and poly1 <= 0.30
+            and obj1 <= 0.25
+            and (jd1 >= 0.58 or fam1 >= 0.34)
+        )
+        if top1_ok:
+            landing_state = "good_landing"
+            landing_reason = "main_strong_normal_retrieval_top1_ok"
 
     # main_strong 的最小闭环补丁：若只有 risky_keep 但 top1 来自 similar_to 且风险不高，则提升为 support_keep（非 seed）
     # 这不改变排序公式，只是让“正常落地”与“纯 risky 挂着”在状态语义上分开，便于后续闭环。
