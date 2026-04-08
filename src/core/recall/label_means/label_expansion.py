@@ -277,6 +277,7 @@ def _split_stage2b_carryover_and_seed_candidates(primary_landings: Optional[List
     carryover_terms = list(primary_landings or [])
     seed_candidates: List[Any] = []
     blocked: List[Tuple[str, str]] = []  # (reason, primary_bucket)
+    tier_none_seedish: List[str] = []  # term samples for audit
     for p in carryover_terms:
         tier = (getattr(p, "stage2b_seed_tier", None) or "none").strip().lower()
         pb = (getattr(p, "primary_bucket", None) or "").strip()
@@ -289,9 +290,10 @@ def _split_stage2b_carryover_and_seed_candidates(primary_landings: Optional[List
             seed_candidates.append(p)
         else:
             blocked.append(("tier_none_after_2a_finalize", pb or "(empty)"))
+            tier_none_seedish.append((getattr(p, "term", "") or "")[:48])
 
-    # 入口审计：仅在 debug 下打印，避免刷屏；帮助解释“谁进入 seed、谁被挡在 seed 外”
-    if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and STAGE2_NOISY_DEBUG and carryover_terms:
+    # 入口审计：VERBOSE+NOISY 打全量；仅 DEBUG 打一行摘要（验收 seed 桥时够用）
+    if LABEL_EXPANSION_DEBUG and carryover_terms:
         blocked_counts: Dict[str, int] = {}
         for r, _pb in blocked:
             blocked_counts[r] = blocked_counts.get(r, 0) + 1
@@ -299,11 +301,18 @@ def _split_stage2b_carryover_and_seed_candidates(primary_landings: Optional[List
         for p in seed_candidates:
             _pb = (getattr(p, "primary_bucket", None) or "").strip() or "(empty)"
             seed_pb_counts[_pb] = seed_pb_counts.get(_pb, 0) + 1
-        print(
-            f"[Stage2B seed entry contract] carryover={len(carryover_terms)} "
-            f"seed_candidates={len(seed_candidates)} seed_bucket_counts={seed_pb_counts} "
-            f"blocked_counts={blocked_counts}"
-        )
+        if STAGE2_VERBOSE_DEBUG and STAGE2_NOISY_DEBUG:
+            print(
+                f"[Stage2B seed entry contract] carryover={len(carryover_terms)} "
+                f"seed_candidates={len(seed_candidates)} seed_bucket_counts={seed_pb_counts} "
+                f"blocked_counts={blocked_counts}"
+            )
+        elif not seed_candidates:
+            print(
+                f"[Stage2B seed entry contract] carryover={len(carryover_terms)} "
+                f"seed_candidates=0 blocked_counts={blocked_counts} "
+                f"tier_none_on_seedish_bucket_sample={tier_none_seedish[:3]!r}"
+            )
     return carryover_terms, seed_candidates
 
 
@@ -329,15 +338,26 @@ def _print_stage2b_input_audit(anchor_text: str, carryover_terms: List[Any], see
     if not STAGE2_VERBOSE_DEBUG:
         return
     seed_names = [getattr(p, "term", "") for p in seed_candidates[:5]]
+    _tier_n = {"strong": 0, "weak": 0, "none": 0}
+    for p in seed_candidates:
+        tv = (getattr(p, "stage2b_seed_tier", None) or "none").strip().lower()
+        if tv in _tier_n:
+            _tier_n[tv] += 1
+        else:
+            _tier_n["none"] += 1
     print(
         f"[Stage2B input audit] anchor={anchor_text!r} "
-        f"seed_candidates={len(seed_candidates)} sample={seed_names!r}"
+        f"seed_candidates={len(seed_candidates)} tier_counts={_tier_n} sample={seed_names!r}"
     )
 
 
-def _print_stage2b_no_seed_reason(anchor_text: str, carryover_terms: List[Any]) -> None:
+def _print_stage2b_no_seed_reason(
+    anchor_text: str,
+    carryover_terms: List[Any],
+    anchor: Optional[Any] = None,
+) -> None:
     """
-    seed_candidates=0 时一眼可读：是「全是 sk/rk」还是「桶名像 seed 但 tier 已在 2A 收口成 none」。
+    seed_candidates=0 时一眼可读：区分「2A 未产出 seed 桶」「tier=none」「landing 挡 seed」等。
     不替代 [Stage2A anchor bucket summary]，只为 2B 长日志省掉回头翻 2A 的成本。
     """
     if not LABEL_EXPANSION_DEBUG or not carryover_terms:
@@ -347,12 +367,19 @@ def _print_stage2b_no_seed_reason(anchor_text: str, carryover_terms: List[Any]) 
         return (getattr(p, "primary_bucket", "") or "").strip()
 
     tag_list: List[str] = []
+    tier_none_on_seedish = 0
     for p in carryover_terms:
         pb = _pb(p)
         if pb == "primary_expandable":
             tag_list.append("exp")
+            tr = (getattr(p, "stage2b_seed_tier", None) or "none").strip().lower()
+            if tr == "none":
+                tier_none_on_seedish += 1
         elif pb == "primary_support_seed":
             tag_list.append("sd")
+            tr = (getattr(p, "stage2b_seed_tier", None) or "none").strip().lower()
+            if tr == "none":
+                tier_none_on_seedish += 1
         elif pb in ("primary_support_keep", "primary_keep_no_expand", "primary_fallback_keep_no_expand"):
             tag_list.append("sk")
         elif pb == "risky_keep":
@@ -363,12 +390,18 @@ def _print_stage2b_no_seed_reason(anchor_text: str, carryover_terms: List[Any]) 
     buckets = ",".join(uniq)
     has_seedish_bucket = any(t in ("exp", "sd") for t in tag_list)
     if not has_seedish_bucket:
-        reason = "all_carryover_are_nonseed_buckets"
+        reason = "2a_no_seed_bucket_only_sk_rk"
+    elif tier_none_on_seedish > 0:
+        reason = "seed_bucket_but_tier_none_finalize_or_landing"
     else:
-        reason = "seedish_bucket_but_tier_none_after_2a_finalize"
+        reason = "seedish_bucket_unexpected_tier_state"
+    _ls = getattr(anchor, "landing_state", None) if anchor is not None else None
+    _lr = getattr(anchor, "landing_reason", None) if anchor is not None else None
+    _br = getattr(anchor, "weak_landing_seed_bridge_blocked_reason", None) if anchor is not None else None
     print(
         f"[Stage2B no-seed reason] anchor={anchor_text!r} reason={reason!r} buckets={buckets!r} "
-        f"(seed_pref=primary_support_seed; keep/risky carryover_only)"
+        f"support_keep_total={tag_list.count('sk')} "
+        f"landing_state={_ls!r} landing_reason={_lr!r} weak_bridge_block={_br!r}"
     )
 
 
@@ -384,6 +417,8 @@ STAGE2A_COLLECT_CONDITIONED_TOP_K_RESCUE = 12  # similar_to 空池或极弱时 c
 CONDITIONED_SUPPLEMENT_MAX = 3
 STAGE2A_SIMILAR_TO_WEAK_MAX_N = 2
 STAGE2A_SIMILAR_TO_WEAK_SIM = 0.79
+# conditioned-only（无 SIMILAR_TO 支撑）FAISS 命中最低 sim；略低于旧 0.82 以提高补池率，分桶/准入仍在后续
+STAGE2A_CONDITIONED_ONLY_MIN_SIM = 0.80
 STAGE2A_FAMILY_LANDING_TOP_K = 6  # canonical_academic_like 锚点 family 先手补池条数
 # 动力学/运动学/仿真等锚点 → 轻量 family 查询词（补池用，不保送 mainline）
 CANONICAL_ACADEMIC_ANCHOR_FAMILY_QUERIES: Dict[str, List[str]] = {
@@ -450,10 +485,26 @@ STAGE2A_CTX_DROP_TOL = 0.08      # 静态强匹配允许 context_sim 略低于 s
 STAGE2A_PRIMARY_KEEP_MIN = STAGE2A_WEAK_KEEP_MIN  # 保守留存门槛（judge/弱保留链）；非 select 前置 reject
 SEED_SCORE_MIN = 0.50              # Stage2B：check_seed 通过后按 seed_score≥此裁剪（仅 can_expand_from_2a 可过 check）
 SEED_SCORE_MIN_WEAK = 0.54         # Stage2B：主线近邻弱 seed（primary_support_seed）略高的 seed_score 下限
+# weak seed 最后一道门：仅当 weak_landing bridge 已成功 + main_strong + dual + similar 结构时，轴下限与 3.1 分布对齐（非全量放宽）
+SEED_WEAK_BRIDGE_FINAL_AXIS_MIN = 0.43
+SEED_WEAK_BRIDGE_FINAL_SCORE_GUARD = 0.62
 # 与 check_seed_eligibility 中 strong 的 axis_consistency_seed 下限一致；select 仅当过此线才维持/升格 primary_expandable
 SEED_AXIS_CONSISTENCY_STRONG_MIN = 0.45
 # keep/seed 救回 expandable：须为组内 axis_consistency_seed 第 1，且与第 2 名间隔≥此，避免 supervised/hand 与真主线并列升格
 STAGE2A_PROMOTE_MIN_AXIS_GAP = 0.03
+# Stage2A landing 闭环：局部「漂」打分（0=稳，1=漂）；用于 good/晋升守卫，非词表拒绝
+STAGE2A_LANDING_DRIFT_GOOD_TOP1_MAX = 0.40
+STAGE2A_LANDING_DRIFT_GOOD_SK_ONLY_MAX = 0.32  # 仅 support_keep 时更严
+STAGE2A_LANDING_DRIFT_WEAK_SEED_MAX = 0.36
+STAGE2A_LANDING_DRIFT_RISKY_TO_SK_MAX = 0.38
+STAGE2A_LANDING_DRIFT_DOWNGRADE_SK_POOL_MAX = 0.44  # 仅 sk 保留且整体偏漂时 good→weak
+# weak_landing 下「seed 桥」极窄恢复：仅 main_strong；比 pre-landing weak-seed fallback 略严，且受全池漂移上限约束
+# weak_landing 桥：与 Step2 后主战线 keep 的 drift 分布对齐（日志主线约 0.37～0.39）；略低于漂词壳词常见上限
+STAGE2A_WEAK_LANDING_SEED_BRIDGE_DRIFT_MAX = 0.41
+STAGE2A_WEAK_LANDING_SEED_BRIDGE_AXIS_MIN = 0.50  # 与 check_seed weak 轴下限一致
+# 池漂移只做「灾难兜底」，不再一票否决；详见 _stage2a_weak_landing_seed_bridge_eligible
+STAGE2A_WEAK_LANDING_SEED_BRIDGE_POOL_CATASTROPHIC = 0.58
+STAGE2A_WEAK_LANDING_SEED_BRIDGE_POOL_PAIR_CAND_DRIFT = 0.40  # 池极漂时候选自身还须不过线
 DENSE_MAX_PER_PRIMARY_WEAK = 2     # Stage2B：弱 seed 的 dense 每 primary 上限（强 seed 见 DENSE_MAX_PER_PRIMARY）
 
 # ---------- Stage2A 五层落点（内部细桶；降级为“内部用途”，不作为跨阶段正式语义） ----------
@@ -1747,6 +1798,27 @@ def _print_stage2b_blocked_weak_seed_audit(
         )
 
 
+def _print_stage2b_eligible_weak_seed_audit(anchor_text: str, seed_detail: List[Tuple[Any, bool, float, Optional[str]]]) -> None:
+    """weak seed 且 eligible=True 时打印 gate 依据（与 blocked audit 对读）。"""
+    if not LABEL_EXPANSION_DEBUG:
+        return
+    for p, eligible, seed_score, _br in seed_detail:
+        if not eligible:
+            continue
+        tier = (getattr(p, "stage2b_seed_tier", None) or "").strip().lower()
+        if tier != "weak":
+            continue
+        gate = getattr(p, "seed_eligibility_gate", None) or ""
+        print(
+            f"[Stage2B weak seed eligible audit] anchor={anchor_text!r} "
+            f"term={(getattr(p, 'term', '') or '')!r} eligible=True "
+            f"seed_score={seed_score:.3f} gate={gate!r} "
+            f"weak_landing_seed_bridge={getattr(p, 'weak_landing_seed_bridge', False)} "
+            f"dual_support={getattr(p, 'dual_support', False)} "
+            f"stage2_process_mode={getattr(p, 'stage2_process_mode', '')!r}"
+        )
+
+
 def check_seed_eligibility(
     label,
     p: "PrimaryLanding",
@@ -1768,6 +1840,8 @@ def check_seed_eligibility(
     - 先挡 fallback / tier=none / semantic_mismatch；再挡 **`blocked_by_2a`**（can_expand_from_2a=False）
     - **strong / weak** 按 **seed_score** 与 **axis_consistency_seed**（identity+family+jd+mainline_pref）分流；
       weak 另拦 **conditioned_only** 与 **generic/poly/object** 上限
+    - **weak 窄门**：仅 `weak_landing_seed_bridge` + main_strong + dual + similar/family 结构 + 高分时，
+      轴下限用 `SEED_WEAK_BRIDGE_FINAL_AXIS_MIN`（与 3.1 bridge 分布对齐），非全量 weak 放宽
     - seed_score 仍参与扩展侧的排序裁剪（SEED_SCORE_MIN / SEED_SCORE_MIN_WEAK）
     - emit_seed_factors=False：dense 内复核时不重复打印 [Stage2B seed factors]
     """
@@ -1943,7 +2017,7 @@ def check_seed_eligibility(
             return _fail("strong_seed_axis_low")
         return _ok()
 
-    # ---------- weak：轴更严 + 风险上限；conditioned_only 改为软惩罚，不交前置一票否决 ----------
+    # ---------- weak：轴 + 风险；bridge 已成功的高质量 weak 单独对齐轴下限（非全 weak 放水）----------
     if seed_tier == "weak":
         if conditioned_only_seed:
             seed_score = max(0.0, seed_score - 0.12)
@@ -1952,9 +2026,42 @@ def check_seed_eligibility(
         if seed_score < SEED_SCORE_MIN_WEAK:
             _weak_seed_audit(False, "weak_seed_score_low")
             return _fail("weak_seed_score_low")
-        if axis_consistency_seed < 0.50:
+
+        _s2m = (getattr(p, "stage2_process_mode", "") or "").strip()
+        if _s2m == "aux_weak_process":
+            _weak_seed_audit(False, "aux_weak_weak_seed_not_eligible")
+            return _fail("aux_weak_weak_seed_not_eligible")
+
+        _has_struct_sim = ("similar_to" in pl_src) or ("family_landing" in pl_src)
+        # 极窄：仅 3.1 bridge 已点亮的 weak seed，且 main_strong + 非 cond-only + 双路 + 结构上有 similar/family + 高分，才允许轴用 SEED_WEAK_BRIDGE_FINAL_AXIS_MIN
+        weak_bridge_final_ok = bool(
+            getattr(p, "weak_landing_seed_bridge", False)
+            and (not conditioned_only_seed)
+            and _s2m == "main_strong_process"
+            and dual_support
+            and _has_struct_sim
+            and seed_score >= SEED_WEAK_BRIDGE_FINAL_SCORE_GUARD
+            and axis_consistency_seed >= SEED_WEAK_BRIDGE_FINAL_AXIS_MIN
+            and axis_consistency_seed < 0.50
+        )
+        axis_ok_default = axis_consistency_seed >= 0.50
+        if not axis_ok_default and not weak_bridge_final_ok:
             _weak_seed_audit(False, "weak_seed_axis_low")
             return _fail("weak_seed_axis_low")
+        if weak_bridge_final_ok:
+            setattr(p, "seed_eligibility_gate", "weak_bridge_main_strong_dual_axis_aligned")
+            if LABEL_EXPANSION_DEBUG:
+                print(
+                    f"[Stage2B weak seed gate] anchor={anchor_text!r} term={primary_term!r} "
+                    f"path=weak_bridge_final_narrow axis={axis_consistency_seed:.3f} seed_score={seed_score:.3f} "
+                    f"axis_floor={SEED_WEAK_BRIDGE_FINAL_AXIS_MIN} (default_weak_floor=0.50) "
+                    f"weak_landing_seed_bridge=True dual_support={dual_support} "
+                    f"has_struct_sim={_has_struct_sim} conditioned_only={conditioned_only_seed} "
+                    f"stage2_process_mode={_s2m!r}"
+                )
+        else:
+            setattr(p, "seed_eligibility_gate", "weak_default_axis_0p50")
+
         if generic_risk >= 0.55 or polysemy_risk >= 0.35 or object_like_risk >= 0.25:
             _weak_seed_audit(False, "weak_seed_risk_high")
             return _fail("weak_seed_risk_high")
@@ -2096,6 +2203,27 @@ def _conditioned_text_substantial_vs_anchor(anchor_term: str, full_text: str) ->
     return len(f) > len(a) + 4
 
 
+def _light_text_ok_for_conditioned_backoff(anchor_term: str, light_text: str) -> bool:
+    """
+    轻句二次编码准入：在 substantial 之外允许「锚词 + 短延申」进入 FAISS，压低 supplement_light_empty。
+    仍要求 light 与 anchor 非纯重复。
+    """
+    if _conditioned_text_substantial_vs_anchor(anchor_term, light_text):
+        return True
+    a = (anchor_term or "").strip()
+    lt = (light_text or "").strip()
+    if not a or not lt:
+        return False
+    if lt == a:
+        return False
+    # 锚词为前缀且多出可编码片段
+    if lt.startswith(a):
+        rest = lt[len(a) :].strip()
+        return len(rest) >= 3
+    # 非前缀但明显更长（如英文锚 + 局部短语）
+    return len(lt) >= len(a) + 4
+
+
 def build_light_conditioned_anchor_text(
     anchor_term: str,
     selected_local: List[str],
@@ -2157,8 +2285,8 @@ def build_conditioned_anchor_text_variants(
 
     # profile：显式拉开强度（不引入新模式体系）
     n_loc = 2 if profile == "main_strong" else 1
-    # aux 默认更保守：co-anchor 可为 0（宁缺毋滥）
-    n_co = 2 if profile == "main_strong" else 1
+    # main 也只取 1 条 co-anchor，降低互喂噪声；aux 仍由下方循环限 main-only
+    n_co = 1 if profile == "main_strong" else 1
 
     loc_all = normalize_anchor_context_tokens(local_phrases, 8)
     co_all = normalize_anchor_context_tokens(co_anchor_terms, 8)
@@ -2294,18 +2422,24 @@ def build_conditioned_anchor_text_variants(
 
     selected_hints = filtered_hints[: (2 if profile == "main_strong" else (1 if planning_ok else 0))]
 
+    # 强文本：JD 紧窗靠前，再叠 local / co / hints，编码更贴近「锚点在该句中的任务」
     lines: List[str] = [anchor_term]
+    if selected_jd_window:
+        lines.append(selected_jd_window[: (120 if profile == "main_strong" else 84)])
     if loc_pick:
         lines.append(" ".join(loc_pick))
     if co_pick:
         lines.append(" ".join(co_pick))
-    if selected_jd_window:
-        lines.append(selected_jd_window[: (120 if profile == "main_strong" else 84)])
     if selected_hints:
         lines.append(" ".join(selected_hints))
 
     strong = _truncate_conditioned_text("\n".join(x for x in lines if x), _STRONG_CONDITIONED_MAX_CHARS, anchor_term)
-    light = build_light_conditioned_anchor_text(anchor_term, loc_pick, selected_hints, mention_win or selected_jd_window)
+    _mw_for_light = (mention_win or selected_jd_window or "").strip()
+    if profile == "aux_weak":
+        _mw_for_light = _mw_for_light[:56]
+    else:
+        _mw_for_light = _mw_for_light[:96]
+    light = build_light_conditioned_anchor_text(anchor_term, loc_pick, selected_hints, _mw_for_light)
     return ConditionedTextBundle(
         strong_text=strong,
         light_text=light,
@@ -2723,7 +2857,7 @@ def _faiss_conditioned_neighbors_once(
         if not ok:
             continue
         has_similar_to_support = tid in similar_to_vids
-        if not has_similar_to_support and sim < 0.82:
+        if not has_similar_to_support and sim < STAGE2A_CONDITIONED_ONLY_MIN_SIM:
             continue
         cand = LandingCandidate(
             vid=tid,
@@ -2801,12 +2935,7 @@ def _retrieve_academic_terms_by_conditioned_vec(
         lt = (getattr(anchor, "light_conditioned_text", None) or "").strip()
         enc = getattr(label, "_query_encoder", None)
         at = (getattr(anchor, "anchor", "") or "").strip()
-        if (
-            enc is not None
-            and lt
-            and at
-            and _conditioned_text_substantial_vs_anchor(at, lt)
-        ):
+        if enc is not None and lt and at and _light_text_ok_for_conditioned_backoff(at, lt):
             try:
                 raw_lv, _ = enc.encode(lt)
                 if raw_lv is not None:
@@ -3858,6 +3987,25 @@ def _stage2a_source_type_set(c: "Stage2ACandidate") -> Set[str]:
     return {st} if st else set()
 
 
+def _stage2a_has_similar_to_evidence(c: Any) -> bool:
+    """与 finalize/桥接对齐：source_set 不全时仍可由 surface_sim / 主 source 识别 similar_to 证据（非词表）。"""
+    if _stage2a_is_conditioned_only_for_seed(c):
+        return False
+    ss = _stage2a_source_type_set(c)
+    if "similar_to" in ss:
+        return True
+    st = (getattr(c, "source_type", None) or getattr(c, "source", "") or "").strip().lower()
+    if st == "similar_to":
+        return True
+    surf = getattr(c, "surface_sim", None)
+    if surf is None:
+        return False
+    try:
+        return float(surf) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
 def _primary_landing_source_type_set(p: Any) -> Set[str]:
     """PrimaryLanding 上的 source_set / source_type，与 _stage2a_source_type_set 对齐。"""
     ss = getattr(p, "source_set", None)
@@ -3876,6 +4024,86 @@ def _stage2a_is_conditioned_only_for_seed(c: "Stage2ACandidate") -> bool:
     has_fam = "family_landing" in ss
     has_cond = "conditioned_vec" in ss
     return bool(has_cond and (not has_sim) and (not has_fam))
+
+
+def _stage2a_axis_consistency_seed_candidate(c: Any) -> float:
+    """与 check_seed_eligibility 中 axis_consistency_seed 同构，供 2A seed 桥排序与门控（无词表）。"""
+    identity = float(getattr(c, "identity_score", 0.0) or 0.0)
+    anchor_identity = float(getattr(c, "anchor_identity_score", identity) or identity)
+    jd_align = float(getattr(c, "jd_align", 0.5) or 0.5)
+    fam = float(getattr(c, "family_match", 0.0) or 0.0)
+    if fam <= 0.0:
+        fam = anchor_identity
+    mlp = getattr(c, "mainline_pref_score", None)
+    if mlp is None:
+        mlp = getattr(c, "mainline_preference", 0.0)
+    mlp_f = max(0.0, min(1.0, float(mlp or 0.0)))
+    return float(
+        0.35 * anchor_identity
+        + 0.30 * fam
+        + 0.20 * jd_align
+        + 0.15 * mlp_f
+    )
+
+
+def _stage2a_weak_landing_seed_bridge_eligible(
+    c: Any,
+    anchor: PreparedAnchor,
+    *,
+    family_only: bool,
+    sk_pool_max_drift: float,
+) -> Tuple[bool, str]:
+    """
+    weak_landing 锚点下，至多将 1 条高质量 primary_support_keep 升格为 primary_support_seed（weak）。
+    门控以「候选自身信号」为主；sk_pool_max_drift 仅灾难兜底，避免主线被整池连坐。
+    """
+    if family_only:
+        return False, "family_only_landing"
+    stage2_mode = (getattr(anchor, "stage2_process_mode", "") or "").strip()
+    if stage2_mode != "main_strong_process":
+        return False, "not_main_strong_process"
+    if _stage2a_is_conditioned_only_for_seed(c):
+        return False, "conditioned_only_no_bridge"
+    if not _stage2a_has_similar_to_evidence(c):
+        return False, "similar_to_evidence_required"
+    pb = (getattr(c, "primary_bucket", "") or "").strip()
+    if pb != "primary_support_keep":
+        return False, "bucket_not_support_keep"
+    drift = _stage2a_local_quality_drift(c)
+    if drift > STAGE2A_WEAK_LANDING_SEED_BRIDGE_DRIFT_MAX:
+        return False, "local_drift_high"
+    # 池极漂 + 候选自身也偏高：双差才挡，避免 pool=0.44 直接把主线 top keep 掐死
+    if (
+        sk_pool_max_drift >= STAGE2A_WEAK_LANDING_SEED_BRIDGE_POOL_CATASTROPHIC
+        and drift >= STAGE2A_WEAK_LANDING_SEED_BRIDGE_POOL_PAIR_CAND_DRIFT
+    ):
+        return False, "sk_pool_catastrophic_and_candidate_drift_high"
+    gen = float(getattr(c, "generic_risk", 0.0) or 0.0)
+    poly = float(getattr(c, "polysemy_risk", 0.0) or 0.0)
+    obj = float(getattr(c, "object_like_risk", 0.0) or 0.0)
+    jd0 = float(getattr(c, "jd_align", 0.0) or 0.0)
+    fam0 = float(getattr(c, "family_match", 0.0) or getattr(c, "anchor_identity_score", 0.0) or 0.0)
+    ctx0 = float(getattr(c, "context_continuity", 0.0) or 0.0)
+    rk0 = getattr(c, "anchor_internal_rank", None)
+    rk_ok = (rk0 is None) or (isinstance(rk0, int) and rk0 <= 1)
+    ax = _stage2a_axis_consistency_seed_candidate(c)
+    if not rk_ok:
+        return False, "rank_not_top1"
+    if gen > 0.52:
+        return False, "generic_risk_high"
+    if poly > 0.26:
+        return False, "polysemy_risk_high"
+    if obj > 0.20:
+        return False, "object_like_risk_high"
+    if fam0 < 0.36:
+        return False, "family_match_low"
+    if jd0 < 0.58:
+        return False, "jd_align_low"
+    if ctx0 < 0.30:
+        return False, "context_continuity_low"
+    if ax < STAGE2A_WEAK_LANDING_SEED_BRIDGE_AXIS_MIN:
+        return False, "weak_seed_axis_low"
+    return True, "ok"
 
 
 def _finalize_stage2b_seed_tiers(
@@ -3908,6 +4136,14 @@ def _finalize_stage2b_seed_tiers(
             new_seed.append(c)
             continue
         if "similar_to" not in ss:
+            # weak_landing 桥已在入口要求 similar_to 证据；source_set 不完整时勿误降级
+            if bool(getattr(c, "weak_landing_seed_bridge", False)) and _stage2a_has_similar_to_evidence(c):
+                c.stage2b_seed_tier = "weak"
+                c.can_expand_from_2a = True
+                c.can_expand = True
+                setattr(c, "seed_downgrade_reason", None)
+                new_seed.append(c)
+                continue
             c.primary_bucket = "primary_support_keep"
             c.stage2b_seed_tier = "none"
             c.can_expand = False
@@ -4014,6 +4250,46 @@ def _stage2a_promote_strong_allowed(
     if has_judge_expandable_stable and w["pre_bucket"] in ("primary_support_keep", "primary_support_seed"):
         return False, "judge_expandable_stable_exists"
     return True, ""
+
+
+def _stage2a_local_quality_drift(c: Any) -> float:
+    """
+    Stage2A 局部 landing 质量：漂移程度 0～1（越高越像壳/场景偏移/仅条件向量）。
+    仅用已有候选字段，无外部词表。
+    """
+    if c is None:
+        return 0.0
+    s = 0.0
+    ft = (getattr(c, "family_type", None) or "").strip()
+    if ft == "shifted":
+        s += 0.38
+    elif ft == "generic":
+        s += 0.22
+    elif ft == "near_synonym":
+        s += 0.08
+    if bool(getattr(c, "scene_shifted", False)):
+        s += 0.18
+    if bool(getattr(c, "generic_like", False)):
+        s += 0.12
+    pr = float(getattr(c, "polysemy_risk", 0.0) or 0.0)
+    s += max(0.0, pr - 0.22) * 0.55
+    gr = float(getattr(c, "generic_risk", 0.0) or 0.0)
+    s += max(0.0, gr - 0.42) * 0.45
+    try:
+        ctxg = float(getattr(c, "ctx_gap", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        ctxg = 0.0
+    if ctxg > 0.16:
+        s += min(0.28, (ctxg - 0.16) * 1.15)
+    try:
+        src = _stage2a_source_type_set(c)
+    except Exception:
+        src = set()
+    if "similar_to" not in src and "conditioned_vec" in src:
+        s += 0.14
+    if "similar_to" not in src and "family_landing" not in src and "conditioned_vec" not in src:
+        s += 0.06
+    return float(min(1.0, max(0.0, s)))
 
 
 def _stage2a_phrase_naturalness_score(term: str) -> float:
@@ -4146,9 +4422,11 @@ def select_primary_per_anchor(
     candidates: List["Stage2ACandidate"],
 ) -> Dict[str, List["Stage2ACandidate"]]:
     """
-    Stage2A 组内选主：**新三层** candidate_core / candidate_support / candidate_noise（见返回键）+
-    **legacy 五层桶**（primary_expandable 等，Stage3 迁移前保留）。
-    综述式收缩：仍以 feature 与相对排序为主，细粒度 promote/reconcile 降噪（见 STAGE2_NOISY_DEBUG）。
+    Stage2A landing 闭环：组内选主 + 显式 landing_state/landing_reason。
+    - **candidate_core** = primary_expandable
+    - **candidate_support** = primary_support_seed + primary_support_keep（稳局部证据）
+    - **candidate_noise** = risky_keep + rejected（弱保留/漂向证据，legacy 桶仍保留供 Stage3）
+    legacy 五桶不变；局部漂移分用于抑制误 promote / 机械 good_landing（无词表黑名单）。
     """
     empty_out = {
         "primary_expandable": [],
@@ -4958,6 +5236,8 @@ def select_primary_per_anchor(
         ctx0 = float(getattr(cand0, "context_continuity", 0.0) or 0.0)
         rk0 = getattr(cand0, "anchor_internal_rank", None)
         rk_ok = (rk0 is None) or (isinstance(rk0, int) and rk0 <= 1)
+        drift_w = _stage2a_local_quality_drift(cand0)
+        setattr(anchor, "weak_seed_fallback_drift", drift_w)
 
         promote_ok = bool(
             rk_ok
@@ -4969,6 +5249,7 @@ def select_primary_per_anchor(
             and fam0 >= 0.34
             and jd0 >= 0.58
             and ctx0 >= 0.30
+            and drift_w <= STAGE2A_LANDING_DRIFT_WEAK_SEED_MAX
         )
 
         if promote_ok:
@@ -4987,6 +5268,7 @@ def select_primary_per_anchor(
                     f"[Stage2A weak-seed fallback] anchor={anchor_term_sel!r} triggered=True "
                     f"term={(getattr(cand0, 'term', '') or '')!r} "
                     f"from_bucket={pb0!r} -> to_bucket='primary_support_seed' "
+                    f"local_drift={drift_w:.3f} "
                     f"evidence={{'has_sim':{has_sim0},'cond_only':{cond_only0},'rk_ok':{rk_ok},"
                     f"'gen':{gen0:.2f},'poly':{poly0:.2f},'obj':{obj0:.2f},"
                     f"'fam':{fam0:.2f},'jd':{jd0:.2f},'ctx':{ctx0:.2f}}}"
@@ -5013,19 +5295,19 @@ def select_primary_per_anchor(
                     reason_bits.append("jd_align_low")
                 if ctx0 < 0.30:
                     reason_bits.append("context_continuity_low")
+                if drift_w > STAGE2A_LANDING_DRIFT_WEAK_SEED_MAX:
+                    reason_bits.append("local_drift_high")
                 why = ",".join(reason_bits) if reason_bits else "unknown"
                 print(
                     f"[Stage2A weak-seed fallback] anchor={anchor_term_sel!r} triggered=False "
-                    f"top_keep={(getattr(cand0, 'term', '') or '')!r} bucket={pb0!r} reason={why!r}"
+                    f"top_keep={(getattr(cand0, 'term', '') or '')!r} bucket={pb0!r} drift={drift_w:.3f} reason={why!r}"
                 )
 
     primary_expandable, primary_support_seed, primary_support_keep, risky_keep = _finalize_stage2b_seed_tiers(
         primary_expandable, primary_support_seed, primary_support_keep, risky_keep
     )
 
-    primary_keep_no_expand: List["Stage2ACandidate"] = (
-        primary_support_seed + primary_support_keep + risky_keep
-    )
+    # primary_keep_no_expand 在 landing +（若触发）weak_landing seed 桥之后统一重算
 
     # --------------------------------------------------
     # 2. Stage2A landing 闭环：显式区分“有候选”与“已落地”，并把状态用于 seed 资格收口
@@ -5076,15 +5358,70 @@ def select_primary_per_anchor(
                 landing_state = "empty_landing"
                 landing_reason = "no_kept_candidates_after_select"
         else:
-            # aux：有保留但不强认落点；无则 empty
-            landing_state = "weak_landing" if landing_kept_count > 0 else "empty_landing"
-            landing_reason = "aux_kept_some_evidence" if landing_kept_count > 0 else "aux_no_evidence"
+            # aux：外层已保证 kept>0 且非 family_only；口径与 main 区分
+            if primary_expandable or primary_support_seed:
+                landing_state = "weak_landing"
+                landing_reason = "aux_weak_seedish_not_main_strong"
+            elif primary_support_keep and not risky_keep:
+                landing_state = "weak_landing"
+                landing_reason = "aux_weak_support_keep_only"
+            elif risky_keep and (not primary_support_keep) and (not primary_support_seed) and (not primary_expandable):
+                landing_state = "weak_landing"
+                landing_reason = "aux_weak_risky_only"
+            else:
+                landing_state = "weak_landing"
+                landing_reason = "aux_weak_mixed_kept"
 
-    # main_strong 放行：当 normal retrieval 的 top1 足够贴锚且风险不过高、对齐充分时，赋予 good_landing 身份
-    # 仅改变 landing_state/landing_reason（可解释），不改 Stage2A 主排序公式与候选生成逻辑。
+    # main_strong：仅 similar_to 单条 risky 时，局部信号足够稳才晋升为 support_keep（防壳词/漂词误升）
+    if (
+        stage2_mode == "main_strong_process"
+        and (not primary_expandable)
+        and (not primary_support_seed)
+        and (not primary_support_keep)
+        and len(risky_keep) == 1
+        and (not family_only)
+    ):
+        rk0 = risky_keep[0]
+        src0 = _cand_src_set(rk0)
+        drift_rk = _stage2a_local_quality_drift(rk0)
+        setattr(anchor, "landing_risky_to_sk_drift", drift_rk)
+        if "similar_to" in src0:
+            gen0 = float(getattr(rk0, "generic_risk", 0.0) or 0.0)
+            poly0 = float(getattr(rk0, "polysemy_risk", 0.0) or 0.0)
+            obj0 = float(getattr(rk0, "object_like_risk", 0.0) or 0.0)
+            jd0 = float(getattr(rk0, "jd_align", 0.0) or 0.0)
+            fam0 = float(getattr(rk0, "family_match", 0.0) or getattr(rk0, "anchor_identity_score", 0.0) or 0.0)
+            promote_keep_ok = bool(
+                gen0 <= 0.50
+                and poly0 <= 0.26
+                and obj0 <= 0.20
+                and jd0 >= 0.62
+                and fam0 >= 0.30
+                and drift_rk <= STAGE2A_LANDING_DRIFT_RISKY_TO_SK_MAX
+            )
+            if promote_keep_ok:
+                risky_keep = []
+                primary_support_keep = [rk0]
+                rk0.primary_bucket = "primary_support_keep"
+                rk0.can_expand = False
+                rk0.can_expand_from_2a = False
+                rk0.stage2b_seed_tier = "none"
+                setattr(rk0, "landing_keep_promoted_from_risky", True)
+                setattr(rk0, "landing_keep_promote_reason", "main_strong_similar_to_top1_promote_to_support_keep")
+                landing_state = "weak_landing"
+                landing_reason = "promoted_risky_top1_to_support_keep"
+            else:
+                setattr(anchor, "landing_risky_sk_promote_blocked", True)
+                setattr(anchor, "landing_risky_sk_promote_blocked_drift", drift_rk)
+
+    kept_all = (
+        list(primary_expandable) + list(primary_support_seed) + list(primary_support_keep) + list(risky_keep)
+    )
+    landing_kept_count = len(kept_all)
+
+    # main_strong：top1 质量 + 漂移守卫后才允许 good_landing（避免仅靠 static sim 机械升格）
     if stage2_mode == "main_strong_process" and (not family_only) and kept_all:
         def _top1_sim(c: "Stage2ACandidate") -> float:
-            # 优先使用静态相似（similar_to），缺失则用 semantic_score/conditioned_sim 的可用值
             v = getattr(c, "semantic_score", None)
             if v is None:
                 v = getattr(c, "surface_sim", None)
@@ -5096,56 +5433,49 @@ def select_primary_per_anchor(
                 return 0.0
 
         top1 = max(kept_all, key=_top1_sim)
+        drift1 = _stage2a_local_quality_drift(top1)
+        setattr(anchor, "landing_top1_drift", drift1)
         sim1 = _top1_sim(top1)
         gen1 = float(getattr(top1, "generic_risk", 0.0) or 0.0)
         poly1 = float(getattr(top1, "polysemy_risk", 0.0) or 0.0)
         obj1 = float(getattr(top1, "object_like_risk", 0.0) or 0.0)
         jd1 = float(getattr(top1, "jd_align", 0.0) or 0.0)
         fam1 = float(getattr(top1, "family_match", 0.0) or getattr(top1, "anchor_identity_score", 0.0) or 0.0)
-
+        only_sk = (
+            (not primary_expandable)
+            and (not primary_support_seed)
+            and bool(primary_support_keep)
+        )
+        top1_in_risky = top1 in risky_keep
+        drift_limit = STAGE2A_LANDING_DRIFT_GOOD_SK_ONLY_MAX if only_sk else STAGE2A_LANDING_DRIFT_GOOD_TOP1_MAX
         top1_ok = bool(
             sim1 >= 0.85
             and gen1 <= 0.55
             and poly1 <= 0.30
             and obj1 <= 0.25
             and (jd1 >= 0.58 or fam1 >= 0.34)
+            and drift1 <= drift_limit
+            and (not top1_in_risky)
         )
         if top1_ok:
             landing_state = "good_landing"
             landing_reason = "main_strong_normal_retrieval_top1_ok"
 
-    # main_strong 的最小闭环补丁：若只有 risky_keep 但 top1 来自 similar_to 且风险不高，则提升为 support_keep（非 seed）
-    # 这不改变排序公式，只是让“正常落地”与“纯 risky 挂着”在状态语义上分开，便于后续闭环。
+    # good_landing 二次收口：仅 support_keep 且池子整体漂偏高 → 降为 weak（与 candidate 质量一致）
     if (
         stage2_mode == "main_strong_process"
+        and landing_state == "good_landing"
+        and (landing_reason == "main_strong_normal_retrieval_top1_ok")
         and (not primary_expandable)
         and (not primary_support_seed)
-        and (not primary_support_keep)
-        and len(risky_keep) == 1
-        and (not family_only)
+        and primary_support_keep
     ):
-        rk0 = risky_keep[0]
-        src0 = _cand_src_set(rk0)
-        if "similar_to" in src0:
-            gen0 = float(getattr(rk0, "generic_risk", 0.0) or 0.0)
-            poly0 = float(getattr(rk0, "polysemy_risk", 0.0) or 0.0)
-            obj0 = float(getattr(rk0, "object_like_risk", 0.0) or 0.0)
-            jd0 = float(getattr(rk0, "jd_align", 0.0) or 0.0)
-            fam0 = float(getattr(rk0, "family_match", 0.0) or getattr(rk0, "anchor_identity_score", 0.0) or 0.0)
-            promote_keep_ok = bool(gen0 <= 0.50 and poly0 <= 0.26 and obj0 <= 0.20 and jd0 >= 0.62 and fam0 >= 0.30)
-            if promote_keep_ok:
-                risky_keep = []
-                primary_support_keep = [rk0]
-                rk0.primary_bucket = "primary_support_keep"
-                rk0.can_expand = False
-                rk0.can_expand_from_2a = False
-                rk0.stage2b_seed_tier = "none"
-                setattr(rk0, "landing_keep_promoted_from_risky", True)
-                setattr(rk0, "landing_keep_promote_reason", "main_strong_similar_to_top1_promote_to_support_keep")
-                kept_all = list(primary_support_keep)
-                landing_kept_count = len(kept_all)
-                landing_state = "weak_landing"
-                landing_reason = "promoted_risky_top1_to_support_keep"
+        sk_drifts = [_stage2a_local_quality_drift(c) for c in primary_support_keep]
+        max_sk_drift = max(sk_drifts) if sk_drifts else 0.0
+        setattr(anchor, "landing_sk_pool_max_drift", max_sk_drift)
+        if max_sk_drift >= STAGE2A_LANDING_DRIFT_DOWNGRADE_SK_POOL_MAX:
+            landing_state = "weak_landing"
+            landing_reason = "main_strong_sk_only_pool_drift_high"
 
     # seed 资格收口：landing_state 不能只是 debug 标签，需影响 Stage2B
     if landing_state in ("fallback_only_landing", "empty_landing"):
@@ -5159,21 +5489,119 @@ def select_primary_per_anchor(
         primary_expandable = []
         primary_support_seed = []
     elif landing_state == "weak_landing":
-        # weak_landing：默认不当 seed（避免从弱落地扩散）；但不强行改其 support/keep 身份
-        for _c in primary_expandable + primary_support_seed:
+        # weak_landing：默认不当 seed；但不再「清空列表丢引用」——先降级进 support_keep，再走极窄 seed 桥（main_strong 至多 1 条 weak）。
+        _demoted: List["Stage2ACandidate"] = []
+        for _c in list(primary_expandable) + list(primary_support_seed):
+            _c.primary_bucket = "primary_support_keep"
             _c.can_expand = False
             _c.can_expand_from_2a = False
             _c.stage2b_seed_tier = "none"
             _c.suppress_seed = True
-            setattr(_c, "seed_block_reason", "weak_landing_no_seed_by_default")
+            setattr(_c, "seed_block_reason", "weak_landing_demoted_from_expandable_or_seed")
+            setattr(_c, "weak_landing_demoted", True)
+            _demoted.append(_c)
         primary_expandable = []
         primary_support_seed = []
+        _sk_ids = {id(x) for x in primary_support_keep}
+        _merged_sk: List["Stage2ACandidate"] = []
+        for _c in _demoted:
+            if id(_c) not in _sk_ids:
+                _merged_sk.append(_c)
+                _sk_ids.add(id(_c))
+        primary_support_keep = _merged_sk + list(primary_support_keep)
+
+        _bridge_applied = False
+        _sk_drifts_w = [_stage2a_local_quality_drift(c) for c in primary_support_keep]
+        _max_sk_drift_w = max(_sk_drifts_w) if _sk_drifts_w else 0.0
+        setattr(anchor, "weak_landing_bridge_sk_pool_max_drift", _max_sk_drift_w)
+        if stage2_mode == "main_strong_process" and primary_support_keep:
+            _sorted_for_bridge = sorted(
+                primary_support_keep,
+                key=lambda c: (
+                    -_stage2a_axis_consistency_seed_candidate(c),
+                    _stage2a_local_quality_drift(c),
+                    -float(getattr(c, "jd_align", 0.0) or 0.0),
+                ),
+            )
+            _audit_rows: List[Tuple[str, bool, str]] = []
+            for _cand in _sorted_for_bridge:
+                _ok, _why = _stage2a_weak_landing_seed_bridge_eligible(
+                    _cand,
+                    anchor,
+                    family_only=family_only,
+                    sk_pool_max_drift=_max_sk_drift_w,
+                )
+                _audit_rows.append((getattr(_cand, "term", "") or "", _ok, _why))
+                if not _ok:
+                    continue
+                primary_support_keep = [x for x in primary_support_keep if id(x) != id(_cand)]
+                primary_support_seed = [_cand]
+                _cand.primary_bucket = "primary_support_seed"
+                _cand.suppress_seed = False
+                setattr(_cand, "seed_block_reason", None)
+                setattr(_cand, "weak_landing_seed_bridge", True)
+                setattr(_cand, "weak_landing_bridge_reason", _why)
+                _bridge_applied = True
+                setattr(anchor, "weak_landing_seed_bridge_blocked_reason", None)
+                if LABEL_EXPANSION_DEBUG:
+                    _co = _stage2a_is_conditioned_only_for_seed(_cand)
+                    _sim_ev = _stage2a_has_similar_to_evidence(_cand)
+                    _surf = getattr(_cand, "surface_sim", None)
+                    _dual = bool(getattr(_cand, "dual_support", False))
+                    print(
+                        f"[Stage2A weak_landing_seed_bridge] anchor={anchor_term_sel!r} applied=True "
+                        f"term={(getattr(_cand, 'term', '') or '')!r} "
+                        f"local_drift={_stage2a_local_quality_drift(_cand):.3f} "
+                        f"axis_seed={_stage2a_axis_consistency_seed_candidate(_cand):.3f} "
+                        f"jd={float(getattr(_cand, 'jd_align', 0.0) or 0.0):.3f} "
+                        f"sk_pool_max_drift={_max_sk_drift_w:.3f} "
+                        f"conditioned_only={_co} has_similar_to_evidence={_sim_ev} "
+                        f"surface_sim={_surf!r} dual_support={_dual} "
+                        f"why=top_support_keep_passes_candidate_first_gates"
+                    )
+                break
+            setattr(anchor, "weak_landing_seed_bridge_audit", _audit_rows[:6])
+            if not _bridge_applied:
+                _first_why = _audit_rows[0][2] if _audit_rows else "empty_support_keep"
+                setattr(anchor, "weak_landing_seed_bridge_blocked_reason", _first_why)
+                if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+                    print(
+                        f"[Stage2A weak_landing_seed_bridge] anchor={anchor_term_sel!r} applied=False "
+                        f"sk_pool_max_drift={_max_sk_drift_w:.3f} first_block={_first_why!r} "
+                        f"audit={_audit_rows[:3]!r}"
+                    )
+        else:
+            setattr(anchor, "weak_landing_seed_bridge_blocked_reason", "not_main_strong_or_empty_sk")
+
+        primary_expandable, primary_support_seed, primary_support_keep, risky_keep = _finalize_stage2b_seed_tiers(
+            primary_expandable, primary_support_seed, primary_support_keep, risky_keep
+        )
+        if LABEL_EXPANSION_DEBUG and _bridge_applied:
+            _bridged_terms = [
+                (getattr(x, "term", "") or "", (getattr(x, "stage2b_seed_tier", "") or "").strip())
+                for x in primary_support_seed
+                if getattr(x, "weak_landing_seed_bridge", False)
+            ]
+            if not _bridged_terms:
+                print(
+                    f"[Stage2A weak_landing_seed_bridge] anchor={anchor_term_sel!r} "
+                    f"post_finalize_warn=bridge_flag_but_no_seed_in_list"
+                )
+            else:
+                print(
+                    f"[Stage2A weak_landing_seed_bridge] anchor={anchor_term_sel!r} "
+                    f"post_finalize_ok bridged_terms_tier={_bridged_terms!r}"
+                )
 
     # 写回 anchor 级可读状态（Stage2B/日志/下游可读）
     setattr(anchor, "landing_state", landing_state)
     setattr(anchor, "landing_reason", landing_reason)
     setattr(anchor, "candidate_generated_count", int(candidate_generated_count))
     setattr(anchor, "landing_kept_count", int(landing_kept_count))
+
+    primary_keep_no_expand: List["Stage2ACandidate"] = (
+        primary_support_seed + primary_support_keep + risky_keep
+    )
 
     if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
         # 中间快照 vs 配额/_finalize 后 final_bucket：对齐 Focus Debug 与 [Stage2A select] 的差异
@@ -5228,26 +5656,38 @@ def select_primary_per_anchor(
         # landing 闭环摘要：区分 candidate_generated vs landing_kept，并输出落地状态（可解释）
         _anchor_text = getattr(anchor, "anchor", "") or ""
         _m = (getattr(anchor, "stage2_process_mode", "") or "").strip()
+        _lt_d = getattr(anchor, "landing_top1_drift", None)
+        _sk_md = getattr(anchor, "landing_sk_pool_max_drift", None)
         print(
             f"[Stage2A landing summary] anchor={_anchor_text!r} stage2_process_mode={_m!r} "
             f"candidate_generated_count={candidate_generated_count} landing_kept_count={landing_kept_count} "
-            f"landing_state={landing_state!r} landing_reason={landing_reason!r}"
+            f"landing_state={landing_state!r} landing_reason={landing_reason!r} "
+            f"landing_top1_drift={_lt_d!r} sk_pool_max_drift={_sk_md!r}"
         )
 
     for c in primary_expandable:
         setattr(c, "candidate_layer", "candidate_core")
         setattr(c, "candidate_layer_note", "legacy: primary_bucket kept for Stage3 compat; prefer candidate_layer")
-    for c in primary_support_seed + primary_support_keep + risky_keep:
+    for c in primary_support_seed + primary_support_keep:
         setattr(c, "candidate_layer", "candidate_support")
+    for c in risky_keep:
+        setattr(c, "candidate_layer", "candidate_noise")
+        setattr(
+            c,
+            "candidate_layer_note",
+            "risky_keep mapped to noise layer: weak/drift-prone local evidence; legacy bucket unchanged",
+        )
     for c in rejected:
         setattr(c, "candidate_layer", "candidate_noise")
 
     if LABEL_EXPANSION_DEBUG:
+        _sup_n = len(primary_support_seed) + len(primary_support_keep)
+        _noise_n = len(risky_keep) + len(rejected)
         print(
             f"[Stage2A candidate_layer_summary] anchor={anchor_term_sel!r} "
             f"core_count={len(primary_expandable)} "
-            f"support_count={len(primary_support_seed) + len(primary_support_keep) + len(risky_keep)} "
-            f"noise_count={len(rejected)}"
+            f"support_count={_sup_n} (seed+support_keep) "
+            f"noise_count={_noise_n} (risky_keep+rejected)"
         )
 
     return {
@@ -5258,8 +5698,8 @@ def select_primary_per_anchor(
         "primary_keep_no_expand": primary_keep_no_expand,
         "rejected": rejected,
         "candidate_core": primary_expandable,
-        "candidate_support": primary_support_seed + primary_support_keep + risky_keep,
-        "candidate_noise": rejected,
+        "candidate_support": primary_support_seed + primary_support_keep,
+        "candidate_noise": risky_keep + rejected,
     }
 
 
@@ -6433,12 +6873,14 @@ def _retrieve_conditioned_supplement_capped(
     cap: int = CONDITIONED_SUPPLEMENT_MAX,
 ) -> Tuple[List[LandingCandidate], Dict[int, float], str]:
     """
-    仅在弱/空 similar_to 时调用；最多 cap 条；强向量先试，失败再轻句编码（与 2.1 backoff 同 spirit）。
+    collect_landing_candidates 内统一调用：最多 cap 条；强向量先试，失败再轻句编码。
+    旧逻辑仅在弱/空 similar_to 时触发；现由 collect 决定是否合并进池，本函数只负责单次检索。
     """
     if getattr(anchor, "conditioned_vec", None) is None:
         setattr(anchor, "conditioned_retrieval_mode", "supplement_skipped_no_vec")
         return [], {}, "supplement_skipped_no_vec"
     if not getattr(label, "vocab_index", None):
+        setattr(anchor, "conditioned_retrieval_mode", "supplement_skipped_no_index")
         return [], {}, "supplement_skipped_no_index"
     load_vocab_meta(label)
     strong_vec = np.asarray(anchor.conditioned_vec, dtype=np.float32).flatten()
@@ -6457,7 +6899,7 @@ def _retrieve_conditioned_supplement_capped(
         enc = getattr(label, "_query_encoder", None)
         lt = (getattr(anchor, "light_conditioned_text", None) or "").strip()
         at = (getattr(anchor, "anchor", "") or "").strip()
-        if enc and lt and at and _conditioned_text_substantial_vs_anchor(at, lt):
+        if enc and lt and at and _light_text_ok_for_conditioned_backoff(at, lt):
             try:
                 raw_lv, _ = enc.encode(lt)
                 if raw_lv is not None:
@@ -6507,8 +6949,9 @@ def collect_landing_candidates(
     query_vector=None,
 ) -> List[LandingCandidate]:
     """
-    Stage2A：主召回 similar_to；conditioned_vec 以点积为 similar_to 补局部证据；仅在空/弱池时少量 FAISS 补召回；
-    family 仅空池弱保底（非主来源）。综述：候选生成优先，强裁决后移 Stage3。
+    Stage2A 承重：先 SIMILAR_TO 基池，再对 conditioned_vec 做 FAISS 补池并 merge（不过早裁决）。
+    conditioned_vec 同时对 similar_to 做点积局部分数；family 仅全空弱保底。
+    准入/分桶仍由后续 admission / select 负责。
     """
     # 1) 主召回 + conditioned 局部分数（非第二套主 FAISS）
     similar_to_candidates = retrieve_academic_term_by_similar_to(
@@ -6519,20 +6962,24 @@ def collect_landing_candidates(
         jd_topic_ids=jd_topic_ids,
         top_k=STAGE2A_COLLECT_BASE_TOP_K,
     )
+    n_base = len(similar_to_candidates)
     setattr(anchor, "conditioned_used_for_scoring", bool(getattr(anchor, "conditioned_vec", None) is not None))
     setattr(anchor, "conditioned_used_for_supplement", False)
     rerank_signals = _conditioned_rerank_signals_dot_product(label, anchor, similar_to_candidates)
 
     context_neighbors: List[LandingCandidate] = []
-    if not _similar_to_pool_needs_conditioned_supplement(similar_to_candidates):
+    weak_pool = _similar_to_pool_needs_conditioned_supplement(similar_to_candidates)
+    can_faiss = getattr(anchor, "conditioned_vec", None) is not None and getattr(label, "vocab_index", None)
+
+    if not can_faiss:
         setattr(anchor, "conditioned_retrieval_mode", "scoring_only_dot_product")
         setattr(anchor, "_cond_strong_raw_hits", 0)
         setattr(anchor, "_cond_strong_postfilter_hits", 0)
         setattr(anchor, "_cond_light_raw_hits", 0)
         setattr(anchor, "_cond_light_postfilter_hits", 0)
-    if _similar_to_pool_needs_conditioned_supplement(similar_to_candidates):
-        ctx_top_k = max(6, STAGE2A_COLLECT_CONDITIONED_TOP_K)
-        context_neighbors, _, _sup_mode = _retrieve_conditioned_supplement_capped(
+    else:
+        ctx_top_k = max(8, STAGE2A_COLLECT_CONDITIONED_TOP_K_RESCUE if weak_pool else STAGE2A_COLLECT_CONDITIONED_TOP_K)
+        context_neighbors, _, _ = _retrieve_conditioned_supplement_capped(
             label, anchor, similar_to_candidates,
             active_domain_set=active_domain_set,
             jd_field_ids=jd_field_ids,
@@ -6703,12 +7150,30 @@ def collect_landing_candidates(
                 reasons = []
             reasons.append("family_landing_support")
             setattr(c, "primary_eligibility_reasons", reasons)
+    setattr(
+        anchor,
+        "stage2a_collect_summary",
+        {
+            "base_similar_to_count": n_base,
+            "conditioned_faiss_raw_count": len(context_neighbors),
+            "merged_tid_count": n_merged,
+            "candidate_generated_count": len(cands),
+            "weak_similar_to_pool": weak_pool,
+            "conditioned_faiss_enabled": bool(can_faiss),
+        },
+    )
     if LABEL_EXPANSION_DEBUG:
         n_raw_sim = len(similar_to_candidates)
         n_raw_ctx = len(context_neighbors)
         dual_final = sum(
             1 for c in cands
             if {"similar_to", "conditioned_vec"}.issubset(getattr(c, "source_set", None) or set())
+        )
+        print(
+            f"[Stage2A collect_landing_summary] anchor={anchor.anchor!r} "
+            f"base_n={n_base} conditioned_faiss_n={n_raw_ctx} merged_n={n_merged} "
+            f"candidate_generated_count={len(cands)} weak_similar_to_pool={weak_pool} "
+            f"faiss_enabled={bool(can_faiss)} retrieval={getattr(anchor, 'conditioned_retrieval_mode', '')!r}"
         )
         print(
             f"[Stage2A candidate_generation_summary] anchor={anchor.anchor!r} "
@@ -9359,6 +9824,13 @@ def stage2_generate_academic_terms(
             setattr(p, "has_static_support", bool(getattr(cand, "has_static_support", False)))
             setattr(p, "dual_support", bool(getattr(cand, "dual_support", False)))
             setattr(p, "source_type", getattr(cand, "source_type", None) or getattr(cand, "source", "") or "")
+            setattr(p, "weak_landing_seed_bridge", bool(getattr(cand, "weak_landing_seed_bridge", False)))
+            setattr(
+                p,
+                "stage2_process_mode",
+                (getattr(anchor, "stage2_process_mode", "") or "").strip(),
+            )
+            setattr(p, "mainline_pref_score", float(getattr(cand, "mainline_pref_score", 0.0) or 0.0))
         # Stage2A 审计字段 → PrimaryLanding → merge → raw_candidates 顶层
         # 说明：以下字段属于 Stage2A 细桶体系/审计痕迹，长期口径应降级为 debug/兼容镜像，
         # 不作为跨阶段正式语义；跨阶段推荐使用 local_role + 局部证据字段（见 Stage2 出口打包层）。
@@ -9581,7 +10053,7 @@ def stage2_generate_academic_terms(
                 emit_merge_debug=False,
             )
             if LABEL_EXPANSION_DEBUG:
-                _print_stage2b_no_seed_reason(anchor.anchor, carryover_terms)
+                _print_stage2b_no_seed_reason(anchor.anchor, carryover_terms, anchor)
                 print(
                     f"[Stage2B] anchor={anchor.anchor!r} carryover={len(carryover_terms)} "
                     f"seed_candidates=0 eligible_seeds=0 diffusion=0 merged={len(merged)}"
@@ -9596,7 +10068,7 @@ def stage2_generate_academic_terms(
 
         _print_stage2b_input_audit(anchor.anchor, carryover_terms, seed_candidates)
         if len(seed_candidates) == 0:
-            _print_stage2b_no_seed_reason(anchor.anchor, carryover_terms)
+            _print_stage2b_no_seed_reason(anchor.anchor, carryover_terms, anchor)
 
         # Stage2B：check_seed_eligibility 仅遍历 seed_candidates（强/弱 seed）
         diffusion_scored: List[Tuple[Any, float]] = []
@@ -9614,6 +10086,17 @@ def stage2_generate_academic_terms(
             _seed_detail.append((p, eligible, seed_score, block_reason))
             if eligible:
                 diffusion_scored.append((p, seed_score))
+        if (
+            LABEL_EXPANSION_DEBUG
+            and seed_candidates
+            and not any(el for (_p, el, _s, _r) in _seed_detail)
+        ):
+            _reasons = [(getattr(_p, "term", "") or "", _r) for _p, _el, _s, _r in _seed_detail]
+            print(
+                f"[Stage2B no-seed reason] anchor={getattr(anchor, 'anchor', '')!r} "
+                f"case=seed_candidates_gt_0_but_all_blocked_by_check_seed "
+                f"seed_candidates={len(seed_candidates)} check_seed_block_reasons={_reasons!r}"
+            )
         _anch_txt = getattr(anchor, "anchor", "") or ""
         _print_stage2b_seed_tier_audit(_anch_txt, _seed_detail)
         _print_stage2b_blocked_weak_seed_audit(_anch_txt, _seed_detail)
