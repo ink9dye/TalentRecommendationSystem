@@ -18,11 +18,207 @@ from src.core.recall.label_means.label_expansion import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Stage2-Entry（Stage2 入口分流层）
+# 位置：Stage1 完成之后、Stage2A local landing 之前。
+# 目标：不继续强化 Stage1；在 Stage2 内显式拉开处理强度，减少弱 aux 对 anchor_ctx/landing 的空转与污染。
+# ---------------------------------------------------------------------------
+STAGE2_PROCESS_MAIN_STRONG = "main_strong_process"
+STAGE2_PROCESS_AUX_WEAK = "aux_weak_process"
+STAGE2_PROCESS_CONTEXT_ONLY = "context_support_only"
+STAGE2_PROCESS_SKIP = "skip_candidate_generation"
+
+
+def _stage2_entry_assign_process_mode(info: Dict[str, Any], mx_main: float) -> Tuple[str, str]:
+    """
+    Stage2-Entry：基于 Stage1 已有轻量字段做稳定映射（只做分流，不做深裁决）。
+    """
+    role = str((info or {}).get("anchor_role") or "")
+    primary = bool((info or {}).get("is_primary_eligible"))
+    is_ctx = bool((info or {}).get("is_context_only"))
+    anchor_type = str((info or {}).get("anchor_type") or "")
+    coarse = str((info or {}).get("coarse_jd_role") or "")
+    src_kind = str((info or {}).get("source_kind") or "")
+    term = str((info or {}).get("term") or "")
+    fs = float((info or {}).get("final_anchor_score") or 0.0)
+    tl = term.strip().lower()
+
+    if is_ctx:
+        return STAGE2_PROCESS_CONTEXT_ONLY, "stage1_is_context_only"
+
+    if role == "main_anchor_candidate" and primary and not is_ctx:
+        return STAGE2_PROCESS_MAIN_STRONG, "stage1_main_primary"
+
+    # 默认：aux 弱处理（保留可见，但限制强上下文/seed）
+    if src_kind == "jd_vector_supplement":
+        return STAGE2_PROCESS_AUX_WEAK, "jd_vector_supplement_aux_weak"
+
+    # 跳过候选生成：挡住最容易漂移/污染的弱 aux（无词表、少量相对阈值）
+    if mx_main > 0:
+        if anchor_type == "acronym" and len(tl) <= 8 and fs < mx_main * 0.22:
+            return STAGE2_PROCESS_SKIP, "weak_acronym_relative_to_main"
+        # 短英文单 token（多为方法/缩写壳），即便 anchor_type 未标成 acronym，也优先跳过以防污染主锚上下文
+        # 仅在其相对主锚明显偏弱时触发，避免把强主线英文（如 robotics）粗暴砍掉
+        if (
+            " " not in tl
+            and 2 <= len(tl) <= 8
+            and tl.isascii()
+            and tl[0].isalpha()
+            and all(ch.isalnum() or ch in "+-" for ch in tl)
+            and fs < mx_main * 0.26
+        ):
+            return STAGE2_PROCESS_SKIP, "weak_short_latin_token_relative_to_main"
+        if coarse == "generic_risky_candidate" and fs < mx_main * 0.18:
+            return STAGE2_PROCESS_SKIP, "weak_generic_risky_relative_to_main"
+        if "-" in tl and tl.endswith("based") and fs < mx_main * 0.30:
+            return STAGE2_PROCESS_SKIP, "weak_hyphen_based_relative_to_main"
+
+    return STAGE2_PROCESS_AUX_WEAK, "stage1_aux_or_non_primary"
+
+
+def _stage2_entry_apply_processing_modes(
+    anchor_skills: Dict[str, Any],
+    recall: Any,
+) -> Dict[str, Any]:
+    """
+    在进入 Stage2A 之前：
+    - 写入 stage2_process_mode / stage2_process_why（日志可观测）
+    - 按 mode 调整 Stage2 的处理强度（哪些进生成池；弱处理时压缩 local/co；skip 不再污染 co-anchor）
+    返回：用于 Stage2A/2B candidate generation 的 anchor_skills 子集。
+    """
+    if not anchor_skills:
+        return {}
+
+    mx_main = 0.0
+    for _vid, info in anchor_skills.items():
+        if (info or {}).get("anchor_role") == "main_anchor_candidate" and bool((info or {}).get("is_primary_eligible")):
+            mx_main = max(mx_main, float((info or {}).get("final_anchor_score") or 0.0))
+    if mx_main <= 0.0:
+        mx_main = max(
+            1.0,
+            max(float((v or {}).get("final_anchor_score") or 0.0) for v in (anchor_skills or {}).values()),
+        )
+
+    term_to_mode: Dict[str, str] = {}
+    counts: Dict[str, int] = {
+        STAGE2_PROCESS_MAIN_STRONG: 0,
+        STAGE2_PROCESS_AUX_WEAK: 0,
+        STAGE2_PROCESS_CONTEXT_ONLY: 0,
+        STAGE2_PROCESS_SKIP: 0,
+    }
+
+    for _vid, info in anchor_skills.items():
+        mode, why = _stage2_entry_assign_process_mode(info or {}, mx_main=mx_main)
+        info["stage2_process_mode"] = mode
+        info["stage2_process_why"] = why
+        counts[mode] = counts.get(mode, 0) + 1
+        t = str((info or {}).get("term") or "").strip().lower()
+        if t:
+            term_to_mode[t] = mode
+
+    out: Dict[str, Any] = {}
+    for vid, info in anchor_skills.items():
+        mode = str((info or {}).get("stage2_process_mode") or STAGE2_PROCESS_AUX_WEAK)
+        if mode in (STAGE2_PROCESS_SKIP, STAGE2_PROCESS_CONTEXT_ONLY):
+            continue
+
+        ctx = (info or {}).get("_anchor_ctx") or {}
+        local_phrases = list(ctx.get("local_phrases") or info.get("local_phrases") or [])
+        co_anchor_terms = list(ctx.get("co_anchor_terms") or info.get("co_anchor_terms") or [])
+
+        # co-anchor 过滤：skip 的弱 aux 不应污染任何人的 conditioned_text
+        def _keep_co(t: str) -> bool:
+            tl = str(t or "").strip().lower()
+            if not tl:
+                return False
+            return term_to_mode.get(tl) != STAGE2_PROCESS_SKIP
+
+        co_anchor_terms = [t for t in co_anchor_terms if _keep_co(t)]
+
+        if mode == STAGE2_PROCESS_AUX_WEAK:
+            local_phrases = local_phrases[:1]
+            co_anchor_terms = co_anchor_terms[:1]
+        else:
+            local_phrases = local_phrases[:2]
+            co_anchor_terms = co_anchor_terms[:3]
+
+        if isinstance(ctx, dict) and ctx:
+            ctx["local_phrases"] = list(local_phrases)
+            ctx["co_anchor_terms"] = list(co_anchor_terms)
+            info["_anchor_ctx"] = ctx
+        else:
+            info["local_phrases"] = list(local_phrases)
+            info["co_anchor_terms"] = list(co_anchor_terms)
+
+        out[vid] = info
+
+    # 侧挂审计：skip/context-only 仍可观察
+    skipped: Dict[str, Any] = {}
+    context_only: Dict[str, Any] = {}
+    for vid, info in anchor_skills.items():
+        mode = str((info or {}).get("stage2_process_mode") or "")
+        if mode == STAGE2_PROCESS_SKIP:
+            skipped[str(vid)] = info
+        elif mode == STAGE2_PROCESS_CONTEXT_ONLY:
+            context_only[str(vid)] = info
+    setattr(recall, "_stage2_entry_skipped_anchors", skipped)
+    setattr(recall, "_stage2_entry_context_support_anchors", context_only)
+
+    if getattr(recall, "verbose", False) and not getattr(recall, "silent", False):
+        total = len(anchor_skills)
+        print(
+            "[Stage2-Entry] anchors_total="
+            f"{total} main_strong_process_count={counts.get(STAGE2_PROCESS_MAIN_STRONG, 0)} "
+            f"aux_weak_process_count={counts.get(STAGE2_PROCESS_AUX_WEAK, 0)} "
+            f"context_support_only_count={counts.get(STAGE2_PROCESS_CONTEXT_ONLY, 0)} "
+            f"skip_candidate_generation_count={counts.get(STAGE2_PROCESS_SKIP, 0)}"
+        )
+        shown = 0
+        for _vid, info in anchor_skills.items():
+            term = str((info or {}).get("term") or "")[:40]
+            ar = str((info or {}).get("anchor_role") or "")
+            md = str((info or {}).get("stage2_process_mode") or "")
+            why = str((info or {}).get("stage2_process_why") or "")
+            if not term:
+                continue
+            print(f"  term={term!r} anchor_role={ar} stage2_process_mode={md} why={why}")
+            shown += 1
+            if shown >= 30:
+                break
+
+    return out
+
+
+def _derive_local_role_from_bucket(primary_bucket: str) -> str:
+    """
+    Stage2 coarse role (formal field):
+    - local_core / local_support / local_risky
+
+    先基于 Stage2A 现有细桶体系做保守映射；细桶字段仍保留在 debug_meta/兼容层（降级为内部/兼容语义）。
+    TODO(Stage3 migration): Stage3 merge/准入迁移完成后，可改为从聚合后的稳定信号推导并进一步收敛。
+    """
+    pb = (primary_bucket or "").strip().lower()
+    if pb in ("primary_expandable", "primary_keep_no_expand", "primary_fallback_keep_no_expand"):
+        return "local_core"
+    if pb in ("primary_support_seed", "primary_support_keep"):
+        return "local_support"
+    if pb in ("risky_keep", "risky"):
+        return "local_risky"
+    # 兜底：弱桶/未知桶一律归入 risky；避免误把未知提升为 core
+    if "support" in pb:
+        return "local_support"
+    return "local_risky"
+
+
 def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict[str, Any]]:
     """
     Stage2 -> Stage3：单条 candidate record 字段分层。
-    顶层仅保留标识 / local evidence / risk / confidence；强 provisional 语义统一下沉到 stage2_local_meta。
-    少量与 meta 重复的键暂留顶层作 Stage3 merge 兼容（TODO: Stage3 迁移后删 legacy mirror）。
+
+    目标（先瘦契约，不破主链）：
+    - 顶层字段尽量只保留“局部证据字段”（标识 / local evidence / risk / confidence）。
+    - Stage2 内部 provisional/bucket/rank/reason 等字段统一下沉到 `stage2_debug_meta`，不再作为“正式字段”。
+    - 但 Stage3 目前仍直接读取少量 legacy 字段（如 primary_bucket / parent_primary 等），因此这里保留
+      **最小 legacy mirror**（顶层同名键），以避免主链报错；待 Stage3 merge 迁移完成后再删。
     """
     out = []
     for c in terms:
@@ -38,20 +234,26 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
         can_ex = bool(getattr(c, "can_expand", False))
         role_ia = getattr(c, "role_in_anchor", "") or ""
 
-        # 正式契约：Stage2 内部 provisional / 排名 / bucket 痕迹（非下游 final fact）
-        stage2_local_meta: Dict[str, Any] = {
+        # Stage2 结构化元信息分两层：
+        # - stage2_local_meta：保留“局部证据/可解释”的轻量字段（稳定口径，允许 Stage3/后续阶段读取）
+        # - stage2_debug_meta：Stage2 内部 provisional/bucket/rank/reason（不应作为正式字段）
+        stage2_debug_meta: Dict[str, Any] = {
+            # 下沉字段清单（口径固定）：不再作为主流程正式字段
             "primary_bucket": getattr(c, "primary_bucket", "") or "",
             "fallback_primary": bool(getattr(c, "fallback_primary", False)),
-            "admission_reason": getattr(c, "admission_reason", "") or "",
-            "reject_reason": getattr(c, "reject_reason", "") or "",
             "survive_primary": bool(getattr(c, "survive_primary", False)),
-            "stage2b_seed_tier": getattr(c, "stage2b_seed_tier", "none") or "none",
-            "mainline_candidate": bool(getattr(c, "mainline_candidate", False)),
             "primary_reason": getattr(c, "primary_reason", "") or "",
             "parent_primary": getattr(c, "parent_primary", c.term) or c.term,
-            "parent_anchor_final_score": float(parent_anchor_final_score),
-            "parent_anchor_step2_rank": int(_rk) if _rk > 0 else None,
             "anchor_internal_rank": getattr(c, "anchor_internal_rank", None),
+            "parent_anchor_step2_rank": int(_rk) if _rk > 0 else None,
+            "admission_reason": getattr(c, "admission_reason", "") or "",
+            "reject_reason": getattr(c, "reject_reason", "") or "",
+            "stage2b_seed_tier": getattr(c, "stage2b_seed_tier", "none") or "none",
+        }
+        local_role = _derive_local_role_from_bucket(stage2_debug_meta.get("primary_bucket") or "")
+        stage2_local_meta: Dict[str, Any] = {
+            "mainline_candidate": bool(getattr(c, "mainline_candidate", False)),
+            "parent_anchor_final_score": float(parent_anchor_final_score),
             "can_expand_local": can_ex_2a,
             "role_in_anchor": role_ia,
             "seed_block_reason": getattr(c, "seed_block_reason", None),
@@ -83,6 +285,8 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
             "term": c.term,
             "anchor_term": c.anchor_term,
             "candidate_source": c.source,
+            # Stage2 formal coarse role (recommended for Stage3): local_core/local_support/local_risky
+            "local_role": local_role,
             "term_role_local": c.term_role,
             "identity_score": c.identity_score,
             "sim_score": c.semantic_score,
@@ -110,6 +314,7 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
             "expansion_confidence": expansion_confidence,
             "retrieval_role": get_retrieval_role_from_term_role(c.term_role),
             "stage2_local_meta": stage2_local_meta,
+            "stage2_debug_meta": stage2_debug_meta,
         }
         if getattr(c, "cluster_id", None) is not None:
             rec["cluster_id"] = c.cluster_id
@@ -134,14 +339,14 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
             "cross_anchor_support": getattr(c, "cross_anchor_support", None),
             "seed_block_reason": getattr(c, "seed_block_reason", None),
             "has_family_evidence": getattr(c, "has_family_evidence", False),
-            "primary_bucket": stage2_local_meta["primary_bucket"],
+            "primary_bucket": stage2_debug_meta["primary_bucket"],
             "can_expand_from_2a": can_ex_2a,
-            "fallback_primary": stage2_local_meta["fallback_primary"],
-            "admission_reason": stage2_local_meta["admission_reason"],
-            "reject_reason": stage2_local_meta["reject_reason"],
-            "stage2b_seed_tier": stage2_local_meta["stage2b_seed_tier"],
+            "fallback_primary": stage2_debug_meta["fallback_primary"],
+            "admission_reason": stage2_debug_meta["admission_reason"],
+            "reject_reason": stage2_debug_meta["reject_reason"],
+            "stage2b_seed_tier": stage2_debug_meta["stage2b_seed_tier"],
             "mainline_candidate": stage2_local_meta["mainline_candidate"],
-            "primary_reason": stage2_local_meta["primary_reason"],
+            "primary_reason": stage2_debug_meta["primary_reason"],
             "surface_sim": getattr(c, "surface_sim", None),
             "conditioned_sim": getattr(c, "conditioned_sim", None),
             "context_gain": getattr(c, "context_gain", None),
@@ -151,27 +356,30 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
             "dual_support": getattr(c, "dual_support", None),
         }
 
-        # --- TODO: remove legacy top-level mirror after Stage3 migration to stage2_local_meta ---
+        # --- TODO: remove legacy top-level mirror after Stage3 merge migration ---
+        # Stage3 当前仍直接读取以下字段（兼容镜像）：primary_bucket / fallback_primary / parent_primary / ...；
+        # 待 Stage3 全量改为从 stage2_debug_meta 或其聚合派生字段读取后，再删除这些镜像键。
         rec["term_role"] = c.term_role
         rec["source"] = c.source
         rec["origin"] = c.source
         rec["parent_anchor"] = c.anchor_term
-        rec["parent_primary"] = stage2_local_meta["parent_primary"]
+        rec["parent_primary"] = stage2_debug_meta["parent_primary"]
         rec["source_type"] = getattr(c, "source", "") or ""
         rec["can_expand"] = can_ex
         rec["can_expand_from_2a"] = can_ex_2a
         rec["can_expand_local"] = can_ex_2a
         rec["role_in_anchor"] = role_ia
         rec["retain_mode"] = getattr(c, "retain_mode", "normal") or "normal"
-        rec["primary_bucket"] = stage2_local_meta["primary_bucket"]
-        rec["fallback_primary"] = stage2_local_meta["fallback_primary"]
-        rec["admission_reason"] = stage2_local_meta["admission_reason"]
-        rec["reject_reason"] = stage2_local_meta["reject_reason"]
-        rec["survive_primary"] = stage2_local_meta["survive_primary"]
-        rec["stage2b_seed_tier"] = stage2_local_meta["stage2b_seed_tier"]
+        rec["primary_bucket"] = stage2_debug_meta["primary_bucket"]
+        rec["fallback_primary"] = stage2_debug_meta["fallback_primary"]
+        rec["admission_reason"] = stage2_debug_meta["admission_reason"]
+        rec["reject_reason"] = stage2_debug_meta["reject_reason"]
+        rec["survive_primary"] = stage2_debug_meta["survive_primary"]
+        rec["stage2b_seed_tier"] = stage2_debug_meta["stage2b_seed_tier"]
         rec["mainline_candidate"] = stage2_local_meta["mainline_candidate"]
-        rec["primary_reason"] = stage2_local_meta["primary_reason"]
+        rec["primary_reason"] = stage2_debug_meta["primary_reason"]
         rec["parent_anchor_final_score"] = float(parent_anchor_final_score)
+        rec["anchor_internal_rank"] = stage2_debug_meta["anchor_internal_rank"]
         if _rk > 0:
             rec["parent_anchor_step2_rank"] = int(_rk)
 
@@ -182,6 +390,10 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
         n = len(out)
         n_2a = sum(1 for r in out if r.get("can_expand_from_2a"))
         n_fb = sum(1 for r in out if r.get("fallback_primary"))
+        role_counts: Dict[str, int] = {}
+        for r in out:
+            lr = str(r.get("local_role") or "(missing)")
+            role_counts[lr] = role_counts.get(lr, 0) + 1
         buckets: Dict[str, int] = {}
         for r in out:
             pb = str(r.get("primary_bucket") or "") or "(empty)"
@@ -190,7 +402,7 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
         pb_s = ",".join(f"{k}:{v}" for k, v in top_pb)
         print(
             f"[Stage2->3 field audit] n={n} can_expand_from_2a={n_2a} fallback_primary={n_fb} "
-            f"primary_bucket_top=[{pb_s}] （逐条前10需 STAGE2_NOISY_DEBUG）"
+            f"primary_bucket_top=[{pb_s}] local_role_counts={role_counts} （逐条前10需 STAGE2_NOISY_DEBUG）"
         )
         if getattr(label_expansion, "STAGE2_NOISY_DEBUG", False):
             for rec in out[:10]:
@@ -648,13 +860,29 @@ def run_stage2(
     jd_profile: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    阶段 2：学术词扩展。
-    先转 anchor_skills 为 PreparedAnchor，再走 Stage2A 主落点 + Stage2B 仅围绕 primary 扩展；
-    传入 jd_profile 时启用四层领域契合与泛词惩罚。
+    Stage2：Candidate Generation / Local Normalization（口径说明）。
 
-    返回结构化 dict（run_stage2 返回契约改造；all_candidates 仍为原 _expanded_to_raw_candidates 列表语义）。
+    - Stage2 的职责是：围绕 Stage1 产出的 anchors 生成候选学术词，并将候选记录整理成
+      **Stage3 可消费的“局部证据集”** 与配套的结构化观测数据（分组/图/摘要）。
+    - Stage2 **不做全局裁决**：不负责跨锚一致性、全局重排、准入门控后的最终留存等；
+      这些全局决策属于 Stage3（Global Coherence / Rerank）入口后完成。
+
+    处理流程保持不变：
+    - 将 anchor_skills 转为 PreparedAnchor；
+    - Stage2A 主落点（保守）+ Stage2B 围绕 primary 扩展；
+    - 若传入 jd_profile，则启用领域契合与泛词惩罚相关的局部特征计算（仍属于候选生成/局部归一化）。
+
+    返回结构化 dict（四键契约保持不变）：
+    - all_candidates：提供给 Stage3 的扁平候选列表（即“局部证据集”，语义与原 `_expanded_to_raw_candidates` 一致）
+    - anchor_to_candidates：按锚分组的节点视图（便于观测/透传；当前 Stage3 主要仍以 all_candidates 驱动合并与打分）
+    - candidate_graph：候选关系图（MUV；用于观测与后续迭代接入，不代表已参与当前打分路径）
+    - stage2_report：Stage2 规模/分布/按锚统计等摘要（观测与验收口径的一部分）
     """
-    prepared_anchors = _anchor_skills_to_prepared_anchors(recall, anchor_skills, query_text=query_text)
+    # Stage2-Entry：入口分流（减法主战场）。不回头强化 Stage1，也不在这里做 topic/domain/paper/family 深裁决。
+    anchor_skills_for_stage2 = _stage2_entry_apply_processing_modes(anchor_skills or {}, recall)
+    prepared_anchors = _anchor_skills_to_prepared_anchors(
+        recall, anchor_skills_for_stage2, query_text=query_text
+    )
     if not prepared_anchors:
         _eg = _empty_candidate_graph()
         out: Dict[str, Any] = {
@@ -684,7 +912,9 @@ def run_stage2(
         jd_topic_ids=jd_t,
         jd_profile=jd_profile,
     )
-    # 出口薄包装：all_candidates 仍为平铺；anchor_to_candidates 为正式 anchor 节点（含 landing/expansion 槽位近似）。
+    # 出口薄包装（口径固定）：
+    # - all_candidates：Stage3 消费的“局部证据集”（扁平候选列表），不在 Stage2 做全局裁决。
+    # - anchor_to_candidates / candidate_graph / stage2_report：结构化观测与透传数据，便于 Stage3/后续阶段使用。
     all_candidates = _expanded_to_raw_candidates(terms)
     anchor_to_candidates = _organize_anchor_to_candidates(all_candidates)
     _print_anchor_node_debug(anchor_to_candidates)

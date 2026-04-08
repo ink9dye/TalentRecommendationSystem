@@ -27,10 +27,22 @@ from src.core.recall.label_means.hierarchy_guard import (
 from src.utils.domain_utils import DomainProcessor
 from src.core.recall.label_means.label_debug import debug_print
 
+
+def _cjk_len(s: str) -> int:
+    """CJK 字符计数（仅用于局部文本收口/长度判断）。"""
+    if not s:
+        return 0
+    try:
+        return sum(1 for ch in str(s) if "\u4e00" <= ch <= "\u9fff")
+    except Exception:
+        return 0
+
 # ---------- Stage2/3 保守常量：单一决策链，无冗余阈值（详见 README） ----------
-LABEL_EXPANSION_DEBUG = True  # 调试时打印 Stage2A/2B 流程
+LABEL_EXPANSION_DEBUG = True  # 调试时打印 Stage2A/2B 流程（观测用途）
 STAGE2_VERBOSE_DEBUG = True   # True 时输出 Stage2 详细工整表格，便于调试
-# 关键裁决点：primary 因子 / dense·cooc 漏斗（可与 STAGE2_VERBOSE_DEBUG 独立开关）
+# 关键内部决策点（Stage2 内部用途）：Stage2A 选主因子 / Stage2B dense·cooc 漏斗（可与 STAGE2_VERBOSE_DEBUG 独立开关）
+# 注意：Stage2A 的细桶体系（primary_bucket 等）用于“锚内选主/Stage2B 扩展资格/调试摘要”，
+# 不是跨阶段正式语义。跨阶段推荐以 Stage2 输出的 local_role + 局部证据字段为主。
 STAGE2_RULING_DEBUG = False
 # 噪声较大的逐候选/逐阶段打印（SIMILAR_TO 明细、dual evidence、fallback cand、seed factors、dense/cooc funnel 等）
 # 默认关闭；仅在深度诊断时临时打开。
@@ -253,14 +265,45 @@ def _split_stage2b_carryover_and_seed_candidates(primary_landings: Optional[List
     """
     Stage2B 输入拆口径（仅主流程命名，不改 2A 判桶）：
     - carryover_terms：2A 非 reject 的全部保留 landing，供 merge 回本锚输出并进入 Stage3；
-    - seed_candidates：仅 stage2b_seed_tier ∈ {strong, weak}，才是「扩散门」候选；support_keep / risky_keep 从不进此列表。
+    - seed_candidates：Stage2B 的“扩展起点（support expansion seed）”候选，入口契约如下：
+      - 首选：primary_support_seed（弱 seed）与 primary_expandable（强 seed）；
+      - primary_support_keep / primary_keep_no_expand / risky_keep：默认仅 carryover，不作为 seed；
+      - 即便出现异常标记（tier=strong/weak），也会被入口侧二次约束挡在 seed 外（只做扩展资格收口，不改 2A 分桶公式）。
+
+    备注：
+    - 返回类型保持不变：Tuple[carryover_terms, seed_candidates]；
+    - “谁被挡在 seed 外、原因是什么”由 Stage2B 日志解释（见 [Stage2B input audit] / [Stage2B no-seed reason]）。
     """
     carryover_terms = list(primary_landings or [])
     seed_candidates: List[Any] = []
+    blocked: List[Tuple[str, str]] = []  # (reason, primary_bucket)
     for p in carryover_terms:
         tier = (getattr(p, "stage2b_seed_tier", None) or "none").strip().lower()
+        pb = (getattr(p, "primary_bucket", None) or "").strip()
+        # 收紧入口语义：seed 只接受 2A 的“可扩/弱 seed”桶；其余桶仅 carryover
+        if pb not in ("primary_expandable", "primary_support_seed"):
+            if tier in ("strong", "weak"):
+                blocked.append(("bucket_not_seed", pb or "(empty)"))
+            continue
         if tier in ("strong", "weak"):
             seed_candidates.append(p)
+        else:
+            blocked.append(("tier_none_after_2a_finalize", pb or "(empty)"))
+
+    # 入口审计：仅在 debug 下打印，避免刷屏；帮助解释“谁进入 seed、谁被挡在 seed 外”
+    if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and STAGE2_NOISY_DEBUG and carryover_terms:
+        blocked_counts: Dict[str, int] = {}
+        for r, _pb in blocked:
+            blocked_counts[r] = blocked_counts.get(r, 0) + 1
+        seed_pb_counts: Dict[str, int] = {}
+        for p in seed_candidates:
+            _pb = (getattr(p, "primary_bucket", None) or "").strip() or "(empty)"
+            seed_pb_counts[_pb] = seed_pb_counts.get(_pb, 0) + 1
+        print(
+            f"[Stage2B seed entry contract] carryover={len(carryover_terms)} "
+            f"seed_candidates={len(seed_candidates)} seed_bucket_counts={seed_pb_counts} "
+            f"blocked_counts={blocked_counts}"
+        )
     return carryover_terms, seed_candidates
 
 
@@ -324,7 +367,8 @@ def _print_stage2b_no_seed_reason(anchor_text: str, carryover_terms: List[Any]) 
     else:
         reason = "seedish_bucket_but_tier_none_after_2a_finalize"
     print(
-        f"[Stage2B no-seed reason] anchor={anchor_text!r} reason={reason!r} buckets={buckets!r}"
+        f"[Stage2B no-seed reason] anchor={anchor_text!r} reason={reason!r} buckets={buckets!r} "
+        f"(seed_pref=primary_support_seed; keep/risky carryover_only)"
     )
 
 
@@ -412,7 +456,13 @@ SEED_AXIS_CONSISTENCY_STRONG_MIN = 0.45
 STAGE2A_PROMOTE_MIN_AXIS_GAP = 0.03
 DENSE_MAX_PER_PRIMARY_WEAK = 2     # Stage2B：弱 seed 的 dense 每 primary 上限（强 seed 见 DENSE_MAX_PER_PRIMARY）
 
-# ---------- Stage2A 五层落点（primary_expandable / primary_support_seed / primary_support_keep / risky_keep / reject）----------
+# ---------- Stage2A 五层落点（内部细桶；降级为“内部用途”，不作为跨阶段正式语义） ----------
+# primary_expandable / primary_support_seed / primary_support_keep / risky_keep / reject
+# 用途限定：
+# - anchor 内部选主（组内相对排序 + 配额）
+# - Stage2B 扩展资格判断（strong/weak seed 的来源）
+# - debug / summary（观测与验收）
+# 对外（跨阶段）语义：以 local_role（core/support/risky）+ 局部证据字段为主。
 # 设计说明见 README「Stage2A 五层落点体系」；以下为与伪代码对齐的数值门（与 expand 的 branch_blocked 阈值解耦）。
 STAGE2A_WEAK_SEED_GENERIC_CAP = 0.65   # 弱 seed：generic 须低于此（高于 expand 的 0.46，避免 robot control 被误打成 risky）
 STAGE2A_WEAK_SEED_POLY_CAP = 0.35
@@ -691,7 +741,7 @@ class Stage2ACandidate:
     primary_eligibility_reasons: List[str] = field(default_factory=list)  # 与 admission_reasons 一致，checklist 字段名
     role_in_anchor_candidate_pool: str = ""  # mainline_candidate | secondary_candidate | reject_candidate
 
-    # 最终标签（由 select_primary_per_anchor 设置）
+    # 组内落点标签（由 select_primary_per_anchor 设置；Stage2 内部使用，非跨阶段正式语义）
     survive_primary: bool = False
     can_expand: bool = False  # primary_expandable 与 primary_support_seed（弱 seed）为 True
     can_expand_from_2a: bool = False  # 强/弱 seed 均为 True；仅支线/高风险保留为 False
@@ -714,7 +764,8 @@ class Stage2ACandidate:
     retain_score: float = 0.0
     mainline_admissible: bool = False
     admission_reason: str = ""
-    # Stage2B：与 primary_bucket 配套；strong=primary_expandable，weak=primary_support_seed，none=不可作 seed
+    # Stage2B seed tier：与 primary_bucket 配套的扩展资格标签（Stage2 内部用途）
+    # strong=primary_expandable，weak=primary_support_seed，none=不可作 seed
     stage2b_seed_tier: str = "none"
 
     def is_stage2b_seed(self) -> bool:
@@ -1704,10 +1755,20 @@ def check_seed_eligibility(
     emit_seed_factors: bool = True,
 ) -> Tuple[bool, float, Optional[str]]:
     """
-    Stage2B 唯一 seed 决策入口：
-    - 先挡 fallback / tier=none / semantic_mismatch；再 **`blocked_by_2a`**（can_expand_from_2a=False）
-    - **strong / weak** 按 **seed_score** 与 **axis_consistency_seed**（identity+family+jd+mainline_pref）分流；weak 另拦 **conditioned_only** 与 **generic/poly/object** 上限
-    - seed_score 仍参与排序裁剪（SEED_SCORE_MIN / SEED_SCORE_MIN_WEAK）
+    Stage2B 的 seed 资格判定（职责收口：support expansion，不是“准终判层”）。
+
+    本函数是 Stage2B 的唯一 seed 决策入口，用于决定哪些 Stage2A 产生的“强局部落点（local landing）”
+    可以作为 Stage2B 的扩展起点（seed），从而补齐 support candidates（dense/cluster/cooc 等）。
+
+    口径说明：
+    - seed 判定只服务于 Stage2B 的“支持项扩展资格”与扩展排序裁剪；
+      不应被理解为最终保留/淘汰或跨锚全局裁决（这些属于 Stage3）。
+
+    判定流程（不改算法，仅澄清）：
+    - 先挡 fallback / tier=none / semantic_mismatch；再挡 **`blocked_by_2a`**（can_expand_from_2a=False）
+    - **strong / weak** 按 **seed_score** 与 **axis_consistency_seed**（identity+family+jd+mainline_pref）分流；
+      weak 另拦 **conditioned_only** 与 **generic/poly/object** 上限
+    - seed_score 仍参与扩展侧的排序裁剪（SEED_SCORE_MIN / SEED_SCORE_MIN_WEAK）
     - emit_seed_factors=False：dense 内复核时不重复打印 [Stage2B seed factors]
     """
     def _emit_sf(*args: Any, **kwargs: Any) -> None:
@@ -2067,10 +2128,19 @@ def build_conditioned_anchor_text_variants(
     co_anchor_terms: Optional[List[str]] = None,
     jd_snippet: str = "",
     query_text: Optional[str] = None,
+    stage2_process_mode: Optional[str] = None,
+    anchor_type: Optional[str] = None,
+    anchor_term_to_process_mode: Optional[Dict[str, str]] = None,
+    all_anchor_terms: Optional[List[str]] = None,
 ) -> ConditionedTextBundle:
     """
-    强/轻两路 + 实际选用片段。短文本优先；不默认拼整段 JD/query。
-    local/co 缺省时用 mention 短窗补局部，仍不灌长段主题。
+    强/轻两路 + 实际选用片段（Stage2A conditioning 入口）。
+
+    收口目标（变干净→可用）：
+    - 显式利用 Stage2-Entry 的 stage2_process_mode 拉开 main/aux 的 conditioning 强度；
+    - hints 仅按锚点类型受控注入（规划 hints 不再全局泛注入）；
+    - local phrase 优先“锚点局部专属”，宁可缺省也不塞泛主线高频短语；
+    - co-anchor 更克制，避免 surviving aux/英文补锚互喂小团。
     """
     anchor_term = (anchor_term or "").strip()
     if not anchor_term:
@@ -2082,20 +2152,105 @@ def build_conditioned_anchor_text_variants(
             selected_jd_window="",
             selected_hints=[],
         )
-    short_cn = _is_short_cn_style_anchor(anchor_term)
-    n_loc = 2 if not short_cn else 2
-    n_co = 2 if not short_cn else 2
+    mode = (stage2_process_mode or "").strip() or "aux_weak_process"
+    profile = "main_strong" if mode == "main_strong_process" else "aux_weak"
+
+    # profile：显式拉开强度（不引入新模式体系）
+    n_loc = 2 if profile == "main_strong" else 1
+    # aux 默认更保守：co-anchor 可为 0（宁缺毋滥）
+    n_co = 2 if profile == "main_strong" else 1
+
     loc_all = normalize_anchor_context_tokens(local_phrases, 8)
     co_all = normalize_anchor_context_tokens(co_anchor_terms, 8)
-    loc_pick = loc_all[:n_loc]
-    co_pick = co_all[:n_co]
 
-    jd_tight = _jd_snippet_around_mention(jd_snippet, anchor_term, max_chars=88)
-    q_tight = _query_text_window(query_text, anchor_term, max_chars=96)
-    mention_win = _best_mention_window(jd_snippet, query_text, anchor_term, max_total=96)
-    selected_jd_window = jd_tight or mention_win or q_tight
+    # ---------- local phrase：优先“锚点专属”，降低主段高频短语支配 ----------
+    anchor_l = anchor_term.strip().lower()
+    all_anchor_l = {str(x).strip().lower() for x in (all_anchor_terms or []) if x and str(x).strip()}
+
+    def _local_score(ph: str, jd_window: str) -> float:
+        pl = (ph or "").strip().lower()
+        if not pl:
+            return -1e9
+        s = 0.0
+        # 字面贴近优先
+        if anchor_l and anchor_l in pl:
+            s += 3.0
+        # 共享锚词惩罚：避免“路径规划”被“运动控制/机器人运动学”这类全局锚词劫持
+        if pl in all_anchor_l and pl != anchor_l:
+            s -= 2.2
+        # 与当前紧窗口的贴合（局部近）
+        jw = (jd_window or "").strip().lower()
+        if jw and pl in jw:
+            s += 1.2
+        # 极短泛片段（更易成为主线高频词）：保守下压
+        if _cjk_len(pl) > 0 and _cjk_len(pl) <= 4 and anchor_l not in pl:
+            s -= 0.6
+        return s
+
+    # 先取紧窗口，再用窗口来排序 local phrase
+    jd_tight = _jd_snippet_around_mention(jd_snippet, anchor_term, max_chars=88 if profile == "main_strong" else 64)
+    q_tight = _query_text_window(query_text, anchor_term, max_chars=96 if profile == "main_strong" else 72)
+    mention_win = _best_mention_window(jd_snippet, query_text, anchor_term, max_total=96 if profile == "main_strong" else 72)
+    selected_jd_window = (jd_tight or mention_win or q_tight or "").strip()
     if selected_jd_window:
-        selected_jd_window = selected_jd_window.strip()[:120]
+        selected_jd_window = selected_jd_window[: (120 if profile == "main_strong" else 84)]
+
+    loc_ranked = sorted(loc_all, key=lambda ph: _local_score(ph, selected_jd_window), reverse=True)
+    loc_pick = []
+    for ph in loc_ranked:
+        if len(loc_pick) >= n_loc:
+            break
+        # aux_weak：若只有“主线共享锚词”可选，宁可不选
+        pl = (ph or "").strip().lower()
+        if profile == "aux_weak" and pl in all_anchor_l and pl != anchor_l:
+            continue
+        loc_pick.append(ph)
+
+    # ---------- co-anchor：避免弱互喂；优先 main→main ----------
+    term_mode = {str(k).strip().lower(): str(v) for k, v in (anchor_term_to_process_mode or {}).items() if k}
+
+    def _co_score(t: str) -> float:
+        tl = (t or "").strip().lower()
+        if not tl or tl == anchor_l:
+            return -1e9
+        s = 0.0
+        m = term_mode.get(tl, "")
+        if profile == "main_strong":
+            if m == "main_strong_process":
+                s += 2.0
+            elif m == "aux_weak_process":
+                s += 0.6
+            else:
+                s += 0.0
+        else:
+            # aux：默认只吃 main 的少量 support
+            if m == "main_strong_process":
+                s += 1.5
+            else:
+                s -= 0.8
+        # 英文补锚互喂限流：英文锚默认不堆英文 co-anchor
+        is_en_anchor = anchor_l.isascii() and _cjk_len(anchor_l) == 0
+        if is_en_anchor and tl.isascii() and _cjk_len(tl) == 0:
+            s -= 1.2
+        # 紧窗口共现加分（局部近）
+        jw = selected_jd_window.lower() if selected_jd_window else ""
+        if jw and tl and tl in jw:
+            s += 0.8
+        return s
+
+    co_ranked = sorted(co_all, key=_co_score, reverse=True)
+    co_pick = []
+    for t in co_ranked:
+        if len(co_pick) >= n_co:
+            break
+        if profile == "aux_weak":
+            # aux 默认更严：仅保留“来自 main”的少量 co-anchor
+            if term_mode.get(str(t).strip().lower(), "") != "main_strong_process":
+                continue
+        co_pick.append(t)
+    if profile == "aux_weak" and not loc_pick:
+        # aux 若已有 local 专属证据不足，则更保守：co-anchor 也不硬塞
+        co_pick = co_pick[:0]
 
     latin_src = " ".join(
         [
@@ -2107,7 +2262,37 @@ def build_conditioned_anchor_text_variants(
         ]
     )
     hints = _extract_latin_alnum_hints(latin_src, max_hints=6)
-    selected_hints = hints[:3]
+
+    # ---------- hints：按锚点类型注入（规划 hints 不再全局泛注入） ----------
+    # 只对“规划/轨迹/运动规划/最优控制”类锚点开放 planning hints；其它锚点宁可不加。
+    def _looks_like_planning_anchor(a: str) -> bool:
+        al = (a or "").strip().lower()
+        if not al:
+            return False
+        if "path" in al or "trajectory" in al or "motion planning" in al:
+            return True
+        if "规划" in al or "路径" in al or "轨迹" in al or "运动规划" in al or "轨迹规划" in al:
+            return True
+        # anchor_type=task_chain / unknown 时不额外强推；只按表面词形
+        return False
+
+    planning_ok = _looks_like_planning_anchor(anchor_term)
+    planning_tokens = ("rrt", "prm", "chomp", "mpc", "ilqr")
+
+    filtered_hints: List[str] = []
+    for h in hints:
+        hl = (h or "").strip().lower()
+        if not hl:
+            continue
+        is_planning_hint = any(tok in hl for tok in planning_tokens)
+        if is_planning_hint and not planning_ok:
+            continue
+        # aux_weak：默认更严，除非是 planning anchor 才给 hints
+        if profile == "aux_weak" and not planning_ok:
+            continue
+        filtered_hints.append(h)
+
+    selected_hints = filtered_hints[: (2 if profile == "main_strong" else (1 if planning_ok else 0))]
 
     lines: List[str] = [anchor_term]
     if loc_pick:
@@ -2115,7 +2300,7 @@ def build_conditioned_anchor_text_variants(
     if co_pick:
         lines.append(" ".join(co_pick))
     if selected_jd_window:
-        lines.append(selected_jd_window[:120])
+        lines.append(selected_jd_window[: (120 if profile == "main_strong" else 84)])
     if selected_hints:
         lines.append(" ".join(selected_hints))
 
@@ -2126,7 +2311,7 @@ def build_conditioned_anchor_text_variants(
         light_text=light,
         selected_local_phrases=list(loc_pick),
         selected_co_anchor_terms=list(co_pick),
-        selected_jd_window=(selected_jd_window or "")[:160],
+        selected_jd_window=(selected_jd_window or "")[: (160 if profile == "main_strong" else 96)],
         selected_hints=list(selected_hints),
     )
 
@@ -2218,6 +2403,16 @@ def _anchor_skills_to_prepared_anchors(
     """
     load_vocab_meta(label)
     out = []
+    # Stage2-Entry 模式映射：用于 conditioning 收口（不新增 Stage1 字段）
+    all_terms: List[str] = []
+    term_to_mode: Dict[str, str] = {}
+    for _vid0, _info0 in (anchor_skills or {}).items():
+        t0 = str((_info0 or {}).get("term") or "").strip()
+        if t0:
+            all_terms.append(t0)
+            tl0 = t0.lower()
+            if tl0 and tl0 not in term_to_mode:
+                term_to_mode[tl0] = str((_info0 or {}).get("stage2_process_mode") or "")
     for vid_str, info in (anchor_skills or {}).items():
         try:
             vid = int(vid_str)
@@ -2238,6 +2433,7 @@ def _anchor_skills_to_prepared_anchors(
         local_phrases = list(ctx.get("local_phrases") or info.get("local_phrases") or [])
         co_anchor_terms = list(ctx.get("co_anchor_terms") or info.get("co_anchor_terms") or [])
         jd_snippet = str(info.get("jd_snippet") or ctx.get("jd_snippet") or "")
+        stage2_process_mode = str(info.get("stage2_process_mode") or "")
         surface_vec = _get_candidate_vec_for_mainline(label, vid)
         bundle = build_conditioned_anchor_text_variants(
             term,
@@ -2245,6 +2441,10 @@ def _anchor_skills_to_prepared_anchors(
             co_anchor_terms=co_anchor_terms,
             jd_snippet=jd_snippet,
             query_text=query_text,
+            stage2_process_mode=stage2_process_mode,
+            anchor_type=anchor_type,
+            anchor_term_to_process_mode=term_to_mode,
+            all_anchor_terms=all_terms,
         )
         conditioned_text = bundle.strong_text
         conditioned_vec, conditioning_mode, cos_sc = build_conditioned_anchor_vec(
@@ -2272,6 +2472,8 @@ def _anchor_skills_to_prepared_anchors(
             surface_conditioned_cosine=cos_sc,
             light_conditioned_text=bundle.light_text,
         )
+        setattr(pa, "stage2_process_mode", stage2_process_mode or "")
+        setattr(pa, "conditioning_profile", "main_strong" if stage2_process_mode == "main_strong_process" else "aux_weak")
         setattr(pa, "conditioned_is_fallback", conditioning_mode == "fallback_surface")
         setattr(pa, "conditioned_text_selected_local", bundle.selected_local_phrases)
         setattr(pa, "conditioned_text_selected_co", bundle.selected_co_anchor_terms)
@@ -2284,7 +2486,8 @@ def _anchor_skills_to_prepared_anchors(
                 setattr(pa, "final_anchor_score", 0.0)
         if LABEL_EXPANSION_DEBUG:
             print(
-                f"[Stage2A conditioning] anchor={term!r} mode={conditioning_mode} "
+                f"[Stage2A conditioning] anchor={term!r} stage2_process_mode={stage2_process_mode!r} "
+                f"conditioning_profile={getattr(pa, 'conditioning_profile', '')!r} mode={conditioning_mode} "
                 f"conditioned_is_fallback={getattr(pa, 'conditioned_is_fallback', False)}\n"
                 f"  surface_text={term!r}\n"
                 f"  conditioned_text={conditioned_text[:260]!r}{'...' if len(conditioned_text) > 260 else ''}\n"
@@ -3813,6 +4016,131 @@ def _stage2a_promote_strong_allowed(
     return True, ""
 
 
+def _stage2a_phrase_naturalness_score(term: str) -> float:
+    """
+    Stage2A 组内“术语自然性/规范性”弱偏好（不依赖具体词表）：
+    - 更像稳定 academic phrase（长度适中、少噪声符号）→ 更高
+    - 过长、噪声符号/数字/下划线等“派生味重” → 降权
+    仅用于 **组内相对排序**，不作为硬拒绝。
+    """
+    if not term:
+        return 0.0
+    t = str(term).strip()
+    if not _lexical_term_sanity(t, None):
+        return 0.0
+    low = t.lower()
+    toks = [x for x in low.replace("-", " ").split() if x]
+    n_tok = len(toks)
+
+    # token 数：2-4 更像稳定术语；1 或 >=6 更像泛词/派生描述
+    if n_tok <= 0:
+        tok_score = 0.0
+    elif n_tok == 1:
+        tok_score = 0.55
+    elif 2 <= n_tok <= 4:
+        tok_score = 1.0
+    elif n_tok == 5:
+        tok_score = 0.72
+    else:
+        tok_score = 0.45
+
+    # 词面噪声：数字/下划线/多符号会降低“术语感”
+    noise = 0.0
+    if any(ch.isdigit() for ch in t):
+        noise += 0.25
+    if "_" in t:
+        noise += 0.25
+    if any(ch in t for ch in ("(", ")", "[", "]", "{", "}", "/", "\\", "|", ";", ":", "@", "#")):
+        noise += 0.15
+    # 过长短语偏惩罚（避免把描述句当术语）
+    if len(t) >= 56:
+        noise += 0.20
+    elif len(t) >= 42:
+        noise += 0.10
+
+    return _clip01(0.70 * tok_score + 0.30 * (1.0 - _clip01(noise)))
+
+
+def _stage2a_local_primary_preference_snapshot(
+    *,
+    anchor_term: str,
+    cand: Any,
+    axis_consistency_seed: float,
+    mainline_pref_score: float,
+    jd_align: float,
+    family_match: float,
+    ctx_sim: float,
+    ctx_drop: float,
+    context_continuity: float,
+    conditioned_only: bool,
+    generic_risk: float,
+    polysemy_risk: float,
+    object_like_risk: float,
+) -> Dict[str, Any]:
+    """
+    Stage2A 的 local candidate ranking / local disambiguation 核心：组内“主位偏好”快照。
+    只负责 **相对排序偏好**（谁更可能成为该 anchor 的自然学术落点），不决定全局一致性。
+    """
+    # 主线/锚一致性：轴一致性 + mainline_pref + family_match
+    mainline = (
+        0.44 * _clip01(axis_consistency_seed)
+        + 0.34 * _clip01(mainline_pref_score)
+        + 0.22 * _clip01(family_match)
+    )
+
+    # 语境连续性：偏好“真实 ctx + 低 drop + 与 local phrases 连贯”
+    ctx_quality = _clip01(
+        0.50 * _clip01(ctx_sim)
+        + 0.25 * _clip01(context_continuity)
+        + 0.25 * (1.0 - _clip01(ctx_drop / 0.10))  # drop<=0.10 近似可信上限
+    )
+
+    # 风险项：高风险不能靠偶然高分抢主位（但不一刀切 reject）
+    risk = _clip01(
+        0.45 * _clip01(generic_risk)
+        + 0.30 * _clip01(polysemy_risk)
+        + 0.25 * _clip01(object_like_risk)
+    )
+
+    # conditioned_only 惩罚：只在“抢主位”时显式降权（保持可保留、但不应轻易 top1）
+    cond_pen = 0.18 if conditioned_only else 0.0
+
+    # 短语自然性：不靠词表，轻量偏好规范术语形态
+    natural = _stage2a_phrase_naturalness_score(getattr(cand, "term", "") or "")
+
+    # 最终 local preference：主线优先 + 语境连续 + JD 主轴一致 + 风险/cond_only/不自然词形惩罚
+    # 注意：这是“组内相对排序”信号，不用于 hard gate，不改变 Stage2B 的强弱阈值体系。
+    score = _clip01(
+        0.46 * mainline
+        + 0.22 * _clip01(jd_align)
+        + 0.20 * ctx_quality
+        + 0.12 * natural
+        - 0.22 * risk
+        - cond_pen
+    )
+
+    return {
+        "local_pref": score,
+        "mainline": mainline,
+        "ctx_quality": ctx_quality,
+        "jd": float(jd_align),
+        "family": float(family_match),
+        "axis_seed": float(axis_consistency_seed),
+        "mainline_pref": float(mainline_pref_score),
+        "ctx_sim": float(ctx_sim),
+        "ctx_drop": float(ctx_drop),
+        "context_cont": float(context_continuity),
+        "natural": float(natural),
+        "risk": float(risk),
+        "cond_only": bool(conditioned_only),
+        "risk_parts": {
+            "generic": float(generic_risk),
+            "poly": float(polysemy_risk),
+            "object": float(object_like_risk),
+        },
+    }
+
+
 def select_primary_per_anchor(
     anchor: PreparedAnchor,
     candidates: List["Stage2ACandidate"],
@@ -4000,12 +4328,39 @@ def select_primary_per_anchor(
         p_snap["axis_consistency_seed"] = axis_consistency_seed
         _strong_axis_ok = bool(axis_consistency_seed >= SEED_AXIS_CONSISTENCY_STRONG_MIN)
 
+        # --------------------------------------------------
+        # Stage2A local ranking（组内主位偏好）：
+        # - 只做单 anchor 内的相对排序/消歧（local disambiguation）
+        # - 不引入 Stage3 的 collective/global 裁决
+        # - 目标：让更自然、更贴 JD 主轴、更稳的学术术语更容易成为 top1/top2
+        # --------------------------------------------------
+        _ctx_cont = float(getattr(c, "context_continuity", 0.0) or 0.0)
+        _pref_snap = _stage2a_local_primary_preference_snapshot(
+            anchor_term=anchor_term_sel,
+            cand=c,
+            axis_consistency_seed=axis_consistency_seed,
+            mainline_pref_score=_mlp,
+            jd_align=_jd,
+            family_match=_fam,
+            ctx_sim=_ps_ctx,
+            ctx_drop=_ps_drop,
+            context_continuity=_ctx_cont,
+            conditioned_only=_cond_only,
+            generic_risk=_gen,
+            polysemy_risk=_poly,
+            object_like_risk=_obj,
+        )
+        local_pref = float(_pref_snap.get("local_pref", 0.0) or 0.0)
+        p_snap["local_primary_pref"] = local_pref
+
         work_rows.append({
             "c": c,
             "pre_bucket": bucket,
             "pre_reason": reason,
             "p_snap": p_snap,
             "axis_consistency_seed": axis_consistency_seed,
+            "local_primary_pref": local_pref,
+            "_local_pref_snap": _pref_snap,
             "strong_expandable_ok": strong_expandable_ok,
             "weak_seed_ok": weak_seed_ok,
             "keep_no_expand_only": keep_no_expand_only,
@@ -4021,11 +4376,20 @@ def select_primary_per_anchor(
             "_mlp": _mlp,
             "_jd": _jd,
             "_ps_ctx": _ps_ctx,
+            "_ctx_cont": _ctx_cont,
         })
 
     sorted_w = sorted(
         work_rows,
-        key=lambda ww: (ww["axis_consistency_seed"], ww["_mlp"], ww["_jd"], ww["_ps_ctx"]),
+        # local preference first；其后用 axis_seed/mainline/jd/ctx_cont 稳定打平
+        key=lambda ww: (
+            ww.get("local_primary_pref", 0.0),
+            ww["axis_consistency_seed"],
+            ww["_mlp"],
+            ww["_jd"],
+            ww.get("_ctx_cont", 0.0),
+            ww["_ps_ctx"],
+        ),
         reverse=True,
     )
     nw = len(sorted_w)
@@ -4050,8 +4414,35 @@ def select_primary_per_anchor(
             print(
                 f"  rank={ww['group_rank']}/{nw} term={(getattr(cc, 'term', '') or '')!r} "
                 f"pre_bucket={ww['pre_bucket']!r} axis_seed={ww['axis_consistency_seed']:.3f} "
+                f"local_pref={ww.get('local_primary_pref', 0.0):.3f} "
                 f"mainline_pref={ww['_mlp']:.3f} jd={ww['_jd']:.3f}"
             )
+
+        # 轻量“组内主位偏好审计”：仅 noisy debug 打印 topK，便于验证 local ranking 是否按论文式信号在起作用
+        if STAGE2_NOISY_DEBUG:
+            topk = min(5, len(sorted_w))
+            print(f"[Stage2A local primary pref audit] anchor={anchor_term_sel!r} topK={topk}")
+            for i in range(topk):
+                ww = sorted_w[i]
+                cc = ww["c"]
+                snap = ww.get("_local_pref_snap", {}) or {}
+                rp = snap.get("risk_parts", {}) or {}
+                print(
+                    f"  top{i+1} term={(getattr(cc, 'term', '') or '')!r} "
+                    f"local_pref={float(snap.get('local_pref', 0.0) or 0.0):.3f} "
+                    f"mainline={float(snap.get('mainline', 0.0) or 0.0):.3f} "
+                    f"ctxQ={float(snap.get('ctx_quality', 0.0) or 0.0):.3f} "
+                    f"jd={float(snap.get('jd', 0.0) or 0.0):.3f} "
+                    f"family={float(snap.get('family', 0.0) or 0.0):.3f} "
+                    f"axis_seed={float(snap.get('axis_seed', 0.0) or 0.0):.3f} "
+                    f"cond_only={bool(snap.get('cond_only', False))} "
+                    f"natural={float(snap.get('natural', 0.0) or 0.0):.3f} "
+                    f"risk={float(snap.get('risk', 0.0) or 0.0):.3f} "
+                    f"(g={float(rp.get('generic', 0.0) or 0.0):.2f},"
+                    f"p={float(rp.get('poly', 0.0) or 0.0):.2f},"
+                    f"o={float(rp.get('object', 0.0) or 0.0):.2f}) "
+                    f"why=mainline+ctx+jd+natural - risk - cond_only"
+                )
 
     for w in work_rows:
         c = w["c"]
@@ -4529,6 +4920,92 @@ def select_primary_per_anchor(
     primary_support_keep = _apply_conditioned_quota(primary_support_keep, cap=2)
     risky_keep = _apply_conditioned_quota(risky_keep, cap=1)
 
+    # --------------------------------------------------
+    # 1.5 受控的 weak-seed fallback（为 Stage2B 保留极小扩展出口；不改主排序公式）
+    # 条件（极保守）：
+    # - 本锚无 primary_expandable 且 support_seed=0（否则不需要 fallback）
+    # - 仅从 primary_support_keep 提升最多 1 条为 primary_support_seed
+    # - 必须 rank 靠前（优先 top1），且非 conditioned-only，且风险不过高，且具备较稳定局部证据（prefer similar_to）
+    # - 永不从 risky_keep 提升
+    #
+    # 目的：让少量合理 anchor 出现 seed_candidates>0，便于 Stage2B support expansion 启动；
+    # 仍保持整体门控保守，避免大放水。
+    # --------------------------------------------------
+    if (not primary_expandable) and (not primary_support_seed) and primary_support_keep:
+        cand0 = primary_support_keep[0]
+        pb0 = (getattr(cand0, "primary_bucket", "") or "").strip()
+        src0 = _stage2a_source_type_set(cand0)
+        has_sim0 = "similar_to" in src0 or "family_landing" in src0
+        cond_only0 = _stage2a_is_conditioned_only_for_seed(cand0)
+        gen0 = float(getattr(cand0, "generic_risk", 0.0) or 0.0)
+        poly0 = float(getattr(cand0, "polysemy_risk", 0.0) or 0.0)
+        obj0 = float(getattr(cand0, "object_like_risk", 0.0) or 0.0)
+        fam0 = float(getattr(cand0, "family_match", 0.0) or getattr(cand0, "anchor_identity_score", 0.0) or 0.0)
+        jd0 = float(getattr(cand0, "jd_align", 0.0) or 0.0)
+        ctx0 = float(getattr(cand0, "context_continuity", 0.0) or 0.0)
+        rk0 = getattr(cand0, "anchor_internal_rank", None)
+        rk_ok = (rk0 is None) or (isinstance(rk0, int) and rk0 <= 1)
+
+        promote_ok = bool(
+            rk_ok
+            and has_sim0
+            and (not cond_only0)
+            and gen0 <= 0.55
+            and poly0 <= 0.28
+            and obj0 <= 0.22
+            and fam0 >= 0.34
+            and jd0 >= 0.58
+            and ctx0 >= 0.30
+        )
+
+        if promote_ok:
+            # promote: support_keep -> support_seed（仅改变桶标签/扩展资格，不改排序公式）
+            primary_support_keep = primary_support_keep[1:]
+            primary_support_seed = [cand0] + primary_support_seed
+            cand0.primary_bucket = "primary_support_seed"
+            cand0.can_expand = True
+            cand0.can_expand_from_2a = True
+            cand0.suppress_seed = False
+            setattr(cand0, "seed_fallback_promoted", True)
+            setattr(cand0, "seed_fallback_from_bucket", pb0)
+            setattr(cand0, "seed_fallback_reason", "no_expandable_and_no_seed_promote_keep_top1")
+            if LABEL_EXPANSION_DEBUG:
+                print(
+                    f"[Stage2A weak-seed fallback] anchor={anchor_term_sel!r} triggered=True "
+                    f"term={(getattr(cand0, 'term', '') or '')!r} "
+                    f"from_bucket={pb0!r} -> to_bucket='primary_support_seed' "
+                    f"evidence={{'has_sim':{has_sim0},'cond_only':{cond_only0},'rk_ok':{rk_ok},"
+                    f"'gen':{gen0:.2f},'poly':{poly0:.2f},'obj':{obj0:.2f},"
+                    f"'fam':{fam0:.2f},'jd':{jd0:.2f},'ctx':{ctx0:.2f}}}"
+                )
+        else:
+            if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+                # 仅在“确实缺 expandable 且缺 seed”时打印一行未触发原因，避免刷屏
+                reason_bits: List[str] = []
+                if not rk_ok:
+                    reason_bits.append("rank_not_top1")
+                if not has_sim0:
+                    reason_bits.append("no_similar_to_or_family_landing")
+                if cond_only0:
+                    reason_bits.append("conditioned_only")
+                if gen0 > 0.55:
+                    reason_bits.append("generic_risk_high")
+                if poly0 > 0.28:
+                    reason_bits.append("polysemy_risk_high")
+                if obj0 > 0.22:
+                    reason_bits.append("object_like_risk_high")
+                if fam0 < 0.34:
+                    reason_bits.append("family_match_low")
+                if jd0 < 0.58:
+                    reason_bits.append("jd_align_low")
+                if ctx0 < 0.30:
+                    reason_bits.append("context_continuity_low")
+                why = ",".join(reason_bits) if reason_bits else "unknown"
+                print(
+                    f"[Stage2A weak-seed fallback] anchor={anchor_term_sel!r} triggered=False "
+                    f"top_keep={(getattr(cand0, 'term', '') or '')!r} bucket={pb0!r} reason={why!r}"
+                )
+
     primary_expandable, primary_support_seed, primary_support_keep, risky_keep = _finalize_stage2b_seed_tiers(
         primary_expandable, primary_support_seed, primary_support_keep, risky_keep
     )
@@ -4536,6 +5013,120 @@ def select_primary_per_anchor(
     primary_keep_no_expand: List["Stage2ACandidate"] = (
         primary_support_seed + primary_support_keep + risky_keep
     )
+
+    # --------------------------------------------------
+    # 2. Stage2A landing 闭环：显式区分“有候选”与“已落地”，并把状态用于 seed 资格收口
+    # 目的：减少“看起来有候选但不可落地”的锚点继续甩给后续阶段。
+    # 注意：不改 Stage2A 主排序公式；仅做 anchor 级状态语义与极小的 post-closure 调整。
+    # --------------------------------------------------
+    kept_all: List["Stage2ACandidate"] = (
+        list(primary_expandable) + list(primary_support_seed) + list(primary_support_keep) + list(risky_keep)
+    )
+    candidate_generated_count = len(candidates or [])
+    landing_kept_count = len(kept_all)
+
+    def _cand_src_set(c: "Stage2ACandidate") -> Set[str]:
+        try:
+            return _stage2a_source_type_set(c)
+        except Exception:
+            return set()
+
+    kept_src_union: Set[str] = set()
+    for _c0 in kept_all:
+        kept_src_union |= _cand_src_set(_c0)
+    has_normal_retrieval = ("similar_to" in kept_src_union) or ("conditioned_vec" in kept_src_union)
+    family_only = (landing_kept_count > 0) and (not has_normal_retrieval) and ("family_landing" in kept_src_union)
+
+    stage2_mode = (getattr(anchor, "stage2_process_mode", "") or "").strip()
+    landing_state = "empty_landing"
+    landing_reason = "no_kept_candidates"
+
+    # main_strong：尽量形成“弱但正常”的落地（不等于抬主，只是不要长期停在全是 risky_keep 的模糊态）
+    if landing_kept_count <= 0:
+        landing_state = "empty_landing"
+        landing_reason = "no_kept_candidates_after_select"
+    elif family_only:
+        landing_state = "fallback_only_landing"
+        landing_reason = "family_fallback_only_no_normal_retrieval"
+    else:
+        if stage2_mode == "main_strong_process":
+            if primary_expandable or primary_support_seed:
+                landing_state = "good_landing"
+                landing_reason = "has_seed_or_expandable"
+            elif primary_support_keep:
+                landing_state = "weak_landing"
+                landing_reason = "support_keep_only"
+            elif risky_keep:
+                landing_state = "weak_landing"
+                landing_reason = "risky_only_keep"
+            else:
+                landing_state = "empty_landing"
+                landing_reason = "no_kept_candidates_after_select"
+        else:
+            # aux：有保留但不强认落点；无则 empty
+            landing_state = "weak_landing" if landing_kept_count > 0 else "empty_landing"
+            landing_reason = "aux_kept_some_evidence" if landing_kept_count > 0 else "aux_no_evidence"
+
+    # main_strong 的最小闭环补丁：若只有 risky_keep 但 top1 来自 similar_to 且风险不高，则提升为 support_keep（非 seed）
+    # 这不改变排序公式，只是让“正常落地”与“纯 risky 挂着”在状态语义上分开，便于后续闭环。
+    if (
+        stage2_mode == "main_strong_process"
+        and (not primary_expandable)
+        and (not primary_support_seed)
+        and (not primary_support_keep)
+        and len(risky_keep) == 1
+        and (not family_only)
+    ):
+        rk0 = risky_keep[0]
+        src0 = _cand_src_set(rk0)
+        if "similar_to" in src0:
+            gen0 = float(getattr(rk0, "generic_risk", 0.0) or 0.0)
+            poly0 = float(getattr(rk0, "polysemy_risk", 0.0) or 0.0)
+            obj0 = float(getattr(rk0, "object_like_risk", 0.0) or 0.0)
+            jd0 = float(getattr(rk0, "jd_align", 0.0) or 0.0)
+            fam0 = float(getattr(rk0, "family_match", 0.0) or getattr(rk0, "anchor_identity_score", 0.0) or 0.0)
+            promote_keep_ok = bool(gen0 <= 0.50 and poly0 <= 0.26 and obj0 <= 0.20 and jd0 >= 0.62 and fam0 >= 0.30)
+            if promote_keep_ok:
+                risky_keep = []
+                primary_support_keep = [rk0]
+                rk0.primary_bucket = "primary_support_keep"
+                rk0.can_expand = False
+                rk0.can_expand_from_2a = False
+                rk0.stage2b_seed_tier = "none"
+                setattr(rk0, "landing_keep_promoted_from_risky", True)
+                setattr(rk0, "landing_keep_promote_reason", "main_strong_similar_to_top1_promote_to_support_keep")
+                kept_all = list(primary_support_keep)
+                landing_kept_count = len(kept_all)
+                landing_state = "weak_landing"
+                landing_reason = "promoted_risky_top1_to_support_keep"
+
+    # seed 资格收口：landing_state 不能只是 debug 标签，需影响 Stage2B
+    if landing_state in ("fallback_only_landing", "empty_landing"):
+        # 不允许 seed；保留项作为弱 evidence（仍可进 Stage3），但不能扩散
+        for _c in primary_expandable + primary_support_seed:
+            _c.can_expand = False
+            _c.can_expand_from_2a = False
+            _c.stage2b_seed_tier = "none"
+            _c.suppress_seed = True
+            setattr(_c, "seed_block_reason", f"landing_state={landing_state}")
+        primary_expandable = []
+        primary_support_seed = []
+    elif landing_state == "weak_landing":
+        # weak_landing：默认不当 seed（避免从弱落地扩散）；但不强行改其 support/keep 身份
+        for _c in primary_expandable + primary_support_seed:
+            _c.can_expand = False
+            _c.can_expand_from_2a = False
+            _c.stage2b_seed_tier = "none"
+            _c.suppress_seed = True
+            setattr(_c, "seed_block_reason", "weak_landing_no_seed_by_default")
+        primary_expandable = []
+        primary_support_seed = []
+
+    # 写回 anchor 级可读状态（Stage2B/日志/下游可读）
+    setattr(anchor, "landing_state", landing_state)
+    setattr(anchor, "landing_reason", landing_reason)
+    setattr(anchor, "candidate_generated_count", int(candidate_generated_count))
+    setattr(anchor, "landing_kept_count", int(landing_kept_count))
 
     if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
         # 中间快照 vs 配额/_finalize 后 final_bucket：对齐 Focus Debug 与 [Stage2A select] 的差异
@@ -4586,6 +5177,14 @@ def select_primary_per_anchor(
             f"landing={_nland} "
             f"expandable={len(primary_expandable)} support_seed={len(primary_support_seed)} "
             f"support_keep={len(primary_support_keep)} risky_keep={len(risky_keep)}"
+        )
+        # landing 闭环摘要：区分 candidate_generated vs landing_kept，并输出落地状态（可解释）
+        _anchor_text = getattr(anchor, "anchor", "") or ""
+        _m = (getattr(anchor, "stage2_process_mode", "") or "").strip()
+        print(
+            f"[Stage2A landing summary] anchor={_anchor_text!r} stage2_process_mode={_m!r} "
+            f"candidate_generated_count={candidate_generated_count} landing_kept_count={landing_kept_count} "
+            f"landing_state={landing_state!r} landing_reason={landing_reason!r}"
         )
 
     for c in primary_expandable:
@@ -6207,6 +6806,28 @@ def score_academic_identity(c: Any) -> float:
 
 # ---------- Stage2B：学术侧补充（dense / 簇 / 共现，不再用 SIMILAR_TO 学术→学术） ----------
 
+def _stage2b_top_blocked_reasons(blocked_counts: Dict[str, int], top_k: int = 6) -> List[Tuple[str, int]]:
+    """Stage2B 审计：取 blocked reasons 的 top-k（仅用于日志/观测）。"""
+    if not blocked_counts:
+        return []
+    return sorted(blocked_counts.items(), key=lambda x: (-int(x[1] or 0), x[0]))[:top_k]
+
+
+def _stage2b_write_expansion_audit(label, chain: str, audit: Dict[str, Any]) -> None:
+    """
+    将 Stage2B 扩展链路审计信息挂到 label 上，供主流程汇总打印。
+    不改变扩展链路返回类型；仅用于解释 kept=0 的原因。
+    """
+    try:
+        store = getattr(label, "_stage2b_last_expansion_audit", None)
+        if not isinstance(store, dict):
+            store = {}
+            setattr(label, "_stage2b_last_expansion_audit", store)
+        store[chain] = audit
+    except Exception:
+        return
+
+
 
 def expand_from_vocab_dense_neighbors(
     label,
@@ -6232,6 +6853,31 @@ def expand_from_vocab_dense_neighbors(
     support_domain_min = max(SUPPORT_MIN_DOMAIN_FIT, 0.72)
 
     anchor_to_primaries: Dict[int, List[Any]] = {}
+    # --- Stage2B expansion audit (aggregated for this call) ---
+    _audit_raw = 0
+    _audit_post = 0
+    _audit_kept = 0
+    _audit_blocked: Dict[str, int] = {}
+    _audit_blocked_samples: Dict[str, List[str]] = {}
+    _audit_no_domain_weak_detail: List[str] = []
+    def _blk(reason: str) -> None:
+        _audit_blocked[reason] = _audit_blocked.get(reason, 0) + 1
+    def _blk_sample(reason: str, sample: str, cap: int = 3) -> None:
+        """每类 reason 仅保留少量样本，避免刷屏。"""
+        lst = _audit_blocked_samples.get(reason)
+        if lst is None:
+            lst = []
+            _audit_blocked_samples[reason] = lst
+        if len(lst) >= cap:
+            return
+        if sample not in lst:
+            lst.append(sample)
+    def _cap_append(lst: List[str], item: str, cap: int = 3) -> None:
+        if len(lst) >= cap:
+            return
+        if item not in lst:
+            lst.append(item)
+
     for p in primary_landings:
         a_vid = getattr(p, "anchor_vid", 0)
         anchor_to_primaries.setdefault(a_vid, []).append(p)
@@ -6255,6 +6901,7 @@ def expand_from_vocab_dense_neighbors(
                 f"seed_ok={ok} seed_block_reason={block_reason!r}"
             )
         if not ok:
+            _blk(f"seed_ineligible:{block_reason or 'blocked'}")
             continue
         sem_p = float(getattr(p, "semantic_score", 0.0) or 0.0)
         cond_p = float(getattr(p, "conditioned_sim", 0.0) or 0.0)
@@ -6274,6 +6921,7 @@ def expand_from_vocab_dense_neighbors(
             min_family_support = 0.68
         idx = label.vocab_to_idx.get(str(p.vid))
         if idx is None:
+            _blk("seed_vid_not_in_vocab_index")
             continue
         vec = np.asarray(label.all_vocab_vectors[idx], dtype=np.float32).reshape(1, -1)
         k = min(top_k_per_primary + 8, 24)
@@ -6348,9 +6996,11 @@ def expand_from_vocab_dense_neighbors(
         for score, tid in zip(scores[0], ids[0]):
             tid = int(tid)
             if tid <= 0:
+                _blk("retrieval_empty_or_invalid_tid")
                 continue
             n_raw += 1
             if tid in seen:
+                _blk("duplicate_or_in_carryover")
                 continue
             meta = label._vocab_meta.get(tid, ("", ""))
             term = (meta[0] or "").strip() or str(tid)
@@ -6358,10 +7008,14 @@ def expand_from_vocab_dense_neighbors(
             if len(top_raw) < 5:
                 top_raw.append(term)
             if vocab_type not in ("concept", "keyword", "") and vocab_type:
+                _blk("vocab_type_filtered")
+                _blk_sample("vocab_type_filtered", f"{term[:36]!r}:{str(vocab_type)[:16]}")
                 continue
             n_src += 1
             sim = max(0.0, min(1.0, float(score)))
             if sim < min_dense_sim:
+                _blk("sim_below_min_dense_sim")
+                _blk_sample("sim_below_min_dense_sim", f"{term[:36]!r}:sim={sim:.3f}<min={min_dense_sim:.2f}")
                 continue
             n_sim += 1
             if active_domain_set is not None or jd_field_ids or jd_subfield_ids or jd_topic_ids:
@@ -6372,6 +7026,36 @@ def expand_from_vocab_dense_neighbors(
                     jd_subfield_ids=jd_subfield_ids,
                     jd_topic_ids=jd_topic_ids,
                 ):
+                    _blk("no_domain_or_topic_fit")
+                    _blk_sample("no_domain_or_topic_fit", f"{term[:44]!r}")
+                    # weak-seed domain/topic gate audit (keep lightweight; do NOT change gate behavior)
+                    if tier_dn == "weak":
+                        try:
+                            df = _compute_domain_fit(
+                                label, tid,
+                                active_domain_set=active_domain_set,
+                                jd_field_ids=jd_field_ids,
+                                jd_subfield_ids=jd_subfield_ids,
+                                jd_topic_ids=jd_topic_ids,
+                            )
+                            ta, tl, tc = _attach_topic_align(
+                                label,
+                                int(tid),
+                                set(str(x) for x in (jd_field_ids or [])),
+                                set(str(x) for x in (jd_subfield_ids or [])),
+                                set(str(x) for x in (jd_topic_ids or [])),
+                            )
+                            sample = (
+                                f"term={term[:38]!r} sim={sim:.3f} vocab_type={str(vocab_type)[:12]!r} "
+                                f"domain_fit={float(df or 0.0):.3f} topic_align={float(ta or 0.0):.3f} "
+                                f"topic_level={str(tl)[:10]!r} topic_conf={float(tc or 0.0):.2f}"
+                            )
+                        except Exception:
+                            sample = (
+                                f"term={term[:38]!r} sim={sim:.3f} vocab_type={str(vocab_type)[:12]!r} "
+                                f"domain_fit=? topic_align=?"
+                            )
+                        _cap_append(_audit_no_domain_weak_detail, sample, cap=3)
                     continue
             n_dom += 1
             domain_fit = _compute_domain_fit(
@@ -6383,6 +7067,7 @@ def expand_from_vocab_dense_neighbors(
             )
             domain_fit_floor = 0.58 if strong_seed else support_domain_min
             if domain_fit < domain_fit_floor:
+                _blk("domain_fit_too_low")
                 continue
             n_dom_fit += 1
 
@@ -6436,6 +7121,8 @@ def expand_from_vocab_dense_neighbors(
                         keep = False
                         keep_meta = {"reason": "dense_tier_context_stability_low"}
             if not keep:
+                # 细因见 keep_meta['reason']（若有）；这里先归为稳定粗类，避免大量原因键碎片化
+                _blk(str(keep_meta.get("reason") or "support_gate_blocked"))
                 if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
                     ac = keep_meta.get("anchor_consistency")
                     fs = keep_meta.get("family_support")
@@ -6460,10 +7147,12 @@ def expand_from_vocab_dense_neighbors(
                 if row:
                     domain_span = int(row[0] or 0)
             if domain_span > DOMAIN_SPAN_EXTREME:
+                _blk("domain_span_extreme")
                 continue
             n_post_mainline += 1
 
             if kept >= max_keep:
+                _blk("max_keep_reached")
                 continue
             seen.add(tid)
             keep_score = float(keep_meta.get("keep_score", sim))
@@ -6503,6 +7192,11 @@ def expand_from_vocab_dense_neighbors(
                     f"score={sim:.3f} keep_score={keep_score:.3f}"
                 )
 
+        # aggregate per-seed funnel into call-level audit
+        _audit_raw += int(n_raw)
+        _audit_post += int(n_post_mainline)
+        _audit_kept += int(kept)
+
         if LABEL_EXPANSION_DEBUG and STAGE2_RULING_DEBUG:
             seed_term = getattr(p, "term", "") or ""
             print(f"\n{'-' * 80}\n[Stage2B] Dense expansion funnel\n{'-' * 80}")
@@ -6520,6 +7214,19 @@ def expand_from_vocab_dense_neighbors(
     if LABEL_EXPANSION_DEBUG and STAGE2_NOISY_DEBUG:
         sample = [c.term for c in out[:3]]
         print(f"[Stage2B] expand_from_vocab_dense_neighbors primary数={len(primary_landings)} -> dense_expansion {len(out)} 个 前3: {sample}")
+
+    _stage2b_write_expansion_audit(
+        label,
+        "dense",
+        {
+            "raw": int(_audit_raw),
+            "post": int(_audit_post),
+            "kept": int(_audit_kept),
+            "blocked_top": _stage2b_top_blocked_reasons(_audit_blocked),
+            "blocked_samples": dict(_audit_blocked_samples),
+            "no_domain_weak_detail": list(_audit_no_domain_weak_detail),
+        },
+    )
     return out
 
 
@@ -6532,7 +7239,20 @@ def expand_from_cluster_members(
     jd_subfield_ids: Optional[Set[str]] = None,
     jd_topic_ids: Optional[Set[str]] = None,
 ) -> List[ExpandedTermCandidate]:
-    """Cluster 扩散当前默认关闭（全关），避免脏簇成员混入。term_role=cluster_expansion。"""
+    """Cluster 扩散当前默认关闭（全关），避免脏簇成员混入。term_role=cluster_expansion。
+
+    Stage2B 审计说明：当 eligible seeds > 0 但 cluster 仍为 0 时，首先检查是否因为此处关闭。
+    """
+    _stage2b_write_expansion_audit(
+        label,
+        "cluster",
+        {
+            "raw": 0,
+            "post": 0,
+            "kept": 0,
+            "blocked_top": [("disabled_by_default", 1)],
+        },
+    )
     return []
 
 
@@ -6546,7 +7266,26 @@ def expand_from_cooccurrence_support(
     jd_profile: Optional[Dict[str, Any]] = None,
 ) -> List[ExpandedTermCandidate]:
     """共现支持词；仅允许强 normal + 多锚 + 高 jd_align 的 seed，support 须过 support_expandable_for_anchor，每 seed 最多 2 条。"""
+    # --- Stage2B expansion audit (aggregated for this call) ---
+    _audit_raw = 0
+    _audit_post = 0
+    _audit_kept = 0
+    _audit_blocked: Dict[str, int] = {}
+    def _blk(reason: str) -> None:
+        _audit_blocked[reason] = _audit_blocked.get(reason, 0) + 1
+
     if not primary_landings or not getattr(label, "stats_conn", None):
+        _blk("stats_conn_missing_or_no_primary_landings")
+        _stage2b_write_expansion_audit(
+            label,
+            "cooc",
+            {
+                "raw": 0,
+                "post": 0,
+                "kept": 0,
+                "blocked_top": _stage2b_top_blocked_reasons(_audit_blocked),
+            },
+        )
         return []
     load_vocab_meta(label)
     term_to_vid = {}
@@ -6578,6 +7317,7 @@ def expand_from_cooccurrence_support(
                 (term, term, cooc_min_freq),
             ).fetchall()
         except Exception:
+            _blk("stats_query_failed")
             continue
         anchor_stub = SimpleNamespace(
             anchor_term=getattr(p, "anchor_term", "") or "",
@@ -6596,15 +7336,19 @@ def expand_from_cooccurrence_support(
             ta, tb, freq = row[0], row[1], row[2]
             other = (tb if ta == term else ta) or ""
             if other == term or not other:
+                _blk("retrieval_empty_or_self")
                 continue
             if len(top_raw_co) < 5:
                 top_raw_co.append((other.strip() or "")[:48])
             vid_other = term_to_vid.get(other.strip())
             if vid_other is None:
+                _blk("term_to_vid_missing")
                 continue
             if vid_other in seen:
+                _blk("duplicate_or_in_carryover")
                 continue
             if (freq or 0) < 3:
+                _blk("freq_below_min")
                 continue
             n_freq3 += 1
             cooc_strength = min(1.0, float(freq or 0) / 5.0)
@@ -6616,6 +7360,7 @@ def expand_from_cooccurrence_support(
                     jd_subfield_ids=jd_subfield_ids,
                     jd_topic_ids=jd_topic_ids,
                 ):
+                    _blk("no_domain_or_topic_fit")
                     continue
             n_dom += 1
             domain_fit = _compute_domain_fit(
@@ -6626,6 +7371,7 @@ def expand_from_cooccurrence_support(
                 jd_topic_ids=jd_topic_ids,
             )
             if domain_fit < 0.75:
+                _blk("domain_fit_too_low")
                 continue
             n_dom_fit += 1
             keep, _ = support_expandable_for_anchor(
@@ -6636,6 +7382,7 @@ def expand_from_cooccurrence_support(
                 candidate_term=other,
             )
             if not keep:
+                _blk("support_gate_blocked")
                 continue
             n_supp += 1
             domain_span = 0
@@ -6647,9 +7394,11 @@ def expand_from_cooccurrence_support(
                 if r:
                     domain_span = int(r[0] or 0)
             if domain_span > DOMAIN_SPAN_EXTREME:
+                _blk("domain_span_extreme")
                 continue
             n_span_ok += 1
             if kept >= 2:
+                _blk("max_keep_reached")
                 continue
             seen.add(vid_other)
             meta = label._vocab_meta.get(vid_other, ("", ""))
@@ -6694,9 +7443,24 @@ def expand_from_cooccurrence_support(
             print(f"  final_kept={kept}")
             print(f"  top_raw={top_raw_co}")
             print(f"  top_kept={top_kept_co}")
+
+        _audit_raw += int(raw_cooc)
+        _audit_post += int(n_span_ok)
+        _audit_kept += int(kept)
     if LABEL_EXPANSION_DEBUG and STAGE2_NOISY_DEBUG:
         sample = [c.term for c in out[:3]] if out else []
         print(f"[Stage2B] expand_from_cooccurrence_support primary数={len(primary_landings)} -> cooc_expansion {len(out)} 个 前3: {sample}")
+
+    _stage2b_write_expansion_audit(
+        label,
+        "cooc",
+        {
+            "raw": int(_audit_raw),
+            "post": int(_audit_post),
+            "kept": int(_audit_kept),
+            "blocked_top": _stage2b_top_blocked_reasons(_audit_blocked),
+        },
+    )
     return out
 
 
@@ -8029,9 +8793,21 @@ def merge_primary_and_support_terms(
     emit_merge_debug: bool = True,
 ) -> List[ExpandedTermCandidate]:
     """
-    合并 primary + dense_expansion + cluster_expansion + cooc_expansion。
-    关键修正：不再把所有 primary 都包成同一种 role；
-    can_expand + role_in_anchor==mainline -> term_role=primary，否则 term_role=primary_side，供 Stage3 区分真主线与弱保留。
+    Stage2B merge：carryover landing + merge support expansions（职责收口：support expansion，不是“准终判层”）。
+
+    本函数负责把本锚点的 Stage2A carryover landings（局部落点证据）与 Stage2B 扩展出来的支持项
+    （dense/cluster/cooc expansions）合并成一条候选流，供 Stage2 出口打包并进入 Stage3。
+
+    口径说明：
+    - 这里的合并目标是“补齐候选与局部证据”，并补充 provenance/cluster/family/source 等可解释痕迹；
+      不做跨锚的全局裁决，也不应被描述为最终保留/最终主词的决定层（全局裁决属于 Stage3）。
+    - `primary_bucket` / `support_seed` / `support_keep` / `weak_primary` 等属于 Stage2 内部细分与兼容字段，
+      会继续保留以维持旧链路，但跨阶段推荐语义应以 `local_role` + 局部证据字段为主。
+
+    实现要点（不改算法，仅澄清）：
+    - carryover landings 逐条转为 ExpandedTermCandidate（维持原字段与分数口径）
+    - 合并 dense/cluster/cooc 扩展项并补齐统计/领域特征
+    - 兼容层：仍根据 Stage2A 的局部标签填充少量历史字段（供旧 Stage3 逻辑读取；后续迁移可逐步降级）
     """
     load_vocab_meta(label)
     active = active_domains or set()
@@ -8263,8 +9039,23 @@ def stage2_generate_academic_terms(
     jd_profile: Optional[Dict[str, Any]] = None,
 ) -> List[ExpandedTermCandidate]:
     """
-    Stage2 总入口：先 Stage2A 主落点（保守），再 Stage2B 仅围绕 primary 扩展。
-    无主落点则不扩展。可选传入 jd_field_ids/jd_subfield_ids/jd_topic_ids 供三层领域 topic_align。
+    Stage2 总入口（职责收口口径，不改算法）。
+
+    - **Stage2A = local landing / local ranking**
+      围绕每个 anchor 收集落点候选（landing candidates），做局部证据增强与组内相对排序，
+      产出按桶分型的“本锚局部落点集合”（仍然是局部视角，不做跨锚全局裁决）。
+
+    - **Stage2B = support expansion around strong local landings**
+      仅围绕 Stage2A 产生的强局部落点（可扩/seed）做支持项扩展（dense/cluster/cooc 等），
+      目标是补齐 recall 侧的局部证据，而不是决定最终保留项。
+
+    - **Stage2 输出的是候选与局部证据，不是最终全局裁决**
+      本函数返回 ExpandedTermCandidate 列表，供 Stage2 出口打包为 raw candidates；
+      跨锚一致性、全局重排、最终准入/淘汰等全局决策属于 Stage3。
+
+    说明：
+    - 无有效局部落点则不做扩展；
+    - 可选传入 jd_field_ids/jd_subfield_ids/jd_topic_ids/jd_profile，用于局部证据字段（如 topic_align/domain_fit 等）的计算与观测。
     """
     active_domains = set(int(x) for x in (active_domain_set or [])) if active_domain_set else set()
     if domain_regex and not active_domains:
@@ -8272,7 +9063,7 @@ def stage2_generate_academic_terms(
             active_domains = set(int(x) for x in re.findall(r"\d+", domain_regex))
         except (ValueError, TypeError):
             pass
-    # 诊断：新 Stage2 流水线统一在此初始化 similar_to 相关 debug，供 stage5 / 诊断面板使用
+    # 诊断：Stage2 流水线统一在此初始化 similar_to 相关 debug（观测用途），供后续阶段/面板使用
     if getattr(label, "debug_info", None) is not None:
         label.debug_info.similar_to_raw_rows = []
         label.debug_info.similar_to_agg = []
@@ -8468,7 +9259,9 @@ def stage2_generate_academic_terms(
             setattr(p, "has_static_support", bool(getattr(cand, "has_static_support", False)))
             setattr(p, "dual_support", bool(getattr(cand, "dual_support", False)))
             setattr(p, "source_type", getattr(cand, "source_type", None) or getattr(cand, "source", "") or "")
-            # Stage2A 审计字段 → PrimaryLanding → merge → raw_candidates 顶层（供 Stage3 分桶/连续分/paper 门）
+        # Stage2A 审计字段 → PrimaryLanding → merge → raw_candidates 顶层
+        # 说明：以下字段属于 Stage2A 细桶体系/审计痕迹，长期口径应降级为 debug/兼容镜像，
+        # 不作为跨阶段正式语义；跨阶段推荐使用 local_role + 局部证据字段（见 Stage2 出口打包层）。
             setattr(p, "admission_reason", str(getattr(cand, "admission_reason", "") or ""))
             _crj = getattr(cand, "reject_reason", None)
             setattr(p, "reject_reason", str(_crj) if _crj is not None else "")
@@ -8611,7 +9404,7 @@ def stage2_generate_academic_terms(
 
     if getattr(label, "debug_info", None) is not None:
         label.debug_info.stage2_anchor_evidence_table = evidence_table
-        # 按 term 聚合：term | sources | similar_to_score | conditioned_score | final_primary_score（便于区分双路来源）
+        # 按 term 聚合：term | sources | similar_to_score | conditioned_score | primary_score_max（便于区分双路来源）
         by_term: Dict[Tuple[int, str], Dict[str, Any]] = {}
         for row in evidence_table:
             tid, term = row["tid"], (row.get("candidate") or "").strip() or str(row["tid"])
@@ -8789,6 +9582,31 @@ def stage2_generate_academic_terms(
             jd_profile=jd_profile,
         )
         _stage2_header("Stage2B 扩展汇总（dense / cluster / cooc）", "-")
+        # Stage2B 扩展产出审计增强：解释 eligible seed 存在但 kept=0 的原因（不改阈值/公式）
+        if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG:
+            audits = getattr(label, "_stage2b_last_expansion_audit", None)
+            audits = audits if isinstance(audits, dict) else {}
+            da = audits.get("dense") or {}
+            ca = audits.get("cluster") or {}
+            oa = audits.get("cooc") or {}
+            ds = da.get("blocked_samples") or {}
+            dense_samples = {
+                k: ds.get(k, [])
+                for k in ("vocab_type_filtered", "no_domain_or_topic_fit", "sim_below_min_dense_sim")
+                if ds.get(k)
+            }
+            weak_no_dom = da.get("no_domain_weak_detail") or []
+            print(
+                f"[Stage2B expansion audit] anchor={getattr(anchor, 'anchor', '')!r} "
+                f"dense_raw/post/kept={da.get('raw', 0)}/{da.get('post', 0)}/{da.get('kept', 0)} "
+                f"cluster_raw/post/kept={ca.get('raw', 0)}/{ca.get('post', 0)}/{ca.get('kept', 0)} "
+                f"cooc_raw/post/kept={oa.get('raw', 0)}/{oa.get('post', 0)}/{oa.get('kept', 0)} "
+                f"dense_blocked_top={da.get('blocked_top', [])} "
+                f"cluster_blocked_top={ca.get('blocked_top', [])} "
+                f"cooc_blocked_top={oa.get('blocked_top', [])} "
+                f"dense_blocked_samples={dense_samples} "
+                f"dense_no_domain_weak_samples={weak_no_dom}"
+            )
         if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and STAGE2_NOISY_DEBUG:
             d3 = [getattr(c, "term", c) for c in dense_list[:3]]
             c3 = [getattr(c, "term", c) for c in cluster_list[:3]]

@@ -27,8 +27,9 @@ from src.utils.domain_utils import DomainProcessor
 from src.utils.tools import extract_skills
 
 # ---------------------------------------------------------------------------
-# Stage1 早期粗分型（阶段 A）：在 extract_anchor_skills 之前产生，用于准入与分层。
-# 粗分角色（非终态，后续经 refine_stage1_anchor_layers 修正）
+# Stage1 早期粗分型（阶段 A）：在 extract_anchor_skills 之前产生，用于**轻量标签**与分层参考。
+# 注意：coarse 不是“终判准入器”，也不承担 Stage2 的 local landing / candidate generation 裁决。
+# 粗分角色为非终态，后续经 refine_stage1_anchor_layers 做来源与层级整理后再稳定输出。
 # ---------------------------------------------------------------------------
 JD_COARSE_CORE = "core_concept_candidate"
 JD_COARSE_OBJECT_TASK = "object_or_task_candidate"
@@ -135,6 +136,7 @@ def _jd_has_richer_concrete_peer(term: str, all_terms: Set[str]) -> bool:
 def coarse_classify_jd_term(term: str, all_terms: Set[str], raw_text: str) -> str:
     """
     阶段 A：对单条 JD 技能短语做轻量粗分型（形式 + 与全集相对位置），不依赖大词表。
+    该 coarse label 仅用于 Stage1 内部的轻量分层与下游调度参考，不表达“是否值得扩展/落点”的终判。
     """
     if not term or not str(term).strip():
         return JD_COARSE_NOISE
@@ -240,8 +242,15 @@ def refine_stage1_anchor_layers(
     raw_text: str,
 ) -> None:
     """
-    阶段 B：在 extract_anchor_skills + supplement 之后，结合来源与 REQUIRE 命中修正分型，
-    写入 anchor_role / anchor_priority / is_primary_eligible / source_kind 等，并真正接管 final 分数与排序。
+    阶段 B：在 extract_anchor_skills + supplement 之后，做**输出整理层**：
+    - 把 Stage1 已有信号（来源、coarse 轻标签、specificity 等）整理成稳定字段；
+    - 写入 anchor_role / anchor_priority / source_kind / coarse_jd_role / anchor_type 等；
+    - 通过少量“比例帽/分层帽”保证主/辅/上下文的分数带分离（避免 context/补锚与主锚同量级竞争）。
+
+    重要语义（协议稳定化）：
+    - is_primary_eligible：仅表示“看起来像主锚候选，可交由 Stage2 正常处理”的轻量 pre-signal，
+      不表示已经确认主落点/值得扩展/优于其它锚点。
+    - is_expand_eligible：仅表示“非 context-only，可被下游看到”，不暗示必须扩展或强 candidate generation。
 
     REQUIRE 直出锚：final 以 extract 中 score_after_role_penalty 为基（已在 backbone 环节折损辅/泛）；
     向量补锚：对主锚峰值做天花板；context_only：禁止与主锚同量级竞争。
@@ -342,6 +351,7 @@ def refine_stage1_anchor_layers(
         info["anchor_role"] = role
         info["anchor_priority"] = priority
         info["source_kind"] = source_kind
+        # 协议字段：轻量预标注（pre-signal），不是 Stage2A 落点/扩展终判
         info["is_primary_eligible"] = role == ANCHOR_ROLE_MAIN
         info["is_expand_eligible"] = role != ANCHOR_ROLE_CONTEXT
         info["is_context_only"] = role == ANCHOR_ROLE_CONTEXT
@@ -376,6 +386,7 @@ def refine_stage1_anchor_layers(
     for _vid, info in (anchor_skills or {}).items():
         role = (info or {}).get("anchor_role")
         source_kind = (info or {}).get("source_kind")
+        coarse = (info or {}).get("coarse_jd_role")
         pre_mainline = float((info or {}).get("score_after_role_penalty") or 0.0)
         base_ordered = _ordered_base_score(info)
         raw_pre = (info or {}).get("score_before_role_penalty")
@@ -436,7 +447,10 @@ def _strip_context_only_from_anchor_skills(
     recall: Any,
 ) -> None:
     """
-    context_only 不参与主锚池与后续 anchor_ctx / 画像；侧挂到 recall._stage1_context_only_anchors 便于审计。
+    context_only 是“保留上下文价值”，不是“继续参与主锚竞争”：
+    - 退出 anchor_skills（因此不参与主锚排序/主池竞争）；
+    - 不进入后续 anchor_ctx / 画像；
+    - 侧挂到 recall._stage1_context_only_anchors 供审计或下游轻支持读取。
     """
     if not anchor_skills:
         return
