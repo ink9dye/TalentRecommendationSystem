@@ -6172,7 +6172,9 @@ def retrieve_family_landing_candidates(
     面向 canonical_academic_like 锚点的轻量 family 补池：先 exact/alias/family 命中，再交给 Stage2A 常规打分。
     只负责补池，不保送 mainline。
     """
+    # 收严：family fallback 只做“保线桥接”，不造新路线；默认最多补 1~2 条即可
     top_k = int(top_k) if top_k is not None else STAGE2A_FAMILY_LANDING_TOP_K
+    top_k = max(0, min(2, top_k))
     anchor_text = (getattr(anchor, "anchor", "") or "").strip()
     if not anchor_text:
         return []
@@ -6183,7 +6185,39 @@ def retrieve_family_landing_candidates(
     meta = getattr(label, "_vocab_meta", None)
     if not meta:
         return []
+
+    # family 候选保线 gate：比 normal retrieval 更严（不靠大词表，主要靠结构与轻量不匹配信号）
+    _METHOD_TAIL_RE = re.compile(
+        r"\b(analysis|microscopy|spectroscopy|tomography|imaging|assay|measurement|metrology)\b",
+        re.IGNORECASE,
+    )
+    _METHOD_PHRASE_RE = re.compile(
+        r"\b(scanning probe|electron microscopy|atomic force|mass spectrometry)\b",
+        re.IGNORECASE,
+    )
+
+    def _family_keep_gate(anchor_txt: str, term_txt: str, best_score: float) -> Tuple[bool, str]:
+        tl = (term_txt or "").strip().lower()
+        if not tl:
+            return False, "empty_term"
+        # 非强贴近（best=0.85）时更保守：过长学术句更易越界
+        if best_score < 1.0 and len(tl) >= 28:
+            return False, "too_long_for_family_bridge"
+        # 研究方法/仪器场景长尾：对“任务型锚点”（抑制/控制/规划等）默认拒绝
+        a = (anchor_txt or "").strip()
+        task_like = bool(a and any(k in a for k in ("抑制", "控制", "规划", "抓取", "端到端")))
+        if task_like and (" with " in tl or "," in tl):
+            if _METHOD_TAIL_RE.search(tl) or _METHOD_PHRASE_RE.search(tl):
+                return False, "academic_method_tail"
+        # 单词过泛：best<1.0 时不收单 token 泛词（避免“vibration”之类泛词靠子串进池）
+        if best_score < 1.0 and " " not in tl and len(tl) <= 10:
+            return False, "single_token_too_generic"
+        return True, "ok"
+
     scored: List[Tuple[float, int, str, str]] = []
+    raw_n = 0
+    blocked_reason_counts: Dict[str, int] = {}
+    blocked_samples: Dict[str, List[str]] = {}
     for vid, tup in meta.items():
         try:
             vid_int = int(vid)
@@ -6202,6 +6236,13 @@ def retrieve_family_landing_candidates(
                 best = max(best, 0.85)
         if best <= 0:
             continue
+        raw_n += 1
+        keep, why = _family_keep_gate(anchor_text, term, best)
+        if not keep:
+            blocked_reason_counts[why] = blocked_reason_counts.get(why, 0) + 1
+            if len(blocked_samples.get(why, [])) < 3:
+                blocked_samples.setdefault(why, []).append(term[:72])
+            continue
         scored.append((best, vid_int, term, vocab_type))
     scored.sort(key=lambda x: (-x[0], -len(x[2])))
     out: List[LandingCandidate] = []
@@ -6218,9 +6259,18 @@ def retrieve_family_landing_candidates(
         out[-1].source_rank = rank
         out[-1].source_score = score
         setattr(out[-1], "has_family_evidence", True)
-    if LABEL_EXPANSION_DEBUG and out:
+    if LABEL_EXPANSION_DEBUG:
+        kept_n = len(out)
+        blocked_n = max(0, raw_n - kept_n)
         sample = [getattr(c, "term", str(c)) for c in out[:3]]
-        print(f"[Stage2A] family_landing anchor={anchor_text!r} -> {len(out)} 条补池 前3: {sample}")
+        print(
+            f"[Stage2A] family_landing anchor={anchor_text!r} raw={raw_n} kept={kept_n} blocked={blocked_n} "
+            f"top_k={top_k} kept_sample={sample}"
+        )
+        if blocked_reason_counts:
+            top_r = sorted(blocked_reason_counts.items(), key=lambda x: -x[1])[:4]
+            rs = ",".join(f"{k}:{v}" for k, v in top_r)
+            print(f"[Stage2A] family_landing blocked_reasons_top=[{rs}] blocked_samples={blocked_samples}")
     return out
 
 
@@ -6448,7 +6498,10 @@ def collect_landing_candidates(
     # 2) family：仅「仍无任何候选」时的弱保底（弱边 / 证据后移，不当主召回）
     family_cands: List[LandingCandidate] = []
     if len(similar_to_candidates) + len(context_neighbors) == 0 and _is_canonical_academic_like_anchor(anchor):
-        family_cands = retrieve_family_landing_candidates(label, anchor, top_k=min(3, STAGE2A_FAMILY_LANDING_TOP_K))
+        # family fallback 收严：只保线，不造新路线（最多 1~2 条；更严 gate 在 retrieve_family_landing_candidates 内）
+        family_cands = retrieve_family_landing_candidates(
+            label, anchor, top_k=min(2, STAGE2A_FAMILY_LANDING_TOP_K)
+        )
         for c in family_cands:
             setattr(c, "family_fallback_only", True)
             setattr(c, "default_expand_block_reason", "family_fallback_no_expand")
