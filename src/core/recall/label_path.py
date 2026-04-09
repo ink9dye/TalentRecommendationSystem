@@ -62,6 +62,7 @@ from src.core.recall.label_pipeline import (
     stage2_expansion,
     stage3_term_filtering,
     stage4_paper_recall,
+    stage4_prep_bridge,
     stage5_author_rank,
 )
 
@@ -1591,11 +1592,12 @@ class LabelRecallPath:
         term_scoring.STAGE3_DEBUG = effective_verbose
         # Stage3 审计表与 rerank 摘要：与 CLI「详细打印」对齐，避免 verbose=n 仍刷屏
         stage3_term_filtering.DEBUG_LABEL_PATH = effective_verbose
-        stage3_term_filtering.STAGE3_PAPER_CUTOFF_AUDIT = effective_verbose
-        stage3_term_filtering.STAGE3_PAPER_LANE_FILL_AUDIT = effective_verbose
-        stage3_term_filtering.STAGE3_BONUS_CORE_BLOCKED_AUDIT = effective_verbose
-        stage3_term_filtering.STAGE3_BONUS_CORE_READINESS_AUDIT = effective_verbose
-        stage3_term_filtering.STAGE3_SUPPORT_CONTAMINATION_AUDIT = effective_verbose
+        # Step8：paper-prep 审计开关在 stage4_prep_bridge（与 select_terms_for_paper_recall 同模块）
+        stage4_prep_bridge.STAGE3_PAPER_CUTOFF_AUDIT = effective_verbose
+        stage4_prep_bridge.STAGE3_PAPER_LANE_FILL_AUDIT = effective_verbose
+        stage4_prep_bridge.STAGE3_BONUS_CORE_BLOCKED_AUDIT = effective_verbose
+        stage4_prep_bridge.STAGE3_BONUS_CORE_READINESS_AUDIT = effective_verbose
+        stage4_prep_bridge.STAGE3_SUPPORT_CONTAMINATION_AUDIT = effective_verbose
         stage3_term_filtering.STAGE3_UNIFIED_SCORE_DEBUG = effective_verbose
         stage3_term_filtering.STAGE3_AUDIT_DEBUG = effective_verbose
         stage3_term_filtering.STAGE3_DUPLICATE_MERGE_AUDIT = effective_verbose

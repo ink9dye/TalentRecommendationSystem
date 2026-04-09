@@ -1895,3 +1895,10 @@ def run_stage4(
                 terms = [str(h.get("term") or h.get("vid") or "") for h in hits if isinstance(h, dict)]
                 _lp(f"aid='{aid}' wid='{p.get('wid')}' hit_count={len(hits)} terms={terms}")
     return out
+
+
+# --- Step8: Stage4 prep bridge (term→paper selection from Stage3 ranked_terms; POST-LAYER) ---
+from src.core.recall.label_pipeline.stage4_prep_bridge import (  # noqa: E402
+    prepare_stage4_terms_from_stage3,
+    select_terms_for_paper_recall,
+)

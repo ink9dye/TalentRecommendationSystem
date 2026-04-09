@@ -36,11 +36,13 @@
 
 ### 0.3 Stage3 / Stage4（本文第四节 P0.2–P0.3 及以后）
 
+**Stage3 职责/边界（Step0 文档冻结，与 `run_stage3` docstring 一致）**：正式身份 = term-level aggregation + cross-anchor coherence + global rerank + light guardrail；**主链终点** **`stage3_result["ranked_terms"]`**；Stage4 prep 仅后置消费 `ranked_terms`；paper lane / dynamic floor / tail expand / swap / quota 不属于 Stage3 主路径。
+
 | 项目 | 状态 | 说明 |
 |------|------|------|
 | **`run_stage3` 入参为完整 `stage2_output` dict** | **已完成** | 实现方式：`run_stage3` 要求四键齐全并做类型检查；从 **`all_candidates`** 得到与旧版等价的 **`raw_candidates`** 再走双闸门或 `_calculate_final_weights`。 |
 | **`run_stage3` 透传 `candidate_graph` / `anchor_to_candidates`** | **已完成（透传层）** | 实现方式：写入 **`recall._stage3_stage2_context`** 与 **`debug_info.stage2_contract_pass_through`**；**全局 coherence 报告**中带 **`used_candidate_graph` / `used_anchor_to_candidates`**（表示结构非空，**非**「已在打分路径使用图」）。 |
-| **`run_stage3` 在 merge/rerank 中消费边表做图重排** | **未做** | docstring 明示壳层迁移；**`_merge_stage3_duplicates` 等仍以扁平行证据为主**。 |
+| **`run_stage3` 在 merge/rerank 中消费边表做图重排** | **未做** | **职责口径已冻结为 Global Coherence Rerank**；**`_merge_stage3_duplicates` 等仍以扁平行证据为主**（图尚未驱动主链 rerank）。 |
 | **`run_stage3` 返回结构化 `dict`** | **已完成（壳层）** | 实现方式：稳定键 **`selected_core_terms`、`selected_support_terms`、`risky_terms`、`paper_terms`、`global_coherence_report`**，并保留 **`score_map` / `term_map` / …** 供 `label_path.recall` 与 Stage4 薄适配；`recall` 将 **`global_coherence_report`** 写入 **`debug_1["stage3_global_coherence_report"]`**。 |
 | **`run_stage4` 按 P0.3 显式接收 Stage3 分桶输出** | **未做** | 仍为 **`run_stage4(self, vocab_ids, ...)`** 与既有论文检索形态；未接 **`selected_core_terms` / `global_coherence_report`** 等独立参数。 |
 | P1–P3（merge 重命名、审计迁出等） | **未做** | 按计划排队。 |
