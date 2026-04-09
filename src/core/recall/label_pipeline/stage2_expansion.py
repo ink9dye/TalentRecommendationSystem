@@ -227,9 +227,9 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
     2) Stable local evidence meta：`stage2_local_meta`
        允许跨阶段消费的稳定局部结构证据（Stage3 主链应优先经 normalize 从此读取）。
 
-    3) Legacy compatibility mirror / temporary fields（临时兼容顶层镜像）
-       与 `stage2_debug_meta` 中语义重叠的同名键（如 primary_bucket / can_expand_from_2a / parent_anchor_*）；
-       仅供旧读法与审计；Stage3 新主链应收敛到 normalize 后字段 + `stage2_local_meta`，勿再依赖顶层镜像做新逻辑。
+    3) Legacy compatibility meta（legacy 下沉，不再顶层 mirror）
+       provisional / half-decision / bucket/fallback/reason 等仅写入 `stage2_debug_meta`；
+       Stage3 normalize 可做兼容读取，但 Stage3 主链不应再直接依赖这些 legacy 语义键。
     """
     out = []
     for c in terms:
@@ -298,6 +298,8 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
             "term": c.term,
             "anchor_term": c.anchor_term,
             "candidate_source": c.source,
+            # Stage3-facing stable anchor pointer (avoid legacy mirror in Stage3 mainline)
+            "parent_anchor": c.anchor_term,
             # Stage2 formal coarse role (recommended for Stage3): local_core/local_support/local_risky
             "local_role": local_role,
             "term_role_local": c.term_role,
@@ -328,6 +330,10 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
             "retrieval_role": get_retrieval_role_from_term_role(c.term_role),
             "stage2_local_meta": stage2_local_meta,
             "stage2_debug_meta": stage2_debug_meta,
+            # Stage3-facing minimal structure signals (local evidence only)
+            "can_expand_local": can_ex_2a,
+            "best_parent_anchor_final_score": float(parent_anchor_final_score),
+            "best_parent_anchor_step2_rank": int(_rk) if _rk > 0 else None,
         }
         if getattr(c, "cluster_id", None) is not None:
             rec["cluster_id"] = c.cluster_id
@@ -369,60 +375,48 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
             "dual_support": getattr(c, "dual_support", None),
         }
 
-        # --- Legacy compatibility mirror / temporary top-level fields（临时兼容，勿在新 Stage3 主逻辑中追加依赖）---
-        # 下列键与 stage2_debug_meta / stage2_local_meta 语义重叠；保留仅为旧读法与 merge/审计不断裂。
-        # 能从 stage2_local_meta 派生的结构语义，请走 Stage3 `_normalize_stage3_input_record` 后的统一字段。
-        rec["term_role"] = c.term_role
+        # --- Legacy compatibility meta sink (Step: contract slimming) ---
+        # 不再把 provisional / half-decision / bucket/fallback 等 legacy 字段镜像到顶层；
+        # 统一下沉到 `stage2_debug_meta`（必要时可在 Stage3 normalize 中做兼容读取，但 Stage3 主链勿直接依赖）。
+        #
+        # 仍保留的顶层字段应尽量是「局部证据 candidate 语义」或「最小结构信号」：
+        # - parent_anchor / can_expand_local / best_parent_anchor_* / local_role / term_role_local 等
+        # - 其余 legacy（primary_bucket/fallback_primary/...）仅在 stage2_debug_meta 中存在
+        rec["retain_mode"] = getattr(c, "retain_mode", "normal") or "normal"
+        rec["source_type"] = getattr(c, "source", "") or ""
         rec["source"] = c.source
         rec["origin"] = c.source
-        rec["parent_anchor"] = c.anchor_term
-        rec["parent_primary"] = stage2_debug_meta["parent_primary"]
-        rec["source_type"] = getattr(c, "source", "") or ""
-        rec["can_expand"] = can_ex
-        rec["can_expand_from_2a"] = can_ex_2a
-        rec["can_expand_local"] = can_ex_2a
-        rec["role_in_anchor"] = role_ia
-        rec["retain_mode"] = getattr(c, "retain_mode", "normal") or "normal"
-        rec["primary_bucket"] = stage2_debug_meta["primary_bucket"]
-        rec["fallback_primary"] = stage2_debug_meta["fallback_primary"]
-        rec["admission_reason"] = stage2_debug_meta["admission_reason"]
-        rec["reject_reason"] = stage2_debug_meta["reject_reason"]
-        rec["survive_primary"] = stage2_debug_meta["survive_primary"]
-        rec["stage2b_seed_tier"] = stage2_debug_meta["stage2b_seed_tier"]
         rec["mainline_candidate"] = stage2_local_meta["mainline_candidate"]
-        rec["primary_reason"] = stage2_debug_meta["primary_reason"]
-        rec["parent_anchor_final_score"] = float(parent_anchor_final_score)
-        rec["anchor_internal_rank"] = stage2_debug_meta["anchor_internal_rank"]
-        if _rk > 0:
-            rec["parent_anchor_step2_rank"] = int(_rk)
 
         out.append(rec)
     # 须读 label_expansion 模块上的当前值：from ... import FLAG 会在 import 时绑定副本，
     # recall() 内 label_expansion.LABEL_EXPANSION_DEBUG = ... 无法更新此处旧绑定。
     if getattr(label_expansion, "LABEL_EXPANSION_DEBUG", False) and out:
         n = len(out)
-        n_2a = sum(1 for r in out if r.get("can_expand_from_2a"))
-        n_fb = sum(1 for r in out if r.get("fallback_primary"))
+        n_2a = sum(1 for r in out if r.get("can_expand_local"))
+        n_fb = sum(1 for r in out if bool((r.get("stage2_debug_meta") or {}).get("fallback_primary")))
         role_counts: Dict[str, int] = {}
         for r in out:
             lr = str(r.get("local_role") or "(missing)")
             role_counts[lr] = role_counts.get(lr, 0) + 1
         buckets: Dict[str, int] = {}
         for r in out:
-            pb = str(r.get("primary_bucket") or "") or "(empty)"
+            dbg = r.get("stage2_debug_meta") or {}
+            pb = str((dbg.get("primary_bucket") if isinstance(dbg, dict) else "") or "") or "(empty)"
             buckets[pb] = buckets.get(pb, 0) + 1
         top_pb = sorted(buckets.items(), key=lambda x: -x[1])[:4]
         pb_s = ",".join(f"{k}:{v}" for k, v in top_pb)
         print(
-            f"[Stage2->3 field audit] n={n} can_expand_from_2a={n_2a} fallback_primary={n_fb} "
+            f"[Stage2->3 field audit] n={n} can_expand_local={n_2a} fallback_primary(dbg)={n_fb} "
             f"primary_bucket_top=[{pb_s}] local_role_counts={role_counts} （逐条前10需 STAGE2_NOISY_DEBUG）"
         )
         if getattr(label_expansion, "STAGE2_NOISY_DEBUG", False):
             for rec in out[:10]:
+                dbg = rec.get("stage2_debug_meta") or {}
                 print(
-                    f"  term={rec['term']!r} primary_bucket={rec.get('primary_bucket')!r} "
-                    f"can_expand_from_2a={rec.get('can_expand_from_2a')!r} "
-                    f"fallback_primary={rec.get('fallback_primary')!r}"
+                    f"  term={rec['term']!r} primary_bucket(dbg)={dbg.get('primary_bucket')!r} "
+                    f"can_expand_local={rec.get('can_expand_local')!r} "
+                    f"fallback_primary(dbg)={dbg.get('fallback_primary')!r}"
                 )
     if out:
         sample = out[0]

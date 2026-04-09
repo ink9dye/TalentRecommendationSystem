@@ -433,6 +433,11 @@ def _normalize_stage3_raw_stage2_record(rec: Dict[str, Any]) -> Dict[str, Any]:
     if sim is not None:
         rec["sim_score"] = _f(sim, 0.0)
 
+    # term_role：Stage3 主链的统一入口字段；优先读 Stage2 新契约字段 term_role_local
+    if not (rec.get("term_role") or "").strip():
+        trl = (rec.get("term_role_local") or "").strip()
+        if trl:
+            rec["term_role"] = trl
     tr = (rec.get("term_role") or "").strip()
     rec["retrieval_role"] = (rec.get("retrieval_role") or "").strip() or get_retrieval_role_from_term_role(tr)
 
@@ -451,6 +456,13 @@ def _normalize_stage3_raw_stage2_record(rec: Dict[str, Any]) -> Dict[str, Any]:
     rec["mainline_candidate"] = mainline_candidate
     rec["has_family_evidence"] = has_family_evidence
     rec["seed_block_reason"] = seed_block
+
+    # legacy half-decision 字段：仅从 stage2_debug_meta 做兼容映射（Stage3 主链勿依赖其原始顶层镜像）
+    dbg = rec.get("stage2_debug_meta") if isinstance(rec.get("stage2_debug_meta"), dict) else {}
+    if not (rec.get("parent_primary") or "").strip():
+        pp = dbg.get("parent_primary")
+        if pp is not None:
+            rec["parent_primary"] = str(pp)
     rec["stage3_input_schema_version"] = "v1"
     rec["stage3_record_normalized"] = True
     return rec
@@ -533,7 +545,11 @@ def _print_stage3_input_normalize_debug(records: List[Dict[str, Any]], *, tag: s
     print(f"[Stage3 input normalize] {tag} (showing {n}/{len(records)})")
     print("-" * 80)
     for rec in records[:n]:
-        legacy_fields_present = sorted(k for k in STAGE3_LEGACY_MIRROR_KEYS_FOR_OBS if k in rec)
+        legacy_fields_seen_top_level = sorted(k for k in STAGE3_LEGACY_MIRROR_KEYS_FOR_OBS if k in rec)
+        dbg = rec.get("stage2_debug_meta") if isinstance(rec.get("stage2_debug_meta"), dict) else {}
+        legacy_keys_in_debug_meta = sorted(
+            k for k in STAGE3_LEGACY_MIRROR_KEYS_FOR_OBS if k in dbg and dbg.get(k) is not None
+        )
         print(
             f"  term={rec.get('term')!r} stage3_record_normalized={rec.get('stage3_record_normalized')!r} "
             f"schema_version={rec.get('stage3_input_schema_version')!r} "
@@ -542,7 +558,8 @@ def _print_stage3_input_normalize_debug(records: List[Dict[str, Any]], *, tag: s
             f"best_parent_anchor_step2_rank={rec.get('best_parent_anchor_step2_rank')!r} "
             f"can_expand_local={rec.get('can_expand_local')!r} "
             f"mainline_candidate={rec.get('mainline_candidate')!r} "
-            f"legacy_fields_present={legacy_fields_present}"
+            f"legacy_fields_seen_top_level={legacy_fields_seen_top_level} "
+            f"legacy_keys_in_stage2_debug_meta={legacy_keys_in_debug_meta}"
         )
     print("-" * 80 + "\n")
 
@@ -1766,7 +1783,12 @@ def _print_stage3_support_contamination_summary(cands: List[Dict[str, Any]]) -> 
 # --- Stage3 merge：multi-anchor evidence aggregation（非 winner-snapshot）---
 def _stage3_rec_bucket_norm(rec: Dict[str, Any]) -> str:
     meta = rec.get("stage2_local_meta") or {}
-    return (meta.get("primary_bucket") or rec.get("primary_bucket") or "").strip().lower()
+    if meta.get("primary_bucket"):
+        return str(meta.get("primary_bucket") or "").strip().lower()
+    dbg = rec.get("stage2_debug_meta") or {}
+    if isinstance(dbg, dict) and dbg.get("primary_bucket"):
+        return str(dbg.get("primary_bucket") or "").strip().lower()
+    return (rec.get("primary_bucket") or "").strip().lower()
 
 
 def _stage3_merge_source_evidence_slice(rec: Dict[str, Any]) -> Dict[str, Any]:
@@ -2010,7 +2032,8 @@ def _stage3_merge_debug_summary(
         for r in records
         if (r.get("role_in_anchor") or "").strip()
     }
-    expands = [bool(r.get("can_expand") or r.get("can_expand_local") or r.get("can_expand_from_2a")) for r in records]
+    # can_expand 语义统一收敛到 can_expand_local（Stage2 侧已瘦身；Stage3 merge 不再抬回 can_expand/can_expand_from_2a 顶层镜像）
+    expands = [bool(r.get("can_expand_local")) for r in records]
     has_t = any(expands)
     has_f = any(not x for x in expands)
     risk_union: Set[Any] = set()
@@ -2043,17 +2066,16 @@ def _stage3_merge_debug_summary(
         "best_signal_mixed_sources": _stage3_compute_best_signal_mixed(records),
         "risk_flags_union": sorted(str(x) for x in risk_union),
         "legacy_compatibility_mirror_fields": [
+            # 仅用于观测：哪些旧语义“可能仍存在于 raw record 顶层”。
+            # 注意：term-level merged record 顶层不再抬回 can_expand/can_expand_from_2a/fallback_primary/primary_reason 等镜像。
             "primary_bucket",
-            "primary_reason",
             "term_role",
             "role_in_anchor",
-            "can_expand",
-            "can_expand_from_2a",
             "can_expand_local",
-            "fallback_primary",
             "mainline_candidate",
+            "parent_primary",
         ],
-        "note": "TODO(Stage3 merge): legacy mirrors derived; global rerank 应消费 *_summary / *_list。",
+        "note": "Stage3 merge: 主链应消费 *_summary / *_list；避免 term-level merged record 再制造 legacy mirror 顶层键。",
     }
 
 
@@ -2078,8 +2100,8 @@ def _stage3_finalize_merged_candidate(obj: Dict[str, Any], representative_rec: A
     - 原始证据：`records` / `source_evidence_list` / `stage2_local_meta_list`
     - 正式聚合字段：`primary_bucket_summary` / `anchor_support_summary` / `provenance_summary` /
       `merge_debug_summary` / `best_*` / `anchor_count` / `mainline_anchor_count` / `multi_source` 等
-    - legacy mirror：`primary_bucket` / `term_role` / `role_in_anchor` / `parent_anchor_final_score` 等
-      仅兼容旧读法；正式语义以 summary + 顶层聚合标量为准。
+    - legacy mirror：仅允许保留极少数为了兼容/桥接仍需的字段；其余不再在 term-level merged record 顶层抬回。
+      正式语义以 summary + 顶层聚合标量为准。
     """
     records = list(obj.get("records") or [])
     obj["source_evidence_list"] = [_stage3_merge_source_evidence_slice(r) for r in records]
@@ -2109,13 +2131,8 @@ def _stage3_finalize_merged_candidate(obj: Dict[str, Any], representative_rec: A
     for pa in list(anchor_role_dist_flat.keys()):
         anchor_role_dist_flat[pa] = sorted(set(anchor_role_dist_flat[pa]))
 
-    can_expand = any(
-        bool(r.get("can_expand") or r.get("can_expand_local") or r.get("can_expand_from_2a")) for r in records
-    )
-    can_expand_from_2a = any(bool(r.get("can_expand_from_2a")) for r in records)
     can_expand_local = any(bool(r.get("can_expand_local")) for r in records)
     mainline_candidate = any(bool(r.get("mainline_candidate")) for r in records)
-    fallback_primary = bool(obj.get("fallback_primary_all", False))
 
     derived_term_role = _stage3_merge_derived_term_role(records, term_role_dist)
     mh = sum(1 for r in records if (r.get("role_in_anchor") or "").strip().lower() == "mainline")
@@ -2132,11 +2149,7 @@ def _stage3_finalize_merged_candidate(obj: Dict[str, Any], representative_rec: A
     idents = [float(r.get("identity_score") or r.get("sim_score") or 0.0) for r in records]
     obj["aggregation_identity_mean"] = sum(idents) / len(idents) if idents else 0.0
     obj["aggregation_identity_max"] = max(idents) if idents else 0.0
-    n_exp = sum(
-        1
-        for r in records
-        if bool(r.get("can_expand") or r.get("can_expand_local") or r.get("can_expand_from_2a"))
-    )
+    n_exp = sum(1 for r in records if bool(r.get("can_expand_local")))
     obj["aggregation_expand_local_fraction"] = float(n_exp) / float(max(1, len(records)))
 
     if representative_rec:
@@ -2153,16 +2166,12 @@ def _stage3_finalize_merged_candidate(obj: Dict[str, Any], representative_rec: A
     obj["role_in_anchor_set"] = role_ia_set
     obj["anchor_role_distribution"] = dict(sorted(anchor_role_dist_flat.items()))
 
-    # 正式 summary：derived_primary_bucket 存于 primary_bucket_summary；顶层 primary_bucket 仅为兼容镜像（= derived）
-    obj["primary_bucket"] = (pb_summary.get("derived_primary_bucket") or "").strip()
-    obj["primary_reason"] = _stage3_merge_pick_primary_reason(records, derived_pb_lower)
+    # 正式 bucket 语义统一写入 primary_bucket_summary.derived_primary_bucket；
+    # 为避免 Stage3 在 merged_post_merge 阶段“二次抬回顶层 legacy mirror”，不再写顶层 primary_bucket 镜像。
     obj["term_role"] = derived_term_role
     obj["role_in_anchor"] = derived_role_in_anchor
-    obj["can_expand"] = can_expand
-    obj["can_expand_from_2a"] = can_expand_from_2a
     obj["can_expand_local"] = can_expand_local
     obj["mainline_candidate"] = mainline_candidate
-    obj["fallback_primary"] = fallback_primary
     obj["has_primary_role"] = hp
     obj["has_support_role"] = hs
     obj["stage3_merge_source"] = STAGE3_AGGREGATE_SOURCE_V2
@@ -2184,8 +2193,7 @@ def _stage3_finalize_merged_candidate(obj: Dict[str, Any], representative_rec: A
     obj["mainline_side_conflict"] = bool(dbg.get("mainline_side_conflict"))
     obj["cross_anchor_side_only"] = bool(dbg.get("cross_anchor_side_only"))
 
-    obj["parent_anchor_final_score"] = float(obj.get("best_parent_anchor_final_score") or 0.0)
-    obj["parent_anchor_step2_rank"] = obj.get("best_parent_anchor_step2_rank")
+    # 不再抬回 parent_anchor_final_score / parent_anchor_step2_rank 这类旧镜像；统一用 best_parent_anchor_*。
 
     # legacy 单字段：优先与 derived bucket 对齐的一条 meta，非 seed 冠军；完整证据见 stage2_local_meta_list
     legacy_meta: Dict[str, Any] = {}
@@ -2202,6 +2210,14 @@ def _stage3_finalize_merged_candidate(obj: Dict[str, Any], representative_rec: A
                 legacy_meta = dict(m)
                 break
     obj["stage2_local_meta"] = legacy_meta
+    # 兼容：term-level merged record 收纳一条 stage2_debug_meta（供后置 Stage4 prep 兼容注入；不参与 Stage3 主链打分）
+    legacy_dbg: Dict[str, Any] = {}
+    for r in records:
+        d = r.get("stage2_debug_meta")
+        if isinstance(d, dict) and d:
+            legacy_dbg = dict(d)
+            break
+    obj["stage2_debug_meta"] = legacy_dbg
     obj.pop("fallback_primary_all", None)
 
 
@@ -2286,9 +2302,7 @@ def _stage3_term_bucket_accumulate_row(obj: Dict[str, Any], rec: Dict[str, Any])
     rm = (rec.get("retain_mode") or "normal").strip().lower()
     if rm == "normal":
         obj["retain_mode"] = "normal"
-    obj["fallback_primary_all"] = bool(obj.get("fallback_primary_all", True)) and bool(
-        rec.get("fallback_primary", False)
-    )
+    # fallback_primary 等 legacy half-decision 已下沉；Stage3 aggregation 不再依赖其顶层镜像。
 
     cur_pb = _stage3_rec_bucket_norm(rec)
     prev_sc = float(obj.get("_merge_best_seed_sc", -1.0))
@@ -2402,12 +2416,9 @@ def _print_stage3_duplicate_merge_audit(merged: List[Dict[str, Any]]) -> None:
             print("-" * 80)
         lines_printed += 1
         recs = obj.get("records") or []
-        raw_pb = [_stage3_rec_bucket_norm(r) or (r.get("primary_bucket") or "") for r in recs]
+        raw_pb = [_stage3_rec_bucket_norm(r) for r in recs]
         raw_roles = [((r.get("role_in_anchor") or "")) for r in recs]
-        raw_ce = [
-            bool(r.get("can_expand") or r.get("can_expand_local") or r.get("can_expand_from_2a"))
-            for r in recs
-        ]
+        raw_ce = [bool(r.get("can_expand_local")) for r in recs]
         pbs = obj.get("primary_bucket_summary") or {}
         adb = obj.get("anchor_support_summary") or {}
         mdbg = obj.get("merge_debug_summary") or {}
@@ -2443,8 +2454,8 @@ def _print_stage3_duplicate_merge_audit(merged: List[Dict[str, Any]]) -> None:
             f"cross_anchor_side_only={mdbg.get('cross_anchor_side_only')}"
         )
         print(
-            f"  legacy_mirror primary_bucket={obj.get('primary_bucket')!r} "
-            f"can_expand={bool(obj.get('can_expand'))} "
+            f"  merged_top_level(unified): derived_primary_bucket={pbs.get('derived_primary_bucket')!r} "
+            f"can_expand_local={bool(obj.get('can_expand_local'))} "
             f"role_in_anchor={obj.get('role_in_anchor')!r} "
             f"term_role={obj.get('term_role')!r}"
         )
@@ -2457,7 +2468,7 @@ def _print_stage3_duplicate_merge_audit(merged: List[Dict[str, Any]]) -> None:
         print(
             f"  stage3_merge_source={obj.get('stage3_merge_source')!r} "
             f"stage3_aggregation_schema_version={obj.get('stage3_aggregation_schema_version')!r} "
-            f"fallback_primary={bool(obj.get('fallback_primary'))}"
+            f"fallback_primary(debug_meta)={bool((obj.get('stage2_debug_meta') or {}).get('fallback_primary'))}"
         )
     if lines_printed:
         print("-" * 80 + "\n")
@@ -2482,9 +2493,9 @@ def _classify_stage3_entry_groups(terms: List[Dict[str, Any]]) -> List[Dict[str,
             if "primary" in term_roles_set:
                 term_role = "primary"
         role_in_anchor = (rec.get("role_in_anchor") or "").strip().lower()
-        # 聚合后正式字段 can_expand 已由 aggregation 层 OR 全证据；非聚合路径仍用 local/legacy
+        # can_expand 语义统一：聚合后也只读 can_expand_local（避免 term-level merged record 再制造 can_expand/can_expand_from_2a 顶层镜像）
         if rec.get("stage3_aggregated"):
-            can_expand = bool(rec.get("can_expand"))
+            can_expand = bool(rec.get("can_expand_local"))
         else:
             can_expand = bool(rec.get("can_expand_local") or rec.get("can_expand"))
         retain_mode = (rec.get("retain_mode") or "normal").strip().lower()
@@ -5610,6 +5621,28 @@ def _prepare_stage4_terms_from_stage3(
     """
     if ranked_terms is None:
         ranked_terms = []
+
+    # Stage4 prep 兼容注入：
+    # Stage3 term aggregation 已避免在 merged_post_merge 顶层抬回 legacy mirror；
+    # 但 Stage4 prep 仍兼容读取少量旧键（primary_bucket / fallback_primary / primary_reason / can_expand* / parent_anchor_*）。
+    # 这里在**后置层入口**做一次就地 materialize，保证行为不变，同时不污染 Stage3 主链与 merged_post_merge。
+    for r in ranked_terms:
+        dbg = r.get("stage2_debug_meta") if isinstance(r.get("stage2_debug_meta"), dict) else {}
+        pbs = r.get("primary_bucket_summary") if isinstance(r.get("primary_bucket_summary"), dict) else {}
+        if "primary_bucket" not in r:
+            r["primary_bucket"] = str(pbs.get("derived_primary_bucket") or "").strip()
+        if "fallback_primary" not in r:
+            r["fallback_primary"] = bool(dbg.get("fallback_primary", False))
+        if "primary_reason" not in r:
+            r["primary_reason"] = str(dbg.get("primary_reason") or "")
+        if "can_expand" not in r:
+            r["can_expand"] = bool(r.get("can_expand_local"))
+        if "can_expand_from_2a" not in r:
+            r["can_expand_from_2a"] = bool(r.get("can_expand_local"))
+        if "parent_anchor_final_score" not in r:
+            r["parent_anchor_final_score"] = float(r.get("best_parent_anchor_final_score") or 0.0)
+        if "parent_anchor_step2_rank" not in r:
+            r["parent_anchor_step2_rank"] = r.get("best_parent_anchor_step2_rank")
 
     # 显式边界：这段开始不再属于 Stage3 主链
     if STAGE3_AUDIT_DEBUG or LABEL_PATH_TRACE or getattr(term_scoring, "STAGE3_DEBUG", False):
