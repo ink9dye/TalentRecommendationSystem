@@ -212,13 +212,24 @@ def _derive_local_role_from_bucket(primary_bucket: str) -> str:
 
 def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict[str, Any]]:
     """
-    Stage2 -> Stage3：单条 candidate record 字段分层。
+    Stage2 -> Stage3：单条 candidate record 字段分层（contract slimming，兼容不删键）。
 
-    目标（先瘦契约，不破主链）：
-    - 顶层字段尽量只保留“局部证据字段”（标识 / local evidence / risk / confidence）。
-    - Stage2 内部 provisional/bucket/rank/reason 等字段统一下沉到 `stage2_debug_meta`，不再作为“正式字段”。
-    - 但 Stage3 目前仍直接读取少量 legacy 字段（如 primary_bucket / parent_primary 等），因此这里保留
-      **最小 legacy mirror**（顶层同名键），以避免主链报错；待 Stage3 merge 迁移完成后再删。
+    三层结构（注释与键位一致，供 Stage3 normalize 与后续 evidence aggregation 对齐）：
+
+    1) Formal Stage3-facing fields（正式局部证据，顶层）
+       tid / term / anchor_term / candidate_source / local_role / term_role_local /
+       identity_score / sim_score / domain_fit / field_fit / subfield_fit / topic_fit /
+       path_match / genericity_penalty / polysemy_risk / object_like_risk / generic_risk /
+       risk_flags / jd_candidate_alignment + jd_align（同值镜像）/ context_continuity /
+       landing_confidence / expansion_confidence / retrieval_role /
+       stage2_local_meta / stage2_debug_meta 等。
+
+    2) Stable local evidence meta：`stage2_local_meta`
+       允许跨阶段消费的稳定局部结构证据（Stage3 主链应优先经 normalize 从此读取）。
+
+    3) Legacy compatibility mirror / temporary fields（临时兼容顶层镜像）
+       与 `stage2_debug_meta` 中语义重叠的同名键（如 primary_bucket / can_expand_from_2a / parent_anchor_*）；
+       仅供旧读法与审计；Stage3 新主链应收敛到 normalize 后字段 + `stage2_local_meta`，勿再依赖顶层镜像做新逻辑。
     """
     out = []
     for c in terms:
@@ -235,8 +246,8 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
         role_ia = getattr(c, "role_in_anchor", "") or ""
 
         # Stage2 结构化元信息分两层：
-        # - stage2_local_meta：保留“局部证据/可解释”的轻量字段（稳定口径，允许 Stage3/后续阶段读取）
-        # - stage2_debug_meta：Stage2 内部 provisional/bucket/rank/reason（不应作为正式字段）
+        # - stage2_local_meta：Stable local evidence meta（可跨阶段；含 rank/score 等结构证据）
+        # - stage2_debug_meta：Stage2 内部 provisional / bucket / reason / fallback（Formal 主链勿依赖）
         stage2_debug_meta: Dict[str, Any] = {
             # 下沉字段清单（口径固定）：不再作为主流程正式字段
             "primary_bucket": getattr(c, "primary_bucket", "") or "",
@@ -254,6 +265,8 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
         stage2_local_meta: Dict[str, Any] = {
             "mainline_candidate": bool(getattr(c, "mainline_candidate", False)),
             "parent_anchor_final_score": float(parent_anchor_final_score),
+            # 与 debug 层同步一份 step2 rank：稳定结构证据，不应仅存在于 stage2_debug_meta
+            "parent_anchor_step2_rank": int(_rk) if _rk > 0 else None,
             "can_expand_local": can_ex_2a,
             "role_in_anchor": role_ia,
             "seed_block_reason": getattr(c, "seed_block_reason", None),
@@ -356,9 +369,9 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
             "dual_support": getattr(c, "dual_support", None),
         }
 
-        # --- TODO: remove legacy top-level mirror after Stage3 merge migration ---
-        # Stage3 当前仍直接读取以下字段（兼容镜像）：primary_bucket / fallback_primary / parent_primary / ...；
-        # 待 Stage3 全量改为从 stage2_debug_meta 或其聚合派生字段读取后，再删除这些镜像键。
+        # --- Legacy compatibility mirror / temporary top-level fields（临时兼容，勿在新 Stage3 主逻辑中追加依赖）---
+        # 下列键与 stage2_debug_meta / stage2_local_meta 语义重叠；保留仅为旧读法与 merge/审计不断裂。
+        # 能从 stage2_local_meta 派生的结构语义，请走 Stage3 `_normalize_stage3_input_record` 后的统一字段。
         rec["term_role"] = c.term_role
         rec["source"] = c.source
         rec["origin"] = c.source
@@ -413,6 +426,7 @@ def _expanded_to_raw_candidates(terms: List[ExpandedTermCandidate]) -> List[Dict
                 )
     if out:
         sample = out[0]
+        # Stage3 Step2：同 tid 在 `_aggregate_stage3_term_evidence` 中聚为单条 term-level record
         print("\n[Stage2] sample candidate top-level keys:", sorted(sample.keys()))
         print(
             "[Stage2] sample candidate stage2_local_meta keys:",
