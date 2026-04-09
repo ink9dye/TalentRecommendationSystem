@@ -200,7 +200,7 @@ STAGE3_CONTEXT_AXIS_TRACE_AUDIT = False
 STAGE3_PAPER_OBS_WITH_AUDIT_DEBUG = False
 # Stage4 prep：penalized-admit / risky compete 轻量审计（可与 STAGE3_PAPER_GATE_DEBUG 叠加）
 STAGE3_PREP_PENALTY_COMPETE_AUDIT = False
-STAGE3_PAPER_CUTOFF_AUDIT = True  # [Stage3 paper cutoff] 排名与截断原因
+STAGE3_PAPER_CUTOFF_AUDIT = True  # [Stage4 prep cutoff] 排名与截断原因（日志已后置，不再属于 Stage3 主链）
 # 主 cutoff、swap 前：四行 KPI（strong/support 实取、bonus 实取、仍≥floor 的 support 余量）。用于一眼判断殿后序是否生效：
 # 若 bonus_core_taken>0 且 support_lane_remaining_candidates>0，主扫描下属异常信号（应排查）；reason 见 bonus-core 审计。
 STAGE3_PAPER_LANE_FILL_AUDIT = True
@@ -208,7 +208,7 @@ STAGE3_PAPER_LANE_FILL_AUDIT = True
 STAGE3_BONUS_CORE_BLOCKED_AUDIT = True
 # [Stage3 bonus-core readiness audit]：bonus-like core 的结构 ready、p_sel 缩放前后、swap/tail near-miss 通道资格（与 STAGE3_PAPER_CUTOFF_AUDIT 联动）
 STAGE3_BONUS_CORE_READINESS_AUDIT = True
-# 与 [Stage3 paper centrality audit] 重叠度高；默认关，需拆 p_sel_base/bonus 时再开
+# 与 [Stage4 prep centrality audit] 重叠度高；默认关，需拆 p_sel_base/bonus 时再开
 STAGE3_ELIGIBLE_CORE_CLOSE_CALL_AUDIT = False
 STAGE3_SUPPORT_CONTAMINATION_AUDIT = True  # Stage3→4 之间：可疑 support 摘要
 STAGE3_UNIFIED_SCORE_DEBUG = True  # 连续分特征拆解（替代原「规则乘子」视角）
@@ -1073,7 +1073,7 @@ def _print_stage3_paper_cutoff_audit(
         return
     print("\n" + "-" * 80)
     print(
-        "[Stage3 paper cutoff] rank | term | final | p_ready | p_sel | family_key | selected | reason"
+        "[Stage4 prep cutoff] rank | term | final | p_ready | p_sel | family_key | selected | reason"
     )
     print(f"  dynamic_floor(on paper_select_score)={floor:.4f} max_terms={max_terms}")
     print("-" * 80)
@@ -1092,13 +1092,13 @@ def _print_stage3_paper_cutoff_audit(
 
 def _print_stage3_paper_selection_narrow_audit(ordered: List[Dict[str, Any]]) -> None:
     """
-    [Stage3 paper selection audit] 窄表：回答「bonus 型词是否仍靠 final_score 抬进 paper」。
+    [Stage4 prep selection audit] 窄表：回答「bonus 型词是否仍靠 final_score 抬进 paper」。
     与 cutoff 表重叠度高：**仅 STAGE3_DEBUG_FOCUS_TERMS 非空** 时打印命中行，避免双表刷屏。
     """
     if not STAGE3_PAPER_CUTOFF_AUDIT or not ordered or not STAGE3_DEBUG_FOCUS_TERMS:
         return
     print("\n" + "-" * 80)
-    print("[Stage3 paper selection audit] eligible · structural ranking (no blocklist)")
+    print("[Stage4 prep selection audit] eligible · structural ranking (no blocklist)")
     print("-" * 80)
     hdr = (
         "term · fs · ready · p_sel · bucket · role · ml · anch · exp co pg sel · "
@@ -1155,7 +1155,7 @@ def _print_stage3_paper_floor_block_audit(
     floor: float,
 ) -> None:
     """
-    [Stage3 paper floor block audit]
+    [Stage4 prep floor block audit]
     仅 core、未入选、且因 dynamic_floor 被拒：对齐「主线可扩却被 paper_select_score 压出 floor」类误杀排查。
     """
     if not STAGE3_PAPER_CUTOFF_AUDIT or not ordered:
@@ -1175,7 +1175,7 @@ def _print_stage3_paper_floor_block_audit(
         return
     print("\n" + "-" * 80)
     print(
-        "[Stage3 paper floor block audit] core · below_dynamic_floor（主场：robot control / route planning 等误杀）"
+        "[Stage4 prep floor block audit] core · below_dynamic_floor（主场：robot control / route planning 等误杀）"
     )
     print(f"  dynamic_floor(paper_select_score)={floor:.4f}")
     print("-" * 80)
@@ -1218,7 +1218,7 @@ def _print_stage3_paper_centrality_audit(ordered: List[Dict[str, Any]], top_n: i
     )[:top_n]
     print("\n" + "-" * 80)
     print(
-        "[Stage3 paper centrality audit] top eligible by paper_select_score "
+        "[Stage4 prep centrality audit] top eligible by paper_select_score "
         "(base=L×R + tier-scaled struct bonus − pool; +b_pre=缩放前 struct 总和, sc=PAPER_SELECT_BONUS_TIER_SCALE_*)"
     )
     print("-" * 80)
@@ -1276,7 +1276,7 @@ def _print_stage3_paper_pool_penalty_audit(ordered: List[Dict[str, Any]], top_n:
     )[:top_n]
     print("\n" + "-" * 80)
     print(
-        "[Stage3 paper pool penalty audit] eligible · base + tier-scaled bonus − pool_penalty(log10 papers) → p_sel "
+        "[Stage4 prep pool penalty audit] eligible · base + tier-scaled bonus − pool_penalty(log10 papers) → p_sel "
         f"(enabled={PAPER_SELECT_POOL_PENALTY_ENABLED}, coef={PAPER_SELECT_POOL_PENALTY_LOG_COEF}, "
         f"max={PAPER_SELECT_POOL_PENALTY_MAX})"
     )
@@ -1308,14 +1308,14 @@ def _print_stage3_paper_pool_penalty_audit(ordered: List[Dict[str, Any]], top_n:
 
 def _print_stage3_paper_lane_tier_audit(ordered: List[Dict[str, Any]]) -> None:
     """
-    [Stage3 paper lane tier audit]：strong / support_lane / other_eligible / bonus_core 分层后的 **全局遍历序**
+    [Stage4 prep lane tier audit]：strong / support_lane / other_eligible / bonus_core 分层后的 **全局遍历序**
     （与截断扫描顺序一致；support_lane 段内 near_miss 先于普通 support，再按 p_sel）。
     """
     if not STAGE3_PAPER_CUTOFF_AUDIT or not ordered:
         return
     print("\n" + "-" * 80)
     print(
-        "[Stage3 paper lane tier audit] tier-order scan (strong_main_axis_core → support_lane[near_miss≻] → "
+        "[Stage4 prep lane tier audit] tier-order scan (strong_main_axis_core → support_lane[near_miss≻] → "
         "other_eligible → bonus_core; "
         f"strong thresholds a_sc≥{PAPER_SELECT_STRONG_MAIN_AXIS_SCORE_MIN} rk≤{PAPER_SELECT_STRONG_MAIN_AXIS_MAX_RANK} "
         f"or ml+exp+a_sc≥{PAPER_SELECT_STRONG_MAIN_AXIS_ML_EXP_SCORE_MIN} rk≤{PAPER_SELECT_STRONG_MAIN_AXIS_ML_EXP_MAX_RANK})"
@@ -1358,13 +1358,13 @@ def _print_stage3_paper_lane_fill_audit(
     floor: float,
 ) -> None:
     """
-    [Stage3 paper lane fill audit] — 与 README 示例一致，仅 5 行（标题 + 4 个 KPI）。
+    [Stage4 prep lane fill audit] — 与 README 示例一致，仅 5 行（标题 + 4 个 KPI）。
 
     - strong / support_lane / bonus_core：主 cutoff 当期 **实际入选** 条数（按 paper_select_lane_tier）。
     - support_lane_remaining_candidates：**support_lane 池**里仍未进栏、且 p_sel≥dynamic_floor 的条数
       （合格 support 仍在池里等名额；与 bonus_core_taken 对照可判断是否「support 未吃满 bonus 却偷跑」）。
 
-    批注：other_eligible 若入选会计入 max_terms，明细见同期 **[Stage3 paper selected composition]**；本块刻意保持极简。
+    批注：other_eligible 若入选会计入 max_terms，明细见同期 **[Stage4 prep selected composition]**；本块刻意保持极简。
     """
     if not STAGE3_PAPER_CUTOFF_AUDIT or not STAGE3_PAPER_LANE_FILL_AUDIT:
         return
@@ -1378,7 +1378,7 @@ def _print_stage3_paper_lane_fill_audit(
             continue
         if float(r.get("paper_select_score") or 0.0) >= fl - 1e-9:
             sup_rem_ge_floor += 1
-    print("\n[Stage3 paper lane fill audit]")
+    print("\n[Stage4 prep lane fill audit]")
     print(f"strong_main_axis_core={by_tier.get('strong_main_axis_core', 0)}")
     print(f"support_lane_taken={by_tier.get('support_lane', 0)}")
     print(f"bonus_core_taken={by_tier.get('bonus_core', 0)}")
@@ -1399,7 +1399,7 @@ def _print_stage3_bonus_core_blocked_audit(
     - support_lane_priority_not_filled：已 **past_paper_recall_max_terms**，且此时仍有 support 池
       p_sel≥floor 未进栏 — 说明名额被前排（含 support）占满，bonus 殿后排到仍无空位（非「RL 抢在 support 前」）。
 
-    批注：打印时机为 **主 cutoff 后、swap/tail 前**；最终入选以 **[Stage3 paper selected composition]** 为准。
+    批注：打印时机为 **主 cutoff 后、swap/tail 前**；最终入选以 **[Stage4 prep selected composition]** 为准。
     """
     if not STAGE3_PAPER_CUTOFF_AUDIT or not STAGE3_BONUS_CORE_BLOCKED_AUDIT:
         return
@@ -1440,11 +1440,11 @@ def _print_stage3_bonus_core_blocked_audit(
 
 
 def _print_stage3_paper_selected_composition_audit(selected: List[Dict[str, Any]]) -> None:
-    """[Stage3 paper selected composition]：最终入选按 paper_select_lane_tier 计数（含 tail 写入的 tier）。"""
+    """[Stage4 prep selected composition]：最终入选按 paper_select_lane_tier 计数（含 tail 写入的 tier）。"""
     if not STAGE3_PAPER_CUTOFF_AUDIT:
         return
     if not selected:
-        print("\n[Stage3 paper selected composition] selected_total=0")
+        print("\n[Stage4 prep selected composition] selected_total=0")
         return
     bucket = defaultdict(int)
     for rec in selected:
@@ -1452,7 +1452,7 @@ def _print_stage3_paper_selected_composition_audit(selected: List[Dict[str, Any]
         bucket[t] += 1
     parts = [f"{k}={bucket[k]}" for k in sorted(bucket.keys())]
     print(
-        f"\n[Stage3 paper selected composition] selected_total={len(selected)} " + " ".join(parts)
+        f"\n[Stage4 prep selected composition] selected_total={len(selected)} " + " ".join(parts)
     )
 
 
@@ -1522,7 +1522,7 @@ def _print_stage3_paper_main_axis_gate_audit(records: List[Dict[str, Any]]) -> N
         return
     print("\n" + "-" * 80)
     print(
-        "[Stage3 paper main-axis gate audit] core → 父锚 (rk≤MAX) ∨ (a_sc≥MIN) 过门；双不达仍拒；非 core 跳过本门"
+        "[Stage4 prep main-axis gate audit] core → 父锚 (rk≤MAX) ∨ (a_sc≥MIN) 过门；双不达仍拒；非 core 跳过本门"
     )
     print(
         f"  (STAGE3_PAPER_MAIN_AXIS_GATE_ENABLED={STAGE3_PAPER_MAIN_AXIS_GATE_ENABLED}, "
@@ -1582,7 +1582,7 @@ def _print_stage3_paper_gate_summary(
     if not STAGE3_PAPER_CUTOFF_AUDIT:
         return
     print(
-        f"[Stage3 paper gate summary] core_at_main_axis_gate={core_at_main_axis_gate} "
+        f"[Stage4 prep gate summary] core_at_main_axis_gate={core_at_main_axis_gate} "
         f"axis_direct_core={axis_direct_core} "
         f"support_pool_n={support_pool_n} "
         f"merged_eligible_n={merged_eligible_n} "
@@ -1599,7 +1599,7 @@ def _print_stage3_paper_gate_reject_audit(counts: Dict[str, int]) -> None:
     if not STAGE3_PAPER_CUTOFF_AUDIT or not counts:
         return
     parts = [f"{k}={v}" for k, v in sorted(counts.items(), key=lambda x: (-x[1], x[0]))]
-    print(f"[Stage3 paper gate reject audit] " + " ".join(parts))
+    print(f"[Stage4 prep gate reject audit] " + " ".join(parts))
 
 
 def _print_stage3_support_soft_admit_audit(rows: List[Dict[str, Any]]) -> None:
@@ -1649,7 +1649,7 @@ def _print_stage3_paper_quota_audit(
         1 for r in selected if (r.get("paper_recall_quota_lane") or "") == "support"
     )
     print(
-        f"[Stage3 paper quota audit] max_terms={max_terms} support_cap={support_cap} "
+        f"[Stage4 prep quota audit] max_terms={max_terms} support_cap={support_cap} "
         f"selected_total={len(selected)} selected_primary_lane={n_primary_lane} "
         f"selected_support_lane={n_support_lane} "
         f"support_quota_full_count={support_quota_full_cnt}"
@@ -1688,7 +1688,7 @@ def _print_stage3_paper_near_miss_audit(
         return
     rows.sort(key=lambda x: -x[0])
     print("\n" + "-" * 80)
-    print("[Stage3 paper near-miss audit] eligible 未入选 · 贴近 floor/末席/top5 线")
+    print("[Stage4 prep near-miss audit] eligible 未入选 · 贴近 floor/末席/top5 线")
     print(
         f"  floor={floor:.4f} min_selected_p_sel={min_sel:.4f} fifth_selected={fifth:.4f}"
     )
@@ -1748,7 +1748,7 @@ def _print_stage3_support_contamination_summary(cands: List[Dict[str, Any]]) -> 
     if not suspicious:
         return
     print("\n" + "-" * 80)
-    print("[Stage3 support contamination] 已选入 paper 的 support 词（结构可疑摘要）")
+    print("[Stage4 prep support contamination] 已选入 paper 的 support 词（结构可疑摘要）")
     print("-" * 80)
     for rec in suspicious:
         term = rec.get("term") or ""
@@ -2512,6 +2512,103 @@ def _stage3_guardrail_tid_ok(term: Dict[str, Any]) -> bool:
     return True
 
 
+def _stage3_compute_basic_risk_flags(term: Dict[str, Any]) -> List[str]:
+    """
+    Stage3 风险标签（仅用于解释与审计，不参与 guardrail 硬裁决）。
+
+    注意：这一步（Step3）要求 Stage3 guardrail 收缩为「底线闸门 + 软标记层」，
+    因此 risk_flags 只做暴露与后续风险分量，不做准入二次裁决。
+    """
+    risk_flags: List[str] = []
+    poly = float(term.get("polysemy_risk") or 0.0)
+    obj = float(term.get("object_like_risk") or 0.0)
+    generic = float(term.get("generic_risk") or 0.0)
+    if poly > 0.75:
+        risk_flags.append("high_polysemy")
+    if obj > 0.55:
+        risk_flags.append("object_like")
+    if generic > 0.55:
+        risk_flags.append("too_generic")
+    return risk_flags
+
+
+def _stage3_should_hard_reject_term(rec: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Stage3 guardrail（hard reject）收口点：只保留**极少数**底线硬拒。
+
+    输入：term-level aggregated record（聚合后 term record）
+    输出：(should_reject, reason)
+
+    仅允许三类哲学：
+    - weak_evidence_noise：明显坏映射 / 弱证据噪声（沿用 should_drop_term 的底线拒绝）
+    - missing_required_stage3_fields：缺核心字段，无法进入 Stage3 主链计算
+    - terminal_low_signal_no_recovery：聚合后仍满足“证据极窄 + 无主线 + 无可扩 + 无多源 + 高风险”的极窄拒绝
+    """
+    if not isinstance(rec, dict):
+        return True, "missing_required_stage3_fields:not_a_dict"
+
+    # 1) 明显坏映射 / 弱证据噪声：沿用底线 drop（不在此处扩规则）
+    try:
+        drop, _reason = should_drop_term(rec)
+    except Exception:
+        drop, _reason = False, ""
+    if drop:
+        # 统一收口为弱证据噪声类，避免 Stage3 扩散成“二次裁决台”
+        return True, "weak_evidence_noise"
+
+    # 2) 缺核心字段：无法进入主链（只保留最基本的可计算性约束）
+    if not _stage3_guardrail_tid_ok(rec):
+        return True, "missing_required_stage3_fields:missing_or_invalid_tid"
+    term_str = str(rec.get("term") or "").strip()
+    if not term_str:
+        return True, "missing_required_stage3_fields:empty_term"
+    recs = rec.get("records") or []
+    evl = rec.get("source_evidence_list") or []
+    ev_c = int(rec.get("evidence_count") or 0)
+    if len(recs) == 0 and len(evl) == 0 and ev_c <= 0:
+        return True, "missing_required_stage3_fields:empty_evidence_shell"
+
+    # 3) 极弱且无补救结构：非常窄的 terminal 规则（不是“看着不喜欢就拒”）
+    #    只对 support_expansion 且聚合后结构无恢复空间的极少数情况触发。
+    group = (rec.get("stage3_entry_group") or "support_expansion").strip().lower()
+    if group != "support_expansion":
+        return False, ""
+
+    anc = int(rec.get("anchor_count") or 0)
+    ml_hits = int(rec.get("mainline_hits") or 0)
+    can_exp = bool(rec.get("can_expand") or rec.get("can_expand_local"))
+    prov = rec.get("provenance_summary") or {}
+    multi_source = prov.get("multi_source")
+    if multi_source is None:
+        multi_source = rec.get("multi_source")
+    multi_source = bool(multi_source)
+    distinct_src = int(prov.get("distinct_source_type_count") or 0)
+    single_path_only = bool(prov.get("single_path_only"))
+
+    # 信号极窄（证据/锚极少）+ 无主线 + 不可扩 + 单路径/单源 + 风险很高 + 主分关键证据极弱
+    best_seed = float(rec.get("best_seed_score") or rec.get("score") or 0.0)
+    best_id = float(rec.get("best_anchor_identity") or rec.get("best_identity_score") or 0.0)
+    best_jd = float(rec.get("best_jd_align") or 0.0)
+    obj = float(rec.get("object_like_risk") or 0.0)
+    generic = float(rec.get("generic_risk") or 0.0)
+    poly = float(rec.get("polysemy_risk") or 0.0)
+
+    if (
+        anc <= 1
+        and ml_hits <= 0
+        and (not can_exp)
+        and (not multi_source)
+        and (single_path_only or distinct_src <= 1)
+        and best_seed <= 0.03
+        and best_id <= 0.10
+        and best_jd <= 0.42
+        and (obj >= 0.78 or generic >= 0.78 or poly >= 0.78)
+    ):
+        return True, "terminal_low_signal_no_recovery"
+
+    return False, ""
+
+
 def _stage3_collect_guardrail_soft_flags(term: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     """
     结构风险软标记 + 说明（不触发 hard_drop）：供 GC / risk_penalty / 审计。
@@ -2544,6 +2641,9 @@ def _stage3_collect_guardrail_soft_flags(term: Dict[str, Any]) -> Tuple[List[str
         soft.append("merge_role_in_anchor_conflict")
     if _conflict_signal("mainline_side_conflict"):
         soft.append("merge_mainline_side_conflict")
+    # 混源不是硬裁决，仅作结构风险暴露
+    if _conflict_signal("best_signal_mixed_sources"):
+        soft.append("best_signal_mixed_sources")
     if prov.get("single_path_only"):
         soft.append("provenance_single_path_only")
     if prov.get("single_path_multi_anchor_weak_signal"):
@@ -2599,12 +2699,46 @@ def _print_stage3_guardrail_soft_audit(samples: List[Dict[str, Any]]) -> None:
     print("-" * 80)
     for rec in samples[: int(STAGE3_GUARDRAIL_SOFT_AUDIT_MAX)]:
         term = (rec.get("term") or "")[:28]
+        prov = rec.get("provenance_summary") or {}
+        multi_source = prov.get("multi_source")
+        if multi_source is None:
+            multi_source = rec.get("multi_source")
         print(
             f"  tid={rec.get('tid')} term={term!r} soft={rec.get('stage3_guardrail_soft_flags')!r} "
+            f"anc={int(rec.get('anchor_count') or 0)} ml_hits={int(rec.get('mainline_hits') or 0)} "
+            f"can_exp={bool(rec.get('can_expand') or rec.get('can_expand_local'))} multi_source={bool(multi_source)} "
             f"notes_n={len(rec.get('stage3_guardrail_notes') or [])}"
         )
     if len(samples) > int(STAGE3_GUARDRAIL_SOFT_AUDIT_MAX):
         print(f"  ... 省略 {len(samples) - int(STAGE3_GUARDRAIL_SOFT_AUDIT_MAX)} 条（仅展示前 {STAGE3_GUARDRAIL_SOFT_AUDIT_MAX}）")
+    print("-" * 80 + "\n")
+
+
+def _print_stage3_guardrail_summary(
+    hard_reject_reasons: List[str],
+    soft_flag_lists: List[List[str]],
+    survivor_count: int,
+) -> None:
+    """
+    轻量汇总：验证 Stage3 是否从“多拒”变为“少拒多标记”。
+    仅用于日志可观测性，不参与打分。
+    """
+    reasons = Counter([r for r in hard_reject_reasons if r])
+    sf = Counter()
+    for flags in soft_flag_lists:
+        for f in flags or []:
+            sf[f] += 1
+    soft_flagged = sum(1 for flags in soft_flag_lists if flags)
+    clean = max(0, int(survivor_count) - int(soft_flagged))
+    print("\n" + "-" * 80)
+    print("[Stage3 guardrail summary]")
+    print("-" * 80)
+    print(f"hard_reject_count={sum(reasons.values())}")
+    print(f"soft_flagged_survivors={soft_flagged}")
+    print(f"clean_survivors={clean}")
+    print(f"hard_reject_reasons={dict(reasons)}")
+    top_soft = dict(sf.most_common(12))
+    print(f"top_soft_flags={top_soft}")
     print("-" * 80 + "\n")
 
 
@@ -2651,17 +2785,8 @@ def _check_stage3_admission(
     if not isinstance(term, dict):
         return _pack(True, "not_a_dict", ["not_a_dict"], [], [], [], "rejected")
 
-    risk_flags: List[str] = []
-    poly = float(term.get("polysemy_risk") or 0.0)
-    obj = float(term.get("object_like_risk") or 0.0)
-    generic = float(term.get("generic_risk") or 0.0)
-    if poly > 0.75:
-        risk_flags.append("high_polysemy")
-    if obj > 0.55:
-        risk_flags.append("object_like")
-    if generic > 0.55:
-        risk_flags.append("too_generic")
-    term["risk_flags"] = risk_flags
+    risk_flags = _stage3_compute_basic_risk_flags(term)
+    term["risk_flags"] = list(risk_flags)
 
     group = term.get("stage3_entry_group") or "support_expansion"
     strength_map = {
@@ -2671,26 +2796,15 @@ def _check_stage3_admission(
     }
     admission_strength = strength_map.get(group, "support")
 
+    # 两段式协议：hard_reject → soft_flags → continue_to_gc
+    should_reject, reason = _stage3_should_hard_reject_term(term)
+    if should_reject:
+        return _pack(True, reason, [reason], risk_flags, [], [], "rejected")
+
     soft, gr_notes = _stage3_collect_guardrail_soft_flags(term)
-
-    # --- A 类：底线硬拒 ---
-    if not _stage3_guardrail_tid_ok(term):
-        return _pack(True, "missing_or_invalid_tid", ["missing_or_invalid_tid"], risk_flags, soft, gr_notes, "rejected")
-
-    term_str = str(term.get("term") or "").strip()
-    if not term_str:
-        return _pack(True, "empty_term", ["empty_term"], risk_flags, soft, gr_notes, "rejected")
-
-    recs = term.get("records") or []
-    evl = term.get("source_evidence_list") or []
-    ev_c = int(term.get("evidence_count") or 0)
-    if len(recs) == 0 and len(evl) == 0 and ev_c <= 0:
-        return _pack(True, "empty_evidence_shell", ["empty_evidence_shell"], risk_flags, soft, gr_notes, "rejected")
-
     term["stage3_guardrail_soft_flags"] = soft
     term["stage3_guardrail_notes"] = gr_notes
-    term["stage3_admission_mode"] = "guardrail_v1"
-
+    term["stage3_admission_mode"] = "guardrail_v2"
     return _pack(False, "", [], risk_flags, soft, gr_notes, admission_strength)
 
 
@@ -3460,7 +3574,7 @@ def _print_stage3_core_miss_audit(cands: List[Dict[str, Any]], limit: int = 24) 
 
 def _print_stage3_to_paper_bridge(cands: List[Dict[str, Any]], top_k: int = 20) -> None:
     """
-    [Stage3->Paper bridge]
+    [Stage4 prep bridge]
     在 select_terms_for_paper_recall 为每条写好 selected / reject 之后调用：
     bucket 与 paper 去留同一行对照。
     """
@@ -3469,11 +3583,11 @@ def _print_stage3_to_paper_bridge(cands: List[Dict[str, Any]], top_k: int = 20) 
     ranked = sorted(cands, key=lambda x: float(x.get("final_score") or 0.0), reverse=True)
     ranked = _stage3_audit_filter_rows(ranked, top_k)
     if not ranked:
-        print("\n" + "-" * 80 + "\n[Stage3->Paper bridge] (no rows after focus filter)\n" + "-" * 80)
+        print("\n" + "-" * 80 + "\n[Stage4 prep bridge] (no rows after focus filter)\n" + "-" * 80)
         return
 
     print("\n" + "-" * 80)
-    print("[Stage3->Paper bridge]")
+    print("[Stage4 prep bridge]")
     print("-" * 80)
     print(
         "term                     | bucket   | final_score | selected_for_paper | select_reason          | "
@@ -3788,7 +3902,7 @@ def _print_stage3_paper_swap_audit(
         return
     delta = float(out_psel) - float(in_psel)
     print(
-        f"\n[Stage3 paper swap audit] swapped={did_swap} "
+        f"\n[Stage4 prep swap audit] swapped={did_swap} "
         f"out={swap_out_term!r} out_p_sel={out_psel:.3f} "
         f"in={swap_in_term!r} in_p_sel={in_psel:.3f} "
         f"delta={delta:+.3f} floor={floor:.3f} "
@@ -3870,7 +3984,7 @@ def _print_stage3_paper_swap_pair_audit(
     if not STAGE3_PAPER_CUTOFF_AUDIT:
         return
     margin_f = float(PAPER_RECALL_SUPPORT_SWAP_SCORE_MARGIN)
-    print("\n[Stage3 paper swap pair audit]")
+    print("\n[Stage4 prep swap pair audit]")
     if not core_nm_for_swap or not sup_soft_for_swap_out:
         print(
             f"  pair_available=False core_nm_n={len(core_nm_for_swap)} "
@@ -4516,7 +4630,7 @@ def _print_stage3_paper_candidate_pool_full(
     recall: Any = None,
 ) -> None:
     print("\n" + "=" * 88)
-    print("[Stage3 paper candidate pool full audit] all survivors in Stage4 prep scope")
+    print("[Stage4 prep candidate pool full audit] all survivors in Stage4 prep scope")
     print("=" * 88)
     ctx_n = None
     if recall is not None:
@@ -4657,10 +4771,10 @@ def _print_stage3_context_coverage_pairwise(
     lam: float,
 ) -> None:
     if not backbone:
-        print("\n[Stage3 context coverage pairwise audit] skipped: no backbone record\n")
+        print("\n[Stage4 prep context coverage pairwise audit] skipped: no backbone record\n")
         return
     print("\n" + "=" * 88)
-    print("[Stage3 context coverage pairwise audit] vs backbone (pair); final gain uses max over selected set")
+    print("[Stage4 prep context coverage pairwise audit] vs backbone (pair); final gain uses max over selected set")
     print(
         f"backbone term={str(backbone.get('term'))!r} tid={backbone.get('tid')} λ={lam:.3f}"
     )
@@ -5436,7 +5550,7 @@ def select_terms_for_paper_recall(
     )
     if do_audit:
         print("\n" + "-" * 80)
-        print("[Stage3 paper term preparation audit] Stage4 input prep (not validation)")
+        print("[Stage4 prep term selection audit] Stage4 input prep (not validation)")
         print("-" * 80)
         for r in selected[:20]:
             print(
@@ -5446,7 +5560,7 @@ def select_terms_for_paper_recall(
                 f"reason={(r.get('select_reason') or '')!r}"
             )
         print("-" * 80)
-        print("[Stage3 context coverage audit] support candidates vs final selected (complement, not validation)")
+        print("[Stage4 prep context coverage audit] support candidates vs final selected (complement, not validation)")
         print("-" * 80)
         for r in sorted_support[:24]:
             g = float(r.get("context_coverage_gain") or 0.0)
@@ -5468,7 +5582,7 @@ def select_terms_for_paper_recall(
                 f"why={(r.get('paper_reject_reason') or r.get('paper_cutoff_reason') or '')!r}"
             )
     print(
-        f"\n[Stage3 paper lane summary] context_coverage_used=True λ={lam:.3f} promotions={coverage_based_promotions} "
+        f"\n[Stage4 prep lane summary] context_coverage_used=True λ={lam:.3f} promotions={coverage_based_promotions} "
         f"same_family_skips={same_family_skips} core={sel_core_n} support={sel_sup_n} risky_exc={sel_risk_n} "
         f"family_dedup_drops={family_dedup_drops} total_to_stage4={len(selected)} "
         f"floor={floor:.4f} core_floor={core_floor:.4f} support_cap={support_cap}"
@@ -5476,6 +5590,50 @@ def select_terms_for_paper_recall(
     if STAGE3_AUDIT_DEBUG:
         _print_stage3_to_paper_bridge(records, top_k=20)
     return selected
+
+
+def _prepare_stage4_terms_from_stage3(
+    ranked_terms: List[Dict[str, Any]],
+    recall: Any = None,
+    stage3_dropped_terms: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Stage4 prep 后置层入口（Step4：Stage3→Paper bridge 剥离）。
+
+    输入：Stage3 已完成 rerank 的 term-level records（含 final_score / bucket / 各类 summary）
+    输出：
+    - selected_terms_for_stage4：送入 Stage4 的 term records（当前沿用 select_terms_for_paper_recall 的返回）
+    - prep_debug_summary：轻量汇总（仅日志/观测用，不参与打分）
+
+    约束：不改 Stage3 主链的 normalize/aggregate/guardrail/GC/unified/bucket/排序逻辑；
+    仅把 Stage4 prep（paper gate / contamination / risky compete / coverage / lane fill / quota/floor）后置化。
+    """
+    if ranked_terms is None:
+        ranked_terms = []
+
+    # 显式边界：这段开始不再属于 Stage3 主链
+    if STAGE3_AUDIT_DEBUG or LABEL_PATH_TRACE or getattr(term_scoring, "STAGE3_DEBUG", False):
+        print("\n" + "-" * 80)
+        print("[Stage4 prep] term selection from Stage3 rerank")
+        print("-" * 80)
+
+    selected = select_terms_for_paper_recall(
+        ranked_terms,
+        PAPER_RECALL_MAX_TERMS,
+        recall,
+        stage3_dropped_pre_paper=stage3_dropped_terms,
+    )
+
+    rejected_pre_coverage = sum(1 for r in ranked_terms if str(r.get("paper_reject_reason") or "").strip())
+    selected_n = len(selected)
+    ranked_n = len(ranked_terms)
+    prep_debug = {
+        "stage4_prep_ranked_terms": ranked_n,
+        "stage4_prep_selected": selected_n,
+        "stage4_prep_rejected_pre_coverage": rejected_pre_coverage,
+        "boundary_source": "stage3_ranked_terms",
+    }
+    return selected, prep_debug
 
 def stage3_build_score_map(survivors: List[Dict[str, Any]], recall: Any = None) -> List[Dict[str, Any]]:
     """
@@ -5574,7 +5732,8 @@ def _run_stage3_dual_gate(
 ]:
     """
     Stage3 主流程：normalize → term-level evidence aggregate → 全局共识 → 轻硬过滤 + identity/topic gate
-    → 唯一主分 score_term_record → family 角色约束 → risky/bucket → paper_terms 选词。彻底移除 cluster 依赖。
+    → 唯一主分 score_term_record → family 角色约束 → risky/bucket → 输出 ranked term records。
+    Stage4 prep（paper gate / coverage / lane fill 等）已后置到 `_prepare_stage4_terms_from_stage3`。
     """
     debug_print(1, "\n" + "-" * 80 + "\n[Stage3] Global Rerank\n" + "-" * 80, recall)
     score_map: Dict[str, float] = {}
@@ -5612,6 +5771,7 @@ def _run_stage3_dual_gate(
     topic_gate_bypass_primary_like_count = 0
     guardrail_reject_audit_rows: List[Dict[str, Any]] = []
     guardrail_soft_samples: List[Dict[str, Any]] = []
+    guardrail_hard_reject_reasons: List[str] = []
 
     for rec in merged_candidates:
         rec["family_key"] = rec.get("family_key") or build_family_key(rec)
@@ -5621,35 +5781,31 @@ def _run_stage3_dual_gate(
         rec["term_role"] = rec.get("term_role") or ""
         rec["retrieval_role"] = rec.get("retrieval_role") or get_retrieval_role_from_term_role(rec.get("term_role"))
 
-        drop, reject_reason = should_drop_term(rec)
-        if drop:
-            rec["reject_reason"] = reject_reason
+        # --- Stage3 guardrail：hard_reject → soft_flags → continue_to_gc ---
+        rec["risk_flags"] = _stage3_compute_basic_risk_flags(rec)
+        hard_reject, gr_reason = _stage3_should_hard_reject_term(rec)
+        if hard_reject:
+            rec["reject_reason"] = gr_reason
+            rec["guardrail_flags"] = [gr_reason]
             dropped_with_reason.append(rec)
-            if STAGE3_DETAIL_DEBUG or stage3_debug:
-                print(f"[Stage3 硬过滤] drop tid={rec.get('tid')} term={rec.get('term')!r} reason={reject_reason}")
-            continue
-
-        gate = _check_stage3_admission(rec, jd_profile, active_domains)
-        if gate.get("hard_drop"):
-            rec["reject_reason"] = gate.get("reason") or "guardrail"
-            rec["guardrail_flags"] = gate.get("guardrail_flags") or []
-            dropped_with_reason.append(rec)
+            guardrail_hard_reject_reasons.append(gr_reason)
             guardrail_reject_audit_rows.append(
                 {
                     "tid": rec.get("tid"),
                     "term": rec.get("term"),
-                    "guardrail_reason": gate.get("guardrail_reason") or gate.get("reason"),
-                    "guardrail_flags": gate.get("guardrail_flags"),
+                    "guardrail_reason": gr_reason,
+                    "guardrail_flags": [gr_reason],
                 }
             )
             if STAGE3_DETAIL_DEBUG or stage3_debug:
-                print(
-                    f"[Stage3 guardrail hard_drop] tid={rec.get('tid')} term={rec.get('term')!r} "
-                    f"reason={rec['reject_reason']!r} flags={rec.get('guardrail_flags')!r}"
-                )
+                print(f"[Stage3 硬过滤] drop tid={rec.get('tid')} term={rec.get('term')!r} reason={gr_reason}")
             continue
 
-        if rec.get("stage3_guardrail_soft_flags"):
+        soft, gr_notes = _stage3_collect_guardrail_soft_flags(rec)
+        rec["stage3_guardrail_soft_flags"] = soft
+        rec["stage3_guardrail_notes"] = gr_notes
+        rec["stage3_admission_mode"] = "guardrail_v2"
+        if soft:
             guardrail_soft_samples.append(rec)
 
         primary_like = _is_primary_like(rec)
@@ -5697,6 +5853,11 @@ def _run_stage3_dual_gate(
 
     _print_stage3_guardrail_reject_audit(guardrail_reject_audit_rows)
     _print_stage3_guardrail_soft_audit(guardrail_soft_samples)
+    _print_stage3_guardrail_summary(
+        hard_reject_reasons=guardrail_hard_reject_reasons,
+        soft_flag_lists=[r.get("stage3_guardrail_soft_flags") or [] for r in survivors],
+        survivor_count=len(survivors),
+    )
 
     if label_trace and topic_gate_bypass_primary_like_count and not STAGE3_DEBUG_FOCUS_TERMS:
         print(
@@ -5755,13 +5916,34 @@ def _run_stage3_dual_gate(
                 f"  down_factors={down_factors}\n"
                 f"  missing_penalty={missing_penalty}"
             )
+    # Stage3 终点对象：到此为止仅是 ranked term set（主链结束点）
+    stage3_result = {
+        "ranked_terms": survivors,
+        "dropped_terms": dropped_with_reason,
+        "stage3_survivors": len(survivors),
+        "stage3_dropped": len(dropped_with_reason),
+    }
+
     top_survivors = survivors[:STAGE3_TOP_K]
-    paper_terms = select_terms_for_paper_recall(
-        survivors,
-        PAPER_RECALL_MAX_TERMS,
-        recall,
-        stage3_dropped_pre_paper=dropped_with_reason,
+
+    # Stage4 prep 后置层：消费 Stage3 ranked_terms，产出送入 Stage4 的 term list（paper bridge 不再挂在 Stage3 名下）
+    paper_terms, prep_dbg = _prepare_stage4_terms_from_stage3(
+        stage3_result["ranked_terms"],
+        recall=recall,
+        stage3_dropped_terms=stage3_result["dropped_terms"],
     )
+
+    # 边界汇总：肉眼可见 Stage3 在哪里结束、Stage4 prep 从哪里开始
+    if STAGE3_AUDIT_DEBUG or LABEL_PATH_TRACE or getattr(term_scoring, "STAGE3_DEBUG", False):
+        print("\n" + "-" * 80)
+        print("[Stage3/Stage4 boundary summary]")
+        print("-" * 80)
+        print(f"stage3_ranked_terms={len(stage3_result['ranked_terms'])}")
+        print(f"stage3_survivors={int(stage3_result.get('stage3_survivors') or 0)}")
+        print(f"stage4_prep_selected={int((prep_dbg or {}).get('stage4_prep_selected') or 0)}")
+        print(f"stage4_prep_rejected_pre_coverage={int((prep_dbg or {}).get('stage4_prep_rejected_pre_coverage') or 0)}")
+        print(f"boundary_source={str((prep_dbg or {}).get('boundary_source') or '')!r}")
+        print("-" * 80 + "\n")
 
     for rec in top_survivors:
         _write_term_maps(
