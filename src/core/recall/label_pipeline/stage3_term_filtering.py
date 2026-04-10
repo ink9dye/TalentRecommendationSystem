@@ -70,6 +70,8 @@ STAGE3_OBSERVABILITY_PANEL_DEBUG = False  # 观测面板 Stage3 / 汇总
 STAGE3_DEBUG_FOCUS_TERMS: Set[str] = {
     "Motion control",
     "motion control",
+    "Movement control",
+    "movement control",
     "robot control",
     "Robot control",
     "digital control",
@@ -2441,6 +2443,171 @@ def _assign_stage3_bucket(term: Dict[str, Any]) -> str:
     return "support"
 
 
+_STAGE3_ROBOT_MOTION_BACKBONE_TERMS: Tuple[str, ...] = (
+    "robot control",
+    "motion control",
+    "movement control",
+)
+
+
+def _stage3_robot_motion_backbone_term_rank(rec: Dict[str, Any]) -> Optional[int]:
+    t = (rec.get("term") or "").strip().lower()
+    try:
+        return _STAGE3_ROBOT_MOTION_BACKBONE_TERMS.index(t)
+    except ValueError:
+        return None
+
+
+def _stage3_robot_motion_rescue_anchor_match(rec: Dict[str, Any]) -> bool:
+    chunks: List[str] = []
+    pa = rec.get("parent_anchor")
+    if pa is not None and str(pa).strip():
+        chunks.append(str(pa))
+    pp = rec.get("parent_primary")
+    if pp is not None and str(pp).strip():
+        chunks.append(str(pp))
+    panchors = rec.get("parent_anchors")
+    if isinstance(panchors, (list, tuple, set)):
+        chunks.extend(str(x) for x in panchors if x is not None and str(x).strip())
+    elif panchors is not None and str(panchors).strip():
+        chunks.append(str(panchors))
+    blob = "\n".join(chunks)
+    return ("机器人运动控制" in blob) or ("运动控制" in blob)
+
+
+def _stage3_robot_motion_rescue_excluded_by_risk(rec: Dict[str, Any]) -> bool:
+    obj = float(rec.get("object_like_risk") or 0.0)
+    if obj >= 0.50:
+        return True
+    drift = float(rec.get("semantic_drift_risk") or 0.0)
+    ex = rec.get("stage3_explain") or {}
+    ptc = float(ex.get("path_topic_consistency") or 0.0)
+    if drift > 0.75 and ptc < 0.30:
+        return True
+    return False
+
+
+def _stage3_is_robot_motion_backbone_rescue_candidate(rec: Dict[str, Any]) -> bool:
+    if _stage3_robot_motion_backbone_term_rank(rec) is None:
+        return False
+    if (rec.get("stage3_bucket") or "").strip().lower() != "support":
+        return False
+    if not _stage3_robot_motion_rescue_anchor_match(rec):
+        return False
+    if _stage3_is_conditioned_only(rec):
+        return False
+    if (rec.get("local_role") or "").strip().lower() == "local_risky":
+        return False
+    mainline_hits = int(rec.get("mainline_hits") or 0)
+    anchor_count = int(rec.get("anchor_count") or 0)
+    if not (mainline_hits >= 1 or anchor_count >= 2):
+        return False
+    can_expand_local = bool(
+        rec.get("can_expand_local")
+        if rec.get("can_expand_local") is not None
+        else (rec.get("can_expand") if rec.get("can_expand") is not None else rec.get("can_expand_from_2a"))
+    )
+    pb = (rec.get("primary_bucket") or "").strip().lower()
+    if not (
+        can_expand_local
+        or pb == "primary_support_seed"
+        or pb == "primary_support_keep"
+    ):
+        return False
+    return True
+
+
+def _stage3_try_promote_robot_motion_backbone_core(survivors: List[Dict[str, Any]]) -> None:
+    """
+    极窄 post-hoc：在「机器人运动控制 / 运动控制」父锚语境下，将组内至多 1 条 support 标为 core，
+    便于 Stage4 拿到 backbone core。不改变 final_score / 主公式 / 排序。
+    """
+    for r in survivors:
+        if _stage3_robot_motion_backbone_term_rank(r) is None:
+            continue
+        if (r.get("stage3_bucket") or "").strip().lower() == "core":
+            return
+    candidates: List[Dict[str, Any]] = []
+    for r in survivors:
+        if not _stage3_is_robot_motion_backbone_rescue_candidate(r):
+            continue
+        if _stage3_robot_motion_rescue_excluded_by_risk(r):
+            continue
+        candidates.append(r)
+    if not candidates:
+        return
+
+    def _sort_key(rec: Dict[str, Any]) -> Tuple[int, int, int, float]:
+        tr = _stage3_robot_motion_backbone_term_rank(rec) or 99
+        mh = int(rec.get("mainline_hits") or 0)
+        ce = bool(
+            rec.get("can_expand_local")
+            if rec.get("can_expand_local") is not None
+            else (rec.get("can_expand") if rec.get("can_expand") is not None else rec.get("can_expand_from_2a"))
+        )
+        fs = float(rec.get("final_score") or 0.0)
+        return (tr, -mh, -int(ce), -fs)
+
+    chosen = sorted(candidates, key=_sort_key)[0]
+    chosen["stage3_bucket"] = "core"
+    chosen["stage3_core_rescue"] = True
+    chosen["bucket_promote_reason"] = "robot_motion_backbone_rescue"
+    flags = list(chosen.get("bucket_reason_flags") or [])
+    if "robot_motion_backbone_rescue" not in flags:
+        flags.append("robot_motion_backbone_rescue")
+    chosen["bucket_reason_flags"] = flags
+    ex = dict(chosen.get("stage3_explain") or {})
+    ex["stage3_core_rescue_reason"] = "robot_motion_backbone_rescue"
+    chosen["stage3_explain"] = ex
+
+
+def _stage3_is_motion_control_multi_anchor_rescue_candidate(rec: Dict[str, Any]) -> bool:
+    if (rec.get("term") or "").strip().lower() != "motion control":
+        return False
+    if (rec.get("stage3_bucket") or "").strip().lower() != "risky":
+        return False
+    if int(rec.get("anchor_count") or 0) < 2:
+        return False
+    if not _stage3_robot_motion_rescue_anchor_match(rec):
+        return False
+    if _stage3_is_conditioned_only(rec):
+        return False
+    if (rec.get("local_role") or "").strip().lower() == "local_risky":
+        return False
+    flags = set(rec.get("bucket_reason_flags") or [])
+    if "no_mainline_support" not in flags or "cross_anchor_but_side_only" not in flags:
+        return False
+    if "object_like" in flags or "generic_like" in flags:
+        return False
+    if _stage3_robot_motion_rescue_excluded_by_risk(rec):
+        return False
+    rr = rec.get("risk_reasons") or []
+    if isinstance(rr, (list, tuple)) and "high_drift_risk" in rr:
+        return False
+    return True
+
+
+def _stage3_try_rescue_motion_control_from_risky(survivors: List[Dict[str, Any]]) -> None:
+    """
+    极窄 post-hoc：仅「motion control」在机器人运动控制主轴下、双锚 side-only + 无主线命中 被标 risky 时，
+    拉回 support；不改 final_score / 排序 / 主链字段，不抬 core（与 robot_motion_backbone_rescue 独立）。
+    """
+    for rec in survivors:
+        if not _stage3_is_motion_control_multi_anchor_rescue_candidate(rec):
+            continue
+        rec["stage3_bucket"] = "support"
+        rec["stage3_support_rescue"] = True
+        rec["bucket_promote_reason"] = "motion_control_multi_anchor_rescue"
+        flags = list(rec.get("bucket_reason_flags") or [])
+        if "motion_control_multi_anchor_rescue" not in flags:
+            flags.append("motion_control_multi_anchor_rescue")
+        rec["bucket_reason_flags"] = flags
+        ex = dict(rec.get("stage3_explain") or {})
+        ex["stage3_support_rescue_reason"] = "motion_control_multi_anchor_rescue"
+        rec["stage3_explain"] = ex
+        return
+
+
 def _is_primary_like(rec: Dict[str, Any]) -> bool:
     """primary-like 主落点：只做软惩罚，不走严格 topic gate。"""
     source_type = (rec.get("source_type") or rec.get("source") or rec.get("origin") or "").strip().lower()
@@ -3190,6 +3357,9 @@ def _run_stage3_dual_gate(
     survivors = stage3_build_score_map(survivors, recall)
     for rec in survivors:
         rec["risk_reasons"] = _collect_risky_reasons(rec)
+
+    _stage3_try_promote_robot_motion_backbone_core(survivors)
+    _stage3_try_rescue_motion_control_from_risky(survivors)
 
     # 窄表审计：final adjust → cross-anchor → support/risky（与 STAGE3_DEBUG_FOCUS_TERMS 配合可只看定点词）
     if STAGE3_AUDIT_DEBUG:

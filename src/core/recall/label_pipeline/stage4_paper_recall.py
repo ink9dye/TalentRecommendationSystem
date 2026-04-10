@@ -73,6 +73,236 @@ STAGE4_AUTHOR_PAYLOAD_AUDIT_VERBOSE = False
 STAGE4_LAYER1_PER_V_CAP = int(os.environ.get("STAGE4_LAYER1_PER_V_CAP", "0"))
 
 
+def _robot_control_axis_hit_count(merged_lc: str) -> int:
+    """仅用于 robot control 错域补丁：统计 title+domains 合并串中主轴偏好词命中数。"""
+    axis_prefs = (
+        "motion control",
+        "robot motion",
+        "trajectory optimization",
+        "trajectory",
+        "planning",
+        "path planning",
+        "motion",
+        "kinematics",
+        "dynamics",
+        "robot dynamics",
+        "locomotion",
+        "state estimation",
+        "optimal control",
+        "mpc",
+        "ilqr",
+        "ddp",
+        "controller design",
+        "controller",
+        "compliance",
+        "whole-body",
+        "whole body",
+        "manipulator",
+        "quadruped",
+        "humanoid",
+        "biped",
+    )
+    return sum(1 for kw in axis_prefs if kw in merged_lc)
+
+
+def _robot_control_offtopic_penalty(merged_lc: str) -> Tuple[float, Dict[str, Any]]:
+    """
+    极窄：仅当 term 为「robot control」时在 grounding 中乘到 off_topic_penalty 上。
+    第二轮收紧：强错域近否决式压分；chat/LLM/安全覆盖面加大；robot+control 缺主轴时区分度更强；强错域∩缺主轴可连乘。
+    """
+    mult = 1.0
+    explain: Dict[str, Any] = {}
+    axis_hits = _robot_control_axis_hit_count(merged_lc)
+    explain["robot_control_axis_hit_count"] = int(axis_hits)
+
+    # 第一层 A：医疗 / 康复 / 患者支持（近「一票否决」式乘子，较第一轮 0.18 显著更强）
+    medical_kw = (
+        "rehabilitation",
+        "rehabilitative",
+        "stroke",
+        "patient",
+        "patients",
+        "healthcare",
+        "clinical",
+        "medical",
+        "therapy",
+        "therapeutic",
+        "hospital",
+        "nursing",
+        "assistive",
+        "disability",
+        "elderly",
+        "elder care",
+        "elderly care",
+        "elderly-care",
+        "patient support",
+        "care robot",
+        "assistive robot",
+    )
+    medical_hit = any(k in merged_lc for k in medical_kw)
+    if medical_hit:
+        mult *= 0.06
+        explain["robot_control_medical_penalty"] = True
+
+    # 第一层 B：chat / LLM / alignment / safety / cyber（较第一轮 0.22 更强 + pattern 更全）
+    chat_safety_kw = (
+        "chat control",
+        "backdoor",
+        "llm",
+        "large language",
+        "large language model",
+        "language model",
+        "chatbot",
+        "jailbreak",
+        "safe alignment",
+        "ai alignment",
+        "gpt-",
+        " gpt",
+        "gpt ",
+        "llama",
+        "prompt injection",
+        "cybersecurity",
+        "cyber security",
+        "cyberattack",
+        "cyber attack",
+        "cyber-attack",
+        "adversarial attack",
+        "network security",
+        "computer security",
+    )
+    chat_hit = any(k in merged_lc for k in chat_safety_kw)
+    if chat_hit:
+        mult *= 0.08
+        explain["robot_control_chat_safety_penalty"] = True
+    # safety / alignment / security：与 LLM/对抗/网络语义绑定时强压，避免单独误伤「机器人安全关键」类表述
+    _robot_motion_hint = any(
+        k in merged_lc
+        for k in (
+            "locomotion",
+            "manipulator",
+            "trajectory",
+            "kinematics",
+            "dynamics",
+            "quadruped",
+            "humanoid",
+            "motion control",
+            "biped",
+        )
+    )
+    if "safety" in merged_lc and any(
+        k in merged_lc
+        for k in (
+            "llm",
+            "language model",
+            "chatbot",
+            "jailbreak",
+            "prompt",
+            "adversarial",
+            "alignment",
+            "attack",
+            "defense",
+        )
+    ):
+        if not _robot_motion_hint:
+            mult *= 0.08
+            explain["robot_control_chat_safety_penalty"] = True
+    if "alignment" in merged_lc and any(
+        k in merged_lc for k in ("llm", "language model", "chatbot", "gpt", "prompt", "jailbreak", "safe")
+    ):
+        if not _robot_motion_hint:
+            mult *= 0.09
+            explain["robot_control_chat_safety_penalty"] = True
+    if "security" in merged_lc and any(
+        k in merged_lc for k in ("cyber", "network", "adversarial", "llm", "language model", "attack", "defense")
+    ):
+        if not _robot_motion_hint and "robot" not in merged_lc and "robotic" not in merged_lc:
+            mult *= 0.10
+            explain["robot_control_chat_safety_penalty"] = True
+    if ("attack" in merged_lc or "defense" in merged_lc) and any(
+        k in merged_lc for k in ("adversarial", "llm", "language model", "network security", "cyber")
+    ):
+        if "robot" not in merged_lc and "robotic" not in merged_lc:
+            mult *= 0.08
+            explain["robot_control_chat_safety_penalty"] = True
+
+    strong_offtopic = bool(
+        explain.get("robot_control_medical_penalty") or explain.get("robot_control_chat_safety_penalty")
+    )
+    if strong_offtopic:
+        explain["robot_control_strong_offtopic_hit"] = True
+
+    # 第二层：robot / robotic + control 同时出现，但主轴命中不足 → 较第一轮 0.88 明显更强，且 0 命中与 1 命中区分
+    looks_generic_rc = ("robot" in merged_lc or "robotic" in merged_lc) and "control" in merged_lc
+    if looks_generic_rc:
+        if axis_hits == 0:
+            mult *= 0.40
+            explain["robot_control_axis_missing_penalty"] = True
+        elif axis_hits == 1:
+            mult *= 0.68
+            explain["robot_control_axis_missing_penalty"] = True
+        # axis_hits >= 2：不施加 axis_missing 惩罚
+
+    # 第三层：强错域且（字面 robot+control 且主轴不足）→ 额外连乘收紧
+    if strong_offtopic and looks_generic_rc and axis_hits < 2:
+        mult *= 0.58
+        explain["robot_control_strong_offtopic_hit"] = True
+
+    explain["robot_control_offtopic_penalty"] = float(mult)
+    return mult, explain
+
+
+def _robot_control_motion_alias_support(
+    term_text_lc: str,
+    merged_lc: str,
+    parent_anchor_raw: str,
+    parent_primary_raw: str,
+    rc_offtopic_mult: float,
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    极窄：仅 term 为 robot control、且父锚处于「机器人运动控制/运动控制」语境时，
+    若 paper 标题+domains 命中运动控制向短语，则在 grounding 上给小额加分（在 off-topic 乘子已确定之后计算）。
+    rc_offtopic_mult 过低（强错域）时不启用，避免与 rehab/chat 压制对冲。
+    """
+    explain: Dict[str, Any] = {}
+    if (term_text_lc or "").strip() != "robot control":
+        return 0.0, explain
+    parents_blob = f"{parent_anchor_raw}\n{parent_primary_raw}"
+    if ("机器人运动控制" not in parents_blob) and ("运动控制" not in parents_blob):
+        return 0.0, explain
+    if rc_offtopic_mult < 0.14:
+        explain["robot_motion_alias_skipped_strong_offtopic"] = True
+        return 0.0, explain
+
+    aliases = (
+        "motion control",
+        "robot motion control",
+        "robot dynamics",
+        "trajectory control",
+        "whole-body control",
+        "whole body control",
+        "locomotion control",
+        "quadruped control",
+        "humanoid control",
+        "manipulator control",
+        "robot controller",
+        "controller design",
+        "compliance control",
+        "optimal control",
+        "state estimation",
+    )
+    hits = [a for a in aliases if a in merged_lc]
+    if not hits:
+        return 0.0, explain
+
+    nh = min(len(hits), 4)
+    bonus = min(0.05, 0.0125 * nh)
+    explain["robot_motion_alias_support"] = True
+    explain["robot_motion_alias_hit"] = True
+    explain["robot_motion_alias_terms"] = hits[:12]
+    explain["robot_motion_alias_bonus"] = float(bonus)
+    return float(bonus), explain
+
+
 def _batch_jd_align_for_wids(
     wids: Set[str],
     paper_vecs: Any,
@@ -1632,12 +1862,14 @@ def run_stage4(
         vid: int,
         title: str,
         domains: str,
-    ) -> Dict[str, float]:
+    ) -> Dict[str, Any]:
         """
         Stage4 的 paper grounding：用 paper 的 title/domains 对齐岗位主轴与 term 证据。
         返回：
           - grounding: 0~1（主轴/词面落地强度）
           - off_topic_penalty: 额外偏题惩罚（用于抑制泛命中论文池）
+          - 可选 robot_control_grounding_explain：仅 term 为 robot control 时的错域压制说明
+          - 可选 robot_motion_alias_explain：robot control + 机器人运动控制父锚且命中 motion 向 alias 时的加分说明
         """
         meta = _get_term_meta(vid)
 
@@ -1681,6 +1913,8 @@ def run_stage4(
 
         # 4) 偏题惩罚（交通/调度/泛 AI 等）
         off_topic_penalty = 1.0
+        rc_explain: Dict[str, Any] = {}
+        rc_mult = 1.0
         off_keywords = [
             "charging station",
             "vehicle routing",
@@ -1743,37 +1977,11 @@ def run_stage4(
             ):
                 off_topic_penalty *= 0.60
 
-        # robot control：字面极泛，易误收「聊天/安全/LLM」类标题；对齐 RL/route/arm 的专项约束风格
+        # robot control：字面极泛；专项错域压制 + 缺主轴轻压（仅本 term，见 _robot_control_offtopic_penalty）
         if "robot control" in term_text:
-            pseudo_control_kw = [
-                "chat control",
-                "backdoor",
-                "safety",
-                "alignment",
-                "llm",
-                "large language",
-                "language model",
-                "prompt",
-                "gpt",
-            ]
-            if any(kw in t for kw in pseudo_control_kw):
-                off_topic_penalty *= 0.25
-            control_axis_keywords = [
-                "motion",
-                "manipulator",
-                "trajectory",
-                "locomotion",
-                "kinematics",
-                "dynamics",
-                "path planning",
-                "rehabilitation robot",
-                "mobile robot",
-                "quadruped",
-                "biped",
-                "humanoid",
-            ]
-            if not any((kw in t) or (kw in d) for kw in control_axis_keywords):
-                off_topic_penalty *= 0.55
+            merged_lc = (t + " " + d).strip()
+            rc_mult, rc_explain = _robot_control_offtopic_penalty(merged_lc)
+            off_topic_penalty *= rc_mult
 
         # supervised learning：易混入通用 ML/自监督综述；无机器人/控制主轴则压
         if "supervised learning" in term_text:
@@ -1798,8 +2006,27 @@ def run_stage4(
         if retrieval_role == "paper_support":
             grounding *= 0.92
 
+        # robot control + 机器人运动控制父锚：off-topic 已乘入 rc_mult 后，对命中 motion 向 alias 的 paper 给小额 grounding 加分（不改动主公式结构）
+        alias_explain: Dict[str, Any] = {}
+        if "robot control" in term_text:
+            merged_alias = (t + " " + d).strip()
+            ab, alias_explain = _robot_control_motion_alias_support(
+                term_text,
+                merged_alias,
+                str(meta.get("parent_anchor") or ""),
+                str(meta.get("parent_primary") or ""),
+                float(rc_mult),
+            )
+            if ab > 0:
+                grounding = min(1.0, float(grounding) + ab)
+
         grounding = max(0.0, min(1.0, float(grounding)))
-        return {"grounding": grounding, "off_topic_penalty": float(off_topic_penalty)}
+        out_gs: Dict[str, Any] = {"grounding": grounding, "off_topic_penalty": float(off_topic_penalty)}
+        if rc_explain:
+            out_gs["robot_control_grounding_explain"] = rc_explain
+        if alias_explain:
+            out_gs["robot_motion_alias_explain"] = alias_explain
+        return out_gs
 
     def _ensure_stage4_resources() -> None:
         """
@@ -1871,7 +2098,7 @@ def run_stage4(
         query_vec_1d: Optional[np.ndarray],
         query_norm: float,
         jd_align_pre: Optional[float] = None,
-    ) -> Dict[str, float]:
+    ) -> Dict[str, Any]:
         """
         Stage4 单篇打分（最小侵入版）：
         在原有 term grounding + penalty 基础上，新增 JD↔摘要向量 jd_align 软融合。
@@ -1882,6 +2109,8 @@ def run_stage4(
             term_type_cache[vid] = tt
 
         ground = _compute_grounding_score(vid, title, domains)
+        rc_gex = ground.get("robot_control_grounding_explain")
+        rm_alias_ex = ground.get("robot_motion_alias_explain")
         term_grounding = float(ground["grounding"]) * float(tt["grounding_factor"])
         term_grounding = max(0.0, min(1.0, term_grounding))
         off_topic_penalty = float(ground["off_topic_penalty"])
@@ -1956,7 +2185,7 @@ def run_stage4(
             elif term_grounding < 0.28:
                 final_paper_score *= 0.70
 
-        return {
+        out_score: Dict[str, Any] = {
             "term_grounding": term_grounding,
             "jd_align": jd_align,
             "hybrid_grounding": hybrid_grounding,
@@ -1967,6 +2196,11 @@ def run_stage4(
             "idf_weight": idf_weight,
             "final_paper_score": final_paper_score,
         }
+        if rc_gex is not None:
+            out_score["robot_control_grounding_explain"] = rc_gex
+        if rm_alias_ex is not None:
+            out_score["robot_motion_alias_explain"] = rm_alias_ex
+        return out_score
 
     def _compute_term_type_factors(vid: int) -> Dict[str, float]:
         """
@@ -2234,24 +2468,27 @@ def run_stage4(
         jd_align = float(score_detail["jd_align"])
         off_topic_penalty = float(score_detail["offtopic_penalty"])
         # 记录“论文贡献前的因子分解”：只用于 debug 打印，不参与排序逻辑
-        term_kept_paper_audit[vid].append(
-            {
-                "paper_id": wid,
-                "title": title,
-                "term_grounding": float(score_detail["term_grounding"]),
-                "jd_align": float(score_detail["jd_align"]),
-                "hybrid_grounding": float(score_detail["hybrid_grounding"]),
-                "grounding": grounding,
-                "gating_grounding": grounding,
-                "hybrid_grounding": hybrid_grounding,
-                "offtopic_penalty": off_topic_penalty,
-                "paper_factor": float(score_detail["paper_factor"]),
-                "year_factor": float(score_detail["year_factor"]),
-                "domain_bonus": domain_bonus,
-                "idf_weight": idf_weight,
-                "final_paper_score": term_contrib,
-            }
-        )
+        _audit_row: Dict[str, Any] = {
+            "paper_id": wid,
+            "title": title,
+            "term_grounding": float(score_detail["term_grounding"]),
+            "jd_align": float(score_detail["jd_align"]),
+            "hybrid_grounding": float(score_detail["hybrid_grounding"]),
+            "grounding": grounding,
+            "gating_grounding": grounding,
+            "hybrid_grounding": hybrid_grounding,
+            "offtopic_penalty": off_topic_penalty,
+            "paper_factor": float(score_detail["paper_factor"]),
+            "year_factor": float(score_detail["year_factor"]),
+            "domain_bonus": domain_bonus,
+            "idf_weight": idf_weight,
+            "final_paper_score": term_contrib,
+        }
+        if score_detail.get("robot_control_grounding_explain") is not None:
+            _audit_row["robot_control_grounding_explain"] = score_detail["robot_control_grounding_explain"]
+        if score_detail.get("robot_motion_alias_explain") is not None:
+            _audit_row["robot_motion_alias_explain"] = score_detail["robot_motion_alias_explain"]
+        term_kept_paper_audit[vid].append(_audit_row)
 
         # 双阈值门：
         # - primary：grounding 必须 >= 0.12

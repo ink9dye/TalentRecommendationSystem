@@ -1194,13 +1194,19 @@ def run_stage1(
     text_for_skills = semantic_query_text or query_text
     jd_terms_cleaned = None
     jd_terms_cleaned_list: List[str] = []
+    sentence_fragment_stats: Dict[str, Any] = {}
     if text_for_skills:
         try:
-            jd_terms_cleaned_list = [s.strip() for s in extract_skills(text_for_skills) if s and str(s).strip()]
+            jd_terms_cleaned_list = [
+                s.strip()
+                for s in extract_skills(text_for_skills, fragment_stats=sentence_fragment_stats)
+                if s and str(s).strip()
+            ]
             jd_terms_cleaned = {s.lower() for s in jd_terms_cleaned_list}
         except Exception:
             jd_terms_cleaned = None
             jd_terms_cleaned_list = []
+            sentence_fragment_stats = {}
     # 每次调用都覆盖上一轮缓存，避免跨查询串扰
     setattr(recall, "_jd_cleaned_terms", jd_terms_cleaned)
     setattr(recall, "_jd_raw_text", text_for_skills or "")
@@ -1283,6 +1289,12 @@ def run_stage1(
             "anchor_debug": anchor_debug,
             "dominance": dominance,
             "stage1_sub_ms": stage1_sub_ms,
+            "sentence_fragment_removed_count": int(
+                sentence_fragment_stats.get("sentence_fragment_removed_count") or 0
+            ),
+            "sentence_fragment_removed_samples": list(
+                sentence_fragment_stats.get("sentence_fragment_removed_samples") or []
+            ),
         }
 
     # anchor_type / anchor_role / is_primary_eligible 等已在 refine_stage1_anchor_layers 中写入
@@ -1457,6 +1469,12 @@ def run_stage1(
         "jd_profile": jd_profile,
         "stage1_sub_ms": stage1_sub_ms,
         "stage1_ctx_summary": stage1_ctx_summary,
+        "sentence_fragment_removed_count": int(
+            sentence_fragment_stats.get("sentence_fragment_removed_count") or 0
+        ),
+        "sentence_fragment_removed_samples": list(
+            sentence_fragment_stats.get("sentence_fragment_removed_samples") or []
+        ),
     }
     stage1_sub_ms["finalize"] = (time.perf_counter() - _t5) * 1000.0
     stage1_sub_ms["total"] = (time.perf_counter() - _t_stage1) * 1000.0

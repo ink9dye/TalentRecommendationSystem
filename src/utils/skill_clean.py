@@ -5,9 +5,10 @@
 
 import re
 import unicodedata
+from typing import Any, Dict, List, Optional
 
 try:
-    from src.utils.text_filters import is_sentence_fragment
+    from src.utils.text_filters.sentence_fragment_filter import is_sentence_fragment
 except ImportError:
     def is_sentence_fragment(text: str) -> bool:
         return False
@@ -147,8 +148,31 @@ GENERIC_JD_SUFFIXES = (
 GENERIC_JD_VERB_HIGH_PERF_PREFIXES = ("建立高性能", "构建高性能", "实现高性能")
 
 FRAGMENT_ACTION_PREFIXES = ("推动", "提升", "形成", "开展", "确保", "调研")
-FRAGMENT_SOFT_SUFFIXES = ("鲁棒性", "可执行性", "系统化思维", "沟通协作能力")
+FRAGMENT_SOFT_SUFFIXES = ("鲁棒性", "可执行性", "平滑性", "系统化思维", "沟通协作能力")
 FRAGMENT_EVALUATIVE = re.compile(r"(高要求|优秀|扎实|良好)")
+
+# 泛 JD 说明壳：整段多为叙述/目标/流程，不宜作技术锚点（仅对含中文的 term 启用，避免误伤纯英文技能词）
+JD_META_SHELL_PATTERN = re.compile(
+    r"(前沿研究|一致性优化|全流程开发|进行调研|进行约束|仿真到实机|平台构建与验证|"
+    r"及规划领域|领域的前沿)"
+)
+
+# 极短纯泛化词（非具体技术栈名）
+GENERIC_SHORT_SKILL_NOISE = frozenset(
+    {
+        "高性能",
+        "系统架构",
+    }
+)
+
+# 「工具名 + 等…说明尾巴」：整段不进 cleaned_skills，由 extract_skills 尝试剥离前导拉丁工具 token
+JD_TOOL_LISTING_SHELL_PATTERNS = (
+    re.compile(r"^([a-z][a-z0-9+\-./]*)\s+等机器人常用开发库", re.IGNORECASE),
+    re.compile(r"^([a-z][a-z0-9+\-./]*)等机器人常用开发库", re.IGNORECASE),
+    re.compile(r"^([a-z][a-z0-9+\-./]*)\s+等平台搭建仿真环境", re.IGNORECASE),
+    re.compile(r"^([a-z][a-z0-9+\-./]*)等平台搭建仿真环境", re.IGNORECASE),
+)
+JD_TOOL_LISTING_TAIL_RE = re.compile(r"(等机器人常用开发库|等平台搭建仿真环境)")
 
 # JD 目录级标题前缀（任职要求● 掌握... → 取●后的内容再归一化）
 JD_HEADER_PREFIX = re.compile(
@@ -166,6 +190,30 @@ _TOKEN_TECH_SHAPED = re.compile(r"^[a-zA-Z][a-zA-Z0-9+\-./]*$")
 
 def _has_cjk(s: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", s))
+
+
+def _has_latin_skill_token(s: str) -> bool:
+    """含 2+ 连续拉丁字母时倾向视为技术缩写/栈名，避免把「包括但不限于 mpc」类条误杀。"""
+    return bool(re.search(r"[a-z]{2,}", s, re.IGNORECASE))
+
+
+def _peel_leading_tool_from_listing_shell(term: str) -> Optional[List[str]]:
+    """
+    识别「前导拉丁工具/缩写 + 等机器人常用开发库 / 等平台搭建仿真环境」类说明壳。
+    返回 [工具小写 token] 供单独准入；不匹配则返回 None（走原有整段判定）。
+    """
+    if not term or not _has_cjk(term):
+        return None
+    t = term.strip()
+    for pat in JD_TOOL_LISTING_SHELL_PATTERNS:
+        m = pat.match(t)
+        if not m:
+            continue
+        tok = (m.group(1) or "").strip().lower()
+        if not tok or not _token_is_tech_shaped(tok):
+            continue
+        return [tok]
+    return None
 
 
 def _token_is_tech_shaped(tok: str) -> bool:
@@ -267,15 +315,62 @@ def is_generic_jd_fragment(term: str) -> bool:
         return True
     if len(term) > 18 and "的" in term:
         return True
+    # 软指标 / 质量叙述：「稳定性与可执行性」等不以「的」结尾，原 10 字门槛过严
+    if "与可执行性" in term and len(term) >= 6:
+        return True
+    if "系统的平滑性" in term:
+        return True
+    if "扎实" in term and "工程实现" in term:
+        return True
     if any(term.startswith(p) for p in FRAGMENT_ACTION_PREFIXES):
         if len(term) >= 8 or FRAGMENT_EVALUATIVE.search(term) or "的" in term:
             return True
     if FRAGMENT_EVALUATIVE.search(term) and (len(term) >= 8 or term.endswith("的")):
         return True
+    if FRAGMENT_EVALUATIVE.search(term) and len(term) >= 6 and "工程" in term:
+        return True
     if any(term.endswith(s) for s in FRAGMENT_SOFT_SUFFIXES):
-        if len(term) >= 10 or "的" in term:
+        if len(term) >= 6 or "的" in term:
             return True
     return False
+
+
+def _is_jd_duty_algorithm_shell(term: str) -> bool:
+    """
+    长职责/研发壳：以「算法开发/算法研发」收尾或含「全身控制算法」叙述块。
+    刻意不泛化到「控制算法」「最优控制」等短技术锚点。
+    """
+    if not term or not _has_cjk(term):
+        return False
+    if len(term) >= 10 and term.endswith("算法开发"):
+        return True
+    if len(term) >= 10 and term.endswith("算法研发"):
+        return True
+    if "全身控制算法" in term and len(term) >= 12:
+        return True
+    if len(term) >= 12 and term.endswith("模块"):
+        return True
+    return False
+
+
+def _is_jd_slogan_innovation_shell(term: str) -> bool:
+    """口号式：知识沉淀、技术创新并形成…"""
+    if not term or not _has_cjk(term):
+        return False
+    if "形成知识沉淀" in term:
+        return True
+    if "技术创新" in term and "并形成" in term:
+        return True
+    return False
+
+
+def _is_evaluative_math_foundation(term: str) -> bool:
+    """素质向：扎实的数学基础（不误伤「线性代数」「数值方法」等独立技能名）。"""
+    if not term or not _has_cjk(term):
+        return False
+    if "数学基础" not in term:
+        return False
+    return bool(re.search(r"(扎实|优秀|良好|深厚).{0,4}数学基础", term))
 
 
 def is_bad_skill(term: str):
@@ -309,6 +404,20 @@ def is_bad_skill(term: str):
         return True
     if any(term.startswith(p) for p in GENERIC_JD_VERB_HIGH_PERF_PREFIXES):
         return True
+    if term in GENERIC_SHORT_SKILL_NOISE:
+        return True
+    if _has_cjk(term) and JD_META_SHELL_PATTERN.search(term):
+        return True
+    if term.startswith("包括") and not _has_latin_skill_token(term):
+        return True
+    if _is_jd_slogan_innovation_shell(term):
+        return True
+    if _is_jd_duty_algorithm_shell(term):
+        return True
+    if _is_evaluative_math_foundation(term):
+        return True
+    if _has_cjk(term) and _has_latin_skill_token(term) and JD_TOOL_LISTING_TAIL_RE.search(term):
+        return True
     if is_generic_jd_fragment(term):
         return True
     if re.search(r"\d", term) and term not in DIGIT_WHITELIST:
@@ -327,7 +436,11 @@ def is_bad_skill(term: str):
     return False
 
 
-def extract_skills(text: str):
+def extract_skills(
+    text: str,
+    *,
+    fragment_stats: Optional[Dict[str, Any]] = None,
+) -> List[str]:
     if not text:
         return []
     parts = SKILL_SPLIT_PATTERN.split(text)
@@ -335,6 +448,7 @@ def extract_skills(text: str):
     for p in parts:
         if not p or not p.strip():
             continue
+        raw_p = p.strip()
         term = normalize_skill(p)
         if not term:
             continue
@@ -345,6 +459,28 @@ def extract_skills(text: str):
                 if first_token and len(first_token) <= 20:
                     term = first_token
         for sub_term in split_space_terms(term):
+            if not sub_term:
+                continue
+            # normalize 会剥掉「对/推动」等 JD 前缀，残片规则需在归一化子项与原始分片上同时判定
+            frag_sub = is_sentence_fragment(sub_term)
+            frag_raw = is_sentence_fragment(raw_p)
+            if frag_sub or frag_raw:
+                if fragment_stats is not None:
+                    fragment_stats["sentence_fragment_removed_count"] = (
+                        int(fragment_stats.get("sentence_fragment_removed_count") or 0) + 1
+                    )
+                    samples = fragment_stats.setdefault("sentence_fragment_removed_samples", [])
+                    if len(samples) < 5:
+                        sample = sub_term if frag_sub else raw_p
+                        if sample and sample not in samples:
+                            samples.append(sample)
+                continue
+            peeled = _peel_leading_tool_from_listing_shell(sub_term)
+            if peeled is not None:
+                for tok in peeled:
+                    if tok and not is_bad_skill(tok):
+                        skills.append(tok)
+                continue
             if is_bad_skill(sub_term):
                 continue
             skills.append(sub_term)
