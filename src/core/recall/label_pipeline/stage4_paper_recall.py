@@ -1,7 +1,7 @@
 import time
 import json
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -519,6 +519,1035 @@ def get_term_role_weight(term_retrieval_roles: Optional[Dict[int, str]], vid: in
     if role == "paper_support":
         return 0.7
     return 0.4
+
+
+# --- Step2：Stage4 paper-level explanation schema（仅观测字段；不改排序/门控）---
+STAGE4_PAPER_EXPLAIN_VERSION = "v1"
+
+_STAGE4_PAPER_EXPLANATION_KEYS = (
+    "paper_explain_version",
+    "hit_terms",
+    "hit_count",
+    "hit_term_roles",
+    "hit_parent_anchors",
+    "hit_parent_primaries",
+    "mainline_term_count",
+    "side_term_count",
+    "same_family_or_cross_family",
+    "grounding_score",
+    "jd_align",
+    "hierarchy_consensus",
+    "hierarchy_bonus",
+    "domain_bonus",
+    "recency_score",
+    "paper_score_base",
+    "paper_score_final",
+    "paper_reason_summary",
+    "hit_quality_class",
+    "coherence_reason",
+    "multi_hit_strength",
+    "paper_global_pool_kept",
+)
+
+
+def _stage4_family_key_for_hit(hit: Dict[str, Any], get_term_meta: Any) -> str:
+    fk = str(hit.get("family_key") or "").strip()
+    if fk:
+        return fk
+    try:
+        tid = int(hit.get("vid"))
+    except (TypeError, ValueError):
+        return ""
+    meta = get_term_meta(tid) or {}
+    return str(meta.get("family_key") or "").strip()
+
+
+def _stage4_hit_mainline_like(hit: Dict[str, Any], get_term_meta: Any) -> bool:
+    """保守：优先 lane_type（Step1）与 retrieval_role；不引入词面规则。"""
+    lt = str(hit.get("lane_type") or "").strip().lower()
+    if lt == "risky_bridge_coverage":
+        return False
+    if lt == "direct_primary":
+        return True
+    role = str(hit.get("role") or "").strip().lower()
+    if lt == "support_coverage" and role == "paper_support":
+        return False
+    if role == "paper_primary":
+        return True
+    if role == "paper_support":
+        return False
+    try:
+        tid = int(hit.get("vid"))
+    except (TypeError, ValueError):
+        return False
+    meta = get_term_meta(tid) or {}
+    r2 = str(meta.get("retrieval_role") or "").strip().lower()
+    return r2 == "paper_primary"
+
+
+def _stage4_same_family_or_cross_family(
+    hits: List[Dict[str, Any]], get_term_meta: Any
+) -> str:
+    if len(hits) < 2:
+        return "single_hit"
+    keys = [_stage4_family_key_for_hit(h, get_term_meta) for h in hits if isinstance(h, dict)]
+    non_empty = [k for k in keys if k]
+    if not non_empty:
+        return "mixed_or_unknown"
+    u = set(non_empty)
+    if len(u) <= 1:
+        return "same_family"
+    return "cross_family"
+
+
+def _classify_stage4_paper_hit_quality(
+    hits: List[Dict[str, Any]],
+    get_term_meta: Any,
+) -> Dict[str, Any]:
+    """
+    multi-hit 质量 + 主/侧计数（只读 hit 与 term_meta；不改变分数）。
+    返回 materialize 所需子字段。
+    """
+    clean = [h for h in (hits or []) if isinstance(h, dict)]
+    n = len(clean)
+    ml = sum(1 for h in clean if _stage4_hit_mainline_like(h, get_term_meta))
+    sl = n - ml
+    sf = _stage4_same_family_or_cross_family(clean, get_term_meta)
+
+    if n <= 0:
+        return {
+            "mainline_term_count": 0,
+            "side_term_count": 0,
+            "same_family_or_cross_family": "single_hit",
+            "hit_quality_class": "side_only_or_accidental_multi_hit",
+            "coherence_reason": "no hits",
+            "multi_hit_strength": 0,
+        }
+
+    if n == 1:
+        if ml == 1:
+            hq = "single_hit_mainline"
+            cr = "single mainline hit"
+        else:
+            hq = "single_hit_side"
+            cr = "single support/side hit"
+        mhs = 0
+        return {
+            "mainline_term_count": ml,
+            "side_term_count": sl,
+            "same_family_or_cross_family": sf,
+            "hit_quality_class": hq,
+            "coherence_reason": cr,
+            "multi_hit_strength": mhs,
+        }
+
+    if ml >= 2:
+        hq = "mainline_resonance"
+        cr = "two or more mainline-like hits"
+        mhs = 2
+    elif ml >= 1 and sl >= 1:
+        hq = "mainline_plus_support"
+        cr = "mainline + support complement"
+        mhs = 2
+    else:
+        hq = "side_only_or_accidental_multi_hit"
+        cr = "two hits but both side/support-like"
+        mhs = 1
+
+    return {
+        "mainline_term_count": ml,
+        "side_term_count": sl,
+        "same_family_or_cross_family": sf,
+        "hit_quality_class": hq,
+        "coherence_reason": cr,
+        "multi_hit_strength": mhs,
+    }
+
+
+def _stage4_paper_reason_summary(
+    cls: Dict[str, Any],
+    grounding_max: float,
+    hit_count: int,
+) -> str:
+    """短英文模板，便于日志与下游稳定展示。"""
+    hq = str(cls.get("hit_quality_class") or "other")
+    g = float(grounding_max or 0.0)
+    strong_g = g >= 0.35
+    if hit_count <= 1:
+        if hq == "single_hit_mainline":
+            return "single-hit mainline with strong grounding" if strong_g else "single-hit mainline paper"
+        if hq == "single_hit_side":
+            return "side-only single-hit paper"
+        return "single-hit paper"
+    if hq == "mainline_resonance":
+        return "multi-hit mainline resonance paper"
+    if hq == "mainline_plus_support":
+        return "multi-hit mainline+support paper"
+    if hq == "side_only_or_accidental_multi_hit":
+        return "multi-hit but side-heavy evidence"
+    return "multi-hit paper"
+
+
+def _materialize_stage4_paper_explanation_fields(
+    wid: str,
+    rec: Dict[str, Any],
+    *,
+    get_term_meta: Any,
+    global_pool_kept: bool,
+) -> None:
+    hits = [h for h in (rec.get("hits") or []) if isinstance(h, dict)]
+    cls = _classify_stage4_paper_hit_quality(hits, get_term_meta)
+
+    hit_terms = [str(h.get("term") or h.get("vid") or "") for h in hits]
+    roles = [str(h.get("role") or "") for h in hits]
+    pas = [str(h.get("parent_anchor") or "") for h in hits]
+    pps = [str(h.get("parent_primary") or "") for h in hits]
+
+    gvals = [float(h.get("grounding") or 0.0) for h in hits]
+    jvals = [float(h.get("jd_align") or 0.0) for h in hits]
+    grounding_max = max(gvals) if gvals else 0.0
+    jd_mean = float(sum(jvals) / len(jvals)) if jvals else None
+
+    det = rec.get("hierarchy_consensus_detail") or {}
+    h_cons = det.get("hierarchy_consensus")
+    try:
+        h_cons_f = float(h_cons) if h_cons is not None else None
+    except (TypeError, ValueError):
+        h_cons_f = None
+
+    h_bonus = rec.get("hierarchy_consensus_bonus")
+    try:
+        h_bonus_f = float(h_bonus) if h_bonus is not None else None
+    except (TypeError, ValueError):
+        h_bonus_f = None
+
+    y = rec.get("year")
+    recency = None
+    if y is not None:
+        try:
+            recency = float(compute_paper_recency(y, None))
+        except Exception:
+            recency = None
+
+    ps_b = rec.get("paper_score_base")
+    try:
+        ps_base = float(ps_b) if ps_b is not None else None
+    except (TypeError, ValueError):
+        ps_base = None
+    ps_f = rec.get("paper_score")
+    try:
+        ps_final = float(ps_f) if ps_f is not None else 0.0
+    except (TypeError, ValueError):
+        ps_final = 0.0
+
+    summ = _stage4_paper_reason_summary(cls, grounding_max, len(hits))
+
+    rec["paper_explain_version"] = STAGE4_PAPER_EXPLAIN_VERSION
+    rec["hit_terms"] = hit_terms
+    rec["hit_count"] = int(len(hits))
+    rec["hit_term_roles"] = roles
+    rec["hit_parent_anchors"] = pas
+    rec["hit_parent_primaries"] = pps
+    rec["mainline_term_count"] = int(cls["mainline_term_count"])
+    rec["side_term_count"] = int(cls["side_term_count"])
+    rec["same_family_or_cross_family"] = str(cls["same_family_or_cross_family"])
+    rec["grounding_score"] = float(grounding_max)
+    rec["jd_align"] = jd_mean
+    rec["hierarchy_consensus"] = h_cons_f
+    rec["hierarchy_bonus"] = h_bonus_f
+    rec["domain_bonus"] = None
+    rec["recency_score"] = recency
+    rec["paper_score_base"] = ps_base
+    rec["paper_score_final"] = float(ps_final)
+    rec["paper_reason_summary"] = summ
+    rec["hit_quality_class"] = str(cls["hit_quality_class"])
+    rec["coherence_reason"] = str(cls["coherence_reason"])
+    rec["multi_hit_strength"] = int(cls["multi_hit_strength"])
+    rec["paper_global_pool_kept"] = bool(global_pool_kept)
+
+
+def _stage4_paper_compact_explanation_row(rec: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "wid": rec.get("wid"),
+        "title": str(rec.get("title") or "")[:100],
+        "hit_terms": rec.get("hit_terms"),
+        "hit_quality_class": rec.get("hit_quality_class"),
+        "grounding_score": rec.get("grounding_score"),
+        "jd_align": rec.get("jd_align"),
+        "hierarchy_bonus": rec.get("hierarchy_bonus"),
+        "paper_score_final": rec.get("paper_score_final"),
+        "paper_reason_summary": rec.get("paper_reason_summary"),
+    }
+
+
+def _print_stage4_paper_explanation_summary(
+    by_wid: Dict[str, Dict[str, Any]],
+    selected_wids_set: Set[str],
+    audit_print: bool,
+) -> None:
+    if not audit_print or not by_wid:
+        return
+    kept = [w for w in by_wid.keys() if w in selected_wids_set]
+    kept_papers_count = len(kept)
+    multi_hit_kept = [
+        w
+        for w in kept
+        if int((by_wid[w] or {}).get("hit_count") or 0) >= 2
+    ]
+    multi_hit_papers_count = len(multi_hit_kept)
+
+    kept_sorted = sorted(
+        kept,
+        key=lambda x: -float((by_wid.get(x) or {}).get("paper_score_final") or 0.0),
+    )
+    ex_kept = [_stage4_paper_compact_explanation_row(by_wid[w]) for w in kept_sorted[:8]]
+
+    mh_sorted = sorted(
+        multi_hit_kept,
+        key=lambda x: -float((by_wid.get(x) or {}).get("paper_score_final") or 0.0),
+    )
+    ex_mh = [_stage4_paper_compact_explanation_row(by_wid[w]) for w in mh_sorted[:5]]
+
+    rejected = [w for w in by_wid.keys() if w not in selected_wids_set]
+    rej_sorted = sorted(
+        rejected,
+        key=lambda x: -float((by_wid.get(x) or {}).get("paper_score_final") or 0.0),
+    )
+    ex_rej = [_stage4_paper_compact_explanation_row(by_wid[w]) for w in rej_sorted[:8]]
+
+    ctr: Counter = Counter()
+    for w in kept:
+        r = by_wid.get(w) or {}
+        ctr[str(r.get("hit_quality_class") or "unknown")] += 1
+
+    print("\n" + "-" * 80)
+    print("[Stage4 paper explanation summary]")
+    print("-" * 80)
+    print(
+        f"kept_papers_count={kept_papers_count} multi_hit_papers_count={multi_hit_papers_count} "
+        f"hit_quality_counter={dict(ctr)}"
+    )
+    print("--- top kept paper examples (compact, max 8) ---")
+    for row in ex_kept:
+        print(f"  {row}")
+    print("--- top multi-hit kept examples (compact, max 5) ---")
+    for row in ex_mh:
+        print(f"  {row}")
+    print("--- top rejected pool examples (compact, max 8, by paper_score_final in wid pool) ---")
+    for row in ex_rej:
+        print(f"  {row}")
+    print("-" * 80 + "\n")
+
+
+# --- Step3：author payload evidence summary（供 Stage5 读；不改作者打分）---
+STAGE4_AUTHOR_PAYLOAD_EXPLAIN_VERSION = "v1"
+
+_AUTHOR_MAINLINE_PAPER_CLASSES = frozenset(
+    {"mainline_resonance", "mainline_plus_support", "single_hit_mainline"}
+)
+_AUTHOR_SIDE_PAPER_CLASSES = frozenset(
+    {"single_hit_side", "side_only_or_accidental_multi_hit"}
+)
+_AUTHOR_HIGH_QUALITY_MULTI_CLASSES = frozenset({"mainline_resonance", "mainline_plus_support"})
+
+
+def _author_paper_score(p: Dict[str, Any]) -> float:
+    v = p.get("paper_score_final")
+    if v is None:
+        v = p.get("score")
+    try:
+        return float(v or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _author_paper_hit_quality_class(p: Dict[str, Any]) -> str:
+    return str(p.get("hit_quality_class") or "").strip()
+
+
+def _author_paper_hit_count(p: Dict[str, Any]) -> int:
+    hc = p.get("hit_count")
+    if hc is not None:
+        try:
+            return int(hc)
+        except (TypeError, ValueError):
+            pass
+    return len(p.get("hits") or [])
+
+
+def _author_collect_hit_terms(p: Dict[str, Any]) -> List[str]:
+    ht = p.get("hit_terms")
+    if isinstance(ht, list) and ht:
+        return [str(t).strip() for t in ht if str(t).strip()]
+    out: List[str] = []
+    for h in p.get("hits") or []:
+        if not isinstance(h, dict):
+            continue
+        t = str(h.get("term") or h.get("vid") or "").strip()
+        if t:
+            out.append(t)
+    return out
+
+
+def _author_dominant_term_from_papers(papers: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[float]]:
+    term_mass: Dict[str, float] = defaultdict(float)
+    for p in papers:
+        sc = _author_paper_score(p)
+        for t in set(_author_collect_hit_terms(p)):
+            term_mass[t] += sc
+    if not term_mass:
+        return None, None
+    dom = max(term_mass.keys(), key=lambda k: term_mass[k])
+    total = sum(_author_paper_score(p) for p in papers)
+    share = float(term_mass[dom] / total) if total > 1e-12 else None
+    return dom, share
+
+
+def _summarize_author_payload_evidence(
+    author_id: str,
+    papers: List[Dict[str, Any]],
+    author_rec: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """只读 papers[] 上 Step2 已透传字段；不改列表与分数。若 author_rec 上已有 dominant_term/dom_share_before 则复用。"""
+    plist = [p for p in (papers or []) if isinstance(p, dict)]
+    pc = len(plist)
+    scores = sorted((_author_paper_score(p) for p in plist), reverse=True)
+    top_score = float(scores[0]) if scores else 0.0
+    top3_mass = float(sum(scores[:3]))
+
+    mainline_n = 0
+    side_n = 0
+    multi_n = 0
+    hq_multi_n = 0
+    side_multi_n = 0
+    all_single_side = bool(plist) and all(
+        _author_paper_hit_quality_class(p) == "single_hit_side" for p in plist
+    )
+
+    for p in plist:
+        hqc = _author_paper_hit_quality_class(p)
+        if hqc in _AUTHOR_MAINLINE_PAPER_CLASSES:
+            mainline_n += 1
+        if hqc in _AUTHOR_SIDE_PAPER_CLASSES:
+            side_n += 1
+        hcnt = _author_paper_hit_count(p)
+        if hcnt >= 2:
+            multi_n += 1
+            if hqc in _AUTHOR_HIGH_QUALITY_MULTI_CLASSES:
+                hq_multi_n += 1
+            if hqc == "side_only_or_accidental_multi_hit":
+                side_multi_n += 1
+
+    dom_t, dom_share = _author_dominant_term_from_papers(plist)
+    if author_rec and isinstance(author_rec, dict):
+        ex_dom = author_rec.get("dominant_term")
+        ex_sh = author_rec.get("dom_share_before")
+        if ex_dom and ex_sh is not None:
+            try:
+                dom_t = str(ex_dom).strip() or dom_t
+                dom_share = float(ex_sh)
+            except (TypeError, ValueError):
+                pass
+    top_paper = max(plist, key=_author_paper_score) if plist else None
+    top_hqc = _author_paper_hit_quality_class(top_paper) if top_paper else None
+    if not top_hqc:
+        top_hqc = None
+
+    denom = max(pc, 1)
+    return {
+        "author_id": str(author_id),
+        "author_explain_version": STAGE4_AUTHOR_PAYLOAD_EXPLAIN_VERSION,
+        "paper_count": int(pc),
+        "top_paper_score": float(top_score),
+        "top3_paper_mass": float(top3_mass),
+        "mainline_paper_count": int(mainline_n),
+        "side_only_paper_count": int(side_n),
+        "multi_hit_paper_count": int(multi_n),
+        "high_quality_multi_hit_count": int(hq_multi_n),
+        "side_only_multi_hit_count": int(side_multi_n),
+        "mainline_support_ratio": float(mainline_n / denom),
+        "side_support_ratio": float(side_n / denom),
+        "dominant_term": dom_t,
+        "dominant_term_share": dom_share,
+        "top_paper_hit_quality_class": top_hqc,
+        "_all_single_hit_side": bool(all_single_side),
+    }
+
+
+def _classify_author_support_profile(summary: Dict[str, Any]) -> None:
+    """就地写入 author_support_class / author_reason_summary / risk / notes。"""
+    pc = int(summary.get("paper_count") or 0)
+    ml = int(summary.get("mainline_paper_count") or 0)
+    so = int(summary.get("side_only_paper_count") or 0)
+    mhr = float(summary.get("mainline_support_ratio") or 0.0)
+    dom = str(summary.get("dominant_term") or "").strip()
+    dom_share = summary.get("dominant_term_share")
+    try:
+        dom_sf = float(dom_share) if dom_share is not None else None
+    except (TypeError, ValueError):
+        dom_sf = None
+    all_single_side = bool(summary.pop("_all_single_hit_side", False))
+
+    notes: List[str] = []
+    risk = False
+
+    if pc <= 0:
+        summary["author_support_class"] = "other"
+        summary["author_reason_summary"] = "no papers in payload"
+        summary["author_evidence_risk_flag"] = False
+        summary["author_evidence_notes"] = []
+        return
+
+    if ml == 0:
+        notes.append("no_mainline_paper")
+
+    if pc == 1:
+        sup = "single_paper_supported"
+        if ml >= 1:
+            reason = "single-paper mainline author"
+        elif so >= 1:
+            reason = "single-paper side-driven author"
+            risk = True
+        else:
+            reason = "single-paper author"
+            risk = True
+        notes.append("one_paper_driven")
+    elif ml > so and mhr >= 0.5:
+        sup = "mainline_supported"
+        reason = "mainline-supported author"
+    elif ml > 0 and so > ml:
+        sup = "mixed_but_side_heavy"
+        reason = "mixed evidence but side-heavy author"
+        risk = True
+    elif so > ml:
+        sup = "side_only_supported"
+        if dom:
+            reason = f"side-heavy author driven by {dom} papers"
+        else:
+            reason = "side-heavy author"
+        risk = True
+    elif ml > 0:
+        sup = "mainline_supported"
+        reason = "mainline-supported author"
+    else:
+        sup = "other"
+        reason = "other evidence mix"
+        risk = True
+
+    if all_single_side:
+        notes.append("only_single_hit_side_papers")
+        risk = True
+    if dom and "robotic arm" in dom.lower():
+        notes.append("dominant_term_is_robotic_arm")
+    if dom_sf is not None and dom_sf >= 0.65:
+        notes.append("high_dominant_term_share")
+        risk = True
+
+    summary["author_support_class"] = sup
+    summary["author_reason_summary"] = reason
+    summary["author_evidence_risk_flag"] = bool(risk)
+    summary["author_evidence_notes"] = notes[:3]
+
+
+def _stage5_author_compact_explanation_row(summary: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "author_id": summary.get("author_id"),
+        "paper_count": summary.get("paper_count"),
+        "mainline_paper_count": summary.get("mainline_paper_count"),
+        "side_only_paper_count": summary.get("side_only_paper_count"),
+        "multi_hit_paper_count": summary.get("multi_hit_paper_count"),
+        "mainline_support_ratio": summary.get("mainline_support_ratio"),
+        "dominant_term": summary.get("dominant_term"),
+        "dominant_term_share": summary.get("dominant_term_share"),
+        "top_paper_hit_quality_class": summary.get("top_paper_hit_quality_class"),
+        "author_support_class": summary.get("author_support_class"),
+        "author_reason_summary": summary.get("author_reason_summary"),
+    }
+
+
+def _print_stage5_author_payload_summary(
+    author_payload: List[Dict[str, Any]],
+    *,
+    audit_print: bool,
+) -> None:
+    if not audit_print:
+        return
+    author_payload = author_payload or []
+    authors_total = len(author_payload)
+    sup_ctr: Counter = Counter()
+    risk_n = 0
+    for rec in author_payload:
+        s = rec.get("author_payload_summary") or {}
+        if not isinstance(s, dict):
+            continue
+        sup_ctr[str(s.get("author_support_class") or "unknown")] += 1
+        if s.get("author_evidence_risk_flag"):
+            risk_n += 1
+
+    ranked = sorted(
+        author_payload,
+        key=lambda r: float((r.get("author_payload_summary") or {}).get("top_paper_score") or 0.0),
+        reverse=True,
+    )
+    top_ex = [
+        _stage5_author_compact_explanation_row(r.get("author_payload_summary") or {})
+        for r in ranked[:12]
+    ]
+    side_pool = [
+        r
+        for r in ranked
+        if str((r.get("author_payload_summary") or {}).get("author_support_class") or "")
+        in ("side_only_supported", "mixed_but_side_heavy", "single_paper_supported")
+    ]
+    side_ex = [
+        _stage5_author_compact_explanation_row(r.get("author_payload_summary") or {})
+        for r in side_pool[:8]
+    ]
+
+    print("\n" + "-" * 80)
+    print("[Stage5 author payload summary]")
+    print("-" * 80)
+    print(f"authors_total={authors_total} support_class_counter={dict(sup_ctr)} risk_flag_count={risk_n}")
+    print("--- top author examples (by top_paper_score, max 12) ---")
+    for row in top_ex:
+        print(f"  {row}")
+    print("--- side-heavy top author examples (max 8) ---")
+    for row in side_ex:
+        print(f"  {row}")
+    print("-" * 80 + "\n")
+
+
+# --- Step4：LTR-like 多特征后置重审（不训练模型；不改召回/解释字段定义）---
+_STAGE4_PAPER_LTR_KEYS = ("paper_rerank_score", "paper_rerank_factor", "paper_rerank_notes")
+STAGE4_PAPER_LTR_FACTOR_CLIP = (0.80, 1.12)
+STAGE5_AUTHOR_LTR_FACTOR_CLIP = (0.78, 1.10)
+
+
+def _compute_stage4_ltr_like_paper_rerank_score(rec: Dict[str, Any]) -> None:
+    """
+    基于 Step2 结构字段的温和联合调整；不覆盖 paper_score_final / paper_score（全局 cap 与审计仍看原分）。
+    Stage5 聚合使用 paper_rerank_score（经 wid_to_hits_and_score → papers[].score）。
+    """
+    base = float(rec.get("paper_score_final") if rec.get("paper_score_final") is not None else rec.get("paper_score") or 0.0)
+    hq = str(rec.get("hit_quality_class") or "").strip()
+    ml = int(rec.get("mainline_term_count") or 0)
+    sd = int(rec.get("side_term_count") or 0)
+    mhs = int(rec.get("multi_hit_strength") or 0)
+    g = float(rec.get("grounding_score") or 0.0)
+    jd_v = rec.get("jd_align")
+    try:
+        jd_f = float(jd_v) if jd_v is not None else 0.5
+    except (TypeError, ValueError):
+        jd_f = 0.5
+    hb_v = rec.get("hierarchy_bonus")
+    try:
+        hb_f = float(hb_v) if hb_v is not None else 1.0
+    except (TypeError, ValueError):
+        hb_f = 1.0
+
+    delta = 0.0
+    notes: List[str] = []
+    if hq == "mainline_resonance":
+        delta += 0.06
+    elif hq == "mainline_plus_support":
+        delta += 0.05
+    elif hq == "single_hit_mainline":
+        delta += 0.04
+    elif hq == "single_hit_side":
+        delta -= 0.045
+        notes.append("side_hit_quality")
+    elif hq == "side_only_or_accidental_multi_hit":
+        delta -= 0.055
+        notes.append("side_multi_hit_quality")
+
+    delta += 0.014 * float(min(ml, 3))
+    delta -= 0.009 * float(min(sd, 3))
+    delta += 0.018 * float(min(mhs, 2))
+    delta += float(np.clip((g - 0.26) * 0.07, -0.028, 0.028))
+    delta += float(np.clip((jd_f - 0.52) * 0.055, -0.026, 0.026))
+    delta += float(np.clip((hb_f - 1.0) * 0.12, -0.022, 0.022))
+
+    lo, hi = STAGE4_PAPER_LTR_FACTOR_CLIP
+    fac = float(np.clip(1.0 + delta, lo, hi))
+    rec["paper_rerank_factor"] = fac
+    rec["paper_rerank_score"] = float(base * fac)
+    rec["paper_rerank_notes"] = notes[:3]
+
+
+def _compute_stage5_ltr_like_author_rerank_score(auth_rec: Dict[str, Any], summary: Dict[str, Any]) -> None:
+    """作者层结构重审；final_score_base 用 top_paper_score 作 Stage4 侧代理基分（Stage5 内仍会再聚合）。"""
+    base = float(summary.get("top_paper_score") or 0.0)
+    mhr = float(summary.get("mainline_support_ratio") or 0.0)
+    ssr = float(summary.get("side_support_ratio") or 0.0)
+    sup_cls = str(summary.get("author_support_class") or "")
+    risk = bool(summary.get("author_evidence_risk_flag"))
+    dom_share = summary.get("dominant_term_share")
+    try:
+        dom_sf = float(dom_share) if dom_share is not None else None
+    except (TypeError, ValueError):
+        dom_sf = None
+    hq_m = int(summary.get("high_quality_multi_hit_count") or 0)
+    so_m = int(summary.get("side_only_multi_hit_count") or 0)
+
+    delta = 0.0
+    notes: List[str] = []
+    delta += 0.11 * mhr
+    delta -= 0.09 * ssr
+
+    if sup_cls == "mainline_supported":
+        delta += 0.038
+    elif sup_cls == "mixed_but_side_heavy":
+        delta -= 0.028
+        notes.append("mixed_side_heavy_profile")
+    elif sup_cls == "side_only_supported":
+        delta -= 0.048
+        notes.append("side_only_profile")
+    elif sup_cls == "single_paper_supported":
+        delta -= 0.055
+        notes.append("single_paper_profile")
+
+    if risk:
+        delta -= 0.038
+        notes.append("risk_flag")
+
+    if dom_sf is not None and sup_cls in (
+        "side_only_supported",
+        "mixed_but_side_heavy",
+        "single_paper_supported",
+    ):
+        if dom_sf >= 0.72:
+            delta -= 0.055 * float(min(1.0, max(0.0, (dom_sf - 0.52) / 0.48)))
+            notes.append("high_dom_share_side_profile")
+
+    delta += 0.022 * float(min(hq_m, 2))
+    delta -= 0.016 * float(min(so_m, 2))
+
+    lo, hi = STAGE5_AUTHOR_LTR_FACTOR_CLIP
+    fac = float(np.clip(1.0 + delta, lo, hi))
+    auth_rec["author_rerank_factor"] = fac
+    auth_rec["final_score_base"] = base
+    auth_rec["final_score_reranked"] = float(base * fac)
+    auth_rec["author_rerank_score"] = float(base * fac)
+    auth_rec["author_rerank_notes"] = notes[:3]
+
+
+def _stage4_paper_ltr_compact_row(rec: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "wid": rec.get("wid"),
+        "hit_terms": rec.get("hit_terms"),
+        "hit_quality_class": rec.get("hit_quality_class"),
+        "paper_score_final": rec.get("paper_score_final"),
+        "paper_rerank_factor": rec.get("paper_rerank_factor"),
+        "paper_rerank_score": rec.get("paper_rerank_score"),
+        "paper_rerank_notes": rec.get("paper_rerank_notes"),
+    }
+
+
+def _print_stage4_paper_ltr_rerank_summary(
+    by_wid: Dict[str, Dict[str, Any]],
+    selected_wids_set: Set[str],
+    *,
+    audit_print: bool,
+) -> None:
+    if not audit_print:
+        return
+    kept = [by_wid[w] for w in selected_wids_set if w in by_wid]
+    if not kept:
+        print("\n[Stage4 paper LTR-like rerank summary] kept_papers_count=0\n")
+        return
+    boosted = sorted(kept, key=lambda r: -float(r.get("paper_rerank_factor") or 1.0))[:8]
+    penal = sorted(kept, key=lambda r: float(r.get("paper_rerank_factor") or 1.0))[:8]
+    print("\n" + "-" * 80)
+    print("[Stage4 paper LTR-like rerank summary]")
+    print("-" * 80)
+    print(f"kept_papers_count={len(kept)} factor_clip={STAGE4_PAPER_LTR_FACTOR_CLIP}")
+    print("--- top boosted papers (by paper_rerank_factor, max 8) ---")
+    for r in boosted:
+        print(f"  {_stage4_paper_ltr_compact_row(r)}")
+    print("--- top penalized papers (lowest factor, max 8) ---")
+    for r in penal:
+        print(f"  {_stage4_paper_ltr_compact_row(r)}")
+    print("-" * 80 + "\n")
+
+
+def _stage5_author_ltr_compact_row(auth_rec: Dict[str, Any]) -> Dict[str, Any]:
+    s = auth_rec.get("author_payload_summary") or {}
+    return {
+        "author_id": auth_rec.get("aid"),
+        "original_score": auth_rec.get("final_score_base"),
+        "rerank_factor": auth_rec.get("author_rerank_factor"),
+        "rerank_score": auth_rec.get("author_rerank_score"),
+        "author_support_class": s.get("author_support_class"),
+        "mainline_support_ratio": s.get("mainline_support_ratio"),
+        "dominant_term": s.get("dominant_term"),
+        "dominant_term_share": s.get("dominant_term_share"),
+        "top_paper_hit_quality_class": s.get("top_paper_hit_quality_class"),
+        "author_rerank_notes": auth_rec.get("author_rerank_notes"),
+        "author_reason_summary": s.get("author_reason_summary"),
+    }
+
+
+def _print_stage5_author_ltr_rerank_summary(
+    author_payload: List[Dict[str, Any]],
+    pre_top20_ids: List[str],
+    *,
+    audit_print: bool,
+) -> None:
+    if not audit_print:
+        return
+    ap = author_payload or []
+    post_top20 = [str(r.get("aid")) for r in ap[:20]]
+    ncmp = min(len(pre_top20_ids), len(post_top20))
+    changed = sum(1 for i in range(ncmp) if pre_top20_ids[i] != post_top20[i])
+    boosted = sorted(ap, key=lambda r: -float(r.get("author_rerank_factor") or 1.0))[:12]
+    penal = sorted(ap, key=lambda r: float(r.get("author_rerank_factor") or 1.0))[:12]
+    print("\n" + "-" * 80)
+    print("[Stage5 author LTR-like rerank summary]")
+    print("-" * 80)
+    print(f"authors_total={len(ap)} rerank_changed_top20_count={changed} factor_clip={STAGE5_AUTHOR_LTR_FACTOR_CLIP}")
+    print("--- top boosted authors (by author_rerank_factor, max 12) ---")
+    for r in boosted:
+        print(f"  {_stage5_author_ltr_compact_row(r)}")
+    print("--- top penalized authors (lowest factor, max 12) ---")
+    for r in penal:
+        print(f"  {_stage5_author_ltr_compact_row(r)}")
+    print("-" * 80 + "\n")
+
+
+# --- Step5：主线主题保护（后置方向层；不推翻 Step2~4 字段与 LTR 定义）---
+_STAGE4_PAPER_MAINLINE_PROT_KEYS = (
+    "paper_mainline_protection_factor",
+    "paper_mainline_protection_notes",
+    "paper_score_protected",
+)
+STAGE4_PAPER_MAINLINE_PROT_CLIP = (0.88, 1.08)
+STAGE5_AUTHOR_MAINLINE_PROT_CLIP = (0.85, 1.08)
+
+
+def _term_looks_object_or_carrier(term: str) -> bool:
+    """极少稳定子串：仅作后置保护微调，不扩展词表体系。"""
+    t = (term or "").strip().lower()
+    if not t:
+        return False
+    needles = (
+        "robotic arm",
+        "robot arm",
+        "robot hand",
+        "robotic hand",
+        "gripper",
+        "end effector",
+        "end-effector",
+        "manipulator",
+        "actuator",
+        "quadcopter",
+        "drone body",
+        "hardware prototype",
+    )
+    return any(n in t for n in needles)
+
+
+def _compute_stage4_mainline_protection_factor(rec: Dict[str, Any]) -> None:
+    """
+    paper_rerank_score 之上再乘温和保护因子；不修改 paper_rerank_score / paper_score_final。
+    """
+    prs = rec.get("paper_rerank_score")
+    try:
+        base = float(prs) if prs is not None else float(rec.get("paper_score_final") or rec.get("paper_score") or 0.0)
+    except (TypeError, ValueError):
+        base = 0.0
+
+    hq = str(rec.get("hit_quality_class") or "").strip()
+    ml = int(rec.get("mainline_term_count") or 0)
+    sd = int(rec.get("side_term_count") or 0)
+    g = float(rec.get("grounding_score") or 0.0)
+    jd_v = rec.get("jd_align")
+    try:
+        jd_f = float(jd_v) if jd_v is not None else 0.5
+    except (TypeError, ValueError):
+        jd_f = 0.5
+
+    hit_terms = rec.get("hit_terms") if isinstance(rec.get("hit_terms"), list) else []
+    carrier_hit = any(_term_looks_object_or_carrier(str(x)) for x in hit_terms)
+
+    delta = 0.0
+    notes: List[str] = []
+
+    if hq in ("mainline_resonance", "mainline_plus_support", "single_hit_mainline"):
+        delta += 0.05 if hq == "mainline_resonance" else 0.042 if hq == "mainline_plus_support" else 0.034
+        notes.append("mainline_hit_structure")
+    if ml >= 1:
+        delta += 0.012 * float(min(ml, 2))
+    if jd_f >= 0.58 and ml >= 1:
+        delta += 0.015
+        notes.append("jd_align_with_mainline_terms")
+
+    if hq == "single_hit_side":
+        delta -= 0.038
+        notes.append("single_side_hit")
+    elif hq == "side_only_or_accidental_multi_hit":
+        delta -= 0.048
+        notes.append("side_multi_hit")
+
+    if ml == 0 and sd >= 1 and hq in ("single_hit_side", "side_only_or_accidental_multi_hit"):
+        delta -= 0.022
+        notes.append("no_mainline_term_on_paper")
+
+    if carrier_hit and hq in ("single_hit_side", "side_only_or_accidental_multi_hit"):
+        delta -= 0.032
+        notes.append("object_carrier_hit_pattern")
+
+    if g < 0.22 and hq in ("single_hit_side", "side_only_or_accidental_multi_hit"):
+        delta -= 0.018
+
+    lo, hi = STAGE4_PAPER_MAINLINE_PROT_CLIP
+    fac = float(np.clip(1.0 + delta, lo, hi))
+    rec["paper_mainline_protection_factor"] = fac
+    rec["paper_mainline_protection_notes"] = notes[:3]
+    rec["paper_score_protected"] = float(base * fac)
+
+
+def _compute_stage5_mainline_protection_factor(auth_rec: Dict[str, Any], summary: Dict[str, Any]) -> None:
+    """在 final_score_reranked 上乘温和因子；保留 Step4 rerank 字段。"""
+    try:
+        base = float(auth_rec.get("final_score_reranked") or 0.0)
+    except (TypeError, ValueError):
+        base = 0.0
+
+    sup_cls = str(summary.get("author_support_class") or "")
+    mhr = float(summary.get("mainline_support_ratio") or 0.0)
+    ssr = float(summary.get("side_support_ratio") or 0.0)
+    risk = bool(summary.get("author_evidence_risk_flag"))
+    dom = str(summary.get("dominant_term") or "").strip()
+    dom_share = summary.get("dominant_term_share")
+    try:
+        dom_sf = float(dom_share) if dom_share is not None else None
+    except (TypeError, ValueError):
+        dom_sf = None
+    top_hqc = str(summary.get("top_paper_hit_quality_class") or "").strip()
+    pc = int(summary.get("paper_count") or 0)
+
+    delta = 0.0
+    notes: List[str] = []
+
+    if sup_cls == "mainline_supported" or mhr > 0.01:
+        delta += 0.045 * float(min(1.0, mhr * 2.2 + (0.25 if sup_cls == "mainline_supported" else 0.0)))
+        notes.append("mainline_author_structure")
+    if top_hqc in ("single_hit_mainline", "mainline_plus_support", "mainline_resonance"):
+        delta += 0.022
+        notes.append("top_paper_mainline_quality")
+
+    if sup_cls == "side_only_supported":
+        delta -= 0.048
+        notes.append("side_only_supported_profile")
+    elif sup_cls == "single_paper_supported":
+        delta -= 0.042
+        notes.append("single_paper_supported_profile")
+    elif sup_cls == "mixed_but_side_heavy":
+        delta -= 0.02
+        notes.append("mixed_side_heavy_profile")
+
+    if risk and mhr < 0.08:
+        delta -= 0.028
+        notes.append("risk_low_mainline")
+
+    if (
+        dom_sf is not None
+        and dom_sf >= 0.78
+        and _term_looks_object_or_carrier(dom)
+        and sup_cls in ("side_only_supported", "single_paper_supported", "mixed_but_side_heavy")
+    ):
+        delta -= 0.055 * float(min(1.0, (dom_sf - 0.55) / 0.45))
+        notes.append("high_share_object_carrier_dom")
+
+    if pc <= 1 and ssr >= 0.85 and mhr < 0.05:
+        delta -= 0.025
+        notes.append("singleton_side_heavy")
+
+    lo, hi = STAGE5_AUTHOR_MAINLINE_PROT_CLIP
+    fac = float(np.clip(1.0 + delta, lo, hi))
+    auth_rec["author_mainline_protection_factor"] = fac
+    auth_rec["author_mainline_protection_notes"] = notes[:3]
+    auth_rec["final_score_protected"] = float(base * fac)
+
+
+def _stage4_paper_mainline_prot_compact_row(rec: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "wid": rec.get("wid"),
+        "hit_terms": rec.get("hit_terms"),
+        "hit_quality_class": rec.get("hit_quality_class"),
+        "paper_rerank_score": rec.get("paper_rerank_score"),
+        "protection_factor": rec.get("paper_mainline_protection_factor"),
+        "paper_score_protected": rec.get("paper_score_protected"),
+        "protection_notes": rec.get("paper_mainline_protection_notes"),
+    }
+
+
+def _print_stage4_paper_mainline_protection_summary(
+    by_wid: Dict[str, Dict[str, Any]],
+    selected_wids_set: Set[str],
+    *,
+    audit_print: bool,
+) -> None:
+    if not audit_print:
+        return
+    kept = [by_wid[w] for w in selected_wids_set if w in by_wid]
+    if not kept:
+        print("\n[Stage4 paper mainline protection summary] kept_papers_count=0\n")
+        return
+    boosted = sorted(kept, key=lambda r: -float(r.get("paper_mainline_protection_factor") or 1.0))[:8]
+    suppressed = sorted(kept, key=lambda r: float(r.get("paper_mainline_protection_factor") or 1.0))[:8]
+    print("\n" + "-" * 80)
+    print("[Stage4 paper mainline protection summary]")
+    print("-" * 80)
+    print(f"kept_papers_count={len(kept)} factor_clip={STAGE4_PAPER_MAINLINE_PROT_CLIP}")
+    print("--- top protected papers (highest factor, max 8) ---")
+    for r in boosted:
+        print(f"  {_stage4_paper_mainline_prot_compact_row(r)}")
+    print("--- top suppressed papers (lowest factor, max 8) ---")
+    for r in suppressed:
+        print(f"  {_stage4_paper_mainline_prot_compact_row(r)}")
+    print("-" * 80 + "\n")
+
+
+def _stage5_author_mainline_prot_compact_row(auth_rec: Dict[str, Any]) -> Dict[str, Any]:
+    s = auth_rec.get("author_payload_summary") or {}
+    return {
+        "author_id": auth_rec.get("aid"),
+        "author_support_class": s.get("author_support_class"),
+        "dominant_term": s.get("dominant_term"),
+        "dominant_term_share": s.get("dominant_term_share"),
+        "final_score_reranked": auth_rec.get("final_score_reranked"),
+        "protection_factor": auth_rec.get("author_mainline_protection_factor"),
+        "final_score_protected": auth_rec.get("final_score_protected"),
+        "protection_notes": auth_rec.get("author_mainline_protection_notes"),
+    }
+
+
+def _print_stage5_author_mainline_protection_summary(
+    author_payload: List[Dict[str, Any]],
+    pre_prot_top20_ids: List[str],
+    *,
+    audit_print: bool,
+) -> None:
+    if not audit_print:
+        return
+    ap = author_payload or []
+    post_top20 = [str(r.get("aid")) for r in ap[:20]]
+    ncmp = min(len(pre_prot_top20_ids), len(post_top20))
+    changed = sum(1 for i in range(ncmp) if pre_prot_top20_ids[i] != post_top20[i])
+    boosted = sorted(ap, key=lambda r: -float(r.get("author_mainline_protection_factor") or 1.0))[:12]
+    suppressed = sorted(ap, key=lambda r: float(r.get("author_mainline_protection_factor") or 1.0))[:12]
+    print("\n" + "-" * 80)
+    print("[Stage5 author mainline protection summary]")
+    print("-" * 80)
+    print(f"authors_total={len(ap)} protected_top20_changed_count={changed} factor_clip={STAGE5_AUTHOR_MAINLINE_PROT_CLIP}")
+    print("--- top protected authors (highest factor, max 12) ---")
+    for r in boosted:
+        print(f"  {_stage5_author_mainline_prot_compact_row(r)}")
+    print("--- top suppressed authors (lowest factor, max 12) ---")
+    for r in suppressed:
+        print(f"  {_stage5_author_mainline_prot_compact_row(r)}")
+    print("-" * 80 + "\n")
 
 
 def run_stage4(
@@ -1449,6 +2478,11 @@ def run_stage4(
             "hit_level": str(hit_level),
             "grounding": float(grounding),
             "jd_align": float(jd_align),
+            # Step2 / Step1：供 wid 级 explanation 与 multi-hit 质量分类（不改打分）
+            "parent_anchor": str(meta.get("parent_anchor") or ""),
+            "parent_primary": str(meta.get("parent_primary") or ""),
+            "lane_type": str(meta.get("lane_type") or ""),
+            "family_key": str(meta.get("family_key") or ""),
         }
         if wid not in by_wid:
             wid_meta = wid_to_paper_meta.get(wid) or {"title": "", "domains": ""}
@@ -1567,6 +2601,7 @@ def run_stage4(
                 "hierarchy_tier_boost_gate": _tier_gate,
                 "hierarchy_bonus": round(_bonus, 6),
             }
+            _rec["paper_score_base"] = float(_before)
             _rec["paper_score"] = _after
             _rec["hierarchy_consensus_bonus"] = _bonus
             _rec["hierarchy_consensus_detail"] = _det
@@ -1598,6 +2633,7 @@ def run_stage4(
         for _rec in by_wid.values():
             _rec["hierarchy_consensus_bonus"] = 1.0
             _rec["hierarchy_consensus_detail"] = {"reason": "disabled_or_no_jd_profile"}
+            _rec["paper_score_base"] = float(_rec.get("paper_score") or 0.0)
 
     # 全局按 paper_score 排序，取前 GLOBAL_PAPER_LIMIT（已乘 hierarchy_consensus_bonus）
     sorted_wids = sorted(
@@ -1605,6 +2641,23 @@ def run_stage4(
         key=lambda w: -float((by_wid[w] or {}).get("paper_score") or 0.0),
     )[:GLOBAL_PAPER_LIMIT]
     selected_wids_set = set(sorted_wids)
+
+    for _w, _rec in by_wid.items():
+        _materialize_stage4_paper_explanation_fields(
+            str(_w),
+            _rec,
+            get_term_meta=_get_term_meta,
+            global_pool_kept=str(_w) in selected_wids_set,
+        )
+    _print_stage4_paper_explanation_summary(by_wid, selected_wids_set, audit_print=_label_path_stdout)
+
+    for __w, __rec in by_wid.items():
+        _compute_stage4_ltr_like_paper_rerank_score(__rec)
+    _print_stage4_paper_ltr_rerank_summary(by_wid, selected_wids_set, audit_print=_label_path_stdout)
+
+    for __w, __rec in by_wid.items():
+        _compute_stage4_mainline_protection_factor(__rec)
+    _print_stage4_paper_mainline_protection_summary(by_wid, selected_wids_set, audit_print=_label_path_stdout)
 
     # -------- final_unique / global_cap_cut 统计（按 term 级唯一 wid）--------
     for vid, capped_wids in term_capped_unique_wids.items():
@@ -1834,7 +2887,13 @@ def run_stage4(
     wid_to_hits_and_score = {
         str(wid): (
             list((rec or {}).get("hits") or []),
-            float((rec or {}).get("paper_score") or 0.0),
+            float(
+                (rec or {}).get("paper_score_protected")
+                if (rec or {}).get("paper_score_protected") is not None
+                else (rec or {}).get("paper_rerank_score")
+                if (rec or {}).get("paper_rerank_score") is not None
+                else (rec or {}).get("paper_score") or 0.0
+            ),
             (rec or {}).get("title"),
             (rec or {}).get("domains"),
             (rec or {}).get("year"),
@@ -1853,7 +2912,8 @@ def run_stage4(
                 continue
             wid_s = str(wid)
             hits, score, title_s4, domains_s4, year_s4 = wid_to_hits_and_score.get(wid_s, ([], 0.0, None, None, None))
-            papers.append({
+            _br = by_wid.get(wid_s) or {}
+            _paper_row: Dict[str, Any] = {
                 "wid": wid_s,
                 "hits": hits,
                 "weight": p.get("weight"),
@@ -1861,12 +2921,49 @@ def run_stage4(
                 "year": year_s4 if year_s4 is not None else p.get("year"),
                 "domains": domains_s4 if domains_s4 is not None else p.get("domains"),
                 "score": score,
-            })
+            }
+            for _ek in _STAGE4_PAPER_EXPLANATION_KEYS:
+                if _ek in _br:
+                    _paper_row[_ek] = _br[_ek]
+            for _lk in _STAGE4_PAPER_LTR_KEYS:
+                if _lk in _br:
+                    _paper_row[_lk] = _br[_lk]
+            for _pk in _STAGE4_PAPER_MAINLINE_PROT_KEYS:
+                if _pk in _br:
+                    _paper_row[_pk] = _br[_pk]
+            papers.append(_paper_row)
         if aid is not None and papers:
             out.append({
                 "aid": str(aid),
                 "papers": papers,
             })
+
+    for _auth_rec in out:
+        _apapers = _auth_rec.get("papers") or []
+        _aid_s = str(_auth_rec.get("aid") or "")
+        _asum = _summarize_author_payload_evidence(_aid_s, _apapers, _auth_rec)
+        _classify_author_support_profile(_asum)
+        _auth_rec["author_payload_summary"] = _asum
+        _compute_stage5_ltr_like_author_rerank_score(_auth_rec, _asum)
+        _compute_stage5_mainline_protection_factor(_auth_rec, _asum)
+
+    _pre_top20_aids = [
+        str(r.get("aid"))
+        for r in sorted(
+            out,
+            key=lambda r: -float((r.get("author_payload_summary") or {}).get("top_paper_score") or 0.0),
+        )[:20]
+    ]
+    _pre_prot_top20_aids = [
+        str(r.get("aid"))
+        for r in sorted(out, key=lambda r: -float(r.get("final_score_reranked") or 0.0))[:20]
+    ]
+    out.sort(key=lambda r: -float(r.get("final_score_protected") or 0.0))
+
+    _print_stage5_author_payload_summary(out, audit_print=_label_path_stdout)
+    _print_stage5_author_ltr_rerank_summary(out, _pre_top20_aids, audit_print=_label_path_stdout)
+    _print_stage5_author_mainline_protection_summary(out, _pre_prot_top20_aids, audit_print=_label_path_stdout)
+
     sub_ms["build_list"] = (time.perf_counter() - t4) * 1000.0
     sub_ms["total"] = (time.perf_counter() - t0) * 1000.0
     _save_sub(sub_ms)

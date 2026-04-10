@@ -2808,12 +2808,17 @@ def _faiss_conditioned_neighbors_once(
     jd_subfield_ids: Optional[Set[str]],
     jd_topic_ids: Optional[Set[str]],
     retrieval_tier: str,
+    *,
+    main_strong_retry: bool = False,
 ) -> Tuple[List[LandingCandidate], Dict[int, float], int, int]:
     """
     单次 FAISS + 与本轮既有相同的过滤链。
     返回 (neighbors, score_map, raw_prefilter_hits, postfilter_hits)。
     raw_prefilter_hits：通过 sim 门槛与词表类型、尚未做 domain 过滤的条数。
     postfilter_hits：最终入池条数。
+
+    main_strong_retry：仅用于 main_strong 锚点在首轮 supplement 空池后的窄 backoff（略扩 K、略降 sim、
+    domain_no_match 软保留进池）；默认 False，不影响常规路径。
     """
     context_neighbors: List[LandingCandidate] = []
     context_score_map: Dict[int, float] = {}
@@ -2825,11 +2830,18 @@ def _faiss_conditioned_neighbors_once(
     faiss.normalize_L2(vec)
     use_k = int(conditioned_top_k) if conditioned_top_k is not None else STAGE2A_COLLECT_CONDITIONED_TOP_K
     use_k = max(use_k, 6)
+    if main_strong_retry:
+        use_k = use_k + 14
     k = min(use_k, getattr(label.vocab_index, "ntotal", 100))
     if k <= 0:
         return [], {}, 0, 0
     scores, ids = label.vocab_index.search(vec, k)
-    conditioned_min_sim = max(SIMILAR_TO_MIN_SCORE, 0.78)
+    if main_strong_retry:
+        conditioned_min_sim = max(float(SIMILAR_TO_MIN_SCORE), 0.74)
+        cond_only_min_sim = 0.74
+    else:
+        conditioned_min_sim = max(float(SIMILAR_TO_MIN_SCORE), 0.78)
+        cond_only_min_sim = float(STAGE2A_CONDITIONED_ONLY_MIN_SIM)
     raw_prefilter = 0
     for score, tid in zip(scores[0], ids[0]):
         try:
@@ -2847,17 +2859,21 @@ def _faiss_conditioned_neighbors_once(
         if sim < conditioned_min_sim:
             continue
         raw_prefilter += 1
-        ok, _ = _term_in_active_domains_with_reason(
+        ok, dom_reason = _term_in_active_domains_with_reason(
             label, tid,
             active_domain_set=active_domain_set,
             jd_field_ids=jd_field_ids,
             jd_subfield_ids=jd_subfield_ids,
             jd_topic_ids=jd_topic_ids,
         )
+        soft_domain = False
         if not ok:
-            continue
+            if main_strong_retry and dom_reason != "domain_conflict_strong":
+                soft_domain = True
+            else:
+                continue
         has_similar_to_support = tid in similar_to_vids
-        if not has_similar_to_support and sim < STAGE2A_CONDITIONED_ONLY_MIN_SIM:
+        if not has_similar_to_support and sim < cond_only_min_sim:
             continue
         cand = LandingCandidate(
             vid=tid,
@@ -2877,6 +2893,10 @@ def _faiss_conditioned_neighbors_once(
         setattr(cand, "conditioned_only", not has_similar_to_support)
         setattr(cand, "has_similar_to_support", has_similar_to_support)
         setattr(cand, "conditioned_retrieval_tier", retrieval_tier)
+        if soft_domain:
+            setattr(cand, "soft_domain_retain", True)
+            setattr(cand, "domain_fit", 0.85)
+            setattr(cand, "main_strong_conditioned_retry_soft_domain", True)
         context_neighbors.append(cand)
         context_score_map[tid] = sim
     return context_neighbors, context_score_map, raw_prefilter, len(context_neighbors)
@@ -4417,6 +4437,114 @@ def _stage2a_local_primary_preference_snapshot(
     }
 
 
+def _stage2a_is_conditioned_only_weak_primary_case(c: "Stage2ACandidate") -> bool:
+    """单锚内：仅 conditioned_vec、无 similar_to/family 证据 → 不应呈现为「已站稳」主落点。"""
+    return bool(_stage2a_is_conditioned_only_for_seed(c))
+
+
+def _stage2a_rank_adj_primary_stability(
+    c: "Stage2ACandidate",
+    *,
+    has_sim: bool,
+    cond_only: bool,
+    dual: bool,
+    local_pref: float,
+    mainline_candidate: bool,
+) -> Tuple[float, str]:
+    """
+    组内排序专用轻量 tie-break（叠加在 local_primary_pref 上），不改动原 local_pref 公式。
+    结构偏好：非 cond_only、有 similar_to 证据、dual、主位候选略抬；role-shell（末词 controller）略压。
+    """
+    adj = 0.0
+    tags: List[str] = []
+    if has_sim and (not cond_only):
+        adj += 0.034
+        tags.append("+sim_non_cond")
+    elif has_sim:
+        adj += 0.012
+        tags.append("+sim_only")
+    if dual:
+        adj += 0.020
+        tags.append("+dual")
+    if cond_only:
+        adj -= 0.048
+        tags.append("-cond_only")
+    term_l = (getattr(c, "term", "") or "").strip().lower()
+    parts = term_l.split()
+    if parts and parts[-1] in ("controller", "controllers"):
+        adj -= 0.028
+        tags.append("-role_shell")
+    if mainline_candidate and float(local_pref or 0.0) >= 0.50:
+        adj += 0.018
+        tags.append("+mainline_cand")
+    audit = ",".join(tags) if tags else "flat"
+    return float(adj), audit
+
+
+def _stage2a_kept_all_conditioned_only_weak(
+    kept: List["Stage2ACandidate"],
+    *,
+    family_only: bool,
+) -> bool:
+    """kept 非空且非 family_only，且每条都仅有 conditioned_vec 证据（无 similar_to/family）。"""
+    if family_only or not kept:
+        return False
+    return all(_stage2a_is_conditioned_only_for_seed(x) for x in kept)
+
+
+def _stage2a_risky_term_prefix_dominated_by_pool(term: str, pool_terms: List[str]) -> bool:
+    """
+    同池存在更长拉丁术语且以此词为前缀 → 当前词更像截断/残片，不宜作 risky-only 唯一保底。
+    仅处理纯拉丁词面（无 CJK），避免误伤中文锚；最短前缀长度 4。
+    """
+    t = (term or "").strip().lower()
+    if len(t) < 4:
+        return False
+    if any("\u4e00" <= ch <= "\u9fff" for ch in t):
+        return False
+    for o in pool_terms:
+        ol = (o or "").strip().lower()
+        if ol == t or len(ol) < len(t) + 3:
+            continue
+        if any("\u4e00" <= ch <= "\u9fff" for ch in ol):
+            continue
+        if ol.startswith(t):
+            return True
+    return False
+
+
+def _stage2a_select_risky_only_fallback_one(
+    risky_keep: List["Stage2ACandidate"],
+    rank_key_fn: Any,
+) -> Tuple[List["Stage2ACandidate"], str]:
+    """
+    risky_only_fallback_1：必须留 1 条时，在 composite_rank 基础上优先避开「被同池更长词前缀覆盖」的残片形候选。
+    若全体均被覆盖或仅 1 条，则退回按 rank_key 择优。
+    """
+    if not risky_keep:
+        return [], "empty_risky_pool"
+    if len(risky_keep) == 1:
+        return risky_keep[:1], "single_risky_no_alternative"
+    terms = [getattr(c, "term", "") or "" for c in risky_keep]
+
+    def _pick_key(c: "Stage2ACandidate") -> Tuple[int, float, int]:
+        term = getattr(c, "term", "") or ""
+        dom = _stage2a_risky_term_prefix_dominated_by_pool(term, terms)
+        rk = float(rank_key_fn(c))
+        tl = len(term.strip())
+        # 先非残片覆盖（1），再 rank，再略长
+        return (1 if not dom else 0, rk, tl)
+
+    best = max(risky_keep, key=_pick_key)
+    any_non_dom = any(
+        not _stage2a_risky_term_prefix_dominated_by_pool(getattr(c, "term", "") or "", terms)
+        for c in risky_keep
+    )
+    if any_non_dom:
+        return [best], "prefer_non_prefix_dominated_over_fragment"
+    return [best], "all_prefix_dominated_use_best_rank"
+
+
 def select_primary_per_anchor(
     anchor: PreparedAnchor,
     candidates: List["Stage2ACandidate"],
@@ -4643,6 +4771,19 @@ def select_primary_per_anchor(
         )
         local_pref = float(_pref_snap.get("local_pref", 0.0) or 0.0)
         p_snap["local_primary_pref"] = local_pref
+        _m_cand = bool(getattr(c, "mainline_candidate", False))
+        _rank_adj, _rank_adj_audit = _stage2a_rank_adj_primary_stability(
+            c,
+            has_sim=_has_sim,
+            cond_only=_cond_only,
+            dual=_dual,
+            local_pref=local_pref,
+            mainline_candidate=_m_cand,
+        )
+        _local_rank_eff = float(local_pref) + float(_rank_adj)
+        p_snap["local_rank_adj"] = float(_rank_adj)
+        p_snap["local_rank_eff"] = float(_local_rank_eff)
+        p_snap["local_rank_adj_audit"] = _rank_adj_audit
 
         work_rows.append({
             "c": c,
@@ -4651,6 +4792,9 @@ def select_primary_per_anchor(
             "p_snap": p_snap,
             "axis_consistency_seed": axis_consistency_seed,
             "local_primary_pref": local_pref,
+            "local_rank_eff": _local_rank_eff,
+            "_rank_adj": _rank_adj,
+            "_rank_adj_audit": _rank_adj_audit,
             "_local_pref_snap": _pref_snap,
             "strong_expandable_ok": strong_expandable_ok,
             "weak_seed_ok": weak_seed_ok,
@@ -4672,8 +4816,9 @@ def select_primary_per_anchor(
 
     sorted_w = sorted(
         work_rows,
-        # local preference first；其后用 axis_seed/mainline/jd/ctx_cont 稳定打平
+        # local_rank_eff = local_pref + 轻量主位稳定 tie-break；其后用 axis_seed/mainline/jd/ctx_cont 稳定打平
         key=lambda ww: (
+            ww.get("local_rank_eff", ww.get("local_primary_pref", 0.0)),
             ww.get("local_primary_pref", 0.0),
             ww["axis_consistency_seed"],
             ww["_mlp"],
@@ -4706,6 +4851,8 @@ def select_primary_per_anchor(
                 f"  rank={ww['group_rank']}/{nw} term={(getattr(cc, 'term', '') or '')!r} "
                 f"pre_bucket={ww['pre_bucket']!r} axis_seed={ww['axis_consistency_seed']:.3f} "
                 f"local_pref={ww.get('local_primary_pref', 0.0):.3f} "
+                f"rank_eff={ww.get('local_rank_eff', ww.get('local_primary_pref', 0.0)):.3f} "
+                f"rank_adj={ww.get('_rank_adj', 0.0):+.3f}({ww.get('_rank_adj_audit', '')}) "
                 f"mainline_pref={ww['_mlp']:.3f} jd={ww['_jd']:.3f}"
             )
 
@@ -4844,6 +4991,25 @@ def select_primary_per_anchor(
             if STAGE2_NOISY_DEBUG and _is_stage2a_focus_case(anchor_term_sel, getattr(c, "term", "")):
                 _debug_stage2a_focus(anchor_term_sel, getattr(c, "term", ""), bucket, reason, p_snap)
 
+        # 单候选 + 仅 conditioned_vec：弱主位收口（保留 landing，禁止呈现为「主轴已站稳 / 可扩散主位」）
+        if len(candidates) == 1 and bucket != "reject":
+            if _stage2a_is_conditioned_only_weak_primary_case(c):
+                setattr(c, "mainline_candidate", False)
+                setattr(c, "weak_conditioned_only_single_keep", True)
+                setattr(c, "stage2a_weak_grounding_only", True)
+                _demoted_from = bucket
+                if bucket in ("primary_expandable", "primary_support_seed"):
+                    bucket = "primary_support_keep"
+                    reason = "conditioned_only_single_weak_demote"
+                    p_snap["can_expand_from_2a"] = False
+                if LABEL_EXPANSION_DEBUG:
+                    print(
+                        f"[Stage2A conditioned_only weak primary demote] anchor={anchor_term_sel!r} "
+                        f"term={(getattr(c, 'term', '') or '')!r} "
+                        f"from_bucket={_demoted_from!r} bucket={bucket!r} reason={reason!r} "
+                        f"note=weak_grounding_not_mainline_landing"
+                    )
+
         static_sim, ctx_sim, ctx_drop, _best = _stage2a_static_ctx_for_primary_expand_split(c)
 
         if bucket == "primary_support_keep" and _primary_ok and LABEL_EXPANSION_DEBUG:
@@ -4857,7 +5023,10 @@ def select_primary_per_anchor(
                 f"ctx_drop={_ps_drop:.3f} family={_fam:.3f} "
                 f"generic={_gen:.3f} poly={_poly:.3f} obj={_obj:.3f}"
             )
-        setattr(c, "is_good_mainline", bucket not in ("reject",))
+        if getattr(c, "stage2a_weak_grounding_only", False):
+            setattr(c, "is_good_mainline", False)
+        else:
+            setattr(c, "is_good_mainline", bucket not in ("reject",))
         setattr(c, "_stage2a_primary_snap", p_snap)
 
         if LABEL_EXPANSION_DEBUG and STAGE2_RULING_DEBUG:
@@ -4879,9 +5048,13 @@ def select_primary_per_anchor(
         if LABEL_EXPANSION_DEBUG and STAGE2_VERBOSE_DEBUG and not STAGE2_RULING_DEBUG:
             anchor_term = getattr(anchor, "anchor", "") or ""
             term_short = (getattr(c, "term", None) or "")[:28]
+            _wgs = ""
+            if getattr(c, "stage2a_weak_grounding_only", False):
+                _wgs = " weak_grounding_only=True"
             print(
                 f"[Stage2A primary/expand split] anchor={anchor_term!r} term={term_short!r} "
                 f"bucket={bucket!r} reason={reason!r} static={static_sim:.3f} ctx={ctx_sim:.3f} ctx_drop={ctx_drop:.3f}"
+                f"{_wgs}"
             )
 
         if bucket == "reject":
@@ -4996,13 +5169,33 @@ def select_primary_per_anchor(
         _MAX_RK = 1
         kept_seed = primary_support_seed[:_MAX_SD]
         kept_keep = primary_support_keep[:_MAX_SK]
+        risky_only_pick_reason = ""
         if kept_seed or kept_keep:
             risky_sorted = sorted(risky_keep, key=_rank_key, reverse=True)
             kept_risky = risky_sorted[:_MAX_RK]
             policy = f"quota_seed<={_MAX_SD}_sk<={_MAX_SK}_rk<={_MAX_RK}_when_sd_or_sk"
             why_risky = "retain_top_risky_as_evidence" if kept_risky else ""
         else:
-            kept_risky = risky_keep[:1]
+            if risky_keep:
+                kept_risky, risky_only_pick_reason = _stage2a_select_risky_only_fallback_one(
+                    risky_keep, _rank_key
+                )
+                if LABEL_EXPANSION_DEBUG:
+                    _rk_terms = [getattr(x, "term", "") for x in risky_keep]
+                    _rk_dom = {
+                        (getattr(x, "term", "") or ""): _stage2a_risky_term_prefix_dominated_by_pool(
+                            getattr(x, "term", "") or "", _rk_terms
+                        )
+                        for x in risky_keep
+                    }
+                    _rk_picked = getattr(kept_risky[0], "term", "") if kept_risky else ""
+                    print(
+                        f"[Stage2A risky fallback retain judge] anchor={anchor_term_sel!r} "
+                        f"pool={_rk_terms!r} prefix_dominated={_rk_dom!r} picked={_rk_picked!r} "
+                        f"why={risky_only_pick_reason!r}"
+                    )
+            else:
+                kept_risky = []
             policy = "risky_only_fallback_1"
             why_risky = "no_support_seed_and_no_support_keep" if kept_risky else ""
 
@@ -5019,6 +5212,7 @@ def select_primary_per_anchor(
                 f"  before: exp=0 sd={n_sd_b} {top_sd_b!r} | sk={n_sk_b} {top_sk_b!r} | rk={n_rk_b} {top_rk_b!r}\n"
                 f"  policy: {policy}\n"
                 f"  why_keep_risky_fallback: {why_risky!r}\n"
+                f"  risky_only_pick_reason: {risky_only_pick_reason!r}\n"
                 f"  after : sd={len(primary_support_seed)} {top_sd_a!r} | sk={len(primary_support_keep)} {top_sk_a!r} "
                 f"| rk={len(risky_keep)} {top_rk_a!r}"
             )
@@ -5419,8 +5613,11 @@ def select_primary_per_anchor(
     )
     landing_kept_count = len(kept_all)
 
+    # weak_landing 收口前快照：用于挡住「全池仅有 conditioned_vec」时的 good_landing 机械升格
+    all_cond_weak_pre_weak = _stage2a_kept_all_conditioned_only_weak(kept_all, family_only=family_only)
+
     # main_strong：top1 质量 + 漂移守卫后才允许 good_landing（避免仅靠 static sim 机械升格）
-    if stage2_mode == "main_strong_process" and (not family_only) and kept_all:
+    if stage2_mode == "main_strong_process" and (not family_only) and kept_all and (not all_cond_weak_pre_weak):
         def _top1_sim(c: "Stage2ACandidate") -> float:
             v = getattr(c, "semantic_score", None)
             if v is None:
@@ -5593,6 +5790,17 @@ def select_primary_per_anchor(
                     f"post_finalize_ok bridged_terms_tier={_bridged_terms!r}"
                 )
 
+    # 最终 kept：weak_landing/seed 桥之后重算；cond-only 弱池标签与 landing_reason 以此为准
+    kept_all_final = (
+        list(primary_expandable) + list(primary_support_seed) + list(primary_support_keep) + list(risky_keep)
+    )
+    landing_kept_count = len(kept_all_final)
+    all_cond_weak_final = _stage2a_kept_all_conditioned_only_weak(kept_all_final, family_only=family_only)
+    setattr(anchor, "landing_all_conditioned_only_weak", all_cond_weak_final)
+    if all_cond_weak_final:
+        landing_state = "weak_landing"
+        landing_reason = "conditioned_only_weak_grounding_pool"
+
     # 写回 anchor 级可读状态（Stage2B/日志/下游可读）
     setattr(anchor, "landing_state", landing_state)
     setattr(anchor, "landing_reason", landing_reason)
@@ -5658,10 +5866,12 @@ def select_primary_per_anchor(
         _m = (getattr(anchor, "stage2_process_mode", "") or "").strip()
         _lt_d = getattr(anchor, "landing_top1_drift", None)
         _sk_md = getattr(anchor, "landing_sk_pool_max_drift", None)
+        _cow = bool(getattr(anchor, "landing_all_conditioned_only_weak", False))
         print(
             f"[Stage2A landing summary] anchor={_anchor_text!r} stage2_process_mode={_m!r} "
             f"candidate_generated_count={candidate_generated_count} landing_kept_count={landing_kept_count} "
             f"landing_state={landing_state!r} landing_reason={landing_reason!r} "
+            f"cond_only_weak_pool={_cow} "
             f"landing_top1_drift={_lt_d!r} sk_pool_max_drift={_sk_md!r}"
         )
 
@@ -6861,6 +7071,87 @@ def _similar_to_pool_needs_conditioned_supplement(cands: List[LandingCandidate])
     return best < STAGE2A_SIMILAR_TO_WEAK_SIM
 
 
+def _retrieve_conditioned_supplement_main_strong_retry(
+    label: Any,
+    anchor: PreparedAnchor,
+    similar_to_candidates: List[LandingCandidate],
+    active_domain_set: Optional[Set[int]],
+    jd_field_ids: Optional[Set[str]],
+    jd_subfield_ids: Optional[Set[str]],
+    jd_topic_ids: Optional[Set[str]],
+    conditioned_top_k: Optional[int],
+    cap: int = 2,
+) -> Tuple[List[LandingCandidate], Dict[int, float], str]:
+    """
+    仅 main_strong：首轮 conditioned supplement 全空时的窄 retry（不放宽 aux/skip）。
+    仍经 merge_landing_candidates + select_primary_per_anchor，不保送。
+    """
+    setattr(anchor, "_cond_retry_strong_raw_hits", 0)
+    setattr(anchor, "_cond_retry_strong_post_hits", 0)
+    setattr(anchor, "_cond_retry_light_raw_hits", 0)
+    setattr(anchor, "_cond_retry_light_post_hits", 0)
+    if getattr(anchor, "conditioned_vec", None) is None or not getattr(label, "vocab_index", None):
+        return [], {}, "main_strong_retry_skipped_no_vec_or_index"
+    load_vocab_meta(label)
+    strong_vec = np.asarray(anchor.conditioned_vec, dtype=np.float32).flatten()
+    r_topk = (int(conditioned_top_k) + 12) if conditioned_top_k is not None else (STAGE2A_COLLECT_CONDITIONED_TOP_K + 12)
+    nbr, smap, sr_pre, sr_post = _faiss_conditioned_neighbors_once(
+        label,
+        anchor,
+        strong_vec,
+        similar_to_candidates,
+        r_topk,
+        active_domain_set,
+        jd_field_ids,
+        jd_subfield_ids,
+        jd_topic_ids,
+        "supplement_retry_strong",
+        main_strong_retry=True,
+    )
+    setattr(anchor, "_cond_retry_strong_raw_hits", sr_pre)
+    setattr(anchor, "_cond_retry_strong_post_hits", sr_post)
+    mode = "main_strong_retry_strong" if nbr else "main_strong_retry_strong_empty"
+    lr_pre, lr_post = 0, 0
+    if not nbr:
+        enc = getattr(label, "_query_encoder", None)
+        lt = (getattr(anchor, "light_conditioned_text", None) or "").strip()
+        at = (getattr(anchor, "anchor", "") or "").strip()
+        if enc and lt and at and _light_text_ok_for_conditioned_backoff(at, lt):
+            try:
+                raw_lv, _ = enc.encode(lt)
+                if raw_lv is not None:
+                    lv = np.asarray(raw_lv, dtype=np.float32).flatten()
+                    nbr2, smap2, lr_pre, lr_post = _faiss_conditioned_neighbors_once(
+                        label,
+                        anchor,
+                        lv,
+                        similar_to_candidates,
+                        r_topk,
+                        active_domain_set,
+                        jd_field_ids,
+                        jd_subfield_ids,
+                        jd_topic_ids,
+                        "supplement_retry_light",
+                        main_strong_retry=True,
+                    )
+                    nbr = nbr2
+                    smap = smap2
+                    mode = "main_strong_retry_light" if nbr else "main_strong_retry_light_empty"
+            except Exception:
+                pass
+        setattr(anchor, "_cond_retry_light_raw_hits", lr_pre)
+        setattr(anchor, "_cond_retry_light_post_hits", lr_post)
+    else:
+        # strong 已命中：retry 未走 light 路径，保持 0/0
+        setattr(anchor, "_cond_retry_light_raw_hits", 0)
+        setattr(anchor, "_cond_retry_light_post_hits", 0)
+    _cap_out = max(1, min(int(cap) if cap is not None else 2, 2))
+    nbr = nbr[:_cap_out]
+    if not nbr:
+        return [], {}, mode
+    return nbr, smap, mode
+
+
 def _retrieve_conditioned_supplement_capped(
     label: Any,
     anchor: PreparedAnchor,
@@ -6977,6 +7268,7 @@ def collect_landing_candidates(
         setattr(anchor, "_cond_strong_postfilter_hits", 0)
         setattr(anchor, "_cond_light_raw_hits", 0)
         setattr(anchor, "_cond_light_postfilter_hits", 0)
+        setattr(anchor, "conditioned_main_strong_retry_admitted", False)
     else:
         ctx_top_k = max(8, STAGE2A_COLLECT_CONDITIONED_TOP_K_RESCUE if weak_pool else STAGE2A_COLLECT_CONDITIONED_TOP_K)
         context_neighbors, _, _ = _retrieve_conditioned_supplement_capped(
@@ -6989,6 +7281,45 @@ def collect_landing_candidates(
             cap=CONDITIONED_SUPPLEMENT_MAX,
         )
         setattr(anchor, "conditioned_used_for_supplement", len(context_neighbors) > 0)
+        setattr(anchor, "conditioned_main_strong_retry_admitted", False)
+        # main_strong：首轮 supplement 未补到 FAISS 邻居时的窄 retry（略扩检索 + 轻门槛，仍进 merge/landing）
+        _ms = (getattr(anchor, "stage2_process_mode", "") or "").strip()
+        if len(context_neighbors) == 0 and _ms == "main_strong_process":
+            _n_before = 0
+            retry_nbr, _, retry_mode = _retrieve_conditioned_supplement_main_strong_retry(
+                label,
+                anchor,
+                similar_to_candidates,
+                active_domain_set=active_domain_set,
+                jd_field_ids=jd_field_ids,
+                jd_subfield_ids=jd_subfield_ids,
+                jd_topic_ids=jd_topic_ids,
+                conditioned_top_k=ctx_top_k,
+                cap=2,
+            )
+            _n_after = len(retry_nbr)
+            setattr(anchor, "conditioned_retry_mode", retry_mode)
+            if LABEL_EXPANSION_DEBUG:
+                print(
+                    f"[Stage2A conditioned retry] anchor={anchor.anchor!r} "
+                    f"triggered=True faiss_n_before={_n_before} faiss_n_after={_n_after} "
+                    f"retry_mode={retry_mode!r} "
+                    f"retry_strong_raw/post={getattr(anchor, '_cond_retry_strong_raw_hits', 0)}/"
+                    f"{getattr(anchor, '_cond_retry_strong_post_hits', 0)} "
+                    f"retry_light_raw/post={getattr(anchor, '_cond_retry_light_raw_hits', 0)}/"
+                    f"{getattr(anchor, '_cond_retry_light_post_hits', 0)}"
+                )
+            if retry_nbr:
+                context_neighbors = retry_nbr
+                setattr(anchor, "conditioned_retrieval_mode", retry_mode)
+                setattr(anchor, "conditioned_used_for_supplement", True)
+                setattr(anchor, "conditioned_main_strong_retry_admitted", True)
+                if LABEL_EXPANSION_DEBUG:
+                    _terms = [getattr(c, "term", "") for c in retry_nbr[:3]]
+                    print(
+                        f"[Stage2A conditioned backoff admit] anchor={anchor.anchor!r} "
+                        f"admitted_n={_n_after} terms={_terms!r} note=merged_into_pool_not_promoted"
+                    )
     # 2) family：仅「仍无任何候选」时的弱保底（弱边 / 证据后移，不当主召回）
     family_cands: List[LandingCandidate] = []
     if len(similar_to_candidates) + len(context_neighbors) == 0 and _is_canonical_academic_like_anchor(anchor):
@@ -7160,6 +7491,10 @@ def collect_landing_candidates(
             "candidate_generated_count": len(cands),
             "weak_similar_to_pool": weak_pool,
             "conditioned_faiss_enabled": bool(can_faiss),
+            "conditioned_main_strong_retry_admitted": bool(
+                getattr(anchor, "conditioned_main_strong_retry_admitted", False)
+            ),
+            "conditioned_retry_mode": getattr(anchor, "conditioned_retry_mode", None),
         },
     )
     if LABEL_EXPANSION_DEBUG:
@@ -7180,7 +7515,9 @@ def collect_landing_candidates(
             f"similar_to_count={n_raw_sim} conditioned_supplement_count={n_raw_ctx} "
             f"family_fallback_count={len(family_cands)} final_candidate_count={len(cands)} "
             f"conditioned_used_for_scoring={getattr(anchor, 'conditioned_used_for_scoring', False)} "
-            f"conditioned_used_for_supplement={getattr(anchor, 'conditioned_used_for_supplement', False)}"
+            f"conditioned_used_for_supplement={getattr(anchor, 'conditioned_used_for_supplement', False)} "
+            f"main_strong_retry_admitted={getattr(anchor, 'conditioned_main_strong_retry_admitted', False)} "
+            f"retry_mode={getattr(anchor, 'conditioned_retry_mode', None)!r}"
         )
         print(
             f"[Stage2A landing source_distribution] anchor={anchor.anchor!r} "
@@ -7193,7 +7530,13 @@ def collect_landing_candidates(
             f"surface_conditioned_cosine={getattr(anchor, 'surface_conditioned_cosine', None)} "
             f"conditioned_retrieval_mode={getattr(anchor, 'conditioned_retrieval_mode', '')!r} "
             f"strong_raw/post={getattr(anchor, '_cond_strong_raw_hits', None)}/{getattr(anchor, '_cond_strong_postfilter_hits', None)} "
-            f"light_raw/post={getattr(anchor, '_cond_light_raw_hits', None)}/{getattr(anchor, '_cond_light_postfilter_hits', None)}"
+            f"light_raw/post={getattr(anchor, '_cond_light_raw_hits', None)}/{getattr(anchor, '_cond_light_postfilter_hits', None)} "
+            f"retry_admitted={getattr(anchor, 'conditioned_main_strong_retry_admitted', False)} "
+            f"retry_mode={getattr(anchor, 'conditioned_retry_mode', None)!r} "
+            f"retry_strong_raw/post={getattr(anchor, '_cond_retry_strong_raw_hits', None)}/"
+            f"{getattr(anchor, '_cond_retry_strong_post_hits', None)} "
+            f"retry_light_raw/post={getattr(anchor, '_cond_retry_light_raw_hits', None)}/"
+            f"{getattr(anchor, '_cond_retry_light_post_hits', None)}"
         )
         print(
             f"[Stage2A landing merge_counts] raw_similar_to={n_raw_sim} raw_conditioned_vec={n_raw_ctx} "

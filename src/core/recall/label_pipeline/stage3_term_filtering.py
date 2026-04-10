@@ -3708,6 +3708,10 @@ def run_stage3(
         print(f"stage4_prep_selected={stage4_prep_result.get('stage4_prep_selected')}")
         print(f"stage4_prep_rejected_pre_coverage={stage4_prep_result.get('stage4_prep_rejected_pre_coverage')}")
         print(f"boundary_source={stage4_prep_result.get('boundary_source')!r}")
+        _pd = stage4_prep_result.get("prep_debug") or {}
+        if isinstance(_pd, dict):
+            print(f"stage4_prep_lane_counter={_pd.get('stage4_prep_lane_counter')!r}")
+            print(f"stage4_prep_reason_counter={_pd.get('stage4_prep_reason_counter')!r}")
         print(
             "note: Stage4 prep uses continuous bridge (final/gc_pre/lf/bb/risk) + paper_ready; "
             "stage3_bucket is weak prior (readiness mult / risky quota), not a duplicate hard sort."
