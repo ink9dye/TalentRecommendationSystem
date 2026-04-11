@@ -48,14 +48,24 @@ PAPER_AUTHOR_FANOUT_SOFT_K = 4.0
 PAPER_AUTHOR_FANOUT_MIN_FACTOR = 0.72
 PAPER_AUTHOR_FANOUT_MAX_COUNT = 12
 STAGE5_FANOUT_AUDIT = True
-# True：打印 single-paper side-driven suppression **audit**（仅旁路识别，不改作者分）
+# True：打印 single-paper side-driven suppression **audit**（窄门识别；实际乘子见下方 penalty）
 STAGE5_SINGLE_PAPER_SIDE_DRIVEN_SUPPRESSION_AUDIT = True
+# True：对「单篇 + side-driven + 无主线托底」作者在 support-only 之后乘温和因子（不改论文分、不碰 Stage4）
+STAGE5_SINGLE_PAPER_SIDE_DRIVEN_PENALTY_ENABLED = True
+STAGE5_SINGLE_PAPER_SIDE_DRIVEN_PENALTY_AUDIT = True
+# fringe 顶篇更强；非 primary 且非 fringe 时略轻（与 Stage4 角色一致）
+STAGE5_SINGLE_PAPER_SIDE_DRIVEN_STRONG_PENALTY = 0.72
+STAGE5_SINGLE_PAPER_SIDE_DRIVEN_MILD_PENALTY = 0.85
 # True：打印 [Stage5 broad-mainline dominance audit]（宽主词/umbrella 独占；与 side-driven 正交；不改分）
 STAGE5_BROAD_MAINLINE_DOMINANCE_AUDIT = os.environ.get("STAGE5_BROAD_MAINLINE_DOMINANCE_AUDIT", "1").strip().lower() not in (
     "0",
     "false",
     "no",
 )
+# True：在 fanout 之后、accumulate_author_scores 之前，对多作者论文按图 pos_weight 排序叠加调和 Zipf（1,1/2,… 归一）× 图权重；全相等则等权 fallback（不猜顺序）
+STAGE5_AUTHORSHIP_WEIGHTING_ENABLED = True
+STAGE5_AUTHORSHIP_WEIGHTING_AUDIT = True
+STAGE5_AUTHORSHIP_WEIGHTING_MAX_PREVIEW = 4
 
 # 从 Stage4 透传的论文旁路字段，供 suppression audit 读取（不改 Stage4，仅 Stage5 合并时保留）
 _STAGE5_PAPER_AUDIT_COPY_KEYS = (
@@ -88,6 +98,180 @@ STAGE5_BROAD_MAINLINE_MHR_EXCLUDE_MIN = float(os.environ.get("STAGE5_BROAD_MAINL
 _STAGE5_MAINLINE_HIT_QUALITY = frozenset(
     {"mainline_resonance", "mainline_plus_support", "single_hit_mainline"}
 )
+
+
+def _stage5_harmonic_zipf_fracs(n: int) -> List[float]:
+    """调和型 Zipf：第 k 位比例 ∝ 1/k，归一化使分量和为 1（再与图 pos_weight 相乘）。"""
+    if n <= 0:
+        return []
+    raw = [1.0 / float(k) for k in range(1, n + 1)]
+    s = sum(raw)
+    if s <= 1e-18:
+        return [1.0 / float(n)] * n
+    return [x / s for x in raw]
+
+
+def _stage5_apply_authorship_zipf_weights_to_papers(
+    papers_for_agg: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    在 fanout 已作用到 p['score'] 之后，仅改写各 author 的 pos_weight（不改论文分、不改 Stage4）。
+    - 图关系 r.pos_weight 在 Stage4 已写入 paper.weight → 此处读 a['pos_weight']。
+    - 多作者且图权重不全相同：按 (pos_weight, aid) 升序视为署名序，叠加调和 Zipf 后与图权重相乘。
+    - 多作者且图权重全相同：fallback_equal，不叠加 Zipf（避免在顺序不明时误伤）。
+    """
+    by_wid: Dict[str, Any] = {}
+    ctr = collections.Counter()
+    tail_ratios: List[float] = []
+
+    for p in papers_for_agg or []:
+        wid = str(p.get("wid") or "")
+        authors = p.get("authors") or []
+        n = len(authors)
+        if n == 0:
+            ctr["empty"] += 1
+            p["authorship_weight_mode"] = "empty"
+            by_wid[wid] = {"mode": "empty", "authors_n": 0}
+            continue
+        if n == 1:
+            ctr["single_author"] += 1
+            a0 = authors[0]
+            gw0 = max(0.0, float(a0.get("pos_weight") or 1.0))
+            p["authorship_weight_mode"] = "single_author"
+            by_wid[wid] = {
+                "mode": "single_author",
+                "authors_n": 1,
+                "paper_score_after_fanout": float(p.get("score") or 0.0),
+                "fanout_factor": float(p.get("fanout_factor") or 1.0),
+                "preview": [(str(a0.get("aid")), gw0, 1.0, gw0)],
+            }
+            continue
+
+        graph_ws = [max(0.0, float(x.get("pos_weight") or 1.0)) for x in authors]
+        if all(g <= 1e-18 for g in graph_ws):
+            graph_ws = [1.0] * n
+
+        rounded = {round(g, 6) for g in graph_ws}
+        if len(rounded) == 1:
+            ctr["fallback_equal"] += 1
+            p["authorship_weight_mode"] = "fallback_equal"
+            by_wid[wid] = {
+                "mode": "fallback_equal",
+                "authors_n": n,
+                "reason": "all_graph_pos_weight_equal",
+                "paper_score_after_fanout": float(p.get("score") or 0.0),
+                "fanout_factor": float(p.get("fanout_factor") or 1.0),
+            }
+            continue
+
+        idx_order = sorted(range(n), key=lambda i: (graph_ws[i], str(authors[i].get("aid") or "")))
+        z_fracs = _stage5_harmonic_zipf_fracs(n)
+        new_w = [0.0] * n
+        for rank, idx in enumerate(idx_order):
+            new_w[idx] = max(1e-18, graph_ws[idx] * z_fracs[rank])
+
+        for i, auth in enumerate(authors):
+            auth["pos_weight_before_authorship"] = graph_ws[i]
+            auth["pos_weight"] = new_w[i]
+
+        tot_sw = sum(new_w)
+        shares = [x / tot_sw for x in new_w]
+        first_s = shares[idx_order[0]]
+        last_s = shares[idx_order[-1]]
+        if first_s > 1e-12:
+            tail_ratios.append(last_s / first_s)
+
+        ctr["zipf_ranked"] += 1
+        p["authorship_weight_mode"] = "zipf_ranked"
+
+        preview: List[Dict[str, Any]] = []
+        for rank in range(min(STAGE5_AUTHORSHIP_WEIGHTING_MAX_PREVIEW, n)):
+            idx = idx_order[rank]
+            preview.append(
+                {
+                    "aid": str(authors[idx].get("aid")),
+                    "graph_pos_weight": graph_ws[idx],
+                    "zipf_frac_of_rank": z_fracs[rank],
+                    "combined_pos_weight": new_w[idx],
+                    "share_of_paper": shares[idx],
+                }
+            )
+
+        by_wid[wid] = {
+            "mode": "zipf_ranked",
+            "authors_n": n,
+            "paper_score_after_fanout": float(p.get("score") or 0.0),
+            "score_before_fanout": float(p.get("score_before_fanout") or 0.0),
+            "fanout_factor": float(p.get("fanout_factor") or 1.0),
+            "tail_to_head_share_ratio": (last_s / first_s) if first_s > 1e-12 else None,
+            "preview": preview,
+        }
+
+    out: Dict[str, Any] = {
+        "by_wid": by_wid,
+        "counters": dict(ctr),
+        "tail_to_head_share_ratio_mean": float(np.mean(tail_ratios)) if tail_ratios else None,
+        "tail_to_head_share_ratio_median": float(np.median(tail_ratios)) if tail_ratios else None,
+    }
+    return out
+
+
+def _print_stage5_authorship_weighting_audit(
+    papers_for_agg: List[Dict[str, Any]],
+    stats: Dict[str, Any],
+    recall: Any,
+    detail_limit: int = 14,
+) -> None:
+    if not _label_recall_stdout_enabled(recall) or not STAGE5_AUTHORSHIP_WEIGHTING_AUDIT:
+        return
+    print("\n" + "-" * 80)
+    print("[Stage5 authorship Zipf-style weighting audit]")
+    print("-" * 80)
+    if not papers_for_agg:
+        print("papers=0")
+        print("-" * 80 + "\n")
+        return
+    ctr = (stats or {}).get("counters") or {}
+    print(
+        f"papers_total={len(papers_for_agg)} "
+        f"zipf_ranked={ctr.get('zipf_ranked', 0)} "
+        f"fallback_equal={ctr.get('fallback_equal', 0)} "
+        f"single_author={ctr.get('single_author', 0)} "
+        f"empty_authors={ctr.get('empty', 0)}"
+    )
+    tr_mean = (stats or {}).get("tail_to_head_share_ratio_mean")
+    tr_med = (stats or {}).get("tail_to_head_share_ratio_median")
+    if tr_mean is not None:
+        print(
+            f"multi_author_zipf tail/head_share_ratio mean={tr_mean:.4f} median={tr_med:.4f} "
+            "(last_author_share / first_author_share; lower = thinner tail)"
+        )
+    multi = [p for p in papers_for_agg if len(p.get("authors") or []) > 1]
+    multi_sorted = sorted(multi, key=lambda x: len(x.get("authors") or []), reverse=True)[
+        : max(detail_limit, 1)
+    ]
+    print(f"--- sample papers (multi-author first, max {detail_limit}) ---")
+    print("wid | authors_n | mode | score_post_fanout | fanout_f | head/tail share ratio | preview(aid:share)")
+    for p in multi_sorted:
+        wid = str(p.get("wid") or "")
+        au = p.get("authors") or []
+        m = len(au)
+        mode = str(p.get("authorship_weight_mode") or "?")
+        s_pf = float(p.get("score") or 0.0)
+        ff = float(p.get("fanout_factor") or 1.0)
+        meta = ((stats or {}).get("by_wid") or {}).get(wid) or {}
+        thr = meta.get("tail_to_head_share_ratio")
+        pr = meta.get("preview") or []
+        pr_s = []
+        for row in pr[:3]:
+            pr_s.append(
+                f"{row.get('aid')!s}:{float(row.get('share_of_paper') or 0.0):.2f}"
+            )
+        print(
+            f"{wid[:18]:18} | {m:^9} | {mode:16} | {s_pf:17.6f} | {ff:8.3f} | "
+            f"{str(thr) if thr is not None else 'n/a':^20} | {', '.join(pr_s)}"
+        )
+    print("-" * 80 + "\n")
 
 
 def _stage5_count_primary_evidence_papers(papers: List[Dict[str, Any]]) -> int:
@@ -233,6 +417,142 @@ def _stage5_is_single_paper_side_driven_author(
         return False, meta
 
     return True, meta
+
+
+def _stage5_single_paper_side_driven_penalty_factor(
+    aid: str,
+    author_record: Optional[Dict[str, Any]],
+    scored_row: Dict[str, Any],
+    paper_map: Dict[str, Dict[str, Any]],
+    author_top_works: Dict[str, List[Tuple[str, float]]],
+    term_cap_audit: Dict[str, Dict[str, Any]],
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    极窄门：在既有 suppression audit 命中前提下，再要求 Stage4 侧叙事为「side-driven」单篇托底；
+    按顶篇 paper_evidence_role 分两档温和乘子（0.72 / 0.85），不误伤 single-paper mainline。
+    """
+    out: Dict[str, Any] = {"penalty_status": "disabled", "author_id": str(aid)}
+    if not STAGE5_SINGLE_PAPER_SIDE_DRIVEN_PENALTY_ENABLED:
+        return 1.0, out
+
+    hit, meta = _stage5_is_single_paper_side_driven_author(
+        aid, author_record, scored_row, paper_map, author_top_works, term_cap_audit
+    )
+    out = {**meta, "penalty_status": "no_penalty"}
+
+    summary = (author_record or {}).get("author_payload_summary") if author_record else None
+    summary = summary if isinstance(summary, dict) else {}
+
+    if not hit:
+        out["penalty_status"] = "audit_not_hit"
+        return 1.0, out
+
+    sup_cls = str(summary.get("author_support_class") or "").strip()
+    if sup_cls != "single_paper_supported":
+        out["penalty_status"] = "skip_support_class"
+        out["author_support_class_seen"] = sup_cls or None
+        return 1.0, out
+
+    reason_s = str(summary.get("author_reason_summary") or "").lower()
+    ml_ct = int(summary.get("mainline_paper_count") or 0)
+    so_ct = int(summary.get("side_only_paper_count") or 0)
+    side_driven_narrative = (
+        "side-driven" in reason_s
+        or "side driven" in reason_s
+        or (so_ct >= 1 and ml_ct == 0)
+    )
+    if not side_driven_narrative:
+        out["penalty_status"] = "skip_not_side_driven_narrative"
+        out["author_reason_summary"] = summary.get("author_reason_summary")
+        return 1.0, out
+
+    top_role = str(meta.get("author_top_paper_evidence_role") or "").strip()
+    if top_role == "primary_evidence":
+        out["penalty_status"] = "skip_primary_evidence"
+        return 1.0, out
+
+    if top_role == "fringe_evidence":
+        factor = float(STAGE5_SINGLE_PAPER_SIDE_DRIVEN_STRONG_PENALTY)
+        tier = "strong_fringe_evidence"
+    else:
+        factor = float(STAGE5_SINGLE_PAPER_SIDE_DRIVEN_MILD_PENALTY)
+        tier = "mild_non_primary"
+
+    trigger_reasons = [
+        "narrow_gate:single_paper_side_driven_suppression_audit_hit",
+        "author_support_class=single_paper_supported",
+        "side_driven_narrative_ok",
+        f"penalty_tier={tier}",
+        f"top_paper_evidence_role={top_role}",
+    ]
+    out.update(
+        {
+            "penalty_status": "applied",
+            "penalty_factor": factor,
+            "penalty_tier": tier,
+            "trigger_reasons": trigger_reasons,
+            "top_paper_hit_quality_class": meta.get("top_paper_hit_quality_class"),
+            "top_paper_evidence_role": top_role,
+            "dominant_term_share": meta.get("dominant_term_share"),
+            "mainline_support_ratio": meta.get("mainline_support_ratio"),
+            "author_primary_evidence_count": meta.get("author_primary_evidence_count"),
+        }
+    )
+    return factor, out
+
+
+def _print_stage5_single_paper_side_driven_penalty_audit(
+    penalty_by_aid: Dict[str, Dict[str, Any]],
+    author_record_by_aid: Dict[str, Dict[str, Any]],
+    recall: Any,
+) -> None:
+    if not _label_recall_stdout_enabled(recall) or not STAGE5_SINGLE_PAPER_SIDE_DRIVEN_PENALTY_AUDIT:
+        return
+    rows = [
+        v
+        for v in (penalty_by_aid or {}).values()
+        if isinstance(v, dict) and v.get("penalty_applied")
+    ]
+    if not rows:
+        print("\n" + "-" * 80)
+        print("[Stage5 single-paper side-driven author penalty audit]")
+        print("-" * 80)
+        print("penalty_applied_count=0")
+        print("-" * 80 + "\n")
+        return
+
+    print("\n" + "-" * 80)
+    print("[Stage5 single-paper side-driven author penalty audit]")
+    print("-" * 80)
+    print(f"penalty_applied_count={len(rows)}")
+    print(
+        "author_id | author_name | original_score | penalty_factor | score_after_penalty | "
+        "top_hqc | top_evidence_role | dom_share | mhr | pri_ct | reasons"
+    )
+    print("-" * 80)
+    for r in sorted(rows, key=lambda x: float(x.get("original_score") or 0.0), reverse=True):
+        aid = str(r.get("author_id") or "")
+        ar = author_record_by_aid.get(aid) or {}
+        name = (
+            (ar.get("name") if isinstance(ar.get("name"), str) else None)
+            or (ar.get("author_name") if isinstance(ar.get("author_name"), str) else None)
+            or ""
+        )
+        rs = r.get("trigger_reasons")
+        rs_s = "; ".join(str(x) for x in (rs or []) if x)[:220]
+        print(
+            f"{aid:16} | {str(name)[:24]:24} | "
+            f"{float(r.get('original_score') or 0.0):14.6f} | "
+            f"{float(r.get('penalty_factor') or 1.0):14.4f} | "
+            f"{float(r.get('score_after_penalty') or 0.0):19.6f} | "
+            f"{str(r.get('top_paper_hit_quality_class') or '')[:16]} | "
+            f"{str(r.get('top_paper_evidence_role') or '')[:18]} | "
+            f"{r.get('dominant_term_share')} | "
+            f"{r.get('mainline_support_ratio')} | "
+            f"{r.get('author_primary_evidence_count')} | "
+            f"{rs_s!r}"
+        )
+    print("-" * 80 + "\n")
 
 
 def _stage5_apply_suppression_audit_fields(
@@ -1144,6 +1464,8 @@ def run_stage5(
     阶段 5：作者打分与排序。论文贡献 → 作者×词矩阵 → 同词递减 → TERM_MAX_AUTHOR_SHARE → 时间权重
     → 结构乘子（分立 structure_factor + st/paper/mtp 三连乘，强词阈 0.35·max）
     → **support-only 作者乘子**（有 **sup_only** 论文、无 **primary 同框** 论文、**top_pri_c≈0** 且 **sup_share** 高时压分）
+    → **single-paper side-driven 窄门乘子**（在既有 suppression audit 与 Stage4「side-driven」叙事一致时，对顶篇 fringe 略强、其余非 primary 略轻；与 fanout/term cap/ broad-mainline audit 正交）
+    → **authorship Zipf-style pos_weight**（fanout 之后、accumulate 之前：图 pos_weight 不全等时按序叠加调和 1/k×图权；全等则等权 fallback）
     → 新作比 → 归一化排序。
     返回 (author_id_list, last_debug_info)。
     """
@@ -1394,6 +1716,20 @@ def run_stage5(
     stage5_sub_ms["author_fanout_penalty"] = (t3_fan - t_fan0) * 1000.0
     _print_stage5_paper_fanout_audit(papers_for_agg, paper_hit_terms, recall=recall)
 
+    authorship_w_stats: Dict[str, Any] = {
+        "enabled": bool(STAGE5_AUTHORSHIP_WEIGHTING_ENABLED),
+        "skipped": True,
+    }
+    t_auth0 = time.perf_counter()
+    if STAGE5_AUTHORSHIP_WEIGHTING_ENABLED and papers_for_agg:
+        authorship_w_stats = _stage5_apply_authorship_zipf_weights_to_papers(papers_for_agg)
+        authorship_w_stats["enabled"] = True
+        authorship_w_stats["skipped"] = False
+        _print_stage5_authorship_weighting_audit(papers_for_agg, authorship_w_stats, recall=recall)
+    t_auth1 = time.perf_counter()
+    stage5_sub_ms["authorship_zipf_weighting"] = (t_auth1 - t_auth0) * 1000.0
+
+    t_accum0 = time.perf_counter()
     agg_result = accumulate_author_scores(papers_for_agg, top_k_per_author=3)
     author_scores = agg_result.author_scores
     author_top_works = agg_result.author_top_works
@@ -1401,7 +1737,7 @@ def run_stage5(
     author_evidence_by_term_role = aggregate_author_evidence_by_term_role(papers_for_agg)
 
     t3a = time.perf_counter()
-    stage5_sub_ms["accumulate_authors"] = (t3a - t3_fan) * 1000.0
+    stage5_sub_ms["accumulate_authors"] = (t3a - t_accum0) * 1000.0
 
     term_paper_contrib: Dict[str, List[Tuple[str, float]]] = collections.defaultdict(list)
     for p in papers_for_agg:
@@ -1495,6 +1831,7 @@ def run_stage5(
     wid_n_terms = _wid_nonzero_term_counts(papers_for_agg)
     author_structure_audit: Dict[str, Dict[str, Any]] = {}
     support_only_penalty_rows: List[Dict[str, Any]] = []
+    single_paper_side_penalty_by_aid: Dict[str, Dict[str, Any]] = {}
 
     if author_scores:
         years_by_author: Dict[str, List[Any]] = {}
@@ -1560,10 +1897,52 @@ def run_stage5(
         stage5_sub_ms["support_only_author_penalty"] = (
             (time.perf_counter() - t_sup_pen0) * 1000.0
         )
+
+        t_sp_pen0 = time.perf_counter()
+        if STAGE5_SINGLE_PAPER_SIDE_DRIVEN_PENALTY_ENABLED:
+            for aid in list(author_scores.keys()):
+                aid_s = str(aid)
+                ar = author_record_by_aid.get(aid_s)
+                pc_fb = int(author_raw_paper_cnt.get(aid, len(author_top_works.get(aid_s, []))))
+                scored_stub = {"paper_count": pc_fb}
+                factor, pmeta = _stage5_single_paper_side_driven_penalty_factor(
+                    aid_s,
+                    ar,
+                    scored_stub,
+                    paper_map,
+                    author_top_works,
+                    term_cap_audit_records,
+                )
+                before_sp = float(author_scores[aid])
+                if factor < 1.0 - 1e-15:
+                    after_sp = before_sp * float(factor)
+                    author_scores[aid] = after_sp
+                    single_paper_side_penalty_by_aid[aid_s] = {
+                        "penalty_applied": True,
+                        "author_id": aid_s,
+                        "original_score": before_sp,
+                        "score_after_penalty": after_sp,
+                        "penalty_factor": float(factor),
+                        "trigger_reasons": pmeta.get("trigger_reasons") or [],
+                        "top_paper_hit_quality_class": pmeta.get("top_paper_hit_quality_class"),
+                        "top_paper_evidence_role": pmeta.get("top_paper_evidence_role"),
+                        "dominant_term_share": pmeta.get("dominant_term_share"),
+                        "mainline_support_ratio": pmeta.get("mainline_support_ratio"),
+                        "author_primary_evidence_count": pmeta.get("author_primary_evidence_count"),
+                    }
+        stage5_sub_ms["single_paper_side_driven_author_penalty"] = (
+            (time.perf_counter() - t_sp_pen0) * 1000.0
+        )
     else:
         stage5_sub_ms["support_only_author_penalty"] = 0.0
+        stage5_sub_ms["single_paper_side_driven_author_penalty"] = 0.0
 
     _print_stage5_support_only_penalty_audit(support_only_penalty_rows, recall=recall)
+    _print_stage5_single_paper_side_driven_penalty_audit(
+        single_paper_side_penalty_by_aid,
+        author_record_by_aid,
+        recall,
+    )
 
     t6 = time.perf_counter()
     stage5_sub_ms["time_and_family"] = (t6 - t5) * 1000.0
@@ -1635,11 +2014,18 @@ def run_stage5(
 
         evidence = author_evidence_by_term_role.get(aid, {})
         _srec = author_structure_audit.get(str(aid), {})
+        _sp_pen = single_paper_side_penalty_by_aid.get(str(aid)) or {}
         scored_authors.append(
             {
                 "aid": aid,
                 "score": final_score,
                 "raw_score": total_score,
+                "single_paper_side_driven_penalty_factor": float(
+                    _sp_pen.get("penalty_factor") or 1.0
+                ),
+                "score_before_single_paper_side_penalty": _sp_pen.get("original_score"),
+                "single_paper_side_driven_penalty_applied": bool(_sp_pen.get("penalty_applied")),
+                "single_paper_side_driven_penalty_reasons": _sp_pen.get("trigger_reasons") or [],
                 "top_paper": best_paper,
                 "paper_count": paper_cnt_author,
                 "top_papers": top_papers,
@@ -1903,6 +2289,7 @@ def run_stage5(
         "author_evidence_by_term_role": author_evidence_debug,
         "stage5_term_cap_audit": stage5_term_cap_audit_out,
         "stage5_author_structure_audit": stage5_author_structure_audit_out,
+        "stage5_authorship_weighting": authorship_w_stats,
         "stage5_sub_ms": stage5_sub_ms,
     }
     if debug_1 and debug_1.get("stage1_sub_ms") is not None:
