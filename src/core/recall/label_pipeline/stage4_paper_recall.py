@@ -106,6 +106,33 @@ STAGE4_KEEP_COHESIVE_MULT_SIDE_ACCIDENTAL = 0.990
 STAGE4_KEEP_COHESIVE_MULT_SIDE_HEAVY_NO_ML = 0.988
 STAGE4_KEEP_COHESIVE_MULT_AXIS_WITH_MAINLINE = 1.004
 STAGE4_KEEP_COHESIVE_AXIS_MIN_LABELS = 2
+# 旁路：最终 kept 中残余 side 论文只读观测（不改分、不改 keep、不改序）
+STAGE4_SIDE_RESIDUAL_AUDIT = os.environ.get("STAGE4_SIDE_RESIDUAL_AUDIT", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+STAGE4_SIDE_RESIDUAL_AUDIT_PREVIEW_K = int(os.environ.get("STAGE4_SIDE_RESIDUAL_AUDIT_PREVIEW_K", "8"))
+# 与 Stage4 multi-hit 分类一致：仅这两类视为「side residual」主判（不另造体系）
+_STAGE4_SIDE_RESIDUAL_HIT_QUALITY_CLASSES: Tuple[str, ...] = (
+    "single_hit_side",
+    "side_only_or_accidental_multi_hit",
+)
+# keep compete 极末段：无主线托底的 fringe·single-hit-side·support-only 残余（叠乘在 compete 链上；**不**改 paper_final_score_v2）
+STAGE4_RESIDUAL_SIDE_PENALTY_ENABLED = os.environ.get("STAGE4_RESIDUAL_SIDE_PENALTY_ENABLED", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+STAGE4_RESIDUAL_SIDE_PENALTY_MULT_MILD = float(os.environ.get("STAGE4_RESIDUAL_SIDE_PENALTY_MULT_MILD", "0.975"))
+STAGE4_RESIDUAL_SIDE_PENALTY_MULT_STRONGER = float(os.environ.get("STAGE4_RESIDUAL_SIDE_PENALTY_MULT_STRONGER", "0.970"))
+STAGE4_RESIDUAL_SIDE_PENALTY_MULT_FLOOR = float(os.environ.get("STAGE4_RESIDUAL_SIDE_PENALTY_MULT_FLOOR", "0.95"))
+STAGE4_RESIDUAL_SIDE_PENALTY_AUDIT = os.environ.get("STAGE4_RESIDUAL_SIDE_PENALTY_AUDIT", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+STAGE4_RESIDUAL_SIDE_PENALTY_AUDIT_TOP_K = int(os.environ.get("STAGE4_RESIDUAL_SIDE_PENALTY_AUDIT_TOP_K", "8"))
 # 收窄 JD overlap：field 单层高阈值；subfield/topic 单独阈值（避免 53/53 宽场沾边即 True）
 STAGE4_JD_OVERLAP_TOPIC_MIN = float(os.environ.get("STAGE4_JD_OVERLAP_TOPIC_MIN", "0.032"))
 STAGE4_JD_OVERLAP_SUBFIELD_MIN = float(os.environ.get("STAGE4_JD_OVERLAP_SUBFIELD_MIN", "0.042"))
@@ -651,6 +678,10 @@ def _stage4_keep_compete_example_line(wid: str, rec: Any) -> str:
         cf = 1.0
     crs = rec.get("keep_cohesive_reasons") or []
     crs_s = ",".join(str(x) for x in crs[:4])
+    try:
+        rsf = float(rec.get("residual_side_keep_penalty_factor") or 1.0)
+    except (TypeError, ValueError):
+        rsf = 1.0
     return (
         f"wid={wid} title={title!r} "
         f"candidate_source_role={rec.get('candidate_source_role')} "
@@ -663,6 +694,7 @@ def _stage4_keep_compete_example_line(wid: str, rec: Any) -> str:
         f"paper_old_score={old_s:.6f} "
         f"paper_final_score_v2={v2:.6f} "
         f"paper_compete_pre_cohesive={pck:.6f} keep_cohesive_factor={cf:.4f} [{crs_s}] "
+        f"residual_side_pf={rsf:.4f} "
         f"paper_compete_score_for_keep={ck:.6f}"
     )
 
@@ -1398,6 +1430,9 @@ _STAGE4_PAPER_EXPLANATION_KEYS = (
     "paper_compete_score_for_keep_pre_cohesive",
     "keep_cohesive_factor",
     "keep_cohesive_reasons",
+    "paper_compete_score_for_keep_pre_residual_side_penalty",
+    "residual_side_keep_penalty_factor",
+    "residual_side_keep_penalty_reason",
 )
 
 
@@ -3205,6 +3240,88 @@ def _stage4_hit_quality_dist_for_wid_set(by_wid: Dict[str, Dict[str, Any]], wid_
     return dict(ctr)
 
 
+def _stage4_hits_support_only_no_primary_lane(rec: Dict[str, Any]) -> bool:
+    """hits 全为 support 语义、无 paper_primary 类主线命中（安全只读）。"""
+    hits = rec.get("hits")
+    if not isinstance(hits, list) or len(hits) == 0:
+        return False
+    any_support = False
+    for h in hits:
+        if not isinstance(h, dict):
+            continue
+        role = str(h.get("role") or "").strip().lower()
+        if role in ("paper_primary", "primary"):
+            return False
+        if "primary" in role and "support" not in role:
+            return False
+        if "support" in role or role.endswith("_support"):
+            any_support = True
+    return bool(any_support)
+
+
+def _is_stage4_fringe_single_side_residual(rec: Dict[str, Any]) -> bool:
+    """
+    极窄门：single_hit_side + fringe_evidence + 无主线托底 + support-only 单命中 + topic_cohesive 候选 + JD overlap。
+    不压 mainline_plus_support / single_hit_mainline（由 hqc 直接排除）。
+    """
+    if not isinstance(rec, dict):
+        return False
+    if str(rec.get("hit_quality_class") or "").strip() != "single_hit_side":
+        return False
+    if str(rec.get("paper_evidence_role") or "").strip() != "fringe_evidence":
+        return False
+    try:
+        ml = int(rec.get("mainline_term_count") or 0)
+    except (TypeError, ValueError):
+        ml = 0
+    if ml > 0:
+        return False
+    try:
+        sd = int(rec.get("side_term_count") or 0)
+    except (TypeError, ValueError):
+        sd = 0
+    if sd < 1:
+        return False
+    if str(rec.get("candidate_source_role") or "").strip() != "topic_cohesive_candidate":
+        return False
+    if not bool(rec.get("paper_jd_topic_profile_overlap_flag")):
+        return False
+    if not _stage4_hits_support_only_no_primary_lane(rec):
+        return False
+    hits = rec.get("hits")
+    n_hits = len(hits) if isinstance(hits, list) else 0
+    try:
+        hc = int(rec.get("hit_count") or 0)
+    except (TypeError, ValueError):
+        hc = n_hits
+    if hc > 1 or n_hits > 1:
+        return False
+    return True
+
+
+def _compute_stage4_residual_side_penalty_factor(rec: Dict[str, Any]) -> Tuple[float, str]:
+    """
+    keep compete 末段乘子：仅对上述极窄 residual 返回 <1；其余恒为 1.0。不下探 STAGE4_RESIDUAL_SIDE_PENALTY_MULT_FLOOR。
+    """
+    if not STAGE4_RESIDUAL_SIDE_PENALTY_ENABLED:
+        return 1.0, "disabled"
+    if not _is_stage4_fringe_single_side_residual(rec):
+        return 1.0, ""
+    floor = float(STAGE4_RESIDUAL_SIDE_PENALTY_MULT_FLOOR)
+    mild = max(floor, float(STAGE4_RESIDUAL_SIDE_PENALTY_MULT_MILD))
+    stronger = max(floor, float(STAGE4_RESIDUAL_SIDE_PENALTY_MULT_STRONGER))
+    cr = str(rec.get("coherence_reason") or "").lower()
+    labs = rec.get("job_axis_labels")
+    unclassified_only = (
+        isinstance(labs, (list, tuple))
+        and len(labs) == 1
+        and str(labs[0]).strip() == "unclassified"
+    )
+    if unclassified_only or "single support" in cr or "side hit" in cr:
+        return stronger, "fringe_single_side_residual_stronger_mild(unclassified_or_coherence_hint)"
+    return mild, "fringe_single_side_residual_support_only_cohesive"
+
+
 def _compute_stage4_compete_score_for_keep(rec: Dict[str, Any]) -> float:
     """
     kept 全局池竞争分：在 paper_final_score_v2 上做极窄乘子；不取代 Step2 v2 公式本身。
@@ -3219,6 +3336,9 @@ def _compute_stage4_compete_score_for_keep(rec: Dict[str, Any]) -> float:
         rec["paper_compete_score_for_keep_pre_cohesive"] = float(base)
         rec["keep_cohesive_factor"] = 1.0
         rec["keep_cohesive_reasons"] = []
+        rec["paper_compete_score_for_keep_pre_residual_side_penalty"] = float(base)
+        rec["residual_side_keep_penalty_factor"] = 1.0
+        rec["residual_side_keep_penalty_reason"] = ""
         rec["paper_compete_score_for_keep"] = float(base)
         return float(base)
     base = float(rec.get("paper_final_score_v2") or 0.0)
@@ -3242,8 +3362,17 @@ def _compute_stage4_compete_score_for_keep(rec: Dict[str, Any]) -> float:
     s_out = float(s * cf)
     rec["keep_cohesive_factor"] = float(cf)
     rec["keep_cohesive_reasons"] = list(crs)
-    rec["paper_compete_score_for_keep"] = float(s_out)
-    return float(s_out)
+    rec["paper_compete_score_for_keep_pre_residual_side_penalty"] = float(s_out)
+    pf, prs = _compute_stage4_residual_side_penalty_factor(rec)
+    try:
+        pf_f = float(pf)
+    except (TypeError, ValueError):
+        pf_f = 1.0
+    rec["residual_side_keep_penalty_factor"] = float(pf_f)
+    rec["residual_side_keep_penalty_reason"] = str(prs or "")
+    s_final = float(s_out * pf_f)
+    rec["paper_compete_score_for_keep"] = float(s_final)
+    return float(s_final)
 
 
 def _stage4_apply_keep_compete_reselect(
@@ -3468,6 +3597,234 @@ def _print_stage4_keep_cohesive_preference_audit(
     print("=" * 80 + "\n")
 
 
+def _print_stage4_residual_side_penalty_audit(
+    by_wid: Dict[str, Dict[str, Any]],
+    selected_wids_set: Set[str],
+    sorted_wids: List[str],
+    *,
+    audit_print: bool,
+) -> None:
+    """keep compete 末段 residual 轻压命中情况（只打印；paper_final_score_v2 不变）。"""
+    if not audit_print or not STAGE4_RESIDUAL_SIDE_PENALTY_AUDIT:
+        return
+    rank_by: Dict[str, int] = {}
+    for i, w in enumerate(sorted_wids):
+        rank_by[str(w)] = int(i + 1)
+    hit_rows: List[Tuple[str, Dict[str, Any]]] = []
+    for w in selected_wids_set:
+        r = by_wid.get(w)
+        if not isinstance(r, dict):
+            continue
+        try:
+            pf = float(r.get("residual_side_keep_penalty_factor") or 1.0)
+        except (TypeError, ValueError):
+            pf = 1.0
+        if pf < 1.0 - 1e-9:
+            hit_rows.append((str(w), r))
+    n_hit = int(len(hit_rows))
+    print("\n" + "=" * 80)
+    print("[Stage4 residual side penalty audit] (keep compete tail; paper_final_score_v2 unchanged)")
+    print("=" * 80)
+    print(
+        f"penalty_hit_count_in_kept={n_hit} "
+        f"STAGE4_RESIDUAL_SIDE_PENALTY_ENABLED={STAGE4_RESIDUAL_SIDE_PENALTY_ENABLED}"
+    )
+    preview_k = max(0, int(STAGE4_RESIDUAL_SIDE_PENALTY_AUDIT_TOP_K))
+    ordered = sorted(
+        hit_rows,
+        key=lambda t: -float(t[1].get("paper_compete_score_for_keep_pre_residual_side_penalty") or 0.0),
+    )[:preview_k]
+    print(f"[Stage4 residual side penalty preview] max_rows={len(ordered)}/{n_hit} sort=pre_penalty_compete_desc")
+    for i, (wid, rec) in enumerate(ordered, 1):
+        rk = rank_by.get(wid)
+        title = str(rec.get("title") or "").replace("\n", " ")[:90]
+        try:
+            pre = float(rec.get("paper_compete_score_for_keep_pre_residual_side_penalty") or 0.0)
+        except (TypeError, ValueError):
+            pre = 0.0
+        try:
+            post = float(rec.get("paper_compete_score_for_keep") or 0.0)
+        except (TypeError, ValueError):
+            post = 0.0
+        try:
+            pf = float(rec.get("residual_side_keep_penalty_factor") or 1.0)
+        except (TypeError, ValueError):
+            pf = 1.0
+        prs = str(rec.get("residual_side_keep_penalty_reason") or "")
+        print(
+            f"  #{i} rk={rk} wid={wid} title={title!r} "
+            f"hqc={rec.get('hit_quality_class')!r} evr={rec.get('paper_evidence_role')!r} "
+            f"csr={rec.get('candidate_source_role')!r} ml={rec.get('mainline_term_count')} sd={rec.get('side_term_count')} "
+            f"factor={pf:.4f} pre_keep={pre:.6f} post_keep={post:.6f} reason={prs!r}"
+        )
+    print("=" * 80 + "\n")
+
+
+def _is_stage4_side_residual_paper(rec: Any) -> bool:
+    """轻判：是否属于 kept 内待观测的 side residual（口径与现有 hit_quality_class 对齐）。"""
+    if not isinstance(rec, dict):
+        return False
+    hq = str(rec.get("hit_quality_class") or "").strip()
+    return hq in _STAGE4_SIDE_RESIDUAL_HIT_QUALITY_CLASSES
+
+
+def _stage4_side_residual_hit_terms_snippet(rec: Dict[str, Any], *, max_chars: int = 140) -> str:
+    """从 hits 拼紧凑 term:role 片段（只读）。"""
+    hits = rec.get("hits")
+    if not isinstance(hits, list):
+        return ""
+    parts: List[str] = []
+    for h in hits[:16]:
+        if not isinstance(h, dict):
+            continue
+        term = str(h.get("term") or "").strip()
+        if not term:
+            continue
+        role = str(h.get("role") or "").strip()
+        parts.append(f"{term}:{role}" if role else term)
+        if len("|".join(parts)) >= max_chars:
+            break
+    s = "|".join(parts)
+    if len(s) > max_chars:
+        return s[: max_chars - 3] + "..."
+    return s
+
+
+def _stage4_side_residual_readonly_display_score(rec: Dict[str, Any]) -> float:
+    """审计展示用最终分：只读 paper_final_score_v2（不改写字段）。"""
+    try:
+        return float(rec.get("paper_final_score_v2") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _stage4_side_residual_compact_row(
+    wid: str,
+    rec: Dict[str, Any],
+    *,
+    rank: Optional[int],
+) -> str:
+    title = str(rec.get("title") or "").replace("\n", " ")[:100]
+    v2 = _stage4_side_residual_readonly_display_score(rec)
+    try:
+        sd = int(rec.get("side_term_count") or 0)
+    except (TypeError, ValueError):
+        sd = 0
+    try:
+        ml = int(rec.get("mainline_term_count") or 0)
+    except (TypeError, ValueError):
+        ml = 0
+    labs = rec.get("job_axis_labels")
+    if isinstance(labs, (list, tuple, set)):
+        labs_s = ",".join(str(x) for x in list(labs)[:6])
+    else:
+        labs_s = ""
+    try:
+        peq = float(rec.get("paper_evidence_quality_score") or 0.0)
+        peq_s = f"{peq:.4f}"
+    except (TypeError, ValueError):
+        peq_s = ""
+    try:
+        papc = float(rec.get("paper_primary_candidate_score") or 0.0)
+        papc_s = f"{papc:.4f}"
+    except (TypeError, ValueError):
+        papc_s = ""
+    jd_flag = rec.get("paper_jd_topic_profile_overlap_flag")
+    hits_s = _stage4_side_residual_hit_terms_snippet(rec)
+    cr = str(rec.get("coherence_reason") or "").replace("\n", " ")[:72]
+    rk_s = str(rank) if rank is not None else "?"
+    return (
+        f"rk={rk_s} wid={wid} v2={v2:.6f} title={title!r} "
+        f"hqc={rec.get('hit_quality_class')!r} role={rec.get('paper_evidence_role')!r} "
+        f"csr={rec.get('candidate_source_role')!r} ml={ml} sd={sd} "
+        f"hits=[{hits_s}] "
+        f"axis=[{labs_s}] "
+        f"peq={peq_s} papc={papc_s} jd_ol={jd_flag!r} cr={cr!r}"
+    )
+
+
+def _print_stage4_side_residual_audit(
+    by_wid: Dict[str, Dict[str, Any]],
+    selected_wids_set: Set[str],
+    sorted_wids: List[str],
+    *,
+    audit_print: bool,
+) -> None:
+    """
+    最终 kept 集合与 sorted_wids 已定稿之后：汇总 + 预览残余 side 论文（只打印，不改状态）。
+    """
+    if not audit_print or not STAGE4_SIDE_RESIDUAL_AUDIT:
+        return
+    print("\n" + "=" * 80)
+    print("[Stage4 side residual audit] (readonly; does not modify scores, keep set, or ordering)")
+    print("=" * 80)
+    kept_total = int(len(selected_wids_set))
+    rank_by: Dict[str, int] = {}
+    for i, w in enumerate(sorted_wids):
+        rank_by[str(w)] = int(i + 1)
+
+    residual_wids: List[str] = []
+    for w in selected_wids_set:
+        rec = by_wid.get(w)
+        if not isinstance(rec, dict):
+            continue
+        if _is_stage4_side_residual_paper(rec):
+            residual_wids.append(str(w))
+
+    residual_n = int(len(residual_wids))
+    share = float(residual_n / float(kept_total)) if kept_total > 0 else 0.0
+
+    hqc_ctr: Counter = Counter()
+    for w in residual_wids:
+        rec = by_wid.get(w)
+        if not isinstance(rec, dict):
+            continue
+        hqc_ctr[str(rec.get("hit_quality_class") or "unknown")] += 1
+
+    axis_ctr: Counter = Counter()
+    for w in residual_wids:
+        rec = by_wid.get(w)
+        if not isinstance(rec, dict):
+            continue
+        labs = rec.get("job_axis_labels")
+        if isinstance(labs, (list, tuple, set)):
+            for x in labs:
+                axis_ctr[str(x)] += 1
+
+    print("[Stage4 side residual summary]")
+    print(
+        f"kept_total={kept_total} residual_side_n={residual_n} "
+        f"residual_share={share:.4f} "
+        f"preview_max={max(0, int(STAGE4_SIDE_RESIDUAL_AUDIT_PREVIEW_K))}"
+    )
+    print(f"hit_quality_class(residual_only)={dict(hqc_ctr)}")
+    top_axes = axis_ctr.most_common(12)
+    if top_axes:
+        print(f"job_axis_labels_top(residual_only, up_to_12)={top_axes}")
+    else:
+        print("job_axis_labels_top(residual_only, up_to_12)=[]")
+
+    preview_k = max(0, int(STAGE4_SIDE_RESIDUAL_AUDIT_PREVIEW_K))
+    ordered = sorted(
+        residual_wids,
+        key=lambda x: -_stage4_side_residual_readonly_display_score(by_wid.get(x) or {}),
+    )[:preview_k]
+
+    print("-" * 80)
+    print(
+        f"[Stage4 side residual preview] sort=paper_final_score_v2_desc "
+        f"rows={len(ordered)}/{residual_n}"
+    )
+    for i, w in enumerate(ordered, 1):
+        rec = by_wid.get(w)
+        if not isinstance(rec, dict):
+            continue
+        rk = rank_by.get(str(w))
+        line = _stage4_side_residual_compact_row(str(w), rec, rank=rk)
+        print(f"  #{i} {line}")
+    print("=" * 80 + "\n")
+
+
 def _print_stage4_keep_competition_migration_summary(
     stats: Optional[Dict[str, Any]],
     by_wid: Dict[str, Dict[str, Any]],
@@ -3486,7 +3843,9 @@ def _print_stage4_keep_competition_migration_summary(
         f"{STAGE4_PREKEPT_MAINLINE_KEEP_BONUS}) * (optional community_isolated="
         f"{STAGE4_COMMUNITY_ISOLATED_FRINGE_FACTOR} | optional community_cohesive_bonus="
         f"{STAGE4_COMMUNITY_COHESIVE_KEEP_BONUS}) * keep_cohesive_factor "
-        f"(clip [{STAGE4_KEEP_COHESIVE_MULT_MIN},{STAGE4_KEEP_COHESIVE_MULT_MAX}], STAGE4_KEEP_COHESIVE_ENABLED={STAGE4_KEEP_COHESIVE_ENABLED})"
+        f"(clip [{STAGE4_KEEP_COHESIVE_MULT_MIN},{STAGE4_KEEP_COHESIVE_MULT_MAX}], STAGE4_KEEP_COHESIVE_ENABLED={STAGE4_KEEP_COHESIVE_ENABLED}) "
+        f"* residual_side_keep_penalty_factor (narrow; floor>={STAGE4_RESIDUAL_SIDE_PENALTY_MULT_FLOOR}, "
+        f"STAGE4_RESIDUAL_SIDE_PENALTY_ENABLED={STAGE4_RESIDUAL_SIDE_PENALTY_ENABLED})"
     )
     if not stats:
         print("keep_compete_reselect=skipped (migration off or STAGE4_KEEP_COMPETE_ENABLED=False)")
@@ -6547,6 +6906,9 @@ def run_stage4(
     _print_stage4_keep_cohesive_preference_audit(
         _keep_compete_stats, by_wid, audit_print=_label_path_stdout
     )
+    _print_stage4_residual_side_penalty_audit(
+        by_wid, selected_wids_set, sorted_wids, audit_print=_label_path_stdout
+    )
     _print_stage4_keep_competition_migration_summary(
         _keep_compete_stats, by_wid, audit_print=_label_path_stdout
     )
@@ -6587,6 +6949,10 @@ def run_stage4(
     _print_stage4_primary_candidate_audit(by_wid, selected_wids_set, audit_print=_label_path_stdout)
     sorted_wids, _stage4_primary_aware_rerank_stats = _apply_stage4_primary_aware_rerank(
         by_wid, sorted_wids, selected_wids_set, audit_print=_label_path_stdout
+    )
+
+    _print_stage4_side_residual_audit(
+        by_wid, selected_wids_set, sorted_wids, audit_print=_label_path_stdout
     )
 
     # -------- final_unique / global_cap_cut 统计（按 term 级唯一 wid）--------
