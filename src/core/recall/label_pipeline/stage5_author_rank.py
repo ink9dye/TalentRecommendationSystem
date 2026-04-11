@@ -2,7 +2,7 @@ import collections
 import math
 import os
 import time
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -48,6 +48,610 @@ PAPER_AUTHOR_FANOUT_SOFT_K = 4.0
 PAPER_AUTHOR_FANOUT_MIN_FACTOR = 0.72
 PAPER_AUTHOR_FANOUT_MAX_COUNT = 12
 STAGE5_FANOUT_AUDIT = True
+# True：打印 single-paper side-driven suppression **audit**（仅旁路识别，不改作者分）
+STAGE5_SINGLE_PAPER_SIDE_DRIVEN_SUPPRESSION_AUDIT = True
+# True：打印 [Stage5 broad-mainline dominance audit]（宽主词/umbrella 独占；与 side-driven 正交；不改分）
+STAGE5_BROAD_MAINLINE_DOMINANCE_AUDIT = os.environ.get("STAGE5_BROAD_MAINLINE_DOMINANCE_AUDIT", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+
+# 从 Stage4 透传的论文旁路字段，供 suppression audit 读取（不改 Stage4，仅 Stage5 合并时保留）
+_STAGE5_PAPER_AUDIT_COPY_KEYS = (
+    "hit_quality_class",
+    "paper_evidence_role",
+    "paper_evidence_quality_score",
+    "paper_final_score_v2",
+    "paper_old_score",
+    "paper_score_final",
+    "paper_score_protected",
+    "job_axis_labels",
+    "job_axis_primary_label",
+    "job_axis_audit_reasons",
+)
+
+# 与 Stage4 job-axis audit 对齐：厚子轴（用于识别「多轴强作者」）
+_STAGE5_THICK_JOB_AXES = frozenset(
+    {
+        "dynamics_kinematics",
+        "planning_trajectory",
+        "optimal_control",
+        "estimation",
+        "simulation_sim2real",
+    }
+)
+STAGE5_BROAD_MAINLINE_DOM_SHARE_MIN = float(os.environ.get("STAGE5_BROAD_MAINLINE_DOM_SHARE_MIN", "0.85"))
+STAGE5_BROAD_MAINLINE_SECOND_TERM_SHARE_MIN = float(os.environ.get("STAGE5_BROAD_MAINLINE_SECOND_TERM_SHARE_MIN", "0.18"))
+STAGE5_BROAD_MAINLINE_MHR_EXCLUDE_MIN = float(os.environ.get("STAGE5_BROAD_MAINLINE_MHR_EXCLUDE_MIN", "0.42"))
+
+_STAGE5_MAINLINE_HIT_QUALITY = frozenset(
+    {"mainline_resonance", "mainline_plus_support", "single_hit_mainline"}
+)
+
+
+def _stage5_count_primary_evidence_papers(papers: List[Dict[str, Any]]) -> int:
+    n = 0
+    for p in papers or []:
+        if not isinstance(p, dict):
+            continue
+        if str(p.get("paper_evidence_role") or "").strip() == "primary_evidence":
+            n += 1
+    return int(n)
+
+
+def _stage5_top_paper_dict_for_audit(
+    aid: str,
+    author_record: Optional[Dict[str, Any]],
+    paper_map: Dict[str, Dict[str, Any]],
+    author_top_works: Dict[str, List[Tuple[str, float]]],
+) -> Dict[str, Any]:
+    papers = (author_record or {}).get("papers") or []
+    plist = [p for p in papers if isinstance(p, dict)]
+    if plist:
+
+        def _paper_score(p: Dict[str, Any]) -> float:
+            try:
+                if p.get("paper_score_final") is not None:
+                    return float(p.get("paper_score_final") or 0.0)
+                return float(p.get("score") or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        top = max(plist, key=_paper_score)
+        return dict(top)
+    wl = author_top_works.get(aid) or author_top_works.get(str(aid)) or []
+    if not wl:
+        return {}
+    wid = max(wl, key=lambda x: float(x[1] or 0.0))[0]
+    wid_s = str(wid)
+    return dict(paper_map.get(wid_s) or paper_map.get(wid) or {})
+
+
+def _stage5_is_single_paper_side_driven_author(
+    aid: str,
+    author_record: Optional[Dict[str, Any]],
+    scored_row: Dict[str, Any],
+    paper_map: Dict[str, Dict[str, Any]],
+    author_top_works: Dict[str, List[Tuple[str, float]]],
+    term_cap_audit: Dict[str, Dict[str, Any]],
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    极窄 suppression audit：单篇 + side hit + 无主轴占比 + 词权极端集中 + 无 primary evidence paper。
+    仅用于日志与旁路字段，不参与排序乘子。
+    """
+    aid_s = str(aid)
+    summary = (author_record or {}).get("author_payload_summary") if author_record else None
+    summary = summary if isinstance(summary, dict) else {}
+
+    top_paper = _stage5_top_paper_dict_for_audit(aid_s, author_record, paper_map, author_top_works)
+    top_hqc = summary.get("top_paper_hit_quality_class")
+    if top_hqc is None or str(top_hqc).strip() == "":
+        top_hqc = str(top_paper.get("hit_quality_class") or "").strip() or None
+
+    pc = (
+        int(summary["paper_count"])
+        if summary.get("paper_count") is not None
+        else int(scored_row.get("paper_count") or 0)
+    )
+
+    if summary.get("mainline_support_ratio") is not None:
+        mhr = float(summary["mainline_support_ratio"])
+    else:
+        if pc == 1 and top_hqc:
+            mhr = 1.0 if top_hqc in _STAGE5_MAINLINE_HIT_QUALITY else 0.0
+        else:
+            mhr = 0.0
+
+    dom_share_raw = summary.get("dominant_term_share")
+    dom_f: Optional[float] = None
+    if dom_share_raw is not None:
+        try:
+            dom_f = float(dom_share_raw)
+        except (TypeError, ValueError):
+            dom_f = None
+    if dom_f is None:
+        tc = term_cap_audit.get(aid_s) or term_cap_audit.get(aid)
+        if tc:
+            try:
+                dom_f = float(tc.get("dominant_share_before") or 0.0)
+            except (TypeError, ValueError):
+                dom_f = None
+
+    papers_for_pri = (author_record or {}).get("papers") or []
+    pri_ct = _stage5_count_primary_evidence_papers(papers_for_pri)
+    if pri_ct == 0 and top_paper:
+        pri_ct = _stage5_count_primary_evidence_papers([top_paper])
+
+    top_role = str(top_paper.get("paper_evidence_role") or "").strip()
+    old_v = top_paper.get("paper_old_score")
+    v2_v = top_paper.get("paper_final_score_v2")
+    try:
+        old_f = float(old_v) if old_v is not None else None
+    except (TypeError, ValueError):
+        old_f = None
+    try:
+        v2_f = float(v2_v) if v2_v is not None else None
+    except (TypeError, ValueError):
+        v2_f = None
+
+    sup_cls = str(summary.get("author_support_class") or "").strip()
+    reason = str(summary.get("author_reason_summary") or "").strip()
+
+    meta: Dict[str, Any] = {
+        "author_id": aid_s,
+        "paper_count": pc,
+        "mainline_support_ratio": mhr,
+        "top_paper_hit_quality_class": top_hqc,
+        "dominant_term_share": dom_f,
+        "author_support_class": sup_cls or None,
+        "author_reason_summary": reason or None,
+        "author_primary_evidence_count": pri_ct,
+        "author_top_paper_evidence_role": top_role or None,
+        "author_top_paper_old_score": old_f,
+        "author_top_paper_v2_score": v2_f,
+        "audit_fail": None,
+    }
+
+    if pc != 1:
+        meta["audit_fail"] = "paper_count!=1"
+        return False, meta
+    if top_hqc != "single_hit_side":
+        meta["audit_fail"] = "top_paper_hit_quality_class"
+        return False, meta
+    if mhr > 0.05:
+        meta["audit_fail"] = "mainline_support_ratio"
+        return False, meta
+    if dom_f is None or dom_f < 0.9:
+        meta["audit_fail"] = "dominant_term_share"
+        return False, meta
+    if pri_ct > 0:
+        meta["audit_fail"] = "author_primary_evidence_count"
+        return False, meta
+    if top_role == "primary_evidence":
+        meta["audit_fail"] = "top_paper_primary_evidence"
+        return False, meta
+
+    return True, meta
+
+
+def _stage5_apply_suppression_audit_fields(
+    scored_authors: List[Dict[str, Any]],
+    author_record_by_aid: Dict[str, Dict[str, Any]],
+    paper_map: Dict[str, Dict[str, Any]],
+    author_top_works: Dict[str, List[Tuple[str, float]]],
+    term_cap_audit: Dict[str, Dict[str, Any]],
+) -> None:
+    for row in scored_authors:
+        aid = str(row.get("aid") or "")
+        ar = author_record_by_aid.get(aid)
+        hit, meta = _stage5_is_single_paper_side_driven_author(
+            aid, ar, row, paper_map, author_top_works, term_cap_audit
+        )
+        row["author_suppression_audit_hit"] = bool(hit)
+        row["author_suppression_audit_reasons"] = dict(meta)
+        row["author_primary_evidence_count"] = meta.get("author_primary_evidence_count")
+        row["author_top_paper_evidence_role"] = meta.get("author_top_paper_evidence_role")
+        row["author_top_paper_old_score"] = meta.get("author_top_paper_old_score")
+        row["author_top_paper_v2_score"] = meta.get("author_top_paper_v2_score")
+
+
+def _stage5_author_suppression_audit_compact_row(
+    author_rec: Dict[str, Any], audit_meta: Dict[str, Any]
+) -> Dict[str, Any]:
+    return {
+        "author_id": audit_meta.get("author_id") or author_rec.get("aid"),
+        "paper_count": audit_meta.get("paper_count"),
+        "mainline_support_ratio": audit_meta.get("mainline_support_ratio"),
+        "dominant_term": (author_rec.get("author_payload_summary") or {}).get("dominant_term")
+        if isinstance(author_rec.get("author_payload_summary"), dict)
+        else None,
+        "dominant_term_share": audit_meta.get("dominant_term_share"),
+        "top_paper_hit_quality_class": audit_meta.get("top_paper_hit_quality_class"),
+        "author_support_class": audit_meta.get("author_support_class"),
+        "author_reason_summary": audit_meta.get("author_reason_summary"),
+        "author_top_paper_evidence_role": audit_meta.get("author_top_paper_evidence_role"),
+        "author_suppression_audit_reasons": audit_meta,
+    }
+
+
+def _print_stage5_single_paper_side_driven_suppression_audit(
+    scored_authors: List[Dict[str, Any]],
+    author_record_by_aid: Dict[str, Dict[str, Any]],
+    recall: Any,
+) -> None:
+    if not _label_recall_stdout_enabled(recall) or not STAGE5_SINGLE_PAPER_SIDE_DRIVEN_SUPPRESSION_AUDIT:
+        return
+    if not scored_authors:
+        return
+    n = len(scored_authors)
+    hits = [r for r in scored_authors if r.get("author_suppression_audit_hit")]
+    hit_n = len(hits)
+    ratio = float(hit_n) / float(n) if n else 0.0
+
+    sup_ctr: collections.Counter = collections.Counter()
+    hqc_ctr: collections.Counter = collections.Counter()
+    for r in scored_authors:
+        aid = str(r.get("aid") or "")
+        s = (author_record_by_aid.get(aid) or {}).get("author_payload_summary") or {}
+        if isinstance(s, dict):
+            sup_ctr[str(s.get("author_support_class") or "unknown")] += 1
+            hqc_ctr[str(s.get("top_paper_hit_quality_class") or "unknown")] += 1
+
+    print("\n" + "-" * 80)
+    print("[Stage5 single-paper side-driven suppression audit]")
+    print("-" * 80)
+    print(
+        f"authors_total={n} audit_hit_count={hit_n} audit_hit_ratio={ratio:.4f} "
+        f"support_class_counter={dict(sup_ctr)} top_paper_hit_quality_counter={dict(hqc_ctr)}"
+    )
+    print("--- audit hit examples (max 10) ---")
+    for r in hits[:10]:
+        aid = str(r.get("aid") or "")
+        ar = author_record_by_aid.get(aid) or {}
+        meta = r.get("author_suppression_audit_reasons") or {}
+        print(f"  {_stage5_author_suppression_audit_compact_row(ar, meta)}")
+    print("-" * 80 + "\n")
+
+
+def _print_stage5_non_hit_good_author_examples(
+    scored_authors: List[Dict[str, Any]],
+    author_record_by_aid: Dict[str, Dict[str, Any]],
+    recall: Any,
+) -> None:
+    if not _label_recall_stdout_enabled(recall) or not STAGE5_SINGLE_PAPER_SIDE_DRIVEN_SUPPRESSION_AUDIT:
+        return
+    if not scored_authors:
+        return
+    good: List[Dict[str, Any]] = []
+    good_ids: Set[str] = set()
+    for r in scored_authors:
+        if r.get("author_suppression_audit_hit"):
+            continue
+        aid = str(r.get("aid") or "")
+        s = (author_record_by_aid.get(aid) or {}).get("author_payload_summary") or {}
+        if not isinstance(s, dict):
+            continue
+        pc = int(s.get("paper_count") or 0)
+        mhr = float(s.get("mainline_support_ratio") or 0.0)
+        thqc = str(s.get("top_paper_hit_quality_class") or "")
+        if pc > 1 or mhr > 0.05 or thqc in _STAGE5_MAINLINE_HIT_QUALITY:
+            good.append(r)
+            good_ids.add(aid)
+        if len(good) >= 5:
+            break
+    # 若不足 5，用未命中的高分作者补齐
+    if len(good) < 5:
+        for r in scored_authors:
+            if r.get("author_suppression_audit_hit"):
+                continue
+            aid = str(r.get("aid") or "")
+            if aid in good_ids:
+                continue
+            good.append(r)
+            good_ids.add(aid)
+            if len(good) >= 5:
+                break
+
+    print("-" * 80)
+    print("[Stage5 non-hit good author examples]")
+    print("-" * 80)
+    print(f"showing={len(good)} (max 5)")
+    for r in good[:5]:
+        aid = str(r.get("aid") or "")
+        s = (author_record_by_aid.get(aid) or {}).get("author_payload_summary") or {}
+        if not isinstance(s, dict):
+            s = {}
+        row = {
+            "author_id": aid,
+            "paper_count": s.get("paper_count"),
+            "mainline_support_ratio": s.get("mainline_support_ratio"),
+            "dominant_term_share": s.get("dominant_term_share"),
+            "top_paper_hit_quality_class": s.get("top_paper_hit_quality_class"),
+            "author_support_class": s.get("author_support_class"),
+            "author_reason_summary": s.get("author_reason_summary"),
+        }
+        print(f"  {row}")
+    print("-" * 80 + "\n")
+
+
+def _stage5_collect_axis_label_union_for_author(
+    aid: str,
+    author_record: Optional[Dict[str, Any]],
+    paper_map: Dict[str, Dict[str, Any]],
+    author_top_works: Dict[str, List[Tuple[str, float]]],
+) -> Set[str]:
+    wids: Set[str] = set()
+    if author_record:
+        for p in author_record.get("papers") or []:
+            if isinstance(p, dict) and p.get("wid") is not None:
+                wids.add(str(p.get("wid")))
+    for wid, _ in author_top_works.get(aid, []) or []:
+        wids.add(str(wid))
+    for wid, _ in author_top_works.get(str(aid), []) or []:
+        wids.add(str(wid))
+    out: Set[str] = set()
+    for wid in wids:
+        info = paper_map.get(wid) or paper_map.get(str(wid)) or {}
+        labs = info.get("job_axis_labels")
+        if isinstance(labs, list):
+            out |= {str(x) for x in labs}
+    return out
+
+
+def _stage5_second_term_share_in_top3(top_terms: List[Tuple[str, Any]]) -> float:
+    """top_terms_by_contribution 中第二词占前三项贡献和的比例（结构信号，非词表）。"""
+    if not top_terms or len(top_terms) < 2:
+        return 0.0
+    vals: List[float] = []
+    for _t, c in top_terms[:3]:
+        try:
+            vals.append(float(c))
+        except (TypeError, ValueError):
+            vals.append(0.0)
+    if len(vals) < 2:
+        return 0.0
+    s = sum(max(0.0, v) for v in vals) + 1e-12
+    return float(max(0.0, vals[1]) / s)
+
+
+def _stage5_author_has_multi_axis_strength(
+    axis_union: Set[str],
+    scored_row: Dict[str, Any],
+    summary: Dict[str, Any],
+) -> bool:
+    """
+    排除 genuinely multi-axis authors：厚轴组合、标签多样性、结构 multi-hit、第二条强词、或较高 mainline 占比。
+    不依赖具体 JD 词表。
+    """
+    ls = {str(x) for x in axis_union if str(x) != "unclassified"}
+    thick = ls & _STAGE5_THICK_JOB_AXES
+    if len(thick) >= 2:
+        return True
+    if len(thick) >= 1 and len(ls) >= 2:
+        return True
+
+    tt = scored_row.get("top_terms_by_contribution") or []
+    if isinstance(tt, list) and _stage5_second_term_share_in_top3(tt) >= STAGE5_BROAD_MAINLINE_SECOND_TERM_SHARE_MIN:
+        return True
+
+    try:
+        mhr = float(summary.get("mainline_support_ratio") or 0.0)
+    except (TypeError, ValueError):
+        mhr = 0.0
+    if mhr >= STAGE5_BROAD_MAINLINE_MHR_EXCLUDE_MIN:
+        return True
+
+    mtp = int(scored_row.get("multi_term_paper_count_struct") or 0)
+    stc = int(scored_row.get("strong_term_count_struct") or 0)
+    if mtp >= 1 and stc >= 2:
+        return True
+
+    return False
+
+
+def _stage5_top_paper_is_broad_mainline_shell(
+    top_paper: Dict[str, Any],
+) -> bool:
+    """
+    top paper「像宽壳/薄主轴」：无厚轴标签时以 mainline 质量 + 角色兜底；有标签则要求无 THICK 轴。
+    """
+    if not top_paper:
+        return False
+    labs = top_paper.get("job_axis_labels")
+    if isinstance(labs, list) and labs:
+        ls = {str(x) for x in labs} - {"unclassified"}
+        if not ls:
+            return True
+        if ls & _STAGE5_THICK_JOB_AXES:
+            return False
+        if ls <= {"control_core", "generic_robot_autonomous_shell"}:
+            return True
+        if "generic_robot_autonomous_shell" in ls:
+            return True
+        return False
+    hqc = str(top_paper.get("hit_quality_class") or "").strip()
+    if hqc in _STAGE5_MAINLINE_HIT_QUALITY:
+        return True
+    return False
+
+
+def _stage5_is_broad_mainline_dominance_author(
+    aid: str,
+    author_record: Optional[Dict[str, Any]],
+    scored_row: Dict[str, Any],
+    paper_map: Dict[str, Dict[str, Any]],
+    author_top_works: Dict[str, List[Tuple[str, float]]],
+    term_cap_audit: Dict[str, Dict[str, Any]],
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Very narrow：单 term 支配度高 + 全作者层面无多轴强支撑 + top paper 像宽壳/薄主轴；
+    与 single-paper side-driven 互斥（由调用方排除 suppression hit）。
+    """
+    aid_s = str(aid)
+    summary = (author_record or {}).get("author_payload_summary") if author_record else None
+    summary = summary if isinstance(summary, dict) else {}
+
+    dom_share_raw = summary.get("dominant_term_share")
+    dom_f: Optional[float] = None
+    if dom_share_raw is not None:
+        try:
+            dom_f = float(dom_share_raw)
+        except (TypeError, ValueError):
+            dom_f = None
+    if dom_f is None:
+        tc = term_cap_audit.get(aid_s) or term_cap_audit.get(aid)
+        if tc:
+            try:
+                dom_f = float(tc.get("dominant_share_before") or 0.0)
+            except (TypeError, ValueError):
+                dom_f = None
+
+    top_paper = _stage5_top_paper_dict_for_audit(aid_s, author_record, paper_map, author_top_works)
+    top_hqc = str(top_paper.get("hit_quality_class") or "").strip()
+
+    axis_union = _stage5_collect_axis_label_union_for_author(aid_s, author_record, paper_map, author_top_works)
+    multi_strong = _stage5_author_has_multi_axis_strength(axis_union, scored_row, summary)
+
+    signals: Dict[str, Any] = {
+        "dominant_term_share": dom_f,
+        "dominant_term": summary.get("dominant_term"),
+        "axis_union": sorted(axis_union),
+        "multi_axis_strength_gate": bool(multi_strong),
+        "top_paper_hit_quality_class": top_hqc or None,
+        "top_paper_evidence_role": str(top_paper.get("paper_evidence_role") or "").strip() or None,
+        "top_paper_job_axis_labels": top_paper.get("job_axis_labels"),
+        "broad_shell_top_paper": bool(_stage5_top_paper_is_broad_mainline_shell(top_paper)),
+    }
+
+    if dom_f is None or dom_f < STAGE5_BROAD_MAINLINE_DOM_SHARE_MIN:
+        return False, {**signals, "reason": "dom_share_below_threshold"}
+
+    if multi_strong:
+        return False, {**signals, "reason": "multi_axis_strength_excluded"}
+
+    if top_hqc == "single_hit_side":
+        return False, {**signals, "reason": "top_paper_single_hit_side_excluded"}
+
+    if not _stage5_top_paper_is_broad_mainline_shell(top_paper):
+        return False, {**signals, "reason": "top_paper_not_broad_shell_profile"}
+
+    return True, {**signals, "reason": "broad_mainline_dominance_hit"}
+
+
+def _stage5_apply_broad_mainline_dominance_audit_fields(
+    scored_authors: List[Dict[str, Any]],
+    author_record_by_aid: Dict[str, Dict[str, Any]],
+    paper_map: Dict[str, Dict[str, Any]],
+    author_top_works: Dict[str, List[Tuple[str, float]]],
+    term_cap_audit: Dict[str, Dict[str, Any]],
+) -> None:
+    for row in scored_authors:
+        aid = str(row.get("aid") or "")
+        ar = author_record_by_aid.get(aid)
+        if row.get("author_suppression_audit_hit"):
+            row["broad_mainline_dominance_hit"] = False
+            row["broad_mainline_dominance_reason"] = "skipped_overlaps_side_driven_suppression_audit"
+            row["broad_mainline_dominance_signals"] = {}
+            continue
+        hit, sig = _stage5_is_broad_mainline_dominance_author(
+            aid, ar, row, paper_map, author_top_works, term_cap_audit
+        )
+        row["broad_mainline_dominance_hit"] = bool(hit)
+        row["broad_mainline_dominance_reason"] = str(sig.get("reason") or "")
+        row["broad_mainline_dominance_signals"] = dict(sig)
+        row["broad_mainline_dominant_term"] = (sig.get("dominant_term") if isinstance(sig, dict) else None) or (
+            (ar or {}).get("author_payload_summary") or {}
+        ).get("dominant_term")
+        row["broad_mainline_axis_profile"] = sig.get("axis_union")
+        row["broad_mainline_has_second_strong_axis"] = bool(sig.get("multi_axis_strength_gate"))
+
+
+def _print_stage5_broad_mainline_dominance_audit(
+    scored_authors: List[Dict[str, Any]],
+    author_record_by_aid: Dict[str, Dict[str, Any]],
+    paper_map: Dict[str, Dict[str, Any]],
+    author_top_works: Dict[str, List[Tuple[str, float]]],
+    recall: Any,
+) -> None:
+    if not _label_recall_stdout_enabled(recall) or not STAGE5_BROAD_MAINLINE_DOMINANCE_AUDIT:
+        return
+    if not scored_authors:
+        return
+    n = len(scored_authors)
+    hits = [r for r in scored_authors if r.get("broad_mainline_dominance_hit")]
+    hit_n = len(hits)
+    ratio = float(hit_n) / float(n) if n else 0.0
+
+    print("\n" + "-" * 80)
+    print("[Stage5 broad-mainline dominance audit]")
+    print("-" * 80)
+    print(f"authors_total={n} audit_hit_count={hit_n} audit_hit_ratio={ratio:.4f}")
+    print("--- audit hit rows (max 12, by final score) ---")
+    hits_sorted = sorted(hits, key=lambda r: float(r.get("score") or 0.0), reverse=True)[:12]
+    for r in hits_sorted:
+        aid = str(r.get("aid") or "")
+        ar = author_record_by_aid.get(aid) or {}
+        s = ar.get("author_payload_summary") or {}
+        if not isinstance(s, dict):
+            s = {}
+        top_paper = _stage5_top_paper_dict_for_audit(aid, ar, paper_map, author_top_works)
+        sig = r.get("broad_mainline_dominance_signals") or {}
+        print(
+            f"  aid={aid!r} final_score={float(r.get('score') or 0.0):.6f} "
+            f"dominant_term={s.get('dominant_term')!r} dominant_term_share={s.get('dominant_term_share')!r} "
+            f"paper_count={s.get('paper_count')!r}"
+        )
+        pri = _stage5_count_primary_evidence_papers((ar.get("papers") or []))
+        print(
+            f"    primary_evidence_paper_count={pri} "
+            f"top_paper_role={str(top_paper.get('paper_evidence_role') or '')!r} "
+            f"top_paper_hqc={str(top_paper.get('hit_quality_class') or '')!r} "
+            f"title={str(top_paper.get('title') or '')[:100]!r}"
+        )
+        print(
+            f"    top_paper_job_axis_labels={top_paper.get('job_axis_labels')!r} "
+            f"signals={sig!r}"
+        )
+    print("--- non-hit good author examples (multi-axis / not umbrella-dominated, max 5) ---")
+    good: List[Dict[str, Any]] = []
+    for r in sorted(scored_authors, key=lambda x: float(x.get("score") or 0.0), reverse=True):
+        if r.get("broad_mainline_dominance_hit"):
+            continue
+        if r.get("author_suppression_audit_hit"):
+            continue
+        aid = str(r.get("aid") or "")
+        ar = author_record_by_aid.get(aid) or {}
+        au = _stage5_collect_axis_label_union_for_author(aid, ar, paper_map, author_top_works)
+        summ = ar.get("author_payload_summary") or {}
+        if not isinstance(summ, dict):
+            summ = {}
+        if _stage5_author_has_multi_axis_strength(au, r, summ):
+            good.append(r)
+        if len(good) >= 5:
+            break
+    if len(good) < 5:
+        for r in sorted(scored_authors, key=lambda x: float(x.get("score") or 0.0), reverse=True):
+            if r.get("broad_mainline_dominance_hit") or r in good:
+                continue
+            if r.get("author_suppression_audit_hit"):
+                continue
+            good.append(r)
+            if len(good) >= 5:
+                break
+    for r in good[:5]:
+        aid = str(r.get("aid") or "")
+        ar = author_record_by_aid.get(aid) or {}
+        summ = ar.get("author_payload_summary") or {}
+        if not isinstance(summ, dict):
+            summ = {}
+        au = _stage5_collect_axis_label_union_for_author(aid, ar, paper_map, author_top_works)
+        print(
+            f"  aid={aid!r} final_score={float(r.get('score') or 0.0):.6f} "
+            f"dominant_term_share={summ.get('dominant_term_share')!r} "
+            f"axis_union={sorted(au)!r} multi_axis_strength={_stage5_author_has_multi_axis_strength(au, r, summ)}"
+        )
+    print("-" * 80 + "\n")
 
 
 def _try_hit_terms_wid(
@@ -597,6 +1201,10 @@ def run_stage5(
     }
     t0 = time.perf_counter()
 
+    author_record_by_aid: Dict[str, Dict[str, Any]] = {
+        str(r["aid"]): r for r in author_papers_list if r.get("aid") is not None
+    }
+
     paper_map: Dict[str, Dict[str, Any]] = {}
     author_raw_paper_cnt: Dict[str, int] = collections.Counter()
 
@@ -662,6 +1270,9 @@ def run_stage5(
                     "pos_weight": float(paper.get("weight") or 1.0),
                 }
             )
+            for _pk in _STAGE5_PAPER_AUDIT_COPY_KEYS:
+                if _pk in paper and paper[_pk] is not None:
+                    entry[_pk] = paper[_pk]
             author_raw_paper_cnt[aid] += 1
 
     t1 = time.perf_counter()
@@ -1050,6 +1661,29 @@ def run_stage5(
     stage5_sub_ms["build_ranked_list"] = (t9 - t8) * 1000.0
 
     scored_authors.sort(key=lambda x: x["score"], reverse=True)
+    _stage5_apply_suppression_audit_fields(
+        scored_authors,
+        author_record_by_aid,
+        paper_map,
+        author_top_works,
+        term_cap_audit_records,
+    )
+    _print_stage5_single_paper_side_driven_suppression_audit(scored_authors, author_record_by_aid, recall)
+    _print_stage5_non_hit_good_author_examples(scored_authors, author_record_by_aid, recall)
+    _stage5_apply_broad_mainline_dominance_audit_fields(
+        scored_authors,
+        author_record_by_aid,
+        paper_map,
+        author_top_works,
+        term_cap_audit_records,
+    )
+    _print_stage5_broad_mainline_dominance_audit(
+        scored_authors,
+        author_record_by_aid,
+        paper_map,
+        author_top_works,
+        recall,
+    )
     _print_stage5_term_cap_audit(scored_authors, term_cap_audit_records, term_map, top_k=25, recall=recall)
     _print_stage5_author_structure_audit(scored_authors, author_structure_audit, top_k=25, recall=recall)
     _print_stage5_support_dominance_audit(
