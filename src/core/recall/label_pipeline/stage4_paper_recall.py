@@ -92,6 +92,20 @@ STAGE4_KEEP_COMPETE_EXTRA_PER_TERM = int(os.environ.get("STAGE4_KEEP_COMPETE_EXT
 # Paper-topic-Paper 轻量社区：kept 竞争位点对孤立 term-only fringe 额外抑制、对 topic-cohesive 极轻加成（不改动 v2 主干公式）
 STAGE4_COMMUNITY_ISOLATED_FRINGE_FACTOR = float(os.environ.get("STAGE4_COMMUNITY_ISOLATED_FRINGE_FACTOR", "0.90"))
 STAGE4_COMMUNITY_COHESIVE_KEEP_BONUS = float(os.environ.get("STAGE4_COMMUNITY_COHESIVE_KEEP_BONUS", "1.05"))
+# keep compete 末段：极轻「主线+互补 support」局部簇偏好（叠乘在 paper_compete_score 链上；**不**改 paper_final_score_v2）
+STAGE4_KEEP_COHESIVE_ENABLED = True
+STAGE4_KEEP_COHESIVE_AUDIT = True
+STAGE4_KEEP_COHESIVE_AUDIT_TOP_K = 8
+STAGE4_KEEP_COHESIVE_MULT_MIN = 0.988
+STAGE4_KEEP_COHESIVE_MULT_MAX = 1.015
+STAGE4_KEEP_COHESIVE_MULT_MAINLINE_RESONANCE = 1.010
+STAGE4_KEEP_COHESIVE_MULT_MAINLINE_PLUS_SUPPORT = 1.010
+STAGE4_KEEP_COHESIVE_MULT_SINGLE_HIT_MAINLINE = 1.008
+STAGE4_KEEP_COHESIVE_MULT_SINGLE_HIT_SIDE = 0.994
+STAGE4_KEEP_COHESIVE_MULT_SIDE_ACCIDENTAL = 0.990
+STAGE4_KEEP_COHESIVE_MULT_SIDE_HEAVY_NO_ML = 0.988
+STAGE4_KEEP_COHESIVE_MULT_AXIS_WITH_MAINLINE = 1.004
+STAGE4_KEEP_COHESIVE_AXIS_MIN_LABELS = 2
 # 收窄 JD overlap：field 单层高阈值；subfield/topic 单独阈值（避免 53/53 宽场沾边即 True）
 STAGE4_JD_OVERLAP_TOPIC_MIN = float(os.environ.get("STAGE4_JD_OVERLAP_TOPIC_MIN", "0.032"))
 STAGE4_JD_OVERLAP_SUBFIELD_MIN = float(os.environ.get("STAGE4_JD_OVERLAP_SUBFIELD_MIN", "0.042"))
@@ -627,6 +641,16 @@ def _stage4_keep_compete_example_line(wid: str, rec: Any) -> str:
         ck = float(rec.get("paper_compete_score_for_keep") or 0.0)
     except (TypeError, ValueError):
         ck = 0.0
+    try:
+        pck = float(rec.get("paper_compete_score_for_keep_pre_cohesive") or ck)
+    except (TypeError, ValueError):
+        pck = ck
+    try:
+        cf = float(rec.get("keep_cohesive_factor") or 1.0)
+    except (TypeError, ValueError):
+        cf = 1.0
+    crs = rec.get("keep_cohesive_reasons") or []
+    crs_s = ",".join(str(x) for x in crs[:4])
     return (
         f"wid={wid} title={title!r} "
         f"candidate_source_role={rec.get('candidate_source_role')} "
@@ -638,6 +662,7 @@ def _stage4_keep_compete_example_line(wid: str, rec: Any) -> str:
         f"paper_evidence_role={rec.get('paper_evidence_role')} "
         f"paper_old_score={old_s:.6f} "
         f"paper_final_score_v2={v2:.6f} "
+        f"paper_compete_pre_cohesive={pck:.6f} keep_cohesive_factor={cf:.4f} [{crs_s}] "
         f"paper_compete_score_for_keep={ck:.6f}"
     )
 
@@ -1370,6 +1395,9 @@ _STAGE4_PAPER_EXPLANATION_KEYS = (
     "paper_topic_neighborhood_hit_flag",
     "community_isolated_fringe_community_guard_applied",
     "community_topic_cohesive_keep_bonus_applied",
+    "paper_compete_score_for_keep_pre_cohesive",
+    "keep_cohesive_factor",
+    "keep_cohesive_reasons",
 )
 
 
@@ -3111,6 +3139,72 @@ def _stage4_should_apply_prekept_mainline_keep_bonus(rec: Dict[str, Any]) -> boo
     return False
 
 
+def _compute_stage4_keep_cohesive_factor(rec: Dict[str, Any]) -> Tuple[float, List[str]]:
+    """
+    keep compete 专用：在 v2 与 prekept/community 链之后极轻叠乘，使 kept 更偏「主线+互补 support」局部簇。
+    不修改 paper_final_score_v2；幅度 clip 防止大洗牌。
+    """
+    if not STAGE4_KEEP_COHESIVE_ENABLED:
+        return 1.0, []
+    reasons: List[str] = []
+    mult = 1.0
+    hq = str(rec.get("hit_quality_class") or "").strip()
+    try:
+        ml = int(rec.get("mainline_term_count") or 0)
+    except (TypeError, ValueError):
+        ml = 0
+    try:
+        sd = int(rec.get("side_term_count") or 0)
+    except (TypeError, ValueError):
+        sd = 0
+
+    if hq == "mainline_resonance":
+        mult *= float(STAGE4_KEEP_COHESIVE_MULT_MAINLINE_RESONANCE)
+        reasons.append("hq:mainline_resonance")
+    elif hq == "mainline_plus_support":
+        mult *= float(STAGE4_KEEP_COHESIVE_MULT_MAINLINE_PLUS_SUPPORT)
+        reasons.append("hq:mainline_plus_support")
+    elif hq == "single_hit_mainline":
+        mult *= float(STAGE4_KEEP_COHESIVE_MULT_SINGLE_HIT_MAINLINE)
+        reasons.append("hq:single_hit_mainline")
+    elif hq == "single_hit_side":
+        mult *= float(STAGE4_KEEP_COHESIVE_MULT_SINGLE_HIT_SIDE)
+        reasons.append("hq:single_hit_side")
+    elif hq == "side_only_or_accidental_multi_hit":
+        mult *= float(STAGE4_KEEP_COHESIVE_MULT_SIDE_ACCIDENTAL)
+        reasons.append("hq:side_only_or_accidental_multi_hit")
+
+    if hq == "side_only_or_accidental_multi_hit" and ml == 0 and sd >= 2:
+        mult *= float(STAGE4_KEEP_COHESIVE_MULT_SIDE_HEAVY_NO_ML)
+        reasons.append("side_heavy_no_mainline_terms")
+
+    cr = str(rec.get("coherence_reason") or "").lower()
+    if "accidental" in cr and hq == "side_only_or_accidental_multi_hit":
+        mult *= 0.996
+        reasons.append("coherence_reason_accidental_hint")
+
+    labs = rec.get("job_axis_labels")
+    n_axis = len(labs) if isinstance(labs, (list, tuple, set)) else 0
+    if n_axis >= int(STAGE4_KEEP_COHESIVE_AXIS_MIN_LABELS) and ml >= 1:
+        mult *= float(STAGE4_KEEP_COHESIVE_MULT_AXIS_WITH_MAINLINE)
+        reasons.append(f"job_axis_labels>={STAGE4_KEEP_COHESIVE_AXIS_MIN_LABELS}_with_mainline")
+
+    mult = float(
+        max(float(STAGE4_KEEP_COHESIVE_MULT_MIN), min(float(STAGE4_KEEP_COHESIVE_MULT_MAX), mult))
+    )
+    return mult, reasons
+
+
+def _stage4_hit_quality_dist_for_wid_set(by_wid: Dict[str, Dict[str, Any]], wid_set: Set[str]) -> Dict[str, int]:
+    ctr: Counter = Counter()
+    for w in wid_set:
+        r = by_wid.get(w)
+        if not isinstance(r, dict):
+            continue
+        ctr[str(r.get("hit_quality_class") or "unknown")] += 1
+    return dict(ctr)
+
+
 def _compute_stage4_compete_score_for_keep(rec: Dict[str, Any]) -> float:
     """
     kept 全局池竞争分：在 paper_final_score_v2 上做极窄乘子；不取代 Step2 v2 公式本身。
@@ -3122,6 +3216,9 @@ def _compute_stage4_compete_score_for_keep(rec: Dict[str, Any]) -> float:
     rec["community_topic_cohesive_keep_bonus_applied"] = False
     if not STAGE4_ENABLE_EVIDENCE_SCORE_MIGRATION or not STAGE4_KEEP_COMPETE_ENABLED:
         base = float(rec.get("paper_final_score_v2") or rec.get("paper_score") or 0.0)
+        rec["paper_compete_score_for_keep_pre_cohesive"] = float(base)
+        rec["keep_cohesive_factor"] = 1.0
+        rec["keep_cohesive_reasons"] = []
         rec["paper_compete_score_for_keep"] = float(base)
         return float(base)
     base = float(rec.get("paper_final_score_v2") or 0.0)
@@ -3140,8 +3237,13 @@ def _compute_stage4_compete_score_for_keep(rec: Dict[str, Any]) -> float:
     ):
         s = float(s * STAGE4_COMMUNITY_COHESIVE_KEEP_BONUS)
         rec["community_topic_cohesive_keep_bonus_applied"] = True
-    rec["paper_compete_score_for_keep"] = float(s)
-    return float(s)
+    rec["paper_compete_score_for_keep_pre_cohesive"] = float(s)
+    cf, crs = _compute_stage4_keep_cohesive_factor(rec)
+    s_out = float(s * cf)
+    rec["keep_cohesive_factor"] = float(cf)
+    rec["keep_cohesive_reasons"] = list(crs)
+    rec["paper_compete_score_for_keep"] = float(s_out)
+    return float(s_out)
 
 
 def _stage4_apply_keep_compete_reselect(
@@ -3174,6 +3276,7 @@ def _stage4_apply_keep_compete_reselect(
     bonus_n = 0
     comm_iso_n = 0
     comm_coh_n = 0
+    cohesive_nonunity_n = 0
     for _w, rec in by_wid.items():
         if not isinstance(rec, dict):
             continue
@@ -3186,6 +3289,11 @@ def _stage4_apply_keep_compete_reselect(
             comm_iso_n += 1
         if rec.get("community_topic_cohesive_keep_bonus_applied"):
             comm_coh_n += 1
+        try:
+            if abs(float(rec.get("keep_cohesive_factor") or 1.0) - 1.0) > 1e-9:
+                cohesive_nonunity_n += 1
+        except (TypeError, ValueError):
+            pass
 
     if audit_print:
         print(
@@ -3196,6 +3304,11 @@ def _stage4_apply_keep_compete_reselect(
         )
 
     all_wids = list(by_wid.keys())
+    pre_sorted = sorted(
+        all_wids,
+        key=lambda w: -float((by_wid.get(w) or {}).get("paper_compete_score_for_keep_pre_cohesive") or 0.0),
+    )[:GLOBAL_PAPER_LIMIT]
+    pre_cohesive_kept_set = set(pre_sorted)
     new_sorted = sorted(
         all_wids,
         key=lambda w: -float((by_wid.get(w) or {}).get("paper_compete_score_for_keep") or 0.0),
@@ -3219,6 +3332,26 @@ def _stage4_apply_keep_compete_reselect(
 
     added = new_set - selected_baseline
     removed = selected_baseline - new_set
+    cohesive_swap_in = new_set - pre_cohesive_kept_set
+    cohesive_swap_out = pre_cohesive_kept_set - new_set
+    dist_pre = _stage4_hit_quality_dist_for_wid_set(by_wid, pre_cohesive_kept_set)
+    dist_post = _stage4_hit_quality_dist_for_wid_set(by_wid, new_set)
+
+    def _mh_ge2_ct(ws: Set[str]) -> int:
+        c = 0
+        for wx in ws:
+            rr = by_wid.get(wx)
+            if not isinstance(rr, dict):
+                continue
+            try:
+                if int(rr.get("hit_count") or 0) >= 2:
+                    c += 1
+            except (TypeError, ValueError):
+                pass
+        return c
+
+    mh_pre = _mh_ge2_ct(pre_cohesive_kept_set)
+    mh_post = _mh_ge2_ct(new_set)
     _n_pool = int(len(by_wid))
 
     return {
@@ -3237,6 +3370,20 @@ def _stage4_apply_keep_compete_reselect(
         "prekept_mainline_keep_bonus_hit_count": int(bonus_n),
         "community_isolated_fringe_guard_hit_count": int(comm_iso_n),
         "community_topic_cohesive_keep_bonus_hit_count": int(comm_coh_n),
+        "keep_cohesive_nonunity_count": int(cohesive_nonunity_n),
+        "pre_cohesive_kept_set": set(pre_cohesive_kept_set),
+        "cohesive_swap_in_wids": sorted(
+            cohesive_swap_in,
+            key=lambda w: -float((by_wid.get(w) or {}).get("paper_compete_score_for_keep") or 0.0),
+        )[: int(STAGE4_KEEP_COHESIVE_AUDIT_TOP_K)],
+        "cohesive_swap_out_wids": sorted(
+            cohesive_swap_out,
+            key=lambda w: -float((by_wid.get(w) or {}).get("paper_compete_score_for_keep_pre_cohesive") or 0.0),
+        )[: int(STAGE4_KEEP_COHESIVE_AUDIT_TOP_K)],
+        "hit_quality_class_dist_pre_cohesive_kept": dist_pre,
+        "hit_quality_class_dist_post_cohesive_kept": dist_post,
+        "kept_multi_hit_ge2_count_pre_cohesive": int(mh_pre),
+        "kept_multi_hit_ge2_count_post_cohesive": int(mh_post),
         "added_wids": sorted(
             added,
             key=lambda w: -float((by_wid.get(w) or {}).get("paper_compete_score_for_keep") or 0.0),
@@ -3247,6 +3394,78 @@ def _stage4_apply_keep_compete_reselect(
         )[:12],
         "sorted_baseline_head": list(sorted_baseline[:8]),
     }
+
+
+def _print_stage4_keep_cohesive_preference_audit(
+    stats: Optional[Dict[str, Any]],
+    by_wid: Dict[str, Dict[str, Any]],
+    *,
+    audit_print: bool,
+) -> None:
+    if not audit_print or not STAGE4_KEEP_COHESIVE_AUDIT:
+        return
+    print("\n" + "=" * 80)
+    print("[Stage4 keep cohesive preference audit] (pre vs post keep ranking; does not modify paper_final_score_v2)")
+    print("=" * 80)
+    if not stats:
+        print("stats=None")
+        print("=" * 80 + "\n")
+        return
+    print(
+        f"STAGE4_KEEP_COHESIVE_ENABLED={STAGE4_KEEP_COHESIVE_ENABLED} "
+        f"nonunity_factor_rows={stats.get('keep_cohesive_nonunity_count')}"
+    )
+    print(
+        "pre_rank=sort_by_paper_compete_score_for_keep_pre_cohesive | "
+        "post_rank=sort_by_paper_compete_score_for_keep (includes keep_cohesive_factor)"
+    )
+    ins = list(stats.get("cohesive_swap_in_wids") or [])
+    outs = list(stats.get("cohesive_swap_out_wids") or [])
+    print(
+        f"cohesive_swap_in_count={len(ins)} cohesive_swap_out_count={len(outs)} "
+        f"(only_when_pool>GLOBAL_PAPER_LIMIT_or_order_ties; else often empty)"
+    )
+    print(f"hit_quality_class_dist_pre_cohesive_kept={stats.get('hit_quality_class_dist_pre_cohesive_kept')}")
+    print(f"hit_quality_class_dist_post_cohesive_kept={stats.get('hit_quality_class_dist_post_cohesive_kept')}")
+    print(
+        f"kept_multi_hit_ge2_pre={stats.get('kept_multi_hit_ge2_count_pre_cohesive')} "
+        f"kept_multi_hit_ge2_post={stats.get('kept_multi_hit_ge2_count_post_cohesive')}"
+    )
+    print("--- cohesive_swap_in (sample) ---")
+    for w in ins[: max(1, int(STAGE4_KEEP_COHESIVE_AUDIT_TOP_K))]:
+        r = by_wid.get(w)
+        if not isinstance(r, dict):
+            continue
+        try:
+            pre = float(r.get("paper_compete_score_for_keep_pre_cohesive") or 0.0)
+            post = float(r.get("paper_compete_score_for_keep") or 0.0)
+            cf = float(r.get("keep_cohesive_factor") or 1.0)
+        except (TypeError, ValueError):
+            pre, post, cf = 0.0, 0.0, 1.0
+        crs = r.get("keep_cohesive_reasons") or []
+        print(
+            f"  wid={w!r} hqc={r.get('hit_quality_class')!r} ml={r.get('mainline_term_count')} "
+            f"sd={r.get('side_term_count')} hc={r.get('hit_count')} "
+            f"pre_cohesive={pre:.6f} post={post:.6f} factor={cf:.4f} reasons={crs!r}"
+        )
+    print("--- cohesive_swap_out (sample) ---")
+    for w in outs[: max(1, int(STAGE4_KEEP_COHESIVE_AUDIT_TOP_K))]:
+        r = by_wid.get(w)
+        if not isinstance(r, dict):
+            continue
+        try:
+            pre = float(r.get("paper_compete_score_for_keep_pre_cohesive") or 0.0)
+            post = float(r.get("paper_compete_score_for_keep") or 0.0)
+            cf = float(r.get("keep_cohesive_factor") or 1.0)
+        except (TypeError, ValueError):
+            pre, post, cf = 0.0, 0.0, 1.0
+        crs = r.get("keep_cohesive_reasons") or []
+        print(
+            f"  wid={w!r} hqc={r.get('hit_quality_class')!r} ml={r.get('mainline_term_count')} "
+            f"sd={r.get('side_term_count')} hc={r.get('hit_count')} "
+            f"pre_cohesive={pre:.6f} post={post:.6f} factor={cf:.4f} reasons={crs!r}"
+        )
+    print("=" * 80 + "\n")
 
 
 def _print_stage4_keep_competition_migration_summary(
@@ -3266,7 +3485,8 @@ def _print_stage4_keep_competition_migration_summary(
         f"{STAGE4_PREKEPTFRINGE_GUARD_FACTOR} | optional prekept_mainline_bonus="
         f"{STAGE4_PREKEPT_MAINLINE_KEEP_BONUS}) * (optional community_isolated="
         f"{STAGE4_COMMUNITY_ISOLATED_FRINGE_FACTOR} | optional community_cohesive_bonus="
-        f"{STAGE4_COMMUNITY_COHESIVE_KEEP_BONUS})"
+        f"{STAGE4_COMMUNITY_COHESIVE_KEEP_BONUS}) * keep_cohesive_factor "
+        f"(clip [{STAGE4_KEEP_COHESIVE_MULT_MIN},{STAGE4_KEEP_COHESIVE_MULT_MAX}], STAGE4_KEEP_COHESIVE_ENABLED={STAGE4_KEEP_COHESIVE_ENABLED})"
     )
     if not stats:
         print("keep_compete_reselect=skipped (migration off or STAGE4_KEEP_COMPETE_ENABLED=False)")
@@ -3293,7 +3513,8 @@ def _print_stage4_keep_competition_migration_summary(
         f"prekept_fringe_guard_hit_count={stats['prekept_fringe_guard_hit_count']} "
         f"prekept_mainline_keep_bonus_hit_count={stats['prekept_mainline_keep_bonus_hit_count']} "
         f"community_isolated_fringe_guard_hit_count={stats.get('community_isolated_fringe_guard_hit_count', 0)} "
-        f"community_topic_cohesive_keep_bonus_hit_count={stats.get('community_topic_cohesive_keep_bonus_hit_count', 0)}"
+        f"community_topic_cohesive_keep_bonus_hit_count={stats.get('community_topic_cohesive_keep_bonus_hit_count', 0)} "
+        f"keep_cohesive_nonunity_count={stats.get('keep_cohesive_nonunity_count', 0)}"
     )
     if stats.get("keep_compete_extra_limited_row_count") is not None:
         print(
@@ -6323,6 +6544,9 @@ def run_stage4(
 
     _print_stage4_primary_evidence_gate_audit(by_wid, selected_wids_set, audit_print=_label_path_stdout)
 
+    _print_stage4_keep_cohesive_preference_audit(
+        _keep_compete_stats, by_wid, audit_print=_label_path_stdout
+    )
     _print_stage4_keep_competition_migration_summary(
         _keep_compete_stats, by_wid, audit_print=_label_path_stdout
     )
