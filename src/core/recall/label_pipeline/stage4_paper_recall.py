@@ -70,6 +70,177 @@ STAGE4_HIERARCHY_BONUS_DISTRIBUTION_DETAIL = os.environ.get(
 ).strip().lower() in ("1", "true", "yes")
 # True：打印 author payload 逐条 multi-hit；False：仅保留汇总计数（默认）
 STAGE4_AUTHOR_PAYLOAD_AUDIT_VERBOSE = False
+# 上游供稿链审计：写入 recall.debug_info.stage4_author_supply_audit；打印需同时 STAGE4_AUTHOR_SUPPLY_AUDIT=1 且 verbose
+STAGE4_AUTHOR_SUPPLY_AUDIT_PRINT = os.environ.get("STAGE4_AUTHOR_SUPPLY_AUDIT", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+# U3 / grounding_gate 误伤排查：默认关；需 STAGE4_GROUNDING_MISS_AUDIT=1 且评测侧传入 recall._eval_jd_id
+STAGE4_GROUNDING_MISS_AUDIT = os.environ.get("STAGE4_GROUNDING_MISS_AUDIT", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+STAGE4_GROUNDING_MISS_AUDIT_JD_IDS = frozenset(
+    x.strip()
+    for x in (os.environ.get("STAGE4_GROUNDING_MISS_AUDIT_JD_IDS") or "").replace(";", ",").split(",")
+    if x.strip()
+)
+STAGE4_GROUNDING_MISS_AUDIT_TOP_K = max(5, min(40, int(os.environ.get("STAGE4_GROUNDING_MISS_AUDIT_TOP_K", "15"))))
+_GROUNDING_MISS_DEFAULT_JD_IDS = frozenset(
+    {
+        "jd_row_0003",
+        "jd_row_0016",
+        "jd_row_0028",
+        "jd_row_0034",
+        "jd_row_0037",
+    }
+)
+
+
+def _stage4_attach_author_supply_audit(recall: Any, payload: Dict[str, Any]) -> None:
+    """供稿链断点观测：不改动召回逻辑，仅挂载字典供评测/CLI 读取。"""
+    di = getattr(recall, "debug_info", None)
+    if di is not None:
+        setattr(di, "stage4_author_supply_audit", dict(payload))
+    if STAGE4_AUTHOR_SUPPLY_AUDIT_PRINT:
+        _stdout = bool(not getattr(recall, "silent", False) and getattr(recall, "verbose", False))
+        if _stdout:
+            print("\n[Stage4 author_supply_audit]\n" + json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _stage4_attach_grounding_miss_audit(recall: Any, payload: Dict[str, Any]) -> None:
+    """grounding_gate 前候选分布（仅审计，不改召回逻辑）。"""
+    di = getattr(recall, "debug_info", None)
+    if di is not None:
+        setattr(di, "stage4_grounding_miss_audit", dict(payload))
+
+
+def _stage4_should_run_grounding_miss_audit(recall: Any) -> bool:
+    if not STAGE4_GROUNDING_MISS_AUDIT:
+        return False
+    jid = getattr(recall, "_eval_jd_id", None)
+    if not jid:
+        return False
+    js = str(jid).strip()
+    allow = _GROUNDING_MISS_DEFAULT_JD_IDS | STAGE4_GROUNDING_MISS_AUDIT_JD_IDS
+    return js in allow
+
+
+def _stage4_build_grounding_miss_audit_payload(
+    *,
+    jd_id: str,
+    v_ids: List[int],
+    term_meta: Optional[Dict[Any, Dict[str, Any]]],
+    term_funnel_counts: Dict[int, Dict[str, int]],
+    term_kept_paper_audit: Dict[int, List[Dict[str, Any]]],
+    primary_g: float,
+    secondary_g: float,
+    secondary_ja: float,
+    top_k: int,
+) -> Dict[str, Any]:
+    """聚合 grounding_gate 前 term_kept_paper_audit，输出 near-miss 与分型提示。"""
+    tm = term_meta or {}
+
+    def _meta(vid: int) -> Dict[str, Any]:
+        return tm.get(vid) or tm.get(str(vid)) or {}
+
+    mainline_term_count = 0
+    for _vid in v_ids:
+        rr = str(_meta(int(_vid)).get("retrieval_role") or "").strip().lower()
+        if rr == "paper_primary":
+            mainline_term_count += 1
+
+    flat: List[Dict[str, Any]] = []
+    tg_max = 0.0
+    ja_max = 0.0
+    cypher_total = 0
+    after_g_total = 0
+    for vid in v_ids:
+        try:
+            vi = int(vid)
+        except (TypeError, ValueError):
+            continue
+        fc = term_funnel_counts.get(vi) or {}
+        cypher_total += int(fc.get("cypher_raw", 0) or 0)
+        after_g_total += int(fc.get("after_grounding_gate", 0) or 0)
+        m = _meta(vi)
+        tname = str(m.get("term") or m.get("anchor") or vi)
+        role = str(m.get("retrieval_role") or "").strip().lower()
+        lane = str(m.get("paper_select_lane_tier") or "").strip()
+        for p in term_kept_paper_audit.get(vi) or []:
+            if not isinstance(p, dict):
+                continue
+            tg = float(p.get("term_grounding") or p.get("grounding") or 0.0)
+            ja = float(p.get("jd_align") or 0.0)
+            tg_max = max(tg_max, tg)
+            ja_max = max(ja_max, ja)
+            pass_p = tg >= primary_g - 1e-9
+            pass_s = (tg >= secondary_g - 1e-9) and (ja >= secondary_ja - 1e-9)
+            gap_p = primary_g - tg
+            gap_s_ja = max(0.0, secondary_ja - ja) if tg >= secondary_g - 1e-9 else None
+            near_p = (not pass_p) and (tg >= primary_g - 0.03) and (tg < primary_g)
+            near_s = (not pass_s) and (tg >= secondary_g) and (ja >= secondary_ja - 0.08) and (ja < secondary_ja)
+            flat.append(
+                {
+                    "wid": str(p.get("paper_id") or ""),
+                    "vid": vi,
+                    "term": tname,
+                    "retrieval_role": role,
+                    "paper_select_lane_tier": lane,
+                    "tg": round(tg, 6),
+                    "jd_align": round(ja, 6),
+                    "pass_primary": pass_p,
+                    "pass_secondary": pass_s,
+                    "gap_to_primary": round(gap_p, 6),
+                    "gap_secondary_jd_align": (round(gap_s_ja, 6) if gap_s_ja is not None else None),
+                    "near_miss_primary_band": bool(near_p),
+                    "near_miss_secondary_band": bool(near_s),
+                    "title": (str(p.get("title") or "")[:140]),
+                }
+            )
+
+    flat.sort(key=lambda x: (-float(x["tg"]), -float(x["jd_align"])))
+    top = flat[: max(0, int(top_k))]
+
+    suspect = False
+    for x in flat:
+        if x["pass_primary"] or x["pass_secondary"]:
+            suspect = True
+            break
+        if x["near_miss_primary_band"] and str(x.get("retrieval_role") or "") == "paper_primary":
+            suspect = True
+            break
+        if x["near_miss_secondary_band"] and mainline_term_count >= 1:
+            suspect = True
+            break
+
+    reasonable = (tg_max < secondary_g - 1e-9) or (
+        tg_max < primary_g - 0.02 and ja_max < secondary_ja - 0.05 and not any(
+            z["near_miss_primary_band"] or z["near_miss_secondary_band"] for z in flat[:50]
+        )
+    )
+
+    verdict = "suspect_misfire" if suspect else ("reasonable_empty" if reasonable else "mixed_or_low_signal")
+
+    return {
+        "jd_id": jd_id,
+        "thresholds": {
+            "primary_grounding_min": primary_g,
+            "secondary_grounding_min": secondary_g,
+            "secondary_jd_align_min": secondary_ja,
+        },
+        "stage3_mainline_term_count": int(mainline_term_count),
+        "stage3_term_count": len(v_ids),
+        "funnel_totals": {"cypher_raw": cypher_total, "after_grounding_gate": after_g_total},
+        "global_max": {"tg": round(tg_max, 6), "jd_align": round(ja_max, 6)},
+        "top_candidates_pre_gate": top,
+        "verdict_hint": verdict,
+        "notes": "pre_gate：无 paper_hit_quality_class/paper_evidence_role（wid 合并后才赋值）；single-hit 用 retrieval_role 与 paper_select_lane_tier 代替",
+    }
+
+
 # 0：关闭。>0：每词沿 HAS_TOPIC 仅保留 year 降序前 N 篇（与 Python 侧 term_contrib 排序不同，可能改变结果；用于压行数时对照）
 STAGE4_LAYER1_PER_V_CAP = int(os.environ.get("STAGE4_LAYER1_PER_V_CAP", "0"))
 # Step2：evidence quality 混入 v2 分；True=按 paper_final_score_v2 重排 sorted_wids 与 term kept 诊断；False=仅审计
@@ -88,10 +259,12 @@ STAGE4_PREKEPT_MAINLINE_KEEP_BONUS = 1.035
 # keep 入口竞争：在 local_cap 截断之外，再纳入「已过 grounding、未进 local cap」的 (vid,wid) 行。
 # <=0：纳入 local_cap 之后 remainder 全部（仅受 grounding 与 triples 长度限制）；>0：最多再纳入这么多条。
 # 使 by_wid 大于「仅 kept 前 local_cap」时的唯一 wid 覆盖，避免 compete 候选与 global baseline 完全同构。
+# Step1：注意语义——<=0 表示 tail remainder 全纳入；>0 表示每 term 的 tail **最多**纳入这么多条（会显著收窄池，勿与「薄池补 2 条」混淆）。
+# 薄池降空 JD 应靠 Stage4 其它窄门/补位逻辑或显式调大本值；默认保持 0 与基线池规模一致。
 STAGE4_KEEP_COMPETE_EXTRA_PER_TERM = int(os.environ.get("STAGE4_KEEP_COMPETE_EXTRA_PER_TERM", "0"))
 # Paper-topic-Paper 轻量社区：kept 竞争位点对孤立 term-only fringe 额外抑制、对 topic-cohesive 极轻加成（不改动 v2 主干公式）
 STAGE4_COMMUNITY_ISOLATED_FRINGE_FACTOR = float(os.environ.get("STAGE4_COMMUNITY_ISOLATED_FRINGE_FACTOR", "0.90"))
-STAGE4_COMMUNITY_COHESIVE_KEEP_BONUS = float(os.environ.get("STAGE4_COMMUNITY_COHESIVE_KEEP_BONUS", "1.05"))
+STAGE4_COMMUNITY_COHESIVE_KEEP_BONUS = float(os.environ.get("STAGE4_COMMUNITY_COHESIVE_KEEP_BONUS", "1.065"))
 # keep compete 末段：极轻「主线+互补 support」局部簇偏好（叠乘在 paper_compete_score 链上；**不**改 paper_final_score_v2）
 STAGE4_KEEP_COHESIVE_ENABLED = True
 STAGE4_KEEP_COHESIVE_AUDIT = True
@@ -101,7 +274,7 @@ STAGE4_KEEP_COHESIVE_MULT_MAX = 1.015
 STAGE4_KEEP_COHESIVE_MULT_MAINLINE_RESONANCE = 1.010
 STAGE4_KEEP_COHESIVE_MULT_MAINLINE_PLUS_SUPPORT = 1.010
 STAGE4_KEEP_COHESIVE_MULT_SINGLE_HIT_MAINLINE = 1.008
-STAGE4_KEEP_COHESIVE_MULT_SINGLE_HIT_SIDE = 0.994
+STAGE4_KEEP_COHESIVE_MULT_SINGLE_HIT_SIDE = 0.986
 STAGE4_KEEP_COHESIVE_MULT_SIDE_ACCIDENTAL = 0.990
 STAGE4_KEEP_COHESIVE_MULT_SIDE_HEAVY_NO_ML = 0.988
 STAGE4_KEEP_COHESIVE_MULT_AXIS_WITH_MAINLINE = 1.004
@@ -161,6 +334,194 @@ STAGE4_COHESIVE_DET_BLEND_MIN = float(os.environ.get("STAGE4_COHESIVE_DET_BLEND_
 STAGE4_WEAK_NEIGHBOR_EXACT = int(os.environ.get("STAGE4_WEAK_NEIGHBOR_EXACT", "1"))
 # Step2：mainline / multi-hit 解释层审计（修正口径后打印 top multi-hit；默认 ≥8 条）
 STAGE4_MAINLINE_TERM_AUDIT_TOP_MULTI_HIT = int(os.environ.get("STAGE4_MAINLINE_TERM_AUDIT_TOP_MULTI_HIT", "12"))
+# --- Step1 R2：薄池应急准入（仅当主 grounding 门全灭、检索侧仍有行、且无任何 paper_primary 时；
+# 从 term_kept_paper_audit 中按 jd_align 与 off_topic 严格捡 **最多 1 条** near-miss，避免错词大灌池。）
+STAGE4_THIN_POOL_EMERGENCY_ENABLED = os.environ.get("STAGE4_THIN_POOL_EMERGENCY", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+STAGE4_THIN_EMERGENCY_JD_ALIGN_MIN = float(os.environ.get("STAGE4_THIN_EMERGENCY_JD_ALIGN_MIN", "0.805"))
+STAGE4_THIN_EMERGENCY_HYBRID_MIN = float(os.environ.get("STAGE4_THIN_EMERGENCY_HYBRID_MIN", "0.175"))
+STAGE4_THIN_EMERGENCY_GROUNDING_MIN = float(os.environ.get("STAGE4_THIN_EMERGENCY_GROUNDING_MIN", "0.038"))
+STAGE4_THIN_EMERGENCY_GROUNDING_BELOW_PRIMARY = float(
+    os.environ.get("STAGE4_THIN_EMERGENCY_GROUNDING_BELOW_PRIMARY", "0.12")
+)
+# 词面 grounding≈0 但摘要向量 jd_align 尚可：仅当 cypher 行数极少时允许（防错词大池灌入）
+STAGE4_THIN_EMERGENCY_VECTOR_JA_MIN = float(os.environ.get("STAGE4_THIN_EMERGENCY_VECTOR_JA_MIN", "0.738"))
+STAGE4_THIN_EMERGENCY_VECTOR_MAX_ROWS = int(os.environ.get("STAGE4_THIN_EMERGENCY_VECTOR_MAX_ROWS", "8"))
+STAGE4_THIN_EMERGENCY_OFF_TOPIC_MIN = float(os.environ.get("STAGE4_THIN_EMERGENCY_OFF_TOPIC_MIN", "0.78"))
+STAGE4_THIN_EMERGENCY_TOTAL_ROWS_MAX = int(os.environ.get("STAGE4_THIN_EMERGENCY_TOTAL_ROWS_MAX", "520"))
+STAGE4_THIN_EMERGENCY_SINGLE_VID_MAX_CYPHER = int(os.environ.get("STAGE4_THIN_EMERGENCY_SINGLE_VID_MAX_CYPHER", "900"))
+STAGE4_THIN_EMERGENCY_CONTRIB_MULT = float(os.environ.get("STAGE4_THIN_EMERGENCY_CONTRIB_MULT", "0.36"))
+
+
+def _stage4_has_any_paper_primary(
+    v_ids: List[int],
+    term_meta: Optional[Dict[Any, Dict[str, Any]]],
+    term_retrieval_roles: Optional[Dict[Any, str]],
+) -> bool:
+    tr = term_retrieval_roles or {}
+    tm = term_meta or {}
+    for vid in v_ids:
+        rr = str(tr.get(vid) or tr.get(str(vid)) or "").strip().lower()
+        if rr == "paper_primary":
+            return True
+        m = tm.get(vid) if isinstance(tm.get(vid), dict) else tm.get(str(vid))
+        if isinstance(m, dict) and str(m.get("retrieval_role") or "").strip().lower() == "paper_primary":
+            return True
+    return False
+
+
+def _stage4_thin_emergency_pool_shape_ok(
+    v_ids: List[int],
+    rows: List[Any],
+    term_funnel_counts: Dict[int, Dict[str, int]],
+) -> bool:
+    n = len(rows)
+    if n <= 0 or n > STAGE4_THIN_EMERGENCY_TOTAL_ROWS_MAX:
+        return False
+    if len(v_ids) == 1:
+        vid = int(v_ids[0])
+        raw = int((term_funnel_counts.get(vid) or {}).get("cypher_raw", 0))
+        if raw > STAGE4_THIN_EMERGENCY_SINGLE_VID_MAX_CYPHER:
+            return False
+    return True
+
+
+def _stage4_lookup_idf_weight(rows: List[Any], vid: int, wid: str) -> float:
+    for r in rows or []:
+        try:
+            if int(r.get("vid")) == int(vid) and str(r.get("wid")) == str(wid):
+                return float(r.get("idf_weight") or 0.0)
+        except (TypeError, ValueError):
+            continue
+    return 0.5
+
+
+def _stage4_thin_pool_emergency_pick(
+    *,
+    v_ids: List[int],
+    rows: List[Any],
+    term_kept_paper_audit: Dict[int, List[Dict[str, Any]]],
+    term_meta: Optional[Dict[Any, Dict[str, Any]]],
+    term_retrieval_roles_pass: Optional[Dict[Any, str]],
+    term_funnel_counts: Dict[int, Dict[str, int]],
+    primary_g: float,
+    secondary_g: float,
+    secondary_ja: float,
+    _lp: Any,
+) -> Tuple[Optional[Tuple[Any, ...]], Optional[str]]:
+    """
+    返回一条 (wid, vid, effective_contrib, idf_weight, hit_level, grounding, jd_align) 或 (None, None)。
+    仅在 audit 中存在「低于 primary 阈、但 jd_align 极高」且 off_topic 未重罚的候选；且主门全灭、无 paper_primary。
+    """
+    if not STAGE4_THIN_POOL_EMERGENCY_ENABLED:
+        return None, None
+    if _stage4_has_any_paper_primary(v_ids, term_meta, term_retrieval_roles_pass):
+        return None, None
+    if not _stage4_thin_emergency_pool_shape_ok(v_ids, rows, term_funnel_counts):
+        return None, None
+    any_after_g = False
+    for vid in v_ids:
+        if int((term_funnel_counts.get(vid) or {}).get("after_grounding_gate", 0)) > 0:
+            any_after_g = True
+            break
+    if any_after_g:
+        return None, None
+
+    best: Optional[Tuple[float, str, int, Dict[str, Any], bool]] = None
+    for vid in v_ids:
+        for ar in term_kept_paper_audit.get(vid) or []:
+            if not isinstance(ar, dict):
+                continue
+            wid = str(ar.get("paper_id") or "").strip()
+            if not wid:
+                continue
+            try:
+                g = float(ar.get("grounding") or ar.get("term_grounding") or 0.0)
+                ja = float(ar.get("jd_align") or 0.0)
+                hyb = float(ar.get("hybrid_grounding") or 0.0)
+                otp = float(ar.get("offtopic_penalty") or 1.0)
+            except (TypeError, ValueError):
+                continue
+            if g >= float(primary_g) - 1e-9:
+                continue
+            if g > float(STAGE4_THIN_EMERGENCY_GROUNDING_BELOW_PRIMARY):
+                continue
+            n_r = int(len(rows) or 0)
+            lex_ok = float(STAGE4_THIN_EMERGENCY_GROUNDING_MIN) <= g <= float(
+                STAGE4_THIN_EMERGENCY_GROUNDING_BELOW_PRIMARY
+            )
+            vec_ok = (
+                g < float(STAGE4_THIN_EMERGENCY_GROUNDING_MIN)
+                and n_r > 0
+                and n_r <= int(STAGE4_THIN_EMERGENCY_VECTOR_MAX_ROWS)
+            )
+            if not lex_ok and not vec_ok:
+                continue
+            if vec_ok:
+                if ja < float(STAGE4_THIN_EMERGENCY_VECTOR_JA_MIN) or otp < float(STAGE4_THIN_EMERGENCY_OFF_TOPIC_MIN):
+                    continue
+                ja_ok_gate = True
+            else:
+                ja_ok_gate = ja >= STAGE4_THIN_EMERGENCY_JD_ALIGN_MIN or (
+                    hyb >= STAGE4_THIN_EMERGENCY_HYBRID_MIN and ja >= 0.62
+                )
+            if not ja_ok_gate:
+                continue
+            if otp < STAGE4_THIN_EMERGENCY_OFF_TOPIC_MIN:
+                continue
+            if g >= float(secondary_g) - 1e-9 and ja >= float(secondary_ja) - 1e-9:
+                continue
+            if vec_ok:
+                rank_score = ja * 1.2 + (otp - 1.0) * 0.25 - 0.08
+            else:
+                rank_score = ja * 1.05 + g * 0.45 + hyb * 0.55 + (otp - 1.0) * 0.35
+            if best is None or rank_score > best[0]:
+                best = (rank_score, wid, int(vid), dict(ar), bool(vec_ok))
+
+    if best is None:
+        if os.environ.get("STAGE4_THIN_EMERGENCY_AUDIT", "").strip().lower() in ("1", "true", "yes"):
+            _mx_ja = -1.0
+            _mx_h = -1.0
+            _mx_g = -1.0
+            _mx_ot = -1.0
+            _n = 0
+            for _vid in v_ids:
+                for _ar in term_kept_paper_audit.get(_vid) or []:
+                    if not isinstance(_ar, dict):
+                        continue
+                    _n += 1
+                    try:
+                        _mx_ja = max(_mx_ja, float(_ar.get("jd_align") or 0.0))
+                        _mx_h = max(_mx_h, float(_ar.get("hybrid_grounding") or 0.0))
+                        _mx_g = max(_mx_g, float(_ar.get("grounding") or _ar.get("term_grounding") or 0.0))
+                        _mx_ot = max(_mx_ot, float(_ar.get("offtopic_penalty") or 0.0))
+                    except (TypeError, ValueError):
+                        pass
+            # 观测用：不受 _lp/silent 影响（仅当 STAGE4_THIN_EMERGENCY_AUDIT=1）
+            print(
+                "[Stage4 thin_pool_emergency_audit] no_pick "
+                f"audit_rows={_n} max_ja={_mx_ja:.3f} max_hybrid={_mx_h:.3f} max_g={_mx_g:.3f} max_offtopic={_mx_ot:.3f}",
+                flush=True,
+            )
+        return None, None
+    _rank, wid_s, vid_i, ar, _vec_pick = best
+    idf_w = _stage4_lookup_idf_weight(rows, vid_i, wid_s)
+    eff = float(ar.get("final_paper_score") or 0.0) * float(STAGE4_THIN_EMERGENCY_CONTRIB_MULT) * (0.82 if _vec_pick else 1.0)
+    g_ok = float(ar.get("grounding") or ar.get("term_grounding") or 0.0)
+    ja_ok = float(ar.get("jd_align") or 0.0)
+    _lp(
+        "[Stage4 thin_pool_emergency] "
+        f"wid={wid_s!r} vid={vid_i} grounding={g_ok:.3f} jd_align={ja_ok:.3f} "
+        f"eff_contrib={eff:.5f} total_cypher_rows={len(rows)} "
+        f"vids={len(v_ids)}"
+    )
+    return (
+        (wid_s, vid_i, eff, idf_w, "secondary_thin_emergency", g_ok, ja_ok),
+        "thin_pool_emergency_admit",
+    )
 
 
 def _stage4_top_keys_from_dist(d: Dict[str, float], n: int = 5) -> List[str]:
@@ -5786,10 +6147,26 @@ def run_stage4(
             di.stage4_sub_ms = ms
 
     if not vocab_ids or not getattr(recall, "graph", None):
+        _stage4_attach_author_supply_audit(
+            recall,
+            {
+                "first_breakpoint_upstream": "U0_VOCAB_IDS_OR_GRAPH_EMPTY",
+                "n_vocab_ids_for_paper": len(list(vocab_ids or [])),
+                "has_graph": bool(getattr(recall, "graph", None)),
+            },
+        )
         _save_sub({})
         return []
     v_ids = [int(x) for x in vocab_ids if x is not None]
     if not v_ids:
+        _stage4_attach_author_supply_audit(
+            recall,
+            {
+                "first_breakpoint_upstream": "U0_VOCAB_IDS_EMPTY_AFTER_FILTER",
+                "n_vocab_ids_for_paper": 0,
+                "has_graph": bool(getattr(recall, "graph", None)),
+            },
+        )
         _save_sub({})
         return []
     total_w = float(getattr(recall, "total_work_count", 1e6) or 1e6)
@@ -6265,6 +6642,13 @@ def run_stage4(
         sub_ms["cypher1"] = (time.perf_counter() - t0) * 1000.0
         sub_ms["total"] = sub_ms["cypher1"]
         _save_sub(sub_ms)
+        _stage4_attach_author_supply_audit(
+            recall,
+            {
+                "first_breakpoint_upstream": "U1_LAYER1_CYPHER_EXCEPTION",
+                "n_vocab_ids_for_paper": len(v_ids),
+            },
+        )
         return []
 
     t1 = time.perf_counter()
@@ -6279,6 +6663,15 @@ def run_stage4(
     if not rows:
         sub_ms["total"] = (time.perf_counter() - t0) * 1000.0
         _save_sub(sub_ms)
+        _stage4_attach_author_supply_audit(
+            recall,
+            {
+                "first_breakpoint_upstream": "U2_LAYER1_ZERO_ROWS",
+                "n_vocab_ids_for_paper": len(v_ids),
+                "n_layer1_cypher_rows": 0,
+                "n_layer1_unique_wids": 0,
+            },
+        )
         return []
 
     # ---------- Python：recency、role_weight、grounding/off_topic、term_contrib，per-term 限流，再按 paper 聚合 ----------
@@ -6483,6 +6876,24 @@ def run_stage4(
             }
         )
 
+    if rows and _stage4_should_run_grounding_miss_audit(recall):
+        _gj = str(getattr(recall, "_eval_jd_id", "") or "").strip()
+        if _gj:
+            _stage4_attach_grounding_miss_audit(
+                recall,
+                _stage4_build_grounding_miss_audit_payload(
+                    jd_id=_gj,
+                    v_ids=v_ids,
+                    term_meta=term_meta,
+                    term_funnel_counts=term_funnel_counts,
+                    term_kept_paper_audit=term_kept_paper_audit,
+                    primary_g=PRIMARY_GROUNDING_MIN,
+                    secondary_g=SECONDARY_GROUNDING_MIN,
+                    secondary_ja=SECONDARY_JD_ALIGN_MIN,
+                    top_k=STAGE4_GROUNDING_MISS_AUDIT_TOP_K,
+                ),
+            )
+
     # 每个 term 最多保留 TERM_MAX_PAPERS 篇（按 term_contrib 降序）
     limited: List[tuple] = []
     limited_row_tag: List[str] = []
@@ -6573,6 +6984,23 @@ def run_stage4(
         rows_for_paper_map = kept_triples
         term = term_name
         _lp(f"[Stage4 paper_map source] term='{term}' source_stage='after_cap' rows={len(rows_for_paper_map)}")
+
+    if not limited and rows:
+        _em_trip, _em_tag = _stage4_thin_pool_emergency_pick(
+            v_ids=v_ids,
+            rows=rows,
+            term_kept_paper_audit=term_kept_paper_audit,
+            term_meta=term_meta,
+            term_retrieval_roles_pass=term_retrieval_roles,
+            term_funnel_counts=term_funnel_counts,
+            primary_g=PRIMARY_GROUNDING_MIN,
+            secondary_g=SECONDARY_GROUNDING_MIN,
+            secondary_ja=SECONDARY_JD_ALIGN_MIN,
+            _lp=_lp,
+        )
+        if _em_trip is not None and _em_tag:
+            limited.append(_em_trip)
+            limited_row_tag.append(_em_tag)
 
     term_capped_all_wids: Set[str] = set()
     for _tcset in term_capped_unique_wids.values():
@@ -7137,6 +7565,18 @@ def run_stage4(
     if not sorted_wids:
         sub_ms["total"] = (time.perf_counter() - t0) * 1000.0
         _save_sub(sub_ms)
+        _stage4_attach_author_supply_audit(
+            recall,
+            {
+                "first_breakpoint_upstream": "U3_GLOBAL_KEPT_SORTED_WIDS_EMPTY",
+                "n_vocab_ids_for_paper": len(v_ids),
+                "n_layer1_cypher_rows": int(sub_ms.get("cypher1_rows", 0) or 0),
+                "n_layer1_unique_wids": int(sub_ms.get("cypher1_unique_wids", 0) or 0),
+                "n_by_wid_merged": len(by_wid),
+                "n_sorted_wids": 0,
+                "note": "图上有 HAS_TOPIC 候选但经过打分/门控/全局池后无 wid 进入 layer2",
+            },
+        )
         return []
 
     # 审计 1：确认 Stage4 内部 wid 聚合后确实存在 multi-hit 论文
@@ -7179,6 +7619,14 @@ def run_stage4(
         sub_ms["cypher2"] = (time.perf_counter() - t3) * 1000.0
         sub_ms["total"] = (time.perf_counter() - t0) * 1000.0
         _save_sub(sub_ms)
+        _stage4_attach_author_supply_audit(
+            recall,
+            {
+                "first_breakpoint_upstream": "U4_LAYER2_AUTHOR_CYPHER_EXCEPTION",
+                "n_vocab_ids_for_paper": len(v_ids),
+                "n_sorted_wids_for_layer2": len(sorted_wids),
+            },
+        )
         return []
 
     t4 = time.perf_counter()
@@ -7292,6 +7740,25 @@ def run_stage4(
                     continue
                 terms = [str(h.get("term") or h.get("vid") or "") for h in hits if isinstance(h, dict)]
                 _lp(f"aid='{aid}' wid='{p.get('wid')}' hit_count={len(hits)} terms={terms}")
+    _bp_ok = "OK_AUTHOR_SUPPLY"
+    if not out:
+        if not author_rows:
+            _bp_ok = "U5_LAYER2_ZERO_ROWS_NO_AUTHORED_EDGE"
+        else:
+            _bp_ok = "U6_AUTHOR_RECORDS_BUILD_EMPTY"
+    _stage4_attach_author_supply_audit(
+        recall,
+        {
+            "first_breakpoint_upstream": _bp_ok,
+            "n_vocab_ids_for_paper": len(v_ids),
+            "n_layer1_cypher_rows": int(sub_ms.get("cypher1_rows", 0) or 0),
+            "n_layer1_unique_wids": int(sub_ms.get("cypher1_unique_wids", 0) or 0),
+            "n_sorted_wids_for_layer2": len(sorted_wids),
+            "n_layer2_author_cypher_rows": len(author_rows),
+            "n_author_papers_records_out": len(out),
+            "note": "U5：Work 在图中无 (Work)<-[:AUTHORED]-(Author)；U6：极少见，需查 wid 与 by_wid 对齐",
+        },
+    )
     return out
 
 

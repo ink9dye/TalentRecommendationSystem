@@ -1,4 +1,5 @@
 import collections
+import json
 import math
 import os
 import time
@@ -94,6 +95,24 @@ _STAGE5_THICK_JOB_AXES = frozenset(
 STAGE5_BROAD_MAINLINE_DOM_SHARE_MIN = float(os.environ.get("STAGE5_BROAD_MAINLINE_DOM_SHARE_MIN", "0.85"))
 STAGE5_BROAD_MAINLINE_SECOND_TERM_SHARE_MIN = float(os.environ.get("STAGE5_BROAD_MAINLINE_SECOND_TERM_SHARE_MIN", "0.18"))
 STAGE5_BROAD_MAINLINE_MHR_EXCLUDE_MIN = float(os.environ.get("STAGE5_BROAD_MAINLINE_MHR_EXCLUDE_MIN", "0.42"))
+
+# 薄候选：放宽「顶篇相对全局 max 论文分」门槛，避免极少作者/极少论文时全员被 AUTHOR_BEST_PAPER_MIN_RATIO 滤空（仅触发于小池，非全局放水）
+STAGE5_THIN_POOL_MAX_AUTHORS = int(os.environ.get("STAGE5_THIN_POOL_MAX_AUTHORS", "3"))
+STAGE5_THIN_POOL_MAX_PAPERS = int(os.environ.get("STAGE5_THIN_POOL_MAX_PAPERS", "4"))
+STAGE5_THIN_BEST_PAPER_RATIO_SCALE = float(os.environ.get("STAGE5_THIN_BEST_PAPER_RATIO_SCALE", "0.58"))
+STAGE5_THIN_BEST_PAPER_RATIO_FLOOR = float(os.environ.get("STAGE5_THIN_BEST_PAPER_RATIO_FLOOR", "0.014"))
+# 统一 LTR-lite 最终作者重排头：线性组合 Stage5 聚合分 + Stage4 author_rerank + 结构/轴多样性 + 审计命中（不经训练器）
+STAGE5_UNIFIED_LTR_LITE_ENABLED = os.environ.get("STAGE5_UNIFIED_LTR_LITE", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+# 供稿链断点审计：写入 last_debug_info["stage5_supply_chain_audit"]，默认关闭（仅排查时开）
+STAGE5_SUPPLY_CHAIN_AUDIT = os.environ.get("STAGE5_SUPPLY_CHAIN_AUDIT", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 _STAGE5_MAINLINE_HIT_QUALITY = frozenset(
     {"mainline_resonance", "mainline_plus_support", "single_hit_mainline"}
@@ -1451,6 +1470,166 @@ def _print_stage5_support_dominance_audit(
 # 预留：HierarchyConsistency、按 term_family 的 FamilyBalancePenalty。
 
 
+def _stage5_effective_best_paper_min_ratio(recall: Any, n_authors: int, n_papers: int) -> float:
+    base = float(getattr(recall, "AUTHOR_BEST_PAPER_MIN_RATIO", 0.05) or 0.05)
+    thin = (int(n_authors) <= STAGE5_THIN_POOL_MAX_AUTHORS) or (int(n_papers) <= STAGE5_THIN_POOL_MAX_PAPERS)
+    if not thin:
+        return base
+    return max(STAGE5_THIN_BEST_PAPER_RATIO_FLOOR, base * STAGE5_THIN_BEST_PAPER_RATIO_SCALE)
+
+
+def _stage5_axis_label_diversity(author_rec: Optional[Dict[str, Any]]) -> int:
+    """作者 payload 上 job_axis_labels 去重计数，作多轴覆盖 proxy（与 export 侧 axis_coverage 一致来源）。"""
+    seen: Set[str] = set()
+    for p in (author_rec or {}).get("papers") or []:
+        if not isinstance(p, dict):
+            continue
+        labs = p.get("job_axis_labels")
+        if isinstance(labs, list):
+            for x in labs:
+                sx = str(x).strip()
+                if sx:
+                    seen.add(sx)
+    return len(seen)
+
+
+def _stage5_apply_unified_ltr_lite_final_rerank(
+    scored_authors: List[Dict[str, Any]],
+    author_record_by_aid: Dict[str, Dict[str, Any]],
+) -> None:
+    """
+    在 suppression / broad-mainline 等 **审计字段已就绪** 之后，对同一 JD 候选作者做一次可解释线性融合并重排。
+    - 保留原聚合分为主信号；并入 Stage4 author_rerank_score（min-max 于本批候选内）。
+    - 轻量奖励：mainline 占比、论文数、多轴、primary 证据、hq multi-hit、结构乘子区间。
+    - 轻量惩罚：suppression audit 与 broad-mainline dominance audit（仅排序层，不回头改论文分）。
+    写出 author_stage5_unified_score 与 stage5_pre_unified_score，供导出与训练样本使用。
+    """
+    if not scored_authors or not STAGE5_UNIFIED_LTR_LITE_ENABLED:
+        return
+
+    s4_vals: List[float] = []
+    for row in scored_authors:
+        aid = str(row.get("aid") or "")
+        ar = author_record_by_aid.get(aid) or {}
+        s4_vals.append(float(ar.get("author_rerank_score") or ar.get("final_score_reranked") or 0.0))
+    mn_s4 = min(s4_vals)
+    mx_s4 = max(s4_vals)
+
+    raw_list: List[float] = []
+    for row in scored_authors:
+        aid = str(row.get("aid") or "")
+        ar = author_record_by_aid.get(aid) or {}
+        s5 = float(row.get("score") or 0.0)
+        row["stage5_pre_unified_score"] = s5
+
+        s4v = float(ar.get("author_rerank_score") or ar.get("final_score_reranked") or 0.0)
+        if mx_s4 > mn_s4 + 1e-18:
+            s4n = (s4v - mn_s4) / (mx_s4 - mn_s4)
+        else:
+            s4n = 0.5
+
+        summ = ar.get("author_payload_summary") if isinstance(ar.get("author_payload_summary"), dict) else {}
+        mhr = float(summ.get("mainline_support_ratio") or 0.0)
+        pc = int(summ.get("paper_count") or row.get("paper_count") or 0)
+        hq_m = int(summ.get("high_quality_multi_hit_count") or 0)
+        pri = float(row.get("primary_supported_score") or 0.0)
+        axis_div = float(_stage5_axis_label_diversity(ar))
+        axis_norm = min(1.0, axis_div / 5.0)
+
+        sup_hit = 1.0 if row.get("author_suppression_audit_hit") else 0.0
+        broad_hit = 1.0 if row.get("broad_mainline_dominance_hit") else 0.0
+
+        struct_tot = float(row.get("structure_mult_total") or 1.0)
+        struct_norm = min(1.0, max(0.0, (struct_tot - 0.42) / 0.70))
+
+        u = (
+            0.46 * s5
+            + 0.20 * s4n
+            + 0.10 * mhr
+            + 0.07 * min(1.0, math.log1p(max(0, pc)) / math.log1p(6.0))
+            + 0.06 * axis_norm
+            + 0.05 * min(1.0, float(hq_m) / 2.0)
+            + 0.04 * min(1.0, pri * 3.0)
+            + 0.02 * struct_norm
+            - 0.08 * sup_hit
+            - 0.06 * broad_hit
+        )
+        raw_list.append(u)
+        row["author_stage5_unified_breakdown"] = {
+            "s5_pre_unified": round(s5, 6),
+            "s4_struct_rerank_norm": round(s4n, 6),
+            "mainline_support_ratio": round(mhr, 6),
+            "axis_label_n": int(axis_div),
+            "hq_multi_hit": int(hq_m),
+            "primary_supported_score": round(pri, 6),
+            "structure_mult_total": round(struct_tot, 6),
+            "suppression_audit": bool(sup_hit > 0.5),
+            "broad_mainline_dom_audit": bool(broad_hit > 0.5),
+            "unified_raw": round(u, 6),
+        }
+
+    mn_u = min(raw_list)
+    mx_u = max(raw_list)
+    for i, row in enumerate(scored_authors):
+        u_raw = raw_list[i]
+        if mx_u > mn_u + 1e-18:
+            u_fin = (u_raw - mn_u) / (mx_u - mn_u)
+        else:
+            u_fin = u_raw
+        row["author_stage5_unified_raw"] = float(u_raw)
+        row["author_stage5_unified_score"] = float(u_fin)
+        row["score"] = float(u_fin)
+        bd = row.get("author_stage5_unified_breakdown")
+        if isinstance(bd, dict):
+            bd["unified_final_norm"] = round(float(u_fin), 6)
+
+    scored_authors.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+
+
+def _stage5_infer_supply_chain_first_breakpoint(
+    *,
+    n_author_papers_records: int,
+    n_unique_aids_in: int,
+    n_unique_wids_in: int,
+    n_paper_map: int,
+    n_papers_nonpos: int,
+    n_papers_for_agg: int,
+    n_papers_for_agg_zero_authors: int,
+    n_author_term_aids: int,
+    n_author_scores_after_term_recompute: int,
+    n_author_scores_before_best_paper_filter: int,
+    n_author_scores_after_best_paper_filter: int,
+    n_scored_authors_pre_unified: int,
+) -> str:
+    """
+    首个断点编码（字母序越靠前越早）：
+    A* 入口 / 合并前 | B merge | C paper 贡献 | D term 矩阵 | E author 总分 | F best-paper 门槛 | G 组装 scored_authors
+    """
+    if n_author_papers_records <= 0:
+        return "A_INPUT_AUTHOR_RECORDS_EMPTY"
+    if n_unique_wids_in <= 0:
+        return "A_INPUT_NO_WIDS_IN_AUTHOR_RECORDS"
+    if n_paper_map <= 0:
+        return "B_MERGED_PAPER_MAP_EMPTY"
+    if n_papers_for_agg <= 0:
+        if n_paper_map > 0 and n_papers_nonpos >= n_paper_map:
+            return "C_ALL_PAPERS_DROPPED_NONPOSITIVE_SCORE"
+        return "C_PAPERS_FOR_AGG_EMPTY_OTHER"
+    if n_papers_for_agg_zero_authors >= n_papers_for_agg > 0:
+        return "C_PAPERS_FOR_AGG_HAVE_NO_AUTHOR_EDGES"
+    if n_author_term_aids <= 0:
+        return "D_NO_AUTHOR_TERM_CONTRIB_NONPOSITIVE_RANK_OR_WEIGHT"
+    if n_author_scores_after_term_recompute <= 0:
+        return "E_AUTHOR_SCORES_EMPTY_AFTER_TERM_RECOMPUTE"
+    if n_author_scores_after_best_paper_filter <= 0 < n_author_scores_before_best_paper_filter:
+        return "F_BEST_PAPER_MIN_RATIO_REMOVED_ALL_AUTHORS"
+    if n_scored_authors_pre_unified <= 0 < n_author_scores_after_best_paper_filter:
+        return "G_SCORED_AUTHORS_EMPTY_BUT_AUTHOR_SCORES_NONEMPTY"
+    if n_scored_authors_pre_unified <= 0:
+        return "G_SCORED_AUTHORS_EMPTY"
+    return "OK"
+
+
 def run_stage5(
     recall,
     author_papers_list: List[Dict[str, Any]],
@@ -1466,7 +1645,7 @@ def run_stage5(
     → **support-only 作者乘子**（有 **sup_only** 论文、无 **primary 同框** 论文、**top_pri_c≈0** 且 **sup_share** 高时压分）
     → **single-paper side-driven 窄门乘子**（在既有 suppression audit 与 Stage4「side-driven」叙事一致时，对顶篇 fringe 略强、其余非 primary 略轻；与 fanout/term cap/ broad-mainline audit 正交）
     → **authorship Zipf-style pos_weight**（fanout 之后、accumulate 之前：图 pos_weight 不全等时按序叠加调和 1/k×图权；全等则等权 fallback）
-    → 新作比 → 归一化排序。
+    → 新作比 → 归一化排序 → **薄候选下放宽顶篇相对门槛** → **统一 LTR-lite 最终作者重排头**（线性融合 Stage5 分、Stage4 author_rerank、轴/结构/审计）。
     返回 (author_id_list, last_debug_info)。
     """
     _lp_out = bool(not getattr(recall, "silent", False) and getattr(recall, "verbose", False))
@@ -1501,6 +1680,22 @@ def run_stage5(
         }
         if debug_1 and debug_1.get("stage1_sub_ms") is not None:
             recall.last_debug_info["stage1_sub_ms"] = debug_1["stage1_sub_ms"]
+        recall.last_debug_info["stage5_supply_chain_audit"] = {
+            "first_breakpoint": "A_INPUT_AUTHOR_RECORDS_EMPTY",
+            "n_author_papers_records": 0,
+            "n_unique_aids_in": 0,
+            "n_unique_wids_in": 0,
+            "n_merged_paper_map": 0,
+            "n_papers_nonpos_drop": 0,
+            "n_papers_for_agg": 0,
+            "n_papers_for_agg_zero_authors": 0,
+            "n_author_term_aids": 0,
+            "n_author_scores_after_term_recompute": 0,
+            "n_author_scores_before_best_paper_filter": 0,
+            "n_author_scores_after_best_paper_filter": 0,
+            "n_scored_authors_pre_unified": 0,
+            "n_best_paper_filter_removed": 0,
+        }
         return [], recall.last_debug_info
 
     industrial_kws = debug_1.get("industrial_kws", [])
@@ -1526,6 +1721,15 @@ def run_stage5(
     author_record_by_aid: Dict[str, Dict[str, Any]] = {
         str(r["aid"]): r for r in author_papers_list if r.get("aid") is not None
     }
+
+    _in_aids: Set[str] = set()
+    _in_wids: Set[str] = set()
+    for _rec in author_papers_list:
+        if _rec.get("aid") is not None:
+            _in_aids.add(str(_rec["aid"]))
+        for _pp in _rec.get("papers") or []:
+            if isinstance(_pp, dict) and _pp.get("wid") is not None:
+                _in_wids.add(str(_pp["wid"]))
 
     paper_map: Dict[str, Dict[str, Any]] = {}
     author_raw_paper_cnt: Dict[str, int] = collections.Counter()
@@ -1617,6 +1821,7 @@ def run_stage5(
     papers_for_agg: List[Dict[str, Any]] = []
     paper_hit_terms: Dict[str, List[str]] = {}
     all_works_count = 0
+    papers_nonpos_drop = 0
 
     for wid, info in paper_map.items():
         paper_struct = {
@@ -1632,6 +1837,7 @@ def run_stage5(
         supporting_count = out[5] if len(out) > 5 else -1
         all_works_count += 1
         if p_score <= 0:
+            papers_nonpos_drop += 1
             continue
         # 护栏 5：论文进入高优先级候选至少满足其一：≥1 个 primary term，或 ≥2 个 primary/supporting；
         # 纯 expansion 支撑的论文不允许排到 very top（压分）
@@ -1655,6 +1861,8 @@ def run_stage5(
                 "supporting_count": supporting_count,
             }
         )
+
+    n_papers_for_agg_zero_authors = sum(1 for p in papers_for_agg if not (p.get("authors") or []))
 
     t2 = time.perf_counter()
     stage5_sub_ms["paper_contribution"] = (t2 - t1) * 1000.0
@@ -1826,6 +2034,8 @@ def run_stage5(
     for aid, atc in author_term_contrib.items():
         recomputed_author_scores[aid] = float(sum(float(v) for v in atc.values()))
     author_scores = recomputed_author_scores
+    n_author_term_aids = len(author_term_contrib)
+    n_author_scores_after_term_recompute = len(author_scores)
 
     # 每篇论文上有多少个非零 term（与 Stage4 multi-hit 对齐），供 multi_term_paper_count
     wid_n_terms = _wid_nonzero_term_counts(papers_for_agg)
@@ -1947,11 +2157,16 @@ def run_stage5(
     t6 = time.perf_counter()
     stage5_sub_ms["time_and_family"] = (t6 - t5) * 1000.0
 
+    n_author_scores_before_best_paper_filter = len(author_scores)
+    n_best_paper_filter_removed = 0
     if papers_for_agg and author_scores and author_top_works:
         paper_scores_by_wid = {p["wid"]: float(p["score"]) for p in papers_for_agg}
         max_paper = max(paper_scores_by_wid.values()) if paper_scores_by_wid else 0.0
         if max_paper > 0:
-            min_contrib = max_paper * float(recall.AUTHOR_BEST_PAPER_MIN_RATIO)
+            eff_ratio = _stage5_effective_best_paper_min_ratio(
+                recall, len(author_scores), len(papers_for_agg)
+            )
+            min_contrib = max_paper * eff_ratio
             to_remove = [
                 aid
                 for aid in author_scores
@@ -1961,8 +2176,10 @@ def run_stage5(
                 )
                 < min_contrib
             ]
+            n_best_paper_filter_removed = len(to_remove)
             for aid in to_remove:
                 author_scores.pop(aid, None)
+    n_author_scores_after_best_paper_filter = len(author_scores)
 
     if author_scores:
         max_score = max(author_scores.values())
@@ -2046,6 +2263,43 @@ def run_stage5(
     t9 = time.perf_counter()
     stage5_sub_ms["build_ranked_list"] = (t9 - t8) * 1000.0
 
+    n_scored_authors_pre_unified = len(scored_authors)
+    _fb = _stage5_infer_supply_chain_first_breakpoint(
+        n_author_papers_records=len(author_papers_list),
+        n_unique_aids_in=len(_in_aids),
+        n_unique_wids_in=len(_in_wids),
+        n_paper_map=len(paper_map),
+        n_papers_nonpos=papers_nonpos_drop,
+        n_papers_for_agg=len(papers_for_agg),
+        n_papers_for_agg_zero_authors=n_papers_for_agg_zero_authors,
+        n_author_term_aids=n_author_term_aids,
+        n_author_scores_after_term_recompute=n_author_scores_after_term_recompute,
+        n_author_scores_before_best_paper_filter=n_author_scores_before_best_paper_filter,
+        n_author_scores_after_best_paper_filter=n_author_scores_after_best_paper_filter,
+        n_scored_authors_pre_unified=n_scored_authors_pre_unified,
+    )
+    stage5_supply_chain_audit: Dict[str, Any] = {
+        "first_breakpoint": _fb,
+        "n_author_papers_records": len(author_papers_list),
+        "n_unique_aids_in": len(_in_aids),
+        "n_unique_wids_in": len(_in_wids),
+        "n_merged_paper_map": len(paper_map),
+        "n_papers_nonpos_drop": papers_nonpos_drop,
+        "n_papers_for_agg": len(papers_for_agg),
+        "n_papers_for_agg_zero_authors": n_papers_for_agg_zero_authors,
+        "n_author_term_aids": n_author_term_aids,
+        "n_author_scores_after_term_recompute": n_author_scores_after_term_recompute,
+        "n_author_scores_before_best_paper_filter": n_author_scores_before_best_paper_filter,
+        "n_author_scores_after_best_paper_filter": n_author_scores_after_best_paper_filter,
+        "n_best_paper_filter_removed": n_best_paper_filter_removed,
+        "n_scored_authors_pre_unified": n_scored_authors_pre_unified,
+    }
+    if STAGE5_SUPPLY_CHAIN_AUDIT and _label_recall_stdout_enabled(recall):
+        print("\n" + "-" * 80)
+        print("[Stage5 supply_chain_audit]")
+        print(json.dumps(stage5_supply_chain_audit, ensure_ascii=False, indent=2))
+        print("-" * 80 + "\n")
+
     scored_authors.sort(key=lambda x: x["score"], reverse=True)
     _stage5_apply_suppression_audit_fields(
         scored_authors,
@@ -2082,6 +2336,7 @@ def run_stage5(
         top_k=25,
         recall=recall,
     )
+    _stage5_apply_unified_ltr_lite_final_rerank(scored_authors, author_record_by_aid)
     # 批注：看 Top 作者分数来自哪几篇论文（全局 paper_score vs 作者贡献份额），便于判断偏题是否 Stage4 混入。
     paper_scores_by_wid_dbg = {p["wid"]: float(p["score"]) for p in papers_for_agg}
     _p("\n[Stage5 top-author paper provenance]")
@@ -2291,6 +2546,7 @@ def run_stage5(
         "stage5_author_structure_audit": stage5_author_structure_audit_out,
         "stage5_authorship_weighting": authorship_w_stats,
         "stage5_sub_ms": stage5_sub_ms,
+        "stage5_supply_chain_audit": stage5_supply_chain_audit,
     }
     if debug_1 and debug_1.get("stage1_sub_ms") is not None:
         recall.last_debug_info["stage1_sub_ms"] = debug_1["stage1_sub_ms"]

@@ -178,6 +178,9 @@ class VocabStatsIndexer:
             source TEXT,
             updated_at TIMESTAMP
         );
+        -- Label Stage1 jd_profile：按 voc_id 批量查（与 config 原 SQL_INIT 意图一致，库为 vocab_stats.db）
+        CREATE INDEX IF NOT EXISTS idx_vocabulary_topic_stats_voc_id ON vocabulary_topic_stats(voc_id);
+        CREATE INDEX IF NOT EXISTS idx_vocabulary_domain_stats_voc_id ON vocabulary_domain_stats(voc_id);
         """)
         conn.close()
 

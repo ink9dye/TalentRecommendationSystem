@@ -1575,6 +1575,9 @@ class LabelRecallPath:
         全链路调度（五阶段）：领域与锚点 → 学术词扩展 → 词权重（统一复杂公式）→ 图检索 → 作者打分。
         入参 domain_id 与向量路统一。返回 (author_id_list, duration_ms)。
         """
+        # 离线评测：由 evaluation/label_eval_adapter 置位；每次 recall 先清空，避免无图/早退路径遗留上一轮快照
+        if getattr(self, "_eval_capture", False):
+            self._eval_stage4_author_papers_list = None
         if not self.graph:
             self.last_debug_info = {"pipeline_checkpoints": [], "active_domains": [], "dominance": 0.0}
             return [], 0
@@ -1850,6 +1853,8 @@ class LabelRecallPath:
             term_meta=term_meta_for_stage4,
             jd_text=semantic_query_text or query_text,
         )
+        if getattr(self, "_eval_capture", False):
+            self._eval_stage4_author_papers_list = author_papers_list
         _print_label_sub_stage_ms(
             "S4", getattr(self.debug_info, "stage4_sub_ms", None) or {}, do_print=show_timing
         )

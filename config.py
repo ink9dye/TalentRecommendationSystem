@@ -250,10 +250,8 @@ SQL_INIT_SCRIPTS = [
 
     # 3. 反向拓扑覆盖索引：解决协同路计算和图谱全量导出的性能瓶颈
     "CREATE INDEX IF NOT EXISTS idx_aship_author_work ON authorships(author_id, work_id)",
-
-    # 4. Label Stage1 jd_profile：按 voc_id 批量查 stats 时走索引（与逐条查询结果一致）
-    "CREATE INDEX IF NOT EXISTS idx_vocabulary_topic_stats_voc_id ON vocabulary_topic_stats(voc_id)",
-    "CREATE INDEX IF NOT EXISTS idx_vocabulary_domain_stats_voc_id ON vocabulary_domain_stats(voc_id)",
+    # 注：vocabulary_topic_stats / vocabulary_domain_stats 在 VOCAB_STATS_DB_PATH（vocab_stats.db），
+    # 不在主库；对应 voc_id 索引见 build_vocab_stats_index._prepare_db。
 ]
 
 # --- 12. KGATAX 训练数据的存放路径 ---
