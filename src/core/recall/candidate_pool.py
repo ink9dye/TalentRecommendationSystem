@@ -38,6 +38,8 @@ class CandidateRecord:
     multi_path_bonus: float = 0.0
     pair_path_bonus: float = 0.0
     candidate_pool_score: float = 0.0
+    # Step7：由 vector_evidence_summary 派生的弱 bonus，已加在 candidate_pool_score 内；缺 evidence 时为 0
+    vector_evidence_bonus: float = 0.0
     is_multi_path_hit: bool = False
 
     # --- 作者静态指标（KGAT-AX/训练用，第一版可 None）---
@@ -94,6 +96,7 @@ class CandidateRecord:
             "multi_path_bonus": self.multi_path_bonus,
             "pair_path_bonus": self.pair_path_bonus,
             "candidate_pool_score": self.candidate_pool_score,
+            "vector_evidence_bonus": self.vector_evidence_bonus,
             "label_term_count": self.label_term_count,
             "label_core_term_count": self.label_core_term_count,
             "label_support_term_count": self.label_support_term_count,
@@ -142,6 +145,16 @@ class PoolDebugSummary:
     bucket_e_count: int = 0
     bucket_f_count: int = 0
     final_pool_size: int = 0
+    # --- Step6：向量路 evidence 接入统计（不改变截断/打分）---
+    vector_evidence_attached_count: int = 0
+    vector_evidence_summary_nonzero_count: int = 0
+    # --- Step7：弱 bonus 审计（最终池内）---
+    vector_evidence_bonus_nonzero_count: int = 0
+    vector_evidence_bonus_avg: float = 0.0
+    vector_evidence_bonus_max: float = 0.0
+    # --- Step8：来源门控与「未门控 raw」审计（便于与 gate off 对比）---
+    vector_origin_candidate_count: int = 0
+    vector_evidence_bonus_raw_nonzero_count: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -161,6 +174,13 @@ class PoolDebugSummary:
             "bucket_e_count": self.bucket_e_count,
             "bucket_f_count": self.bucket_f_count,
             "final_pool_size": self.final_pool_size,
+            "vector_evidence_attached_count": self.vector_evidence_attached_count,
+            "vector_evidence_summary_nonzero_count": self.vector_evidence_summary_nonzero_count,
+            "vector_evidence_bonus_nonzero_count": self.vector_evidence_bonus_nonzero_count,
+            "vector_evidence_bonus_avg": self.vector_evidence_bonus_avg,
+            "vector_evidence_bonus_max": self.vector_evidence_bonus_max,
+            "vector_origin_candidate_count": self.vector_origin_candidate_count,
+            "vector_evidence_bonus_raw_nonzero_count": self.vector_evidence_bonus_raw_nonzero_count,
         }
 
 

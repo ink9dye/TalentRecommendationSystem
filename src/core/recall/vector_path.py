@@ -2,6 +2,8 @@ import faiss
 
 import json
 
+import re
+
 import sqlite3
 
 import time
@@ -52,7 +54,7 @@ _MULTI_QUERY_FUSION_WEIGHTS: Dict[str, float] = {
 
 
 
-# 与 query_bundle 字段一致；clause 仅预留，本轮不检索
+# 与 query_bundle 字段一致；Step4 对 clause_queries 做浅层补充检索
 
 _MULTI_QUERY_BRANCH_KEYS: Tuple[str, ...] = (
 
@@ -83,6 +85,774 @@ _SCORE_FIELD_BY_BRANCH: Dict[str, str] = {
 }
 
 
+# --- Step3：paper 层轻量 hybrid（dense 主导；surface 为在 fused_dense 之上的有界加性修正，避免稀释 Step2 尺度）---
+
+_HYBRID_W_LEX = 0.045
+
+_HYBRID_W_ACR = 0.04
+
+_HYBRID_W_TOOL = 0.035
+
+_HYBRID_W_CONS = 0.02
+
+_HYBRID_BUMP_CAP = 0.10
+
+
+# --- Step4：clause 局部补充检索（浅层 topK；不替代 raw/compressed/task/method 主路）---
+
+_CLAUSE_MAX_SELECTED = 6
+
+_CLAUSE_MIN_LEN = 14
+
+_CLAUSE_SEARCH_K = 110
+
+_CLAUSE_BONUS_CAP = 0.048
+
+
+# Step5：每位作者随结果输出的 evidence 条数上限（与 author_top_works 的 top_k 对齐，通常 ≤3）
+
+_EVIDENCE_PAPERS_PER_AUTHOR = 4
+
+
+_MIN_EN_STOP = frozenset(
+
+    {
+
+        "the",
+
+        "and",
+
+        "for",
+
+        "with",
+
+        "this",
+
+        "that",
+
+        "from",
+
+        "have",
+
+        "has",
+
+        "are",
+
+        "was",
+
+        "were",
+
+        "been",
+
+        "being",
+
+        "not",
+
+        "but",
+
+        "you",
+
+        "all",
+
+        "can",
+
+        "her",
+
+        "she",
+
+        "may",
+
+        "use",
+
+        "any",
+
+        "our",
+
+        "out",
+
+    }
+
+)
+
+
+def _normalize_surface_text(text: str) -> str:
+
+    """英文小写 + 空白折叠，便于子串匹配；中文保持原样由调用方处理。"""
+
+    if not text:
+
+        return ""
+
+    t = text.lower()
+
+    t = re.sub(r"\s+", " ", t)
+
+    return t.strip()
+
+
+def _extract_query_surface_terms(query_bundle: Dict[str, Any]) -> Dict[str, Any]:
+
+    """
+
+    从 query bundle 动态抽 surface terms，不依赖大规模静态词表。
+
+    - lexical：raw/compressed/task 的通用词面（中英）
+
+    - acronym：全大写、混合大小写技术缩写、字母数字混合短 token
+
+    - method_tool：以 method_focused 为主，并并入 compressed 中的英文技术词
+
+    """
+
+    raw = (query_bundle.get("raw_query") or "").strip()
+
+    comp = (query_bundle.get("compressed_query") or "").strip()
+
+    task = (query_bundle.get("task_focused_query") or "").strip()
+
+    method = (query_bundle.get("method_focused_query") or "").strip()
+
+    blob = " ".join([x for x in (raw, comp, task, method) if x])
+
+    lexical: List[str] = []
+
+    acronym: List[str] = []
+
+    method_tool: List[str] = []
+
+
+
+    def _add_unique(bucket: List[str], term: str, cap: int = 96) -> None:
+
+        t = term.strip()
+
+        if len(t) < 2 or len(bucket) >= cap:
+
+            return
+
+        if t not in bucket:
+
+            bucket.append(t)
+
+
+
+    # 英文长 token（潜在一般词面）
+
+    for m in re.finditer(r"[A-Za-z][A-Za-z0-9/+.\-]{2,}", blob):
+
+        w = m.group(0)
+
+        wl = w.lower()
+
+        if wl in _MIN_EN_STOP:
+
+            continue
+
+        if len(w) >= 3:
+
+            _add_unique(lexical, w)
+
+
+
+    # 中文片段（2~8 字）
+
+    for m in re.finditer(r"[\u4e00-\u9fff]{2,8}", blob):
+
+        _add_unique(lexical, m.group(0))
+
+
+
+    # 缩写 / 方法名片段：全大写、驼峰、iLQR 类
+
+    for m in re.finditer(r"\b[A-Z]{2,}\b", blob):
+
+        _add_unique(acronym, m.group(0))
+
+    for m in re.finditer(r"\b[A-Za-z]{1,3}\d+[A-Za-z0-9]*\b|\b[A-Za-z]*[A-Z][a-z0-9]+[A-Za-z0-9]*\b", blob):
+
+        _add_unique(acronym, m.group(0))
+
+
+
+    # 斜杠列举：RRT/PRM/MPC
+
+    for part in re.split(r"[/，,;\s]+", blob):
+
+        p = part.strip()
+
+        if 2 <= len(p) <= 16 and re.match(r"^[A-Za-z0-9+\-]+$", p):
+
+            if any(c.isupper() for c in p):
+
+                _add_unique(acronym, p)
+
+
+
+    method_blob = " ".join([method, comp])
+
+    for m in re.finditer(r"[A-Za-z][A-Za-z0-9/+.\-]{2,}", method_blob):
+
+        _add_unique(method_tool, m.group(0))
+
+    for m in re.finditer(r"[\u4e00-\u9fff]{2,8}", method_blob):
+
+        _add_unique(method_tool, m.group(0))
+
+
+
+    # 从 lexical 去掉与 acronym 完全重复的短项，降低重复计数
+
+    acr_set = {a.lower() for a in acronym}
+
+    lexical = [x for x in lexical if x.lower() not in acr_set or len(x) > 4]
+
+
+
+    has_any = bool(lexical or acronym or method_tool)
+
+    return {
+
+        "lexical_terms": lexical[:96],
+
+        "acronym_terms": acronym[:64],
+
+        "method_tool_terms": method_tool[:64],
+
+        "has_query_terms": has_any,
+
+    }
+
+
+
+def _term_hit_in_title(title: str, term: str) -> bool:
+
+    """轻量命中：中文子串；英文用词界或子串（短词用词界减噪）。"""
+
+    if not title or not term:
+
+        return False
+
+    t = term.strip()
+
+    if len(t) < 2:
+
+        return False
+
+    if re.search(r"[\u4e00-\u9fff]", t):
+
+        return t in title
+
+    tl = title.lower()
+
+    tlw = t.lower()
+
+    if len(tlw) <= 5 and tlw.encode("utf-8").isalpha():
+
+        return re.search(r"\b" + re.escape(tlw) + r"\b", tl) is not None
+
+    return tlw in tl
+
+
+
+def _coverage_ratio(terms: List[str], title: str) -> float:
+
+    if not terms:
+
+        return 0.0
+
+    hits = sum(1 for x in terms if _term_hit_in_title(title, x))
+
+    return float(min(1.0, hits / float(len(terms))))
+
+
+
+def _multi_query_consistency_surface(rec: Dict[str, Any]) -> float:
+
+    """
+
+    与 Step2 的 multi-hit dense bonus 正交：奖励「任务视角 + 方法视角」同时命中等结构，
+
+    数值仅作 0~1 特征，再乘极小权重，避免重复放大 Step2。
+
+    """
+
+    hits = set(rec.get("hit_query_types") or [])
+
+    v = 0.0
+
+    if "task_focused_query" in hits and "method_focused_query" in hits:
+
+        v = 1.0
+
+    elif "task_focused_query" in hits or "method_focused_query" in hits:
+
+        v = 0.5
+
+    if "compressed_query" in hits and "raw_query" in hits:
+
+        v = min(1.0, v + 0.25)
+
+    return float(min(1.0, v))
+
+
+
+def _compute_paper_surface_match_features(
+
+    paper_title: str,
+
+    query_terms: Optional[Dict[str, Any]],
+
+    paper_record: Dict[str, Any],
+
+) -> Dict[str, Any]:
+
+    """单篇 paper 的 surface 特征，全部压到 [0,1]。"""
+
+    qt = query_terms or {}
+
+    title = paper_title or ""
+
+    lex = qt.get("lexical_terms") or []
+
+    acr = qt.get("acronym_terms") or []
+
+    mt = qt.get("method_tool_terms") or []
+
+
+
+    lexical_coverage = _coverage_ratio(lex, title)
+
+    acronym_bonus = _coverage_ratio(acr, title)
+
+    method_tool_bonus = _coverage_ratio(mt, title)
+
+    consistency_bonus = _multi_query_consistency_surface(paper_record)
+
+
+
+    return {
+
+        "lexical_coverage": float(lexical_coverage),
+
+        "acronym_bonus": float(acronym_bonus),
+
+        "method_tool_bonus": float(method_tool_bonus),
+
+        "consistency_bonus": float(consistency_bonus),
+
+    }
+
+
+
+def _compute_paper_hybrid_score(
+
+    fused_dense_score: float,
+
+    surface_features: Dict[str, Any],
+
+    has_query_terms: bool,
+
+) -> float:
+
+    """
+
+    在 Step2 的 fused_dense_score 之上叠加有界 surface bump（dense 仍为主分；surface 全 0 时与 Step2 完全一致）。
+
+    bump = Σ w_i * feat_i，并 cap 在 _HYBRID_BUMP_CAP，避免单靠术语把小 dense 论文顶到最前。
+
+    """
+
+    fd = float(min(1.0, max(0.0, fused_dense_score)))
+
+    if not has_query_terms:
+
+        return fd
+
+    bump = (
+
+        float(surface_features.get("lexical_coverage", 0.0)) * _HYBRID_W_LEX
+
+        + float(surface_features.get("acronym_bonus", 0.0)) * _HYBRID_W_ACR
+
+        + float(surface_features.get("method_tool_bonus", 0.0)) * _HYBRID_W_TOOL
+
+        + float(surface_features.get("consistency_bonus", 0.0)) * _HYBRID_W_CONS
+
+    )
+
+    bump = min(_HYBRID_BUMP_CAP, bump)
+
+    return float(min(1.0, fd + bump))
+
+
+
+def _norm_clause_key(text: str) -> str:
+
+    return re.sub(r"\s+", "", (text or "").strip().lower())
+
+
+
+def _compute_clause_bonus(rec: Dict[str, Any]) -> float:
+
+    """Step4：与 Step2/3 信号解耦的轻量局部 clause bonus；上界 _CLAUSE_BONUS_CAP。"""
+
+    hc = int(rec.get("hit_clause_count") or 0)
+
+    if hc <= 0:
+
+        return 0.0
+
+    best = float(rec.get("clause_best_score") or 0.0)
+
+    cov = float(rec.get("clause_coverage_ratio") or 0.0)
+
+    bonus = 0.007 * min(hc, 6) + 0.022 * best * (0.45 + 0.55 * cov)
+
+    return float(min(_CLAUSE_BONUS_CAP, bonus))
+
+
+
+def _select_effective_clause_queries(
+
+    clause_queries: Optional[List[str]],
+
+    query_bundle: Dict[str, Any],
+
+) -> List[str]:
+
+    """从 Step1 的 clause_queries 中选少量可检索子句：过短/与全局视角重复/前缀重复的跳过。"""
+
+    gnorm: set = set()
+
+    for k in ("raw_query", "compressed_query", "task_focused_query", "method_focused_query"):
+
+        t = (query_bundle.get(k) or "").strip()
+
+        if t:
+
+            gnorm.add(_norm_clause_key(t))
+
+    out: List[str] = []
+
+    seen_norm: set = set()
+
+    for c in clause_queries or []:
+
+        t = (c or "").strip()
+
+        if len(t) < _CLAUSE_MIN_LEN:
+
+            continue
+
+        if len(t) > 520:
+
+            continue
+
+        nk = _norm_clause_key(t)
+
+        if len(nk) < 12:
+
+            continue
+
+        if nk in gnorm or nk in seen_norm:
+
+            continue
+
+        dup_prefix = False
+
+        for ex in out:
+
+            if min(len(t), len(ex)) >= 36 and t[:36] == ex[:36]:
+
+                dup_prefix = True
+
+                break
+
+        if dup_prefix:
+
+            continue
+
+        out.append(t)
+
+        seen_norm.add(nk)
+
+        if len(out) >= _CLAUSE_MAX_SELECTED:
+
+            break
+
+    return out
+
+
+
+def _apply_clause_hits_to_merged_records(
+
+    merged_records: Dict[str, Dict[str, Any]],
+
+    selected_clauses: List[str],
+
+    per_clause_maps: Dict[str, Dict[str, float]],
+
+) -> None:
+
+    """将各 clause 的命中并入 paper 记录；仅 clause 命中的 wid 以较低 synthetic fused_dense 进入候选池（补覆盖）。"""
+
+    selected_n = len(selected_clauses)
+
+    if selected_n == 0:
+
+        return
+
+    wid_detail: Dict[str, Dict[str, float]] = defaultdict(dict)
+
+    for i, _txt in enumerate(selected_clauses):
+
+        cid = f"c{i}"
+
+        for wid, sim in (per_clause_maps.get(cid) or {}).items():
+
+            cur = wid_detail[wid]
+
+            cur[cid] = max(float(sim), float(cur.get(cid, 0.0)))
+
+    for wid, detail in wid_detail.items():
+
+        best = max(detail.values()) if detail else 0.0
+
+        cids = sorted(detail.keys())
+
+        if wid in merged_records:
+
+            rec = merged_records[wid]
+
+            rec["hit_clause_ids"] = cids
+
+            rec["hit_clause_count"] = len(cids)
+
+            rec["clause_best_score"] = best
+
+            rec["clause_scores_detail"] = dict(detail)
+
+            rec["clause_selected_n"] = selected_n
+
+            rec["clause_coverage_ratio"] = float(len(cids)) / float(max(1, selected_n))
+
+            merged_records[wid] = rec
+
+        else:
+
+            fd = float(min(0.40, 0.09 + 0.58 * best))
+
+            merged_records[wid] = {
+
+                "wid": wid,
+
+                "score_raw_query": None,
+
+                "score_compressed_query": None,
+
+                "score_task_query": None,
+
+                "score_method_query": None,
+
+                "hit_query_types": [],
+
+                "hit_clause_ids": cids,
+
+                "hit_clause_count": len(cids),
+
+                "clause_best_score": best,
+
+                "clause_scores_detail": dict(detail),
+
+                "clause_selected_n": selected_n,
+
+                "clause_coverage_ratio": float(len(cids)) / float(max(1, selected_n)),
+
+                "fused_dense_score": fd,
+
+                "best_dense_score": best * 0.55,
+
+                "query_hit_count": 0,
+
+                "clause_only_entry": True,
+
+            }
+
+    for wid, rec in merged_records.items():
+
+        if wid in wid_detail:
+
+            continue
+
+        rec.setdefault("hit_clause_ids", [])
+
+        rec.setdefault("hit_clause_count", 0)
+
+        rec.setdefault("clause_best_score", 0.0)
+
+        rec.setdefault("clause_scores_detail", {})
+
+        rec.setdefault("clause_selected_n", selected_n)
+
+        rec.setdefault("clause_coverage_ratio", 0.0)
+
+
+
+def _build_paper_evidence_item(
+
+    wid: str,
+
+    merged_records: Dict[str, Dict[str, Any]],
+
+    meta_dict: Dict[str, Any],
+
+) -> Dict[str, Any]:
+
+    """单篇论文的可序列化 evidence 片段（来自 Step2~4 已有字段，非 _last_debug 全量）。"""
+
+    rec = merged_records.get(wid) or {}
+
+    meta = meta_dict.get(wid) or {}
+
+    sf = rec.get("surface_features") or {}
+
+    aware = float(rec.get("paper_clause_aware_score") or rec.get("paper_hybrid_score") or 0.0)
+
+    return {
+
+        "wid": wid,
+
+        "title": str(meta.get("title") or "")[:500],
+
+        "year": meta.get("year"),
+
+        "score_dense": float(rec.get("fused_dense_score") or 0.0),
+
+        "score_hybrid": float(rec.get("paper_hybrid_score") or 0.0),
+
+        "score_clause_aware": aware,
+
+        "hit_query_types": list(rec.get("hit_query_types") or []),
+
+        "query_hit_count": int(rec.get("query_hit_count") or 0),
+
+        "hit_clause_ids": list(rec.get("hit_clause_ids") or []),
+
+        "hit_clause_count": int(rec.get("hit_clause_count") or 0),
+
+        "clause_best_score": float(rec.get("clause_best_score") or 0.0),
+
+        "lexical_coverage": float(sf.get("lexical_coverage") or 0.0),
+
+        "acronym_bonus": float(sf.get("acronym_bonus") or 0.0),
+
+        "method_tool_bonus": float(sf.get("method_tool_bonus") or 0.0),
+
+    }
+
+
+
+def _select_author_evidence_paper_items(
+
+    author_works: List[Tuple[str, float]],
+
+    merged_records: Dict[str, Dict[str, Any]],
+
+    meta_dict: Dict[str, Any],
+
+    top_k: int,
+
+) -> List[Dict[str, Any]]:
+
+    """在作者 Top 贡献论文中，按最终 paper 分（clause_aware 优先）取少量 evidence。"""
+
+    if not author_works:
+
+        return []
+
+    wids = [w for w, _ in author_works]
+
+    def _final_score(w: str) -> float:
+
+        r = merged_records.get(w) or {}
+
+        return float(
+
+            r.get("paper_clause_aware_score")
+
+            or r.get("paper_hybrid_score")
+
+            or r.get("fused_dense_score")
+
+            or 0.0
+
+        )
+
+    wids_sorted = sorted(wids, key=_final_score, reverse=True)[:top_k]
+
+    return [_build_paper_evidence_item(w, merged_records, meta_dict) for w in wids_sorted]
+
+
+
+def _summarize_author_vector_evidence(paper_items: List[Dict[str, Any]]) -> Dict[str, Any]:
+
+    """作者级轻量摘要，供候选池 / 解释层消费。"""
+
+    if not paper_items:
+
+        return {
+
+            "top_evidence_count": 0,
+
+            "best_paper_score": 0.0,
+
+            "max_query_hit_count": 0,
+
+            "max_clause_hit_count": 0,
+
+            "query_type_coverage": [],
+
+            "evidence_sources_summary": {"query_branches": [], "clause_signal_present": False},
+
+        }
+
+    qt_all: set = set()
+
+    for p in paper_items:
+
+        for t in p.get("hit_query_types") or []:
+
+            qt_all.add(t)
+
+    best = max(float(p.get("score_clause_aware") or 0.0) for p in paper_items)
+
+    max_qh = max(int(p.get("query_hit_count") or 0) for p in paper_items)
+
+    max_ch = max(int(p.get("hit_clause_count") or 0) for p in paper_items)
+
+    clause_sig = any(int(p.get("hit_clause_count") or 0) > 0 for p in paper_items)
+
+    return {
+
+        "top_evidence_count": len(paper_items),
+
+        "best_paper_score": float(best),
+
+        "max_query_hit_count": max_qh,
+
+        "max_clause_hit_count": max_ch,
+
+        "query_type_coverage": sorted(qt_all),
+
+        "evidence_sources_summary": {
+
+            "query_branches": sorted(qt_all),
+
+            "clause_signal_present": bool(clause_sig),
+
+        },
+
+    }
 
 
 
@@ -106,7 +876,7 @@ class VectorPath:
 
     """
 
-    向量路召回：实现基于 SBERT 的语义召回（Step2：内部 multi-query retrieval + paper 层保守融合）
+    向量路召回：基于 SBERT；Step2 multi-query dense；Step3 paper 层轻量 hybrid（dense 仍主导）。
 
     """
 
@@ -363,6 +1133,62 @@ class VectorPath:
 
 
 
+    def _search_papers_for_selected_clauses(
+
+        self, selected_clauses: List[str]
+
+    ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, int]]:
+
+        """
+
+        Step4：每个子句独立浅层检索（深度 < 主 multi-query），clause_id 形如 c0,c1,...
+
+        """
+
+        if not selected_clauses:
+
+            return {}, {}
+
+        enc = self._get_query_encoder()
+
+        batch = enc.encode_batch(selected_clauses)
+
+        per_maps: Dict[str, Dict[str, float]] = {}
+
+        per_counts: Dict[str, int] = {}
+
+        for i, _txt in enumerate(selected_clauses):
+
+            row = batch[i : i + 1].copy()
+
+            faiss.normalize_L2(row)
+
+            scores, indices = self.index.search(row, _CLAUSE_SEARCH_K)
+
+            cid = f"c{i}"
+
+            m: Dict[str, float] = {}
+
+            for j, idx in enumerate(indices[0]):
+
+                if 0 <= idx < len(self.id_map):
+
+                    wid = self.id_map[idx]
+
+                    sim = _faiss_dist_to_similarity(self.index, float(scores[0][j]))
+
+                    if wid not in m:
+
+                        m[wid] = sim
+
+            per_maps[cid] = m
+
+            per_counts[cid] = len(m)
+
+        return per_maps, per_counts
+
+
+
     def _merge_multi_query_paper_hits(
 
         self, per_query_hits: Dict[str, Dict[str, float]], active_branches: List[str]
@@ -487,6 +1313,128 @@ class VectorPath:
 
 
 
+    def _attach_vector_evidence_to_meta_list(
+
+        self,
+
+        meta_list: List[Dict[str, Any]],
+
+        agg_result: Any,
+
+        merged_records: Dict[str, Dict[str, Any]],
+
+        meta_dict: Dict[str, Any],
+
+    ) -> Dict[str, Any]:
+
+        """
+
+        Step5：将 Step2~4 已算好的 paper 级信息收敛为每位作者的 vector_evidence（JSON 友好，非 debug 全量）。
+
+        """
+
+        author_evidence_preview: List[Dict[str, Any]] = []
+
+        total_evidence_papers = 0
+
+        atw = agg_result.author_top_works
+
+        for item in meta_list:
+
+            aid = str(item["author_id"])
+
+            works = atw.get(aid, [])
+
+            if not works:
+
+                for k, v in atw.items():
+
+                    if str(k) == aid:
+
+                        works = v
+
+                        break
+
+            papers = _select_author_evidence_paper_items(
+
+                works,
+
+                merged_records,
+
+                meta_dict,
+
+                _EVIDENCE_PAPERS_PER_AUTHOR,
+
+            )
+
+            summary = _summarize_author_vector_evidence(papers)
+
+            item["vector_evidence"] = {"top_papers": papers, "summary": summary}
+
+            total_evidence_papers += len(papers)
+
+            if len(author_evidence_preview) < 8:
+
+                author_evidence_preview.append(
+
+                    {
+
+                        "author_id": aid,
+
+                        "top_evidence_count": summary.get("top_evidence_count"),
+
+                        "best_paper_score": summary.get("best_paper_score"),
+
+                        "query_type_coverage": summary.get("query_type_coverage"),
+
+                    }
+
+                )
+
+        n_auth = max(1, len(meta_list))
+
+        author_evidence_stats = {
+
+            "authors_with_evidence": len(meta_list),
+
+            "avg_evidence_papers_per_author": float(total_evidence_papers) / float(n_auth),
+
+            "total_evidence_papers": total_evidence_papers,
+
+        }
+
+        vec_top: Dict[str, Any] = {}
+
+        if meta_list:
+
+            ev0 = meta_list[0].get("vector_evidence") or {}
+
+            tp0 = ev0.get("top_papers") or []
+
+            vec_top = {
+
+                "author_id": meta_list[0].get("author_id"),
+
+                "summary": ev0.get("summary"),
+
+                "first_paper_wid": (tp0[0].get("wid") if tp0 else None),
+
+                "first_paper_score_clause_aware": (tp0[0].get("score_clause_aware") if tp0 else None),
+
+            }
+
+        return {
+
+            "author_evidence_preview": author_evidence_preview,
+
+            "author_evidence_stats": author_evidence_stats,
+
+            "vector_evidence_top_author_preview": vec_top,
+
+        }
+
+
+
     def recall(self, query_vector, target_domains=None, verbose=False, query_text=None):
 
         """
@@ -563,7 +1511,63 @@ class VectorPath:
 
             merged_paper_candidate_count = len(merged_records)
 
+            # --- Step4：clause 局部多视角补充检索（浅层），并入 merged_records ---
 
+            selected_clause_queries = _select_effective_clause_queries(clause_reserved, query_bundle)
+
+            per_clause_hit_counts: Dict[str, int] = {}
+
+            clause_maps: Dict[str, Dict[str, float]] = {}
+
+            if selected_clause_queries:
+
+                clause_maps, per_clause_hit_counts = self._search_papers_for_selected_clauses(selected_clause_queries)
+
+                _apply_clause_hits_to_merged_records(merged_records, selected_clause_queries, clause_maps)
+
+            else:
+
+                for _w, rec in merged_records.items():
+
+                    rec.setdefault("hit_clause_ids", [])
+
+                    rec.setdefault("hit_clause_count", 0)
+
+                    rec.setdefault("clause_best_score", 0.0)
+
+                    rec.setdefault("clause_coverage_ratio", 0.0)
+
+                    rec.setdefault("clause_selected_n", 0)
+
+                    rec.setdefault("clause_scores_detail", {})
+
+            merged_paper_candidate_count = len(merged_records)
+
+            clause_merged_paper_count = merged_paper_candidate_count
+
+            self._last_debug.update(
+
+                {
+
+                    "selected_clause_queries": list(selected_clause_queries),
+
+                    "per_clause_hit_counts": per_clause_hit_counts,
+
+                    "clause_merged_paper_count": clause_merged_paper_count,
+
+                }
+
+            )
+
+            if verbose and selected_clause_queries:
+
+                print(
+
+                    f"[VectorPath] clause retrieval: selected={len(selected_clause_queries)} "
+
+                    f"hits={per_clause_hit_counts} merged_papers={clause_merged_paper_count}"
+
+                )
 
             # 按融合分排序，取前 search_k 进入原主链（与旧版「单路 topK」带宽对齐）
 
@@ -580,14 +1584,6 @@ class VectorPath:
 
 
             raw_work_ids = sorted_wids
-
-            faiss_score_map: Dict[str, float] = {
-
-                w: float(merged_records[w]["fused_dense_score"]) for w in raw_work_ids
-
-            }
-
-
 
             merged_paper_top_preview: List[Dict[str, Any]] = []
 
@@ -611,7 +1607,19 @@ class VectorPath:
 
                 )
 
+            query_surface_terms = _extract_query_surface_terms(query_bundle)
 
+            query_surface_terms_preview = {
+
+                "lexical_terms": (query_surface_terms.get("lexical_terms") or [])[:28],
+
+                "acronym_terms": (query_surface_terms.get("acronym_terms") or [])[:28],
+
+                "method_tool_terms": (query_surface_terms.get("method_tool_terms") or [])[:28],
+
+                "has_query_terms": query_surface_terms.get("has_query_terms", False),
+
+            }
 
             self._last_debug.update(
 
@@ -627,11 +1635,11 @@ class VectorPath:
 
                     "multi_query_active_branches": active_branches,
 
+                    "query_surface_terms_preview": query_surface_terms_preview,
+
                 }
 
             )
-
-
 
             if verbose:
 
@@ -653,13 +1661,45 @@ class VectorPath:
 
                 print(f"[VectorPath] merged_top5_wid+hit_types: {prev_titles}")
 
+                print(
 
+                    f"[VectorPath] hybrid terms: lexical={len(query_surface_terms.get('lexical_terms') or [])} "
+
+                    f"acronym={len(query_surface_terms.get('acronym_terms') or [])} "
+
+                    f"method_tool={len(query_surface_terms.get('method_tool_terms') or [])}"
+
+                )
 
             if not raw_work_ids:
 
+                self._last_debug.update(
+
+                    {
+
+                        "paper_hybrid_feature_preview": [],
+
+                        "paper_hybrid_top_preview": [],
+
+                        "hybrid_feature_stats": {
+
+                            "mean_lexical_coverage": 0.0,
+
+                            "mean_acronym_bonus": 0.0,
+
+                            "mean_method_tool_bonus": 0.0,
+
+                            "pct_any_surface_signal": 0.0,
+
+                            "papers_count": 0,
+
+                        },
+
+                    }
+
+                )
+
                 return [], (time.time() - start_t) * 1000
-
-
 
             # --- 步骤 2: 获取论文的领域标签与元信息用于过滤与调试 ---
 
@@ -673,7 +1713,271 @@ class VectorPath:
 
             meta_dict = {row[0]: {"title": row[2], "year": row[3]} for row in work_data}
 
+            # --- Step3：paper 层轻量 hybrid（title 匹配；dense 主干不变）---
 
+            has_qt = bool(query_surface_terms.get("has_query_terms"))
+
+            lex_vals: List[float] = []
+
+            acr_vals: List[float] = []
+
+            tool_vals: List[float] = []
+
+            nonzero_hybrid = 0
+
+            for wid in raw_work_ids:
+
+                rec = merged_records.get(wid) or {}
+
+                title = (meta_dict.get(wid, {}).get("title") or "")
+
+                feats = _compute_paper_surface_match_features(title, query_surface_terms, rec)
+
+                for k, arr in (
+
+                    ("lexical_coverage", lex_vals),
+
+                    ("acronym_bonus", acr_vals),
+
+                    ("method_tool_bonus", tool_vals),
+
+                ):
+
+                    arr.append(float(feats.get(k, 0.0)))
+
+                phs = _compute_paper_hybrid_score(float(rec.get("fused_dense_score", 0.0)), feats, has_qt)
+
+                rec["surface_features"] = feats
+
+                rec["paper_hybrid_score"] = phs
+
+                cb = _compute_clause_bonus(rec)
+
+                rec["clause_bonus"] = cb
+
+                rec["paper_clause_aware_score"] = float(min(1.0, phs + cb))
+
+                merged_records[wid] = rec
+
+                if (feats.get("lexical_coverage", 0) + feats.get("acronym_bonus", 0) + feats.get("method_tool_bonus", 0)) > 0.02:
+
+                    nonzero_hybrid += 1
+
+            n_p = max(1, len(raw_work_ids))
+
+            hybrid_feature_stats = {
+
+                "mean_lexical_coverage": float(sum(lex_vals) / n_p),
+
+                "mean_acronym_bonus": float(sum(acr_vals) / n_p),
+
+                "mean_method_tool_bonus": float(sum(tool_vals) / n_p),
+
+                "pct_any_surface_signal": float(nonzero_hybrid / float(n_p)),
+
+                "papers_count": len(raw_work_ids),
+
+            }
+
+            raw_work_ids = sorted(
+
+                raw_work_ids,
+
+                key=lambda w: float((merged_records.get(w) or {}).get("paper_clause_aware_score", 0.0)),
+
+                reverse=True,
+
+            )
+
+            faiss_score_map: Dict[str, float] = {
+
+                w: float((merged_records.get(w) or {}).get("paper_clause_aware_score", 0.0)) for w in raw_work_ids
+
+            }
+
+            paper_hybrid_feature_preview: List[Dict[str, Any]] = []
+
+            for w in raw_work_ids[:14]:
+
+                r = merged_records.get(w) or {}
+
+                sf = r.get("surface_features") or {}
+
+                paper_hybrid_feature_preview.append(
+
+                    {
+
+                        "work_id": w,
+
+                        "lexical_coverage": sf.get("lexical_coverage"),
+
+                        "acronym_bonus": sf.get("acronym_bonus"),
+
+                        "method_tool_bonus": sf.get("method_tool_bonus"),
+
+                        "consistency_bonus": sf.get("consistency_bonus"),
+
+                        "paper_hybrid_score": r.get("paper_hybrid_score"),
+
+                        "clause_bonus": r.get("clause_bonus"),
+
+                        "paper_clause_aware_score": r.get("paper_clause_aware_score"),
+
+                        "fused_dense_score": r.get("fused_dense_score"),
+
+                    }
+
+                )
+
+            paper_hybrid_top_preview: List[Dict[str, Any]] = []
+
+            for w in raw_work_ids[:18]:
+
+                r = merged_records.get(w) or {}
+
+                t = (meta_dict.get(w, {}).get("title") or "")
+
+                if len(t) > 120:
+
+                    t = t[:117] + "..."
+
+                sf = r.get("surface_features") or {}
+
+                paper_hybrid_top_preview.append(
+
+                    {
+
+                        "work_id": w,
+
+                        "title": t,
+
+                        "fused_dense_score": r.get("fused_dense_score"),
+
+                        "lexical_coverage": sf.get("lexical_coverage"),
+
+                        "acronym_bonus": sf.get("acronym_bonus"),
+
+                        "method_tool_bonus": sf.get("method_tool_bonus"),
+
+                        "consistency_bonus": sf.get("consistency_bonus"),
+
+                        "query_hit_count": r.get("query_hit_count"),
+
+                        "paper_hybrid_score": r.get("paper_hybrid_score"),
+
+                        "clause_bonus": r.get("clause_bonus"),
+
+                        "paper_clause_aware_score": r.get("paper_clause_aware_score"),
+
+                    }
+
+                )
+
+            clause_top_preview: List[Dict[str, Any]] = []
+
+            cb_vals = [
+
+                float((merged_records.get(w) or {}).get("clause_bonus") or 0.0) for w in raw_work_ids
+
+            ]
+
+            hit_any_clause = sum(
+
+                1
+
+                for w in raw_work_ids
+
+                if int((merged_records.get(w) or {}).get("hit_clause_count") or 0) > 0
+
+            )
+
+            clause_feature_stats = {
+
+                "mean_clause_bonus": float(sum(cb_vals) / max(1, len(cb_vals))),
+
+                "pct_papers_with_clause_hit": float(hit_any_clause / float(max(1, len(raw_work_ids)))),
+
+                "selected_clause_n": len(selected_clause_queries) if selected_clause_queries else 0,
+
+            }
+
+            for w in raw_work_ids[:14]:
+
+                r = merged_records.get(w) or {}
+
+                t = (meta_dict.get(w, {}).get("title") or "")
+
+                if len(t) > 100:
+
+                    t = t[:97] + "..."
+
+                clause_top_preview.append(
+
+                    {
+
+                        "work_id": w,
+
+                        "title": t,
+
+                        "hit_clause_ids": r.get("hit_clause_ids"),
+
+                        "hit_clause_count": r.get("hit_clause_count"),
+
+                        "clause_best_score": r.get("clause_best_score"),
+
+                        "clause_bonus": r.get("clause_bonus"),
+
+                        "paper_hybrid_score": r.get("paper_hybrid_score"),
+
+                        "paper_clause_aware_score": r.get("paper_clause_aware_score"),
+
+                    }
+
+                )
+
+            self._last_debug.update(
+
+                {
+
+                    "paper_hybrid_feature_preview": paper_hybrid_feature_preview,
+
+                    "paper_hybrid_top_preview": paper_hybrid_top_preview,
+
+                    "hybrid_feature_stats": hybrid_feature_stats,
+
+                    "clause_top_preview": clause_top_preview,
+
+                    "clause_feature_stats": clause_feature_stats,
+
+                }
+
+            )
+
+            if verbose:
+
+                h1 = paper_hybrid_top_preview[0] if paper_hybrid_top_preview else {}
+
+                print(
+
+                    f"[VectorPath] hybrid top1: wid={h1.get('work_id')} "
+
+                    f"dense={h1.get('fused_dense_score')} hybrid={h1.get('paper_hybrid_score')} "
+
+                    f"lex={h1.get('lexical_coverage')} acr={h1.get('acronym_bonus')} tool={h1.get('method_tool_bonus')}"
+
+                )
+
+                c1 = clause_top_preview[0] if clause_top_preview else {}
+
+                print(
+
+                    f"[VectorPath] clause top1: wid={c1.get('work_id')} "
+
+                    f"clause_hit={c1.get('hit_clause_count')} cb={c1.get('clause_bonus')} "
+
+                    f"aware={c1.get('paper_clause_aware_score')}"
+
+                )
 
             # --- 步骤 3: 领域硬过滤（只有对应领域的论文才能发挥作用） ---
 
@@ -747,11 +2051,31 @@ class VectorPath:
 
                     mq = merged_records.get(wid, {})
 
+                    sf = mq.get("surface_features") or {}
+
                     work_debug_map[wid] = {
 
                         "faiss_sim": float(base_sim),
 
-                        "multi_query_fused_dense": float(mq.get("fused_dense_score", base_sim)),
+                        "fused_dense_score": float(mq.get("fused_dense_score", base_sim)),
+
+                        "paper_hybrid_score": float(mq.get("paper_hybrid_score", base_sim)),
+
+                        "clause_bonus": float(mq.get("clause_bonus") or 0.0),
+
+                        "paper_clause_aware_score": float(mq.get("paper_clause_aware_score", base_sim)),
+
+                        "hit_clause_ids": mq.get("hit_clause_ids"),
+
+                        "hit_clause_count": mq.get("hit_clause_count"),
+
+                        "lexical_coverage": sf.get("lexical_coverage"),
+
+                        "acronym_bonus": sf.get("acronym_bonus"),
+
+                        "method_tool_bonus": sf.get("method_tool_bonus"),
+
+                        "consistency_bonus": sf.get("consistency_bonus"),
 
                         "hit_query_types": mq.get("hit_query_types"),
 
@@ -919,9 +2243,33 @@ class VectorPath:
 
             ]
 
+            ev_dbg = self._attach_vector_evidence_to_meta_list(meta_list, agg_result, merged_records, meta_dict)
 
+            self._last_debug.update(ev_dbg)
 
             if verbose:
+
+                st = ev_dbg.get("author_evidence_stats") or {}
+
+                print(
+
+                    f"[VectorPath] evidence attached: authors={st.get('authors_with_evidence', 0)} "
+
+                    f"avg_papers={st.get('avg_evidence_papers_per_author', 0.0):.2f}"
+
+                )
+
+                tp = ev_dbg.get("vector_evidence_top_author_preview") or {}
+
+                print(
+
+                    f"[VectorPath] evidence top1 author preview: aid={tp.get('author_id')} "
+
+                    f"best={(tp.get('summary') or {}).get('best_paper_score')} "
+
+                    f"first_wid={tp.get('first_paper_wid')}"
+
+                )
 
                 top20_items = sorted(author_scores.items(), key=lambda x: x[1], reverse=True)[:20]
 

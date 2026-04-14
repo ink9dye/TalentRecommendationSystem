@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
 from config import DB_PATH
@@ -35,6 +36,165 @@ def extract_terms_from_label_evidence(label_evidence: Any) -> List[Dict[str, Any
                 if isinstance(x, dict)
             ]
     return []
+
+
+# Step7/8：向量路 evidence 弱 bonus 的全局上界（不得上调；Step8 仅允许更小 cap / 门控 / 关闭）
+_VECTOR_EVIDENCE_BONUS_CAP = 0.048
+
+
+@dataclass(frozen=True)
+class VectorEvidenceBonusConfig:
+    """
+    Step8：极小配置面，便于本地消融（关 bonus / 关 gate / 紧 cap），不做复杂实验框架。
+    默认 gate_vector_origin=True：仅「确有向量路来源」的候选吃 bonus，比 Step7 更干净、可解释。
+    """
+
+    enabled: bool = True
+    gate_vector_origin: bool = True
+    cap: Optional[float] = None  # None 表示使用全局上界 _VECTOR_EVIDENCE_BONUS_CAP；显式值仅允许 ≤ 该上界
+    scale: float = 1.0
+
+    def effective_cap(self) -> float:
+        if self.cap is None:
+            return float(_VECTOR_EVIDENCE_BONUS_CAP)
+        return min(float(_VECTOR_EVIDENCE_BONUS_CAP), float(self.cap))
+
+
+DEFAULT_VECTOR_EVIDENCE_BONUS_CONFIG = VectorEvidenceBonusConfig()
+
+
+def candidate_has_vector_origin(rec: Any) -> bool:
+    """
+    来源门控：是否经向量路进入合并池（依据路径/来源字段，不用 evidence 摘要非零反推）。
+    无法解析或异常时返回 False（保守不加 bonus）。
+    """
+    try:
+        if bool(getattr(rec, "from_vector", False)):
+            return True
+        if getattr(rec, "vector_rank", None) is not None:
+            return True
+        if getattr(rec, "vector_score_raw", None) is not None:
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def extract_vector_evidence_summary(vector_evidence: Any) -> Dict[str, Any]:
+    """
+    从 vector_path 输出的 vector_evidence 抽取少量稳定标量，供 KGAT-AX sidecar / 调试。
+    Step7/8：同一套摘要由 compute_vector_evidence_bonus_from_summary 以极小权重可并入 candidate_pool_score；
+    Step8 对 bonus 做来源门控与配置化。主分仍以 RRF / 路径融合为主。缺失时摘要与 bonus 均安全为 0。
+    """
+    out = {
+        "vector_evidence_top_paper_count": 0,
+        "vector_evidence_best_paper_score": 0.0,
+        "vector_evidence_max_query_hit_count": 0,
+        "vector_evidence_max_clause_hit_count": 0,
+        "vector_evidence_query_type_coverage_count": 0,
+        "vector_evidence_has_clause_signal": 0,
+        "vector_evidence_has_method_hit_signal": 0,
+        "vector_evidence_avg_top_paper_score": 0.0,
+    }
+    if not vector_evidence or not isinstance(vector_evidence, dict):
+        return out
+    summ = vector_evidence.get("summary") or {}
+    top_papers = vector_evidence.get("top_papers") or []
+    n_top = int(summ.get("top_evidence_count") or len(top_papers) or 0)
+    best = float(summ.get("best_paper_score") or 0.0)
+    max_qh = int(summ.get("max_query_hit_count") or 0)
+    max_ch = int(summ.get("max_clause_hit_count") or 0)
+    cov = summ.get("query_type_coverage") or []
+    cov_n = len(cov) if isinstance(cov, list) else 0
+    es = summ.get("evidence_sources_summary") or {}
+    clause_sig = bool(es.get("clause_signal_present"))
+    method_hit = False
+    for p in top_papers:
+        if not isinstance(p, dict):
+            continue
+        h = p.get("hit_query_types") or []
+        if isinstance(h, (list, tuple)) and "method_focused_query" in h:
+            method_hit = True
+            break
+    scores = [
+        float(p.get("score_clause_aware") or p.get("score_hybrid") or 0.0)
+        for p in top_papers
+        if isinstance(p, dict)
+    ]
+    avg_top = sum(scores) / len(scores) if scores else 0.0
+    out["vector_evidence_top_paper_count"] = n_top
+    out["vector_evidence_best_paper_score"] = best
+    out["vector_evidence_max_query_hit_count"] = max_qh
+    out["vector_evidence_max_clause_hit_count"] = max_ch
+    out["vector_evidence_query_type_coverage_count"] = cov_n
+    out["vector_evidence_has_clause_signal"] = 1 if clause_sig else 0
+    out["vector_evidence_has_method_hit_signal"] = 1 if method_hit else 0
+    out["vector_evidence_avg_top_paper_score"] = float(avg_top)
+    return out
+
+
+def compute_vector_evidence_bonus_from_summary(
+    summary: Optional[Dict[str, Any]],
+    *,
+    cap: Optional[float] = None,
+    scale: float = 1.0,
+) -> float:
+    """
+    从 vector_evidence_summary（与 extract_vector_evidence_summary 输出键一致）计算非负、有上界的弱 bonus。
+
+    设计原则（Step7 低风险；Step8 仅参数化 cap/scale，不放大上界）：
+    - 先对各分量截断/饱和，再加权求和，再乘 scale，最后 min(cap_eff)；不把 clause 当强信号。
+    - 不替代 RRF；量级控制在主分尾部；enabled=0 或来源门控在调用侧处理。
+    - 比 HyDE 等生成式改写更低风险：仅用已有结构化标量，无额外推理链。
+
+    cap_eff = min(_VECTOR_EVIDENCE_BONUS_CAP, cap)（若传入 cap）；不得高于全局上界。
+    """
+    if not summary or not isinstance(summary, dict):
+        return 0.0
+    cap_eff = min(_VECTOR_EVIDENCE_BONUS_CAP, float(cap)) if cap is not None else float(_VECTOR_EVIDENCE_BONUS_CAP)
+    try:
+        sc = float(scale)
+    except (TypeError, ValueError):
+        sc = 1.0
+    sc = max(0.0, sc)
+    try:
+        best = min(1.0, max(0.0, float(summary.get("vector_evidence_best_paper_score") or 0.0)))
+        qhit = max(0, int(summary.get("vector_evidence_max_query_hit_count") or 0))
+        cov_n = max(0, int(summary.get("vector_evidence_query_type_coverage_count") or 0))
+        chit = max(0, int(summary.get("vector_evidence_max_clause_hit_count") or 0))
+        clause_sig = 1 if int(summary.get("vector_evidence_has_clause_signal") or 0) else 0
+        n_top = max(0, int(summary.get("vector_evidence_top_paper_count") or 0))
+        avg = min(1.0, max(0.0, float(summary.get("vector_evidence_avg_top_paper_score") or 0.0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+    b = 0.0
+    b += 0.018 * best
+    b += 0.008 * min(qhit / 4.0, 1.0)
+    b += 0.006 * min(cov_n / 4.0, 1.0)
+    b += 0.004 * min(chit / 3.0, 1.0)
+    b += 0.003 * float(clause_sig)
+    b += 0.003 * min(n_top / 3.0, 1.0)
+    b += 0.004 * avg
+    return float(min(cap_eff, max(0.0, b * sc)))
+
+
+def apply_vector_evidence_bonus_for_candidate(
+    rec: Any,
+    summary: Dict[str, Any],
+    cfg: VectorEvidenceBonusConfig,
+) -> float:
+    """按配置计算最终并入 candidate_pool_score 的 bonus（含 enabled 与来源门控）。"""
+    if not cfg.enabled:
+        return 0.0
+    raw = compute_vector_evidence_bonus_from_summary(
+        summary,
+        cap=cfg.effective_cap(),
+        scale=cfg.scale,
+    )
+    if cfg.gate_vector_origin and not candidate_has_vector_origin(rec):
+        return 0.0
+    return raw
 
 
 def infer_dominant_path(rec: Any) -> str:
@@ -358,6 +518,7 @@ def build_kgatax_feature_row(rec: Any) -> Dict[str, Any]:
         "label_rank": _safe_rank(getattr(rec, "label_rank", None)),
         "collab_rank": _safe_rank(getattr(rec, "collab_rank", None)),
         "candidate_pool_score": _safe_num(getattr(rec, "candidate_pool_score", None)),
+        "vector_evidence_bonus": _safe_num(getattr(rec, "vector_evidence_bonus", None)),
     }
     author_aux = {
         "h_index": _safe_num(getattr(rec, "h_index", None)),
@@ -380,9 +541,12 @@ def build_kgatax_feature_row(rec: Any) -> Dict[str, Any]:
         "label_risky_term_count": getattr(rec, "label_risky_term_count", 0) or 0,
         "label_best_term_score": _safe_num(getattr(rec, "label_best_term_score", None)),
     }
+    # Step6/7：摘要进 sidecar；Step7 弱 bonus 已并入 candidate_pool_score，此处同步导出便于审计
+    vec_summ = extract_vector_evidence_summary(getattr(rec, "vector_evidence", None))
     return {
         "author_id": getattr(rec, "author_id", ""),
         "recall_features": recall_features,
         "author_aux": author_aux,
         "interaction_features": interaction_features,
+        "vector_evidence_summary": vec_summ,
     }

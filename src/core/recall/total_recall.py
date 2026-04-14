@@ -31,6 +31,12 @@ from src.core.recall.candidate_features import (
     calc_top_work_quality,
     bucket_quota_truncate,
     build_kgatax_feature_row,
+    extract_vector_evidence_summary,
+    compute_vector_evidence_bonus_from_summary,
+    VectorEvidenceBonusConfig,
+    DEFAULT_VECTOR_EVIDENCE_BONUS_CONFIG,
+    candidate_has_vector_origin,
+    apply_vector_evidence_bonus_for_candidate,
 )
 from src.utils.domain_detector import DomainDetector
 from src.utils.domain_utils import DomainProcessor
@@ -82,7 +88,13 @@ class TotalRecallSystem:
         "16": "Geology", "17": "Economics"
     }
 
-    def __init__(self, k_vector: int = 150, k_label: int = 150, k_collab: int = 80):
+    def __init__(
+        self,
+        k_vector: int = 150,
+        k_label: int = 150,
+        k_collab: int = 80,
+        vector_evidence_bonus_config: Optional[VectorEvidenceBonusConfig] = None,
+    ):
         print("[*] 正在初始化全量召回系统 (Training-Safe Mode)...", flush=True)
         self.encoder = QueryEncoder()
         self.v_path = VectorPath(recall_limit=k_vector)
@@ -90,6 +102,12 @@ class TotalRecallSystem:
         self.c_path = CollaborativeRecallPath(recall_limit=k_collab)
         self.executor = ThreadPoolExecutor(max_workers=3)
         self.domain_detector = DomainDetector(self.l_path)
+        # Step8：默认开启来源门控，比 Step7 更保守、可解释；单次 execute 可覆盖
+        self.vector_evidence_bonus_config = (
+            vector_evidence_bonus_config
+            if vector_evidence_bonus_config is not None
+            else DEFAULT_VECTOR_EVIDENCE_BONUS_CONFIG
+        )
 
     def _get_author_works(self, author_id, top_n=2):
         """利用知识图谱获取作者贡献度最高的代表作"""
@@ -164,8 +182,13 @@ class TotalRecallSystem:
         summary.after_dedup_count = len(by_id)
         return list(by_id.values())
 
-    def score_candidate_pool(self, records: List[CandidateRecord]) -> List[CandidateRecord]:
+    def score_candidate_pool(
+        self,
+        records: List[CandidateRecord],
+        bonus_cfg: Optional[VectorEvidenceBonusConfig] = None,
+    ) -> List[CandidateRecord]:
         """RRF、multi_path_bonus、pair_path_bonus、label_hint、candidate_pool_score，排序；多路一致优先。"""
+        cfg = bonus_cfg if bonus_cfg is not None else self.vector_evidence_bonus_config
         for r in records:
             rrf = 0.0
             if r.vector_rank is not None:
@@ -188,7 +211,12 @@ class TotalRecallSystem:
             if r.from_label:
                 label_hint += min(0.05, 0.01 * r.label_core_term_count)
                 label_hint -= min(0.05, 0.01 * r.label_risky_term_count)
-            r.candidate_pool_score = r.rrf_score + r.multi_path_bonus + r.pair_path_bonus + label_hint
+            base_pool = r.rrf_score + r.multi_path_bonus + r.pair_path_bonus + label_hint
+            # Step7/8：主分形成后再加极小 vector evidence bonus；Step8 用配置 + 来源门控收紧生效范围
+            summ = extract_vector_evidence_summary(getattr(r, "vector_evidence", None))
+            ev_bonus = apply_vector_evidence_bonus_for_candidate(r, summ, cfg)
+            r.vector_evidence_bonus = ev_bonus
+            r.candidate_pool_score = base_pool + ev_bonus
             r.dominant_recall_path = infer_dominant_path(r)
         records.sort(key=lambda x: x.candidate_pool_score, reverse=True)
         return records
@@ -294,7 +322,13 @@ class TotalRecallSystem:
                 r.bucket_reasons = "unknown"
         summary.final_pool_size = len(records)
 
-    def execute(self, query_text, domain_id=None, is_training=False):
+    def execute(
+        self,
+        query_text,
+        domain_id=None,
+        is_training=False,
+        vector_evidence_bonus_config: Optional[VectorEvidenceBonusConfig] = None,
+    ):
         """
         执行多路召回：编码 → 三路召回 → build_candidate_records → score_candidate_pool
         → _enrich_candidate_features → _apply_hard_filters → _assign_buckets → CandidatePool。
@@ -333,7 +367,14 @@ class TotalRecallSystem:
             query_vec, _ = self.encoder.encode(final_query)
             faiss.normalize_L2(query_vec)
 
-        future_v = self.executor.submit(self.v_path.recall, query_vec, target_domains=vector_domains)
+        # 传入 query_text 以便向量路构建完整 vector_evidence（Step5）；不改变三路职责与主排序
+        future_v = self.executor.submit(
+            self.v_path.recall,
+            query_vec,
+            target_domains=vector_domains,
+            verbose=False,
+            query_text=query_text,
+        )
         future_l = self.executor.submit(
             self.l_path.recall,
             query_vec,
@@ -356,11 +397,59 @@ class TotalRecallSystem:
         summary.c_raw_count = len(c_meta)
 
         records = self.build_candidate_records(v_meta, l_meta, c_meta, summary)
-        records = self.score_candidate_pool(records)
+        bonus_cfg = (
+            vector_evidence_bonus_config
+            if vector_evidence_bonus_config is not None
+            else self.vector_evidence_bonus_config
+        )
+        records = self.score_candidate_pool(records, bonus_cfg=bonus_cfg)
         self._enrich_candidate_features(records, active_domains, query_text)
         records = self._apply_hard_filters(records, summary)
         self._assign_buckets(records, summary)
         records = bucket_quota_truncate(records, BUCKET_QUOTAS, FINAL_POOL_TOP_N)
+
+        # Step6/8：最终池内审计（bonus 已在 score_candidate_pool 写入；raw 统计用于观察门控剥掉的量）
+        ve_attached = sum(1 for r in records if getattr(r, "vector_evidence", None))
+        ve_summary_nz = 0
+        bonus_vals = [float(getattr(r, "vector_evidence_bonus", 0.0) or 0.0) for r in records]
+        ve_bonus_nz = sum(1 for x in bonus_vals if x > 1e-9)
+        ve_bonus_avg = float(sum(bonus_vals)) / max(1, len(bonus_vals))
+        ve_bonus_max = max(bonus_vals) if bonus_vals else 0.0
+        vo_cnt = 0
+        raw_nz = 0
+        for r in records:
+            srow = extract_vector_evidence_summary(getattr(r, "vector_evidence", None))
+            if srow.get("vector_evidence_best_paper_score", 0.0) > 0.0:
+                ve_summary_nz += 1
+            if candidate_has_vector_origin(r):
+                vo_cnt += 1
+            if bonus_cfg.enabled:
+                rw = compute_vector_evidence_bonus_from_summary(
+                    srow,
+                    cap=bonus_cfg.effective_cap(),
+                    scale=bonus_cfg.scale,
+                )
+                if rw > 1e-9:
+                    raw_nz += 1
+        summary.vector_evidence_attached_count = ve_attached
+        summary.vector_evidence_summary_nonzero_count = ve_summary_nz
+        summary.vector_evidence_bonus_nonzero_count = ve_bonus_nz
+        summary.vector_evidence_bonus_avg = ve_bonus_avg
+        summary.vector_evidence_bonus_max = ve_bonus_max
+        summary.vector_origin_candidate_count = vo_cnt
+        summary.vector_evidence_bonus_raw_nonzero_count = raw_nz
+        print(
+            f"[TotalRecall] vector_evidence: attached={ve_attached}/{len(records)} "
+            f"summary_nonzero={ve_summary_nz}",
+            flush=True,
+        )
+        print(
+            f"[TotalRecall] vector bonus gate: origin={vo_cnt} raw_nz={raw_nz} applied_nz={ve_bonus_nz} "
+            f"enabled={bonus_cfg.enabled} gate={bonus_cfg.gate_vector_origin} "
+            f"cap={bonus_cfg.effective_cap():.4f} scale={bonus_cfg.scale} "
+            f"avg={ve_bonus_avg:.4f} max={ve_bonus_max:.4f}",
+            flush=True,
+        )
 
         kgatax_rows = [build_kgatax_feature_row(r) for r in records]
         evidence_rows = []
@@ -404,8 +493,80 @@ class TotalRecallSystem:
                 "l_cost": l_cost,
                 "cost_c": c_cost,
                 "domain_debug": domain_debug,
+                "vector_evidence_attached_count": ve_attached,
+                "vector_evidence_summary_nonzero_count": ve_summary_nz,
+                "vector_evidence_bonus_nonzero_count": ve_bonus_nz,
+                "vector_evidence_bonus_avg": ve_bonus_avg,
+                "vector_evidence_bonus_max": ve_bonus_max,
+                "vector_origin_candidate_count": vo_cnt,
+                "vector_evidence_bonus_raw_nonzero_count": raw_nz,
+                "vector_bonus_enabled": bonus_cfg.enabled,
+                "vector_bonus_gate_vector_origin": bonus_cfg.gate_vector_origin,
+                "vector_bonus_cap_effective": bonus_cfg.effective_cap(),
+                "vector_bonus_scale": bonus_cfg.scale,
             },
         }
+
+
+def run_step8_vector_bonus_ablation(
+    system: TotalRecallSystem,
+    query_text: str,
+    domain_id: Any = None,
+    is_training: bool = False,
+) -> Dict[str, Any]:
+    """
+    Step8 最小消融：同一 system 下多次 execute，对比 bonus 关 / gate off / gate on / 更紧 cap。
+    仅用于本地验证，非通用实验平台；完整流水线会重复运行，耗时与单次总召回成正比。
+    """
+    configs: List[Tuple[str, VectorEvidenceBonusConfig]] = [
+        ("no_bonus", VectorEvidenceBonusConfig(enabled=False, gate_vector_origin=False)),
+        ("bonus_gate_off", VectorEvidenceBonusConfig(enabled=True, gate_vector_origin=False)),
+        ("bonus_gate_on", VectorEvidenceBonusConfig(enabled=True, gate_vector_origin=True)),
+        (
+            "bonus_gate_on_half_scale",
+            # 实测 bonus 常低于 0.036，单独紧 cap 不易与 gate_on 区分；用 scale=0.5 做保守校准消融更可见
+            VectorEvidenceBonusConfig(enabled=True, gate_vector_origin=True, cap=0.048, scale=0.5),
+        ),
+    ]
+    runs: List[Dict[str, Any]] = []
+    print("[TotalRecall] Step8 ablation: start", flush=True)
+    for name, cfg in configs:
+        out = system.execute(
+            query_text,
+            domain_id,
+            is_training=is_training,
+            vector_evidence_bonus_config=cfg,
+        )
+        recs = out["candidate_pool"].candidate_records
+        top5 = [r.author_id for r in recs[:5]]
+        mix = {
+            "vector_only": sum(1 for r in recs[:20] if r.from_vector and not r.from_label and not r.from_collab),
+            "label_only": sum(1 for r in recs[:20] if r.from_label and not r.from_vector and not r.from_collab),
+            "multi": sum(1 for r in recs[:20] if (r.from_vector + r.from_label + r.from_collab) >= 2),
+        }
+        nz_bonus_in_top20 = sum(1 for r in recs[:20] if (r.vector_evidence_bonus or 0) > 1e-9)
+        d = out["details"]
+        runs.append(
+            {
+                "name": name,
+                "top5": top5,
+                "top20_mix": mix,
+                "top20_nonzero_bonus": nz_bonus_in_top20,
+                "vector_origin_candidate_count": d.get("vector_origin_candidate_count"),
+                "vector_evidence_bonus_raw_nonzero_count": d.get("vector_evidence_bonus_raw_nonzero_count"),
+                "vector_evidence_bonus_nonzero_count": d.get("vector_evidence_bonus_nonzero_count"),
+                "vector_evidence_bonus_avg": round(float(d.get("vector_evidence_bonus_avg", 0)), 6),
+                "vector_evidence_bonus_max": round(float(d.get("vector_evidence_bonus_max", 0)), 6),
+            }
+        )
+        print(
+            f"[TotalRecall] Step8 ablation row: {name} raw_nz={d.get('vector_evidence_bonus_raw_nonzero_count')} "
+            f"applied_nz={d.get('vector_evidence_bonus_nonzero_count')} "
+            f"avg={d.get('vector_evidence_bonus_avg')} max={d.get('vector_evidence_bonus_max')} top5={top5}",
+            flush=True,
+        )
+    print("[TotalRecall] Step8 ablation: done", flush=True)
+    return {"query_text": query_text[:120], "runs": runs}
 
 
 if __name__ == "__main__":
