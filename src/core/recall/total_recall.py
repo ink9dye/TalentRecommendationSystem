@@ -1,12 +1,24 @@
 # -*- coding: utf-8 -*-
 """
 多路召回总控：统一编码、三路并行召回、候选池构建、打分、特征补全、硬过滤、分桶、导出。
+
+Step1：主链在分桶后拆出 base（候选中间层）、training pool（骨架 top100）、display pool（分桶截断 top50）；
+后续 Step 仍会调整 hard filter / 分数 / 分桶等，本文件内注释与命名与之对齐。
 """
+import sys
+from pathlib import Path
 import time
 import faiss
 import os
+import copy
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional, Tuple
+
+# 允许以“python path/to/total_recall.py”直接运行（Windows 下常见），不改变作为包导入时的行为
+_THIS_FILE = Path(__file__).resolve()
+_REPO_ROOT = _THIS_FILE.parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from src.core.recall.input_to_vector import QueryEncoder
 from src.core.recall.vector_path import VectorPath
@@ -48,8 +60,13 @@ os.environ["MKL_NUM_THREADS"] = "1"
 # RRF 与配额默认值
 RRF_K = 60
 PATH_WEIGHTS = {"v": 2.0, "l": 3.0, "c": 1.0}
-ALPHA_MULTI_PATH = 0.05
+# Step4：多路命中“轻微鼓励”系数（粗排 prior 的 tie-break 级别，不承担预精排裁决）
+ALPHA_MULTI_PATH = 0.02
+# 历史主链截断上限；Step1 后主链已改用 DISPLAY_POOL_TOP_N 参与分桶截断，本常量仅保留以免外部误删引用时报错
 FINAL_POOL_TOP_N = 200
+# Step1：双池骨架上限（训练池 / 展示池）；后续 Step5 可再分叉策略，不在本步改分桶实现本身
+TRAINING_POOL_TOP_N = 100
+DISPLAY_POOL_TOP_N = 50
 # 分桶配额（多路一致优先）
 BUCKET_QUOTAS = {"A": 80, "B": 30, "C": 60, "D": 20, "E": 20, "F": 10}
 
@@ -187,7 +204,14 @@ class TotalRecallSystem:
         records: List[CandidateRecord],
         bonus_cfg: Optional[VectorEvidenceBonusConfig] = None,
     ) -> List[CandidateRecord]:
-        """RRF、multi_path_bonus、pair_path_bonus、label_hint、candidate_pool_score，排序；多路一致优先。"""
+        """
+        Step4：候选中间层粗排 prior（light fusion / coarse score）。
+
+        目标：为 base candidate layer 提供一个轻量、可解释、不过度裁决的合成分，用于“粗排序”与 tie-break。
+        - 保留 RRF 作为主体（来源共识/多路命中倾向）；
+        - 仅保留弱 multi-path / pair bonus 与轻量 label_hint / vector_evidence_bonus 做校准；
+        - 该分数不是最终精排分、不是训练标签、也不替 KGAT-AX 做排序裁决。
+        """
         cfg = bonus_cfg if bonus_cfg is not None else self.vector_evidence_bonus_config
         for r in records:
             rrf = 0.0
@@ -201,25 +225,173 @@ class TotalRecallSystem:
             r.multi_path_bonus = ALPHA_MULTI_PATH * max(0, r.path_count - 1)
             pair_bonus = 0.0
             if r.from_vector and r.from_label:
-                pair_bonus += 0.20
+                # Step4：弱 bonus / tie-break（不代表训练标签，不应主导排序）
+                pair_bonus += 0.04
             elif r.from_vector and r.from_collab:
-                pair_bonus += 0.10
+                pair_bonus += 0.02
             elif r.from_label and r.from_collab:
-                pair_bonus += 0.08
+                pair_bonus += 0.015
             r.pair_path_bonus = pair_bonus
             label_hint = 0.0
             if r.from_label:
+                # Step4：轻量校准（非弱监督标签）
                 label_hint += min(0.05, 0.01 * r.label_core_term_count)
                 label_hint -= min(0.05, 0.01 * r.label_risky_term_count)
-            base_pool = r.rrf_score + r.multi_path_bonus + r.pair_path_bonus + label_hint
+            prior_score = r.rrf_score + r.multi_path_bonus + r.pair_path_bonus + label_hint
             # Step7/8：主分形成后再加极小 vector evidence bonus；Step8 用配置 + 来源门控收紧生效范围
             summ = extract_vector_evidence_summary(getattr(r, "vector_evidence", None))
             ev_bonus = apply_vector_evidence_bonus_for_candidate(r, summ, cfg)
             r.vector_evidence_bonus = ev_bonus
-            r.candidate_pool_score = base_pool + ev_bonus
+            r.candidate_pool_score = prior_score + ev_bonus
             r.dominant_recall_path = infer_dominant_path(r)
         records.sort(key=lambda x: x.candidate_pool_score, reverse=True)
         return records
+
+    def _build_training_pool_records(
+        self,
+        base_records: List[CandidateRecord],
+        top_n: int = TRAINING_POOL_TOP_N,
+    ) -> List[CandidateRecord]:
+        """
+        Step5：训练池生成策略（与展示池显式分叉）。
+
+        - training pool：服务训练样本构造，优先保留来源多样性与可分层候选，允许一定边界样本进入；
+          这是“轻量补位”，不是展示池那种分桶配额系统，也不是重规则/teacher 分。
+        - display pool：仍由分桶 + 截断生成（在 execute 中保持原逻辑不动）。
+        """
+        if not base_records:
+            return []
+
+        # base_records 当前已按 coarse prior（candidate_pool_score）降序排列；本函数在该主序上做轻量补位
+        def _group_key(r: CandidateRecord) -> str:
+            if getattr(r, "path_count", 0) >= 2:
+                return "multi_path"
+            if getattr(r, "from_label", False):
+                return "label_backed_single"
+            if getattr(r, "from_vector", False):
+                return "vector_only"
+            if getattr(r, "from_collab", False):
+                return "collab_only"
+            return "other"
+
+        # 1) 主干：先取较小前段作为 backbone（刻意小于 top_n，给后续补位留空间）
+        backbone_n = min(70, top_n, len(base_records))
+        selected: List[CandidateRecord] = []
+        selected_ids = set()
+        for r in base_records[:backbone_n]:
+            if r.author_id not in selected_ids:
+                selected.append(r)
+                selected_ids.add(r.author_id)
+
+        # 2) 从较大的前段窗口里补位（避免从尾部深挖噪声）
+        window_n = min(max(top_n * 6, 300), len(base_records))
+        window = base_records[:window_n]
+
+        by_group: Dict[str, List[CandidateRecord]] = {
+            "multi_path": [],
+            "label_backed_single": [],
+            "vector_only": [],
+            "collab_only": [],
+            "other": [],
+        }
+        for r in window:
+            by_group[_group_key(r)].append(r)
+
+        def _add_from_group(g: str, need: int) -> None:
+            if need <= 0:
+                return
+            for r in by_group.get(g, []):
+                if len(selected) >= top_n:
+                    return
+                if r.author_id in selected_ids:
+                    continue
+                selected.append(r)
+                selected_ids.add(r.author_id)
+                need -= 1
+                if need <= 0:
+                    return
+
+        # 3) 轻量“来源层次”补位：不做复杂比例控制，只设几个保守下限（不足则跳过）
+        def _cnt(g: str) -> int:
+            return sum(1 for r in selected if _group_key(r) == g)
+
+        # multi-path 仍应占优，但不把训练池压成展示池
+        _add_from_group("multi_path", max(0, min(30, top_n // 2) - _cnt("multi_path")))
+        # label-backed 单路：保留结构化证据入口
+        _add_from_group("label_backed_single", max(0, 15 - _cnt("label_backed_single")))
+        # vector-only：保留语义相似但证据较薄的对比样本
+        _add_from_group("vector_only", max(0, 15 - _cnt("vector_only")))
+        # 少量 collab-only：用于边界关系对比（若存在）
+        _add_from_group("collab_only", max(0, 5 - _cnt("collab_only")))
+
+        # 4) 软标记边界样本：给 risk_flags 非空候选留少量机会（不强保全量）
+        risk_pool = [r for r in window if getattr(r, "risk_flags", None)]
+        risk_in_selected = sum(1 for r in selected if getattr(r, "risk_flags", None))
+        risk_target = min(10, max(0, len(risk_pool)))
+        if risk_in_selected < risk_target:
+            need = risk_target - risk_in_selected
+            for r in risk_pool:
+                if len(selected) >= top_n:
+                    break
+                if r.author_id in selected_ids:
+                    continue
+                selected.append(r)
+                selected_ids.add(r.author_id)
+                need -= 1
+                if need <= 0:
+                    break
+
+        # 5) 最后按主序补满
+        if len(selected) < top_n:
+            for r in window:
+                if len(selected) >= top_n:
+                    break
+                if r.author_id in selected_ids:
+                    continue
+                selected.append(r)
+                selected_ids.add(r.author_id)
+
+        # 保持与 base 主序一致（按 base_records 中的顺序输出）
+        idx = {r.author_id: i for i, r in enumerate(base_records)}
+        selected.sort(key=lambda r: idx.get(r.author_id, 10**9))
+        selected = selected[:top_n]
+
+        # 若仍退化为“机械前缀”，则做一次最小扰动：从 top_n 之后补入 1 个可解释的候选（优先 soft-flag / label-backed）
+        # 目的：保证 training pool 与 base[:top_n] 在策略上“显式分叉”，但不引入复杂配额或重排序体系。
+        if len(base_records) > top_n:
+            prefix_ids = [r.author_id for r in base_records[:top_n]]
+            selected_ids_list = [r.author_id for r in selected]
+            if selected_ids_list == prefix_ids:
+                tail_window = base_records[top_n:window_n]
+                swap_in = None
+                for r in tail_window:
+                    if r.author_id in selected_ids:
+                        continue
+                    if getattr(r, "risk_flags", None):
+                        swap_in = r
+                        break
+                if swap_in is None:
+                    for r in tail_window:
+                        if r.author_id in selected_ids:
+                            continue
+                        if getattr(r, "from_label", False):
+                            swap_in = r
+                            break
+                if swap_in is None:
+                    for r in tail_window:
+                        if r.author_id in selected_ids:
+                            continue
+                        swap_in = r
+                        break
+                if swap_in is not None and selected:
+                    # 只替换最后一位，保证对粗排 prior 的尊重（前段排序不动）
+                    drop = selected.pop(-1)
+                    selected_ids.discard(drop.author_id)
+                    selected.append(swap_in)
+                    selected_ids.add(swap_in.author_id)
+                    selected.sort(key=lambda r: idx.get(r.author_id, 10**9))
+
+        return selected
 
     def _enrich_candidate_features(
         self,
@@ -264,28 +436,49 @@ class TotalRecallSystem:
         records: List[CandidateRecord],
         summary: PoolDebugSummary,
     ) -> List[CandidateRecord]:
-        """硬过滤：协同无主题、无论文无指标、label_only 弱命中。"""
+        """
+        Step3 过滤口径：
+        - 真硬过滤（hard delete）：只删除明显垃圾/空壳候选，删除是安全的；
+        - 软标记（soft flag only）：边界/偏弱/高风险但仍可能有训练对比价值的候选，不在这里删除，
+          仅写入 risk_flags / sampleability_flags，保留进候选中间层。
+        """
         out = []
         for r in records:
-            reasons = []
+            hard_reasons = []
+            # --- A. 真硬过滤：明显垃圾/空壳 ---
+            # 1) 纯协同来源且缺少任何主题/证据支撑：更像噪声扩散，不适合作为候选中间层成员
             if r.from_collab and r.path_count == 1 and not r.from_label and not r.from_vector:
-                reasons.append("collab_only_no_topic")
+                hard_reasons.append("collab_only_no_topic")
+            # 2) 无论文/无指标，且也不是 label/vector 支撑：极端数据残缺
             if (r.works_count is None or r.works_count == 0) and not r.from_label and not r.from_vector:
-                reasons.append("no_paper_no_metrics")
-            if r.from_label and r.path_count == 1:
-                if r.domain_consistency is not None and r.domain_consistency < 0.25:
-                    reasons.append("label_only_low_domain_consistency")
-                if r.paper_hit_strength is not None and r.paper_hit_strength < 0.15:
-                    reasons.append("label_only_weak_paper_hit")
-                if r.recent_activity_match is not None and r.recent_activity_match < 0.20:
-                    reasons.append("label_only_stale_activity")
-                if r.label_risky_term_count >= 2 and r.label_core_term_count == 0:
-                    reasons.append("label_only_risky_terms")
-            if reasons:
+                hard_reasons.append("no_paper_no_metrics")
+
+            if hard_reasons:
                 r.passed_hard_filter = False
-                r.hard_filter_reasons = reasons
+                r.hard_filter_reasons = hard_reasons
                 summary.hard_filtered_count += 1
                 continue
+
+            # --- B. 软标记：边界候选保留，仅写 risk_flags / sampleability_flags ---
+            # 仅对 label_only 场景保守打标（沿用旧 reason 的原词，便于日志对照）
+            if r.from_label and r.path_count == 1:
+                if r.domain_consistency is not None and r.domain_consistency < 0.25:
+                    if "label_only_low_domain_consistency" not in r.risk_flags:
+                        r.risk_flags.append("label_only_low_domain_consistency")
+                if r.paper_hit_strength is not None and r.paper_hit_strength < 0.15:
+                    if "label_only_weak_paper_hit" not in r.risk_flags:
+                        r.risk_flags.append("label_only_weak_paper_hit")
+                if r.recent_activity_match is not None and r.recent_activity_match < 0.20:
+                    if "label_only_stale_activity" not in r.risk_flags:
+                        r.risk_flags.append("label_only_stale_activity")
+                if r.label_risky_term_count >= 2 and r.label_core_term_count == 0:
+                    if "label_only_risky_terms_high" not in r.risk_flags:
+                        r.risk_flags.append("label_only_risky_terms_high")
+
+                # 若存在任一风险标记，作为“边界候选”预留给后续样本构造（不等同训练标签）
+                if r.risk_flags and "borderline_candidate" not in r.sampleability_flags:
+                    r.sampleability_flags.append("borderline_candidate")
+
             r.passed_hard_filter = True
             out.append(r)
         return out
@@ -331,7 +524,11 @@ class TotalRecallSystem:
     ):
         """
         执行多路召回：编码 → 三路召回 → build_candidate_records → score_candidate_pool
-        → _enrich_candidate_features → _apply_hard_filters → _assign_buckets → CandidatePool。
+        → _enrich_candidate_features → _apply_hard_filters → _assign_buckets
+        → base / training / display 双池骨架 → CandidatePool。
+
+        返回除 candidate_pool、kgatax_sidecar_rows 等外，含 training_pool_top_100、display_pool_top_50
+        及对应 count 字段；final_top_200 / final_top_500 为 deprecated，仅兼容旧调用，语义同展示池列表。
         """
         start_time = time.time()
         raw_vec, _ = self.encoder.encode(query_text)
@@ -406,18 +603,52 @@ class TotalRecallSystem:
         self._enrich_candidate_features(records, active_domains, query_text)
         records = self._apply_hard_filters(records, summary)
         self._assign_buckets(records, summary)
-        records = bucket_quota_truncate(records, BUCKET_QUOTAS, FINAL_POOL_TOP_N)
+        # 候选中间层：三路合并 + 打分 + enrich + 硬过滤 + 分桶之后，尚未做分桶配额截断
+        base_records = records
+        for r in base_records:
+            # Step2：训练中间层友好字段；非真值/非标签，仅标记该记录当前“被 base 视角引用”
+            r.pool_role = "base"
+        # Step3：软标记统计（仅统计保留下来的候选中间层成员）
+        summary.soft_flagged_count = sum(1 for r in base_records if getattr(r, "risk_flags", None))
+        # Step5：训练池正式分叉（轻量补位策略，服务训练样本构造；不追求榜单观感）
+        training_records = self._build_training_pool_records(base_records, top_n=TRAINING_POOL_TOP_N)
+        # 展示池：沿用既有 bucket_quota_truncate 实现，仅将截断上限改为 DISPLAY_POOL_TOP_N
+        display_records = bucket_quota_truncate(base_records, BUCKET_QUOTAS, DISPLAY_POOL_TOP_N)
+        # Step2：同一作者可能同时出现在 training 与 display；为避免 pool_role 单字段被覆盖，这里为不同池视角构造轻量副本
+        training_records_view = [copy.copy(r) for r in training_records]
+        for r in training_records_view:
+            r.pool_role = "training"
+        display_records_view = [copy.copy(r) for r in display_records]
+        for r in display_records_view:
+            r.pool_role = "display"
+
+        training_pool_top_100 = [r.author_id for r in training_records]
+        display_pool_top_50 = [r.author_id for r in display_records]
+        training_candidate_records_count = len(training_records)
+        display_candidate_records_count = len(display_records)
+        # Step2：池级 summary 的三层规模（soft_flagged_count 留给 Step3）
+        summary.base_pool_size = len(base_records)
+        summary.training_pool_size = len(training_records)
+        summary.display_pool_size = len(display_records)
+
+        # Step6/8：池内审计；范围对齐「训练池 ∪ 展示池」涉及记录，避免仅扫 display 导致统计过窄
+        audit_records = list(training_records)
+        seen_audit = {r.author_id for r in audit_records}
+        for r in display_records:
+            if r.author_id not in seen_audit:
+                seen_audit.add(r.author_id)
+                audit_records.append(r)
 
         # Step6/8：最终池内审计（bonus 已在 score_candidate_pool 写入；raw 统计用于观察门控剥掉的量）
-        ve_attached = sum(1 for r in records if getattr(r, "vector_evidence", None))
+        ve_attached = sum(1 for r in audit_records if getattr(r, "vector_evidence", None))
         ve_summary_nz = 0
-        bonus_vals = [float(getattr(r, "vector_evidence_bonus", 0.0) or 0.0) for r in records]
+        bonus_vals = [float(getattr(r, "vector_evidence_bonus", 0.0) or 0.0) for r in audit_records]
         ve_bonus_nz = sum(1 for x in bonus_vals if x > 1e-9)
         ve_bonus_avg = float(sum(bonus_vals)) / max(1, len(bonus_vals))
         ve_bonus_max = max(bonus_vals) if bonus_vals else 0.0
         vo_cnt = 0
         raw_nz = 0
-        for r in records:
+        for r in audit_records:
             srow = extract_vector_evidence_summary(getattr(r, "vector_evidence", None))
             if srow.get("vector_evidence_best_paper_score", 0.0) > 0.0:
                 ve_summary_nz += 1
@@ -439,7 +670,7 @@ class TotalRecallSystem:
         summary.vector_origin_candidate_count = vo_cnt
         summary.vector_evidence_bonus_raw_nonzero_count = raw_nz
         print(
-            f"[TotalRecall] vector_evidence: attached={ve_attached}/{len(records)} "
+            f"[TotalRecall] vector_evidence: attached={ve_attached}/{len(audit_records)} "
             f"summary_nonzero={ve_summary_nz}",
             flush=True,
         )
@@ -451,9 +682,9 @@ class TotalRecallSystem:
             flush=True,
         )
 
-        kgatax_rows = [build_kgatax_feature_row(r) for r in records]
+        kgatax_rows = [build_kgatax_feature_row(r) for r in base_records]
         evidence_rows = []
-        for r in records:
+        for r in base_records:
             if r.vector_evidence:
                 evidence_rows.append({"author_id": r.author_id, "path": "vector", "evidence": r.vector_evidence})
             if r.label_evidence:
@@ -464,16 +695,19 @@ class TotalRecallSystem:
         pool = CandidatePool(
             query_text=query_text,
             applied_domains=applied_domain_str,
-            candidate_records=records,
+            candidate_records=base_records,
+            training_pool_records=training_records_view,
+            display_pool_records=display_records_view,
             candidate_evidence_rows=evidence_rows,
             pool_debug_summary=summary,
             path_costs={"v_cost": v_cost, "l_cost": l_cost, "cost_c": c_cost},
             domain_debug=domain_debug,
         )
 
-        final_list = [r.author_id for r in records[:FINAL_POOL_TOP_N]]
+        # deprecated / compatibility only：与 display_pool_top_50 同源，不代表真实 200/500 规模
+        compat_display_ids = display_pool_top_50
         rank_map = {}
-        for r in records:
+        for r in base_records:
             rank_map[r.author_id] = {
                 "v": r.vector_rank if r.vector_rank is not None else "-",
                 "l": r.label_rank if r.label_rank is not None else "-",
@@ -483,8 +717,13 @@ class TotalRecallSystem:
         return {
             "candidate_pool": pool,
             "kgatax_sidecar_rows": kgatax_rows,
-            "final_top_200": final_list,
-            "final_top_500": final_list,
+            "training_pool_top_100": training_pool_top_100,
+            "display_pool_top_50": display_pool_top_50,
+            "training_candidate_records_count": training_candidate_records_count,
+            "display_candidate_records_count": display_candidate_records_count,
+            # deprecated / compatibility only：与 display_pool_top_50 一致，勿理解为 200/500 人规模
+            "final_top_200": compat_display_ids,
+            "final_top_500": compat_display_ids,
             "rank_map": rank_map,
             "total_ms": (time.time() - start_time) * 1000,
             "applied_domains": applied_domain_str,
@@ -579,7 +818,8 @@ if __name__ == "__main__":
     }
 
     print("\n" + "=" * 115)
-    print("🚀 人才推荐系统 - 生产级全量召回集成版")
+    # Windows 控制台常为 GBK 编码，避免 emoji 触发 UnicodeEncodeError
+    print("[TotalRecall] 人才推荐系统 - 全量召回集成版")
     print("-" * 115)
     f_list = list(fields.items())
     for i in range(0, len(f_list), 6):

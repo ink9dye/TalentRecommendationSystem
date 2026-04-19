@@ -72,6 +72,14 @@ class CandidateRecord:
     hard_filter_reasons: List[str] = field(default_factory=list)
     bucket_reasons: Optional[str] = None
 
+    # --- Step2：训练中间层友好字段（非真值/非标签，仅用于后续弱监督与样本构造）---
+    # pool_role 表示“这条记录当前被哪一层池视角引用”，可为 base / training / display（允许被覆盖）
+    pool_role: str = ""
+    # 软风险标记：承接 Step3 的软标记体系；本步先允许为空
+    risk_flags: List[str] = field(default_factory=list)
+    # 可采样性标记：承接后续样本构造（如 borderline/hard_negative 等）；本步先允许为空
+    sampleability_flags: List[str] = field(default_factory=list)
+
     # --- 证据（可为 None）---
     vector_evidence: Optional[Dict[str, Any]] = None
     label_evidence: Optional[Dict[str, Any]] = None
@@ -120,6 +128,10 @@ class CandidateRecord:
             "dominant_recall_path": self.dominant_recall_path,
             "hard_filter_reasons": self.hard_filter_reasons,
             "bucket_reasons": self.bucket_reasons,
+            # Step2：训练中间层友好字段（非真值/非标签）
+            "pool_role": self.pool_role,
+            "risk_flags": self.risk_flags,
+            "sampleability_flags": self.sampleability_flags,
             "vector_evidence": self.vector_evidence,
             "label_evidence": self.label_evidence,
             "collab_evidence": self.collab_evidence,
@@ -145,6 +157,12 @@ class PoolDebugSummary:
     bucket_e_count: int = 0
     bucket_f_count: int = 0
     final_pool_size: int = 0
+    # --- Step2：三层池规模（候选中间层 / 训练池 / 展示池）---
+    base_pool_size: int = 0
+    training_pool_size: int = 0
+    display_pool_size: int = 0
+    # --- Step2：软标记预留（Step3 才会写入真实计数）---
+    soft_flagged_count: int = 0
     # --- Step6：向量路 evidence 接入统计（不改变截断/打分）---
     vector_evidence_attached_count: int = 0
     vector_evidence_summary_nonzero_count: int = 0
@@ -174,6 +192,10 @@ class PoolDebugSummary:
             "bucket_e_count": self.bucket_e_count,
             "bucket_f_count": self.bucket_f_count,
             "final_pool_size": self.final_pool_size,
+            "base_pool_size": self.base_pool_size,
+            "training_pool_size": self.training_pool_size,
+            "display_pool_size": self.display_pool_size,
+            "soft_flagged_count": self.soft_flagged_count,
             "vector_evidence_attached_count": self.vector_evidence_attached_count,
             "vector_evidence_summary_nonzero_count": self.vector_evidence_summary_nonzero_count,
             "vector_evidence_bonus_nonzero_count": self.vector_evidence_bonus_nonzero_count,
@@ -191,10 +213,17 @@ class CandidatePool:
     - candidate_records：候选主表，一人一条
     - candidate_evidence_rows：证据明细表，一人多条
     - pool_debug_summary：统计信息
+
+    Step1 双池骨架（与 candidate_records 并存，便于下游区分训练入口与展示入口）：
+    - training_pool_records：训练池切片（当前为 base 上前若干条，策略后续 Step 再分叉）
+    - display_pool_records：展示池（当前为分桶配额截断产物）
     """
     query_text: str = ""
     applied_domains: Optional[str] = None
     candidate_records: List[CandidateRecord] = field(default_factory=list)
+    # Step1：双出口骨架；不改变 CandidateRecord 结构
+    training_pool_records: List[CandidateRecord] = field(default_factory=list)
+    display_pool_records: List[CandidateRecord] = field(default_factory=list)
     candidate_evidence_rows: List[Dict[str, Any]] = field(default_factory=list)
     pool_debug_summary: Optional[PoolDebugSummary] = None
     path_costs: Optional[Dict[str, float]] = None
