@@ -6,6 +6,8 @@ KGAT-AX 训练数据生成器。
 - 分层正负样本：Strong/Weak Positive，EasyNeg/FieldNeg/HardNeg/CollabNeg。
 - 可选导出四分支字段到 train_four_branch.json / test_four_branch.json，供 DataLoader 与四分支模型使用。
 - 多进程：子进程各持一套 TotalRecallSystem，仅并行 execute(is_training=True)；主进程顺序做 ID 映射与样本行组装。
+- 金标监督增强（独立 JSONL）：在保留随机大池 train.txt/test.txt 的前提下，基于 dataset_splits + v_gold_samples
+  额外导出 train/dev/test_gold_supervised.jsonl，供后续 trainer 消费。
 """
 import os
 import re
@@ -15,6 +17,7 @@ import faiss
 import numpy as np
 import pandas as pd
 import random
+from collections import Counter
 from multiprocessing import Pool, cpu_count
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -59,6 +62,19 @@ def _kgat_mp_worker_task(spec: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, 
     return jid, res
 
 
+def _kgat_mp_worker_task_gold(spec: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """金标支路：按 query_text（jd_text）与 target_domain=None 执行召回；返回 (query_id, execute 结果)。"""
+    global _MP_RECALL_SYSTEM, _MP_JOB_IDX
+    assert _MP_RECALL_SYSTEM is not None and _MP_JOB_IDX is not None
+    qid = str(spec["query_id"])
+    jid = str(spec["securityId"])
+    if jid not in _MP_JOB_IDX:
+        return qid, None
+    query_text = spec["query_text"]
+    res = _MP_RECALL_SYSTEM.execute(query_text, domain_id=None, is_training=True)
+    return qid, res
+
+
 def parallel_total_recall_for_specs(
     specs: List[Dict[str, Any]],
     workers: int,
@@ -79,6 +95,27 @@ def parallel_total_recall_for_specs(
     return {jid: res for jid, res in pairs}
 
 
+def parallel_gold_recall_for_specs(
+    specs: List[Dict[str, Any]],
+    workers: int,
+) -> Dict[str, Optional[Dict[str, Any]]]:
+    """
+    对金标 query specs 并行执行 TotalRecallSystem.execute(is_training=True, domain_id=None)。
+    specs 每项至少: query_id, securityId, query_text
+    返回 query_id -> execute 结果。
+    """
+    if not specs:
+        return {}
+    n = max(1, int(workers))
+    n = min(n, cpu_count() or 1)
+    if n < 2:
+        raise ValueError("parallel_gold_recall_for_specs requires workers >= 2")
+    chunksize = max(1, len(specs) // (n * 4))
+    with Pool(processes=n, initializer=_kgat_mp_worker_init) as pool:
+        pairs = pool.map(_kgat_mp_worker_task_gold, specs, chunksize=chunksize)
+    return {qid: res for qid, res in pairs}
+
+
 # 分层正负样本标签（README 5.5）
 LABEL_STRONG_POS = "strong_pos"
 LABEL_WEAK_POS = "weak_pos"
@@ -86,6 +123,396 @@ LABEL_HARD_NEG = "hard_neg"
 LABEL_COLLAB_NEG = "collab_neg"
 LABEL_FIELD_NEG = "field_neg"
 LABEL_EASY_NEG = "easy_neg"
+
+
+# ---------------------------------------------------------------------------
+# 金标监督增强支路：dataset_splits + v_gold_samples → JSONL（独立于 train.txt / test.txt）
+# ---------------------------------------------------------------------------
+
+
+def load_dataset_splits(db_path: str) -> Dict[str, str]:
+    """
+    读取 SQLite 表 dataset_splits。
+    返回 query_id -> split_name（'train' | 'dev' | 'test'）。
+    """
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute("SELECT query_id, split_name FROM dataset_splits").fetchall()
+    finally:
+        conn.close()
+    return {str(r["query_id"]): str(r["split_name"]) for r in rows}
+
+
+def load_gold_samples(db_path: str) -> pd.DataFrame:
+    """读取视图 v_gold_samples 为 DataFrame。"""
+    conn = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query("SELECT * FROM v_gold_samples", conn)
+    finally:
+        conn.close()
+    return df
+
+
+def validate_gold_splits(split_map: Dict[str, str], gold_df: pd.DataFrame) -> None:
+    """
+    校验 dataset_splits 为 20/5/5（共 30 query），且 v_gold_samples 共 900 行，
+    且 splits 与金标的 query_id 集合一致。
+    不通过时抛出 ValueError。
+    """
+    if len(gold_df) != 900:
+        raise ValueError(f"v_gold_samples 期望 900 行，实际为 {len(gold_df)}")
+    by_split = Counter(split_map.values())
+    if (
+        by_split.get("train") != 20
+        or by_split.get("dev") != 5
+        or by_split.get("test") != 5
+    ):
+        raise ValueError(
+            f"dataset_splits 期望 train/dev/test = 20/5/5，实际计数为 {dict(by_split)}"
+        )
+    if len(split_map) != 30:
+        raise ValueError(f"dataset_splits 期望 30 条 query，实际为 {len(split_map)}")
+    gq = set(gold_df["query_id"].astype(str))
+    sq = set(split_map.keys())
+    if gq != sq:
+        raise ValueError(
+            "dataset_splits 与 v_gold_samples 的 query_id 集合不一致："
+            f"仅 splits 有 {sq - gq}，仅 gold 有 {gq - sq}"
+        )
+
+
+def build_gold_query_specs(
+    split_map: Dict[str, str], gold_df: pd.DataFrame
+) -> List[Dict[str, Any]]:
+    """
+    对每个 gold query 组织 spec，包含：
+    query_id, securityId, jd_text, split_name, gold_rows（该 query 的金标行）,
+    query_text（优先 jd_text）, target_domain=None。
+    """
+    specs: List[Dict[str, Any]] = []
+    for qid, split_name in split_map.items():
+        qid_s = str(qid)
+        sub = gold_df[gold_df["query_id"].astype(str) == qid_s]
+        if sub.empty:
+            raise ValueError(f"v_gold_samples 中缺少 query_id={qid_s}")
+        row0 = sub.iloc[0]
+        jd_text = row0.get("jd_text")
+        if jd_text is None or (isinstance(jd_text, float) and np.isnan(jd_text)):
+            jd_text = ""
+        else:
+            jd_text = str(jd_text)
+        specs.append(
+            {
+                "query_id": qid_s,
+                "securityId": str(row0["securityId"]),
+                "jd_text": jd_text,
+                "split_name": split_name,
+                "gold_rows": sub.copy(),
+                "query_text": jd_text,
+                "target_domain": None,
+            }
+        )
+    order = {"train": 0, "dev": 1, "test": 2}
+    specs.sort(key=lambda s: (order.get(s["split_name"], 9), s["query_id"]))
+    return specs
+
+
+def _is_nullish(val: Any) -> bool:
+    if val is None:
+        return True
+    try:
+        if isinstance(val, float) and np.isnan(val):
+            return True
+    except (TypeError, ValueError):
+        pass
+    try:
+        return bool(pd.isna(val))
+    except (TypeError, ValueError):
+        return False
+
+
+def _series_gold_fields(row: pd.Series) -> Dict[str, Any]:
+    """从金标行提取 gold_label / label_level / author_bucket / manual_rank / paper titles。视图列 rank → manual_rank。"""
+    gl = row["gold_label"] if "gold_label" in row.index else None
+    if _is_nullish(gl):
+        gl = None
+    ll = row["label_level"] if "label_level" in row.index else None
+    if _is_nullish(ll):
+        ll = None
+    ab = row["author_bucket"] if "author_bucket" in row.index else None
+    if _is_nullish(ab):
+        ab = None
+    mr = row["rank"] if "rank" in row.index else None
+    if _is_nullish(mr):
+        manual_rank = None
+    else:
+        try:
+            manual_rank = int(mr)
+        except (TypeError, ValueError):
+            manual_rank = None
+    p1 = row["paper_1_title"] if "paper_1_title" in row.index else None
+    if _is_nullish(p1):
+        p1 = None
+    else:
+        p1 = str(p1)
+    p2 = row["paper_2_title"] if "paper_2_title" in row.index else None
+    if _is_nullish(p2):
+        p2 = None
+    else:
+        p2 = str(p2)
+    return {
+        "gold_label": gl,
+        "label_level": ll,
+        "author_bucket": ab,
+        "manual_rank": manual_rank,
+        "paper_1_title": p1,
+        "paper_2_title": p2,
+    }
+
+
+def binary_label_from_gold(gold_label: Any) -> Any:
+    """
+    binary_label = 1 when gold_label >= 2
+    binary_label = 0 when gold_label == 0
+    binary_label = null when gold_label == 1 或其它无法判定情形
+    """
+    if _is_nullish(gold_label):
+        return None
+    try:
+        g = int(gold_label)
+    except (TypeError, ValueError):
+        return None
+    if g >= 2:
+        return 1
+    if g == 0:
+        return 0
+    if g == 1:
+        return None
+    return None
+
+
+def attach_gold_labels_to_candidates(
+    query_id: str,
+    candidate_records: Optional[List[Any]],
+    gold_df_query: pd.DataFrame,
+    split_name: str,
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    """
+    将召回 candidate_records 与金标按 author_id merge，并追加「未被召回覆盖」的金标作者行。
+    securityId / jd_text 取自 gold_df_query 首行（与 v_gold_samples 一致）。
+
+    返回 (jsonl 行列表, 召回覆盖的金标作者数, 未覆盖的金标作者数)。
+    """
+    if gold_df_query.empty:
+        raise ValueError(f"金标子表为空: query_id={query_id}")
+    _r0 = gold_df_query.iloc[0]
+    security_id = str(_r0["securityId"])
+    _jd = _r0.get("jd_text")
+    if _jd is None or (isinstance(_jd, float) and np.isnan(_jd)):
+        jd_text = ""
+    else:
+        jd_text = str(_jd)
+
+    gold_by_aid: Dict[str, pd.Series] = {}
+    for _, row in gold_df_query.iterrows():
+        aid = str(row["author_id"])
+        gold_by_aid[aid] = row
+
+    cand_aids: set = set()
+    rows_out: List[Dict[str, Any]] = []
+    records = candidate_records or []
+
+    for r in records:
+        aid = str(r.author_id)
+        cand_aids.add(aid)
+        base: Dict[str, Any] = {
+            "split": split_name,
+            "query_id": query_id,
+            "securityId": security_id,
+            "jd_text": jd_text,
+            "author_id": aid,
+            "author_name": getattr(r, "author_name", None),
+            "candidate_pool_score": getattr(r, "candidate_pool_score", None),
+            "path_count": getattr(r, "path_count", None),
+            "from_vector": bool(getattr(r, "from_vector", False)),
+            "from_label": bool(getattr(r, "from_label", False)),
+            "from_collab": bool(getattr(r, "from_collab", False)),
+            "vector_rank": getattr(r, "vector_rank", None),
+            "label_rank": getattr(r, "label_rank", None),
+            "collab_rank": getattr(r, "collab_rank", None),
+            "vector_score_raw": getattr(r, "vector_score_raw", None),
+            "label_score_raw": getattr(r, "label_score_raw", None),
+            "collab_score_raw": getattr(r, "collab_score_raw", None),
+        }
+        g_row = gold_by_aid.get(aid)
+        if g_row is not None:
+            gf = _series_gold_fields(g_row)
+            base.update(gf)
+            base["binary_label"] = binary_label_from_gold(base.get("gold_label"))
+        else:
+            base["gold_label"] = None
+            base["label_level"] = None
+            base["author_bucket"] = None
+            base["manual_rank"] = None
+            base["paper_1_title"] = None
+            base["paper_2_title"] = None
+            base["binary_label"] = None
+        rows_out.append(base)
+
+    covered = len(set(gold_by_aid.keys()) & cand_aids)
+    missing_aids = [a for a in gold_by_aid.keys() if a not in cand_aids]
+
+    for aid in missing_aids:
+        grow = gold_by_aid[aid]
+        gf = _series_gold_fields(grow)
+        name = grow["author_name"] if "author_name" in grow.index else None
+        if _is_nullish(name):
+            an = None
+        else:
+            an = str(name)
+        rows_out.append(
+            {
+                "split": split_name,
+                "query_id": query_id,
+                "securityId": security_id,
+                "jd_text": jd_text,
+                "author_id": aid,
+                "author_name": an,
+                **gf,
+                "candidate_pool_score": None,
+                "path_count": None,
+                "from_vector": None,
+                "from_label": None,
+                "from_collab": None,
+                "vector_rank": None,
+                "label_rank": None,
+                "collab_rank": None,
+                "vector_score_raw": None,
+                "label_score_raw": None,
+                "collab_score_raw": None,
+                "binary_label": binary_label_from_gold(gf.get("gold_label")),
+            }
+        )
+
+    missed = len(missing_aids)
+    return rows_out, covered, missed
+
+
+def generate_gold_supervised_exports(
+    generator: "KGATAXTrainingGenerator",
+    recall_workers: int = 0,
+) -> Dict[str, Any]:
+    """
+    金标监督增强：基于 dataset_splits + v_gold_samples 对 30 个 query 跑三路召回，
+    merge 后写出 train_gold_supervised.jsonl / dev_gold_supervised.jsonl / test_gold_supervised.jsonl。
+
+    不改变 train.txt / test.txt。返回统计信息供主流程汇总日志使用。
+    """
+    out_dir = generator.output_dir
+    split_map = load_dataset_splits(DB_PATH)
+    gold_df = load_gold_samples(DB_PATH)
+    validate_gold_splits(split_map, gold_df)
+    specs = build_gold_query_specs(split_map, gold_df)
+
+    by_split_lines: Dict[str, List[Dict[str, Any]]] = {"train": [], "dev": [], "test": []}
+    query_counts = Counter()
+    stats_split: Dict[str, Dict[str, Any]] = {
+        "train": {"hits": 0, "missed": 0, "queries": 0},
+        "dev": {"hits": 0, "missed": 0, "queries": 0},
+        "test": {"hits": 0, "missed": 0, "queries": 0},
+    }
+
+    rw = int(recall_workers or 0)
+    results_by_qid: Dict[str, Optional[Dict[str, Any]]] = {}
+
+    if rw >= 2:
+        print(
+            f"[*] 金标支路多进程召回: workers={min(rw, cpu_count() or 1)}，"
+            f"queries={len(specs)}，is_training=True, domain_id=None",
+            flush=True,
+        )
+        gold_specs_parallel = [
+            {
+                "query_id": s["query_id"],
+                "securityId": s["securityId"],
+                "query_text": s["query_text"],
+            }
+            for s in specs
+        ]
+        results_by_qid = parallel_gold_recall_for_specs(gold_specs_parallel, rw)
+    else:
+        rs = generator._ensure_recall_system()
+        for s in tqdm(specs, desc="Gold-supervised recall"):
+            jid = str(s["securityId"])
+            if jid not in generator.job_id_to_idx:
+                print(
+                    f"[WARN] 金标 query_id={s['query_id']} securityId={jid} 不在 JOB_MAP，跳过召回。",
+                    flush=True,
+                )
+                results_by_qid[s["query_id"]] = None
+                continue
+            results_by_qid[s["query_id"]] = rs.execute(
+                s["query_text"], domain_id=None, is_training=True
+            )
+
+    for s in tqdm(specs, desc="Gold-supervised merge & export"):
+        sp_name = s["split_name"]
+        qid = s["query_id"]
+        query_counts[sp_name] += 1
+        stats_split[sp_name]["queries"] += 1
+
+        rec = results_by_qid.get(qid)
+        pool = rec.get("candidate_pool") if rec else None
+        records = getattr(pool, "candidate_records", None) if pool else None
+        if rec is None or pool is None:
+            print(
+                f"[WARN] 金标 query_id={qid} 无有效召回结果，仅导出金标行（召回字段为空）。",
+                flush=True,
+            )
+            records = []
+
+        gsub = s["gold_rows"]
+        lines, hit_n, miss_n = attach_gold_labels_to_candidates(
+            qid,
+            records,
+            gsub,
+            sp_name,
+        )
+        stats_split[sp_name]["hits"] += hit_n
+        stats_split[sp_name]["missed"] += miss_n
+        by_split_lines[sp_name].extend(lines)
+
+    out_names = {
+        "train": os.path.join(out_dir, "train_gold_supervised.jsonl"),
+        "dev": os.path.join(out_dir, "dev_gold_supervised.jsonl"),
+        "test": os.path.join(out_dir, "test_gold_supervised.jsonl"),
+    }
+    for split_k, path in out_names.items():
+        with open(path, "w", encoding="utf-8") as wf:
+            for obj in by_split_lines[split_k]:
+                wf.write(
+                    json.dumps(obj, ensure_ascii=False, default=str) + "\n"
+                )
+
+    dist_per_split: Dict[str, Counter] = {}
+    for split_k in ("train", "dev", "test"):
+        dist_per_split[split_k] = Counter()
+        for obj in by_split_lines[split_k]:
+            gl = obj.get("gold_label")
+            if not _is_nullish(gl):
+                try:
+                    dist_per_split[split_k][int(gl)] += 1
+                except (TypeError, ValueError):
+                    dist_per_split[split_k][str(gl)] += 1
+
+    return {
+        "query_counts": dict(query_counts),
+        "line_counts": {k: len(v) for k, v in by_split_lines.items()},
+        "stats_split": stats_split,
+        "gold_label_dist": {k: dict(v) for k, v in dist_per_split.items()},
+        "paths": out_names,
+    }
 
 
 class KGATAXTrainingGenerator:
@@ -581,9 +1008,47 @@ if __name__ == "__main__":
         train_size=3000, test_size=300, recall_workers=_rw
     )
 
+    _train_txt = os.path.join(gen.output_dir, "train.txt")
+    _test_txt = os.path.join(gen.output_dir, "test.txt")
+    def _count_nonempty_lines(p: str) -> int:
+        if not os.path.isfile(p):
+            return 0
+        with open(p, encoding="utf-8") as f:
+            return sum(1 for line in f if line.strip())
+
+    _train_lines_n = _count_nonempty_lines(_train_txt)
+    _test_lines_n = _count_nonempty_lines(_test_txt)
+
     # 第三步：执行全量拓扑收割
     gen.generate_kg_topology(sampled_job_ids=trained_anchors)
+
+    # 第四步：金标监督增强 JSONL（不改变 train.txt / test.txt）
+    _gold_stats = generate_gold_supervised_exports(gen, recall_workers=_rw)
 
     from src.infrastructure.database.kgat_ax.pipeline_state import write_stage_done
 
     write_stage_done(1)
+
+    print("\n" + "=" * 60)
+    print("[汇总] 阶段 1 数据产出")
+    print("=" * 60)
+    print(f"  [旧主链] train.txt 样本行数: {_train_lines_n}")
+    print(f"  [旧主链] test.txt  样本行数: {_test_lines_n}")
+    print("  [金标增强] 各 split query 数 (train/dev/test): "
+          f"{_gold_stats['query_counts'].get('train', 0)} / "
+          f"{_gold_stats['query_counts'].get('dev', 0)} / "
+          f"{_gold_stats['query_counts'].get('test', 0)}")
+    print("  [金标增强] 各 split JSONL 行数: "
+          f"train={_gold_stats['line_counts'].get('train', 0)}, "
+          f"dev={_gold_stats['line_counts'].get('dev', 0)}, "
+          f"test={_gold_stats['line_counts'].get('test', 0)}")
+    for sk in ("train", "dev", "test"):
+        dist = _gold_stats["gold_label_dist"].get(sk, {})
+        print(f"  [金标增强] split={sk} gold_label 分布: {dist}")
+    for sk in ("train", "dev", "test"):
+        st = _gold_stats["stats_split"].get(sk, {})
+        print(
+            f"  [金标增强] split={sk} 召回命中金标作者数(累计): {st.get('hits', 0)} | "
+            f"未覆盖金标作者数(累计): {st.get('missed', 0)}"
+        )
+    print("=" * 60 + "\n")

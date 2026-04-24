@@ -3404,6 +3404,44 @@ def enrich_stage2a_candidates(
         c.subfield_fit = float(ev.get("effective_subfield_overlap", 0) or 0)
         c.topic_fit = float(ev.get("effective_topic_overlap", 0) or 0)
         c.polysemy_risk, _ = compute_polysemy_risk(c.term or "", c.family_match)
+        # 通用纠偏（仅用现成结构信号；无词面特判、无领域特判）：
+        # 当候选呈现“多义风险高 + 层级不贴合(topic/subfield overlap 很低) + 与锚点本义一致性弱 + 上下文未能补足甚至掉分”
+        # 时，提高 polysemy_risk，抑制其成为主落点，防止 Stage4/5 被保底词带偏。
+        poly = float(c.polysemy_risk or 0.0)
+        topic_fit = float(getattr(c, "topic_fit", 0.0) or 0.0)
+        subfield_fit = float(getattr(c, "subfield_fit", 0.0) or 0.0)
+        anchor_id = float(getattr(c, "anchor_identity_score", 0.0) or 0.0)
+        ctx_gain = getattr(c, "context_gain", None)
+        ctx_gain_v = float(ctx_gain) if ctx_gain is not None else 0.0
+        xa = int(getattr(c, "cross_anchor_support_count", 0) or 0)
+        # 结构性“可疑跨域”形态（软抑制）：越满足这些结构条件，polysemy_risk 连续上调越多。
+        # 注意：topic_fit/subfield_fit 在无 jd_profile 的情况下可能为 0；因此提升条件要求同时出现：
+        # - poly 本就偏高；且
+        # - context_gain 明显为负；且
+        # - anchor_identity 弱
+        # 才启动软提升，避免无 profile 时误伤。
+        if poly >= 0.55 and ctx_gain_v <= -0.06 and anchor_id <= 0.35:
+            # s ∈ [0,1]：结构性“错义/跨域”可疑度
+            s_poly = min(1.0, max(0.0, (poly - 0.55) / 0.35))
+            s_fit = 0.0
+            if topic_fit > 0.0 or subfield_fit > 0.0:
+                # 有层级证据时才使用 fit；否则不靠 fit 判错
+                s_fit = min(
+                    1.0,
+                    max(0.0, (0.06 - min(topic_fit, subfield_fit if subfield_fit > 0 else topic_fit)) / 0.06),
+                )
+            s_id = min(1.0, max(0.0, (0.35 - anchor_id) / 0.35))
+            s_gain = min(1.0, max(0.0, (-ctx_gain_v - 0.06) / 0.24))  # -0.06→0, -0.30→1
+            s_xa = 1.0 if xa <= 1 else (0.5 if xa == 2 else 0.0)
+
+            suspicious = (0.28 * s_poly + 0.22 * s_fit + 0.22 * s_id + 0.22 * s_gain + 0.06 * s_xa)
+            suspicious = max(0.0, min(1.0, suspicious))
+
+            # 连续加成：最多 +0.25；不改原 poly 的相对序，只是把“更可疑”的往上抬一点
+            boost = 0.25 * suspicious
+            if boost > 0:
+                c.polysemy_risk = min(1.0, poly + boost)
+                c.polysemy_note = "structural_polysemy_soft_boost"
 
         admission = check_primary_admission(c)
         c.retain_mode = admission["retain_mode"]
