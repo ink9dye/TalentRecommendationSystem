@@ -549,4 +549,8 @@ def build_kgatax_feature_row(rec: Any) -> Dict[str, Any]:
         "author_aux": author_aux,
         "interaction_features": interaction_features,
         "vector_evidence_summary": vec_summ,
+        # 训练侧车诊断字段（不参与模型张量维度，仅 JSON/日志）
+        "candidate_trust_tier": str(getattr(rec, "candidate_trust_tier", "") or ""),
+        "risk_flags": list(getattr(rec, "risk_flags", None) or []),
+        "sampleability_flags": list(getattr(rec, "sampleability_flags", None) or []),
     }

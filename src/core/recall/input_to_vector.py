@@ -4,6 +4,8 @@ import time
 from typing import Dict, List, Optional, Set
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 from sentence_transformers import SentenceTransformer
 from config import SBERT_DIR
 
@@ -31,6 +33,43 @@ class QueryEncoder:
         # 原文 → (1, dim) 向量；与 lookup_or_encode / encode_cache 键一致，供 encode / batch 去重
         self._embed_dedup_cache: Dict[str, np.ndarray] = {}
 
+    def _encode_texts(self, texts: List[str]) -> np.ndarray:
+        """
+        Stable encoding path for local gte model.
+
+        Why: In some environments, remote-code model forward may produce invalid internal position_ids.
+        We pass explicit position_ids to keep behavior stable. Pooling follows the model's
+        sentence-transformers config (gte-multilingual-base uses CLS pooling).
+        """
+        if not texts:
+            dim = int(self.model.get_sentence_embedding_dimension())
+            return np.zeros((0, dim), dtype=np.float32)
+
+        # sentence-transformers layout: [0]=Transformer, [1]=Pooling, ...
+        transformer = self.model[0]
+        auto_model = getattr(transformer, "auto_model", None)
+        tokenizer = getattr(transformer, "tokenizer", None)
+        if auto_model is None or tokenizer is None:
+            # Fallback to library default if internal structure differs.
+            vecs = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+            return np.asarray(vecs, dtype=np.float32)
+
+        with torch.no_grad():
+            batch = tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=int(getattr(self.model, "max_seq_length", 1024) or 1024),
+                return_tensors="pt",
+            )
+            seq_len = int(batch["input_ids"].shape[1])
+            position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch["input_ids"].shape[0], -1)
+            outputs = auto_model(**batch, position_ids=position_ids)
+            last_hidden = outputs.last_hidden_state  # [bs, seq, dim]
+            cls = last_hidden[:, 0, :]  # CLS pooling
+            cls = F.normalize(cls, p=2, dim=1)
+            return cls.cpu().numpy().astype(np.float32)
+
     def clear_embed_dedup_cache(self) -> None:
         """单次召回入口清空，避免跨查询无限增长；键为原文，与 encode/lookup 一致。"""
         self._embed_dedup_cache.clear()
@@ -48,11 +87,7 @@ class QueryEncoder:
 
         start_encode = time.time()
 
-        vector = self.model.encode(
-            [text],
-            normalize_embeddings=True,
-            show_progress_bar=False
-        ).astype("float32")
+        vector = self._encode_texts([text]).astype("float32")
 
         duration = time.time() - start_encode
         self._embed_dedup_cache[text] = vector
@@ -75,11 +110,7 @@ class QueryEncoder:
             cache[text] = vector
             return vector
         start_encode = time.time()
-        vector = self.model.encode(
-            [text],
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        ).astype("float32")
+        vector = self._encode_texts([text]).astype("float32")
         _ = time.time() - start_encode
         cache[text] = vector
         self._embed_dedup_cache[text] = vector
@@ -114,11 +145,7 @@ class QueryEncoder:
             if t not in seen:
                 seen.add(t)
                 unique_order.append(t)
-        batch_vecs = self.model.encode(
-            unique_order,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        ).astype(np.float32)
+        batch_vecs = self._encode_texts(unique_order).astype(np.float32)
         for j, t in enumerate(unique_order):
             self._embed_dedup_cache[t] = batch_vecs[j : j + 1].copy()
         text_to_row = {t: batch_vecs[j] for j, t in enumerate(unique_order)}

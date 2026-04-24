@@ -75,6 +75,12 @@ class CandidateRecord:
     # --- Step2：训练中间层友好字段（非真值/非标签，仅用于后续弱监督与样本构造）---
     # pool_role 表示“这条记录当前被哪一层池视角引用”，可为 base / training / display（允许被覆盖）
     pool_role: str = ""
+    # Step1：候选可信度分层（用于总召回融合主序 / training pool 构造 / 弱标签辅助）
+    # 取值示例：strong_consensus / strong_label / strong_vector / weak_consensus / weak_vector / risky_vector
+    #
+    # 说明：该字段用于候选池诊断与统计（如汇总各层级数量、打印 TopN 供排查），
+    # 不作为新的主排序体系，也不等同于训练真值标签。
+    candidate_trust_tier: str = ""
     # 软风险标记：承接 Step3 的软标记体系；本步先允许为空
     risk_flags: List[str] = field(default_factory=list)
     # 可采样性标记：承接后续样本构造（如 borderline/hard_negative 等）；本步先允许为空
@@ -130,6 +136,7 @@ class CandidateRecord:
             "bucket_reasons": self.bucket_reasons,
             # Step2：训练中间层友好字段（非真值/非标签）
             "pool_role": self.pool_role,
+            "candidate_trust_tier": self.candidate_trust_tier,
             "risk_flags": self.risk_flags,
             "sampleability_flags": self.sampleability_flags,
             "vector_evidence": self.vector_evidence,
@@ -173,6 +180,8 @@ class PoolDebugSummary:
     # --- Step8：来源门控与「未门控 raw」审计（便于与 gate off 对比）---
     vector_origin_candidate_count: int = 0
     vector_evidence_bonus_raw_nonzero_count: int = 0
+    # Step1：候选可信度分层统计（由 total_recall 计算并写入）
+    candidate_trust_tier_counts: Dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -203,6 +212,7 @@ class PoolDebugSummary:
             "vector_evidence_bonus_max": self.vector_evidence_bonus_max,
             "vector_origin_candidate_count": self.vector_origin_candidate_count,
             "vector_evidence_bonus_raw_nonzero_count": self.vector_evidence_bonus_raw_nonzero_count,
+            "candidate_trust_tier_counts": self.candidate_trust_tier_counts,
         }
 
 

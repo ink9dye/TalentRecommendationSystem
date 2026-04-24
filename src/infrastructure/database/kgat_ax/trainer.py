@@ -184,7 +184,12 @@ def train(args):
         for _ in cf_pbar:
             batch = data.generate_cf_batch(data.train_user_dict, args.cf_batch_size)
             if batch is None: continue
-            u, p, n = batch
+            if len(batch) == 4:
+                u, p, n, sample_w = batch
+                sample_w = sample_w.to(device)
+            else:
+                u, p, n = batch
+                sample_w = None
             author_aux_p, author_aux_n, recall_up, recall_un, interaction_up, interaction_un = data.get_four_branch_for_batch(u, p, n, use_train=True)
 
             if (recall_up is not None and author_aux_p is not None and interaction_up is not None):
@@ -218,9 +223,14 @@ def train(args):
                     s_pos = s_pos.squeeze(1)
                 if s_neg.dim() == 2:
                     s_neg = s_neg.squeeze(1)
-                loss_rank = torch.mean(F.softplus(s_neg - s_pos))
+                per = F.softplus(s_neg - s_pos)
+                if sample_w is not None:
+                    loss_rank = torch.sum(per * sample_w) / torch.clamp(torch.sum(sample_w), min=1e-6)
+                else:
+                    loss_rank = torch.mean(per)
                 loss = loss_rank
             else:
+                # 兼容旧版：calc_cf_loss 内部已聚合；池监督加权仅对四分支分支执行
                 loss = model.calc_cf_loss(u.to(device), p.to(device), n.to(device), aux_all_device)
 
             optimizer.zero_grad()
@@ -265,10 +275,26 @@ def train(args):
                 f"Eval (Fitting) @{Ks[0]}: Recall: {res_fit[Ks[0]]['recall']:.4f}, NDCG: {res_fit[Ks[0]]['ndcg']:.4f}")
 
             # B. 【核心修改】泛化验证：这是衡量模型实力的真实指标
-            res_test = evaluate(model, data, Ks, device, use_test_set=True)
-            # 关键：将当前 Recall 锁定为测试集的结果
-            curr_recall = res_test[Ks[0]]['recall']
-            logging.info(f"Eval (Generalization) @{Ks[0]}: Recall: {curr_recall:.4f}")
+            res_test_all = evaluate(model, data, Ks, device, use_test_set=True)
+            curr_recall = res_test_all[Ks[0]]['recall']
+            logging.info(f"Eval (Generalization, all) @{Ks[0]}: Recall: {curr_recall:.4f}")
+
+            # gold-only：避免 weak 样本当作正式泛化指标
+            if getattr(data, "pool_supervised_mode", False) and hasattr(data, "test_user_dict_gold"):
+                gold_n = sum(len(v) for v in getattr(data, "test_user_dict_gold", {}).values())
+                logging.info(f"[Gold-only] test_gold_sample_count: {gold_n}")
+                if gold_n > 0:
+                    _orig = data.test_user_dict
+                    try:
+                        data.test_user_dict = data.test_user_dict_gold
+                        res_test_gold = evaluate(model, data, Ks, device, use_test_set=True)
+                        logging.info(
+                            f"Eval (Generalization, gold-only) @{Ks[0]}: "
+                            f"Recall: {res_test_gold[Ks[0]]['recall']:.4f}, "
+                            f"NDCG: {res_test_gold[Ks[0]]['ndcg']:.4f}"
+                        )
+                    finally:
+                        data.test_user_dict = _orig
 
             # C. 决策逻辑：使用测试集指标决定早停与保存
             recall_list.append(curr_recall)  # 记录测试集 Recall，避开 Fitting 的 nan 陷阱

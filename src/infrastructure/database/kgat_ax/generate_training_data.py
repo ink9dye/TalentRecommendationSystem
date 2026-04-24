@@ -1,13 +1,14 @@
 """
 KGAT-AX 训练数据生成器。
 
-职责（对齐 README 修改计划 5.5）：
-- 训练样本入口优先基于 candidate_pool.candidate_records；final_top_500 仅作兼容回退。
-- 分层正负样本：Strong/Weak Positive，EasyNeg/FieldNeg/HardNeg/CollabNeg。
-- 可选导出四分支字段到 train_four_branch.json / test_four_branch.json，供 DataLoader 与四分支模型使用。
-- 多进程：子进程各持一套 TotalRecallSystem，仅并行 execute(is_training=True)；主进程顺序做 ID 映射与样本行组装。
-- 金标监督增强（独立 JSONL）：在保留随机大池 train.txt/test.txt 的前提下，基于 dataset_splits + v_gold_samples
-  额外导出 train/dev/test_gold_supervised.jsonl，供后续 trainer 消费。
+职责（对齐 README / ch04）：
+- 训练样本入口优先基于 candidate_pool.training_pool_records（与 total_recall 精排/训练入口一致）；
+  若为空则回退 candidate_records 前 100；再无则 final_top_500 仅作末级兼容。
+- 随机大池 train.txt/test.txt：分层正负样本（Strong/Weak Positive 等），与线上「全库随机岗位」扩展集兼容。
+- 池监督 JSONL（主口径）：以 training_pool_records 为样本主体；picked_authors（若存在）或 v_gold_samples 为金标覆盖；
+  简单弱标签 + sample_weight；可选金标未命中注入（INJECT_MISSING_GOLD）；评估仅用 label_source=gold。
+- 可选导出四分支侧车到 train_four_branch.json；池监督行内附带 kgatax sidecar（按 author_id 对齐）。
+- 多进程：子进程各持一套 TotalRecallSystem，仅并行 execute(is_training=True)。
 """
 import os
 import re
@@ -271,6 +272,135 @@ def _series_gold_fields(row: pd.Series) -> Dict[str, Any]:
     }
 
 
+def _pool_debug_query_limit() -> int:
+    """KGATAX_DEBUG_QUERY_LIMIT 优先；未设置时回退 KGATAX_DEBUG_LIMIT（与随机大池调试一致）。"""
+    v = int(os.environ.get("KGATAX_DEBUG_QUERY_LIMIT", "0") or "0")
+    if v > 0:
+        return v
+    return int(os.environ.get("KGATAX_DEBUG_LIMIT", "0") or "0")
+
+
+def _inject_missing_gold_default() -> bool:
+    raw = os.environ.get("INJECT_MISSING_GOLD", "true").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _weak_sample_weight() -> float:
+    try:
+        return float(os.environ.get("KGATAX_WEAK_SAMPLE_WEIGHT", "0.25") or "0.25")
+    except (TypeError, ValueError):
+        return 0.25
+
+
+GOLD_SAMPLE_WEIGHT: float = 1.0
+
+
+def infer_weak_label(record: Any) -> Tuple[Optional[int], str]:
+    """
+    轻量弱标签（无 teacher / 蒸馏）。返回 (label_grade, weak_label_type)。
+    label_grade: 2 弱正强 / 1 边缘 / 0 弱负；无法标注时为 (None, 'unlabeled')。
+    """
+    tier = str(getattr(record, "candidate_trust_tier", "") or "")
+    bucket = str(getattr(record, "bucket_type", "") or "")
+    path_count = int(getattr(record, "path_count", 0) or 0)
+    from_label = bool(getattr(record, "from_label", False))
+    from_vector = bool(getattr(record, "from_vector", False))
+    risk_flags = set(getattr(record, "risk_flags", []) or [])
+
+    serious_risk = bool(
+        risk_flags
+        & {
+            "single_paper_dominated",
+            "thin_job_axis_coverage",
+            "weak_job_axis_coverage",
+            "possible_off_context_dense_match",
+            "off_context_dense_match",
+            "label_only_low_domain_consistency",
+            "label_only_weak_paper_hit",
+        }
+    )
+
+    if tier in {"strong_consensus", "strong_label"}:
+        return 2, "weak_positive"
+
+    if tier in {"strong_vector", "weak_consensus"}:
+        return 1, "weak_borderline"
+
+    if tier == "risky_vector" or serious_risk:
+        return 0, "weak_negative"
+
+    if from_label:
+        return 1, "weak_borderline"
+
+    if from_vector and not from_label and path_count == 1:
+        return 0, "weak_negative"
+
+    _ = bucket  # 保留与规范一致；当前规则未直接用 bucket
+    return None, "unlabeled"
+
+
+def train_y_from_grade(label_grade: Optional[int]) -> int:
+    """二分类训练目标：grade 1/2 为正，0 与缺失为负。"""
+    if label_grade is None:
+        return 0
+    return 1 if label_grade in (1, 2) else 0
+
+
+def load_gold_author_map(db_path: str) -> Tuple[Dict[Tuple[str, str], Dict[str, Any]], str]:
+    """
+    金标映射 (query_id, author_id) -> {gold_label, label_level, note, ...}。
+    优先表 picked_authors；不存在则使用 v_gold_samples。
+    """
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    gold_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    source = "v_gold_samples"
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='picked_authors'"
+        ).fetchone()
+        if row:
+            source = "picked_authors"
+            q = (
+                "SELECT query_id, author_id, gold_label, label_level, note "
+                "FROM picked_authors WHERE gold_label IS NOT NULL"
+            )
+            try:
+                rows = conn.execute(q).fetchall()
+            except sqlite3.OperationalError:
+                rows = conn.execute(
+                    "SELECT query_id, author_id, gold_label, label_level, NULL AS note "
+                    "FROM picked_authors WHERE gold_label IS NOT NULL"
+                ).fetchall()
+            for r in rows:
+                key = (str(r["query_id"]), str(r["author_id"]))
+                note_v = None
+                try:
+                    note_v = r["note"]
+                except (KeyError, IndexError):
+                    pass
+                gold_map[key] = {
+                    "gold_label": int(r["gold_label"]),
+                    "label_level": r["label_level"],
+                    "note": note_v,
+                }
+        else:
+            rows = conn.execute(
+                "SELECT query_id, author_id, gold_label, label_level FROM v_gold_samples "
+                "WHERE gold_label IS NOT NULL"
+            ).fetchall()
+            for r in rows:
+                key = (str(r["query_id"]), str(r["author_id"]))
+                gold_map[key] = {
+                    "gold_label": int(r["gold_label"]),
+                    "label_level": r["label_level"],
+                    "note": None,
+                }
+    finally:
+        conn.close()
+    return gold_map, source
+
+
 def binary_label_from_gold(gold_label: Any) -> Any:
     """
     binary_label = 1 when gold_label >= 2
@@ -464,7 +594,11 @@ def generate_gold_supervised_exports(
 
         rec = results_by_qid.get(qid)
         pool = rec.get("candidate_pool") if rec else None
-        records = getattr(pool, "candidate_records", None) if pool else None
+        records = (
+            generator._select_training_pool_records(pool)
+            if pool is not None
+            else []
+        )
         if rec is None or pool is None:
             print(
                 f"[WARN] 金标 query_id={qid} 无有效召回结果，仅导出金标行（召回字段为空）。",
@@ -512,6 +646,414 @@ def generate_gold_supervised_exports(
         "stats_split": stats_split,
         "gold_label_dist": {k: dict(v) for k, v in dist_per_split.items()},
         "paths": out_names,
+    }
+
+
+def _training_pool_supervised_row_from_record(
+    *,
+    split_name: str,
+    query_id: str,
+    security_id: str,
+    jd_text: str,
+    record: Any,
+    label_grade: Optional[int],
+    train_y: int,
+    label_source: str,
+    sample_weight: float,
+    recall_hit: int,
+    forced_gold_injection: int,
+    weak_label_type: Optional[str],
+) -> Dict[str, Any]:
+    aid = str(getattr(record, "author_id", ""))
+    rf = getattr(record, "risk_flags", None) or []
+    sf = getattr(record, "sampleability_flags", None) or []
+    row: Dict[str, Any] = {
+        "split": split_name,
+        "query_id": query_id,
+        "securityId": security_id,
+        "jd_text": jd_text,
+        "author_id": aid,
+        "author_name": getattr(record, "author_name", None),
+        "label_grade": label_grade,
+        "train_y": train_y,
+        "label_source": label_source,
+        "sample_weight": float(sample_weight),
+        "recall_hit": int(recall_hit),
+        "forced_gold_injection": int(forced_gold_injection),
+        "weak_label_type": weak_label_type,
+        "from_vector": bool(getattr(record, "from_vector", False)),
+        "from_label": bool(getattr(record, "from_label", False)),
+        "from_collab": bool(getattr(record, "from_collab", False)),
+        "path_count": int(getattr(record, "path_count", 0) or 0),
+        "vector_rank": getattr(record, "vector_rank", None),
+        "label_rank": getattr(record, "label_rank", None),
+        "collab_rank": getattr(record, "collab_rank", None),
+        "candidate_pool_score": getattr(record, "candidate_pool_score", None),
+        "bucket_type": getattr(record, "bucket_type", None),
+        "candidate_trust_tier": str(getattr(record, "candidate_trust_tier", "") or ""),
+        "risk_flags": list(rf) if isinstance(rf, (list, tuple, set)) else [],
+        "sampleability_flags": list(sf) if isinstance(sf, (list, tuple, set)) else [],
+    }
+    return row
+
+
+def _injected_gold_training_row(
+    *,
+    split_name: str,
+    query_id: str,
+    security_id: str,
+    jd_text: str,
+    author_id: str,
+    author_name: Optional[str],
+    label_grade: int,
+    train_y: int,
+    gold_meta: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "split": split_name,
+        "query_id": query_id,
+        "securityId": security_id,
+        "jd_text": jd_text,
+        "author_id": author_id,
+        "author_name": author_name,
+        "label_grade": int(label_grade),
+        "train_y": int(train_y),
+        "label_source": "gold",
+        "sample_weight": float(GOLD_SAMPLE_WEIGHT),
+        "recall_hit": 0,
+        "forced_gold_injection": 1,
+        "weak_label_type": None,
+        "from_vector": None,
+        "from_label": None,
+        "from_collab": None,
+        "path_count": None,
+        "vector_rank": None,
+        "label_rank": None,
+        "collab_rank": None,
+        "candidate_pool_score": None,
+        "bucket_type": None,
+        "candidate_trust_tier": "",
+        "risk_flags": [],
+        "sampleability_flags": [],
+        "gold_label_level": gold_meta.get("label_level"),
+        "gold_note": gold_meta.get("note"),
+    }
+
+
+def generate_training_pool_supervised_exports(
+    generator: "KGATAXTrainingGenerator",
+    recall_workers: int = 0,
+) -> Dict[str, Any]:
+    """
+    池内精排监督 JSONL：主体为 training_pool_records；金标覆盖弱标；可选注入未命中金标作者。
+    写出 train/dev/test_pool_supervised.jsonl；返回汇总统计。
+    """
+    out_dir = generator.output_dir
+    q_lim = _pool_debug_query_limit()
+    inject_miss = _inject_missing_gold_default()
+    weak_w = _weak_sample_weight()
+
+    split_map = load_dataset_splits(DB_PATH)
+    gold_df = load_gold_samples(DB_PATH)
+    validate_gold_splits(split_map, gold_df)
+    gold_map, gold_src = load_gold_author_map(DB_PATH)
+
+    specs = build_gold_query_specs(split_map, gold_df)
+    if q_lim > 0:
+        # 调试时尽量覆盖 train/dev/test，避免 dev/test 为空导致评估口径无法验证
+        by = {"train": [], "dev": [], "test": []}
+        for s in specs:
+            sp = str(s.get("split_name") or "")
+            if sp in by:
+                by[sp].append(s)
+        picked: List[Dict[str, Any]] = []
+        # round-robin: train -> dev -> test
+        order = ["train", "dev", "test"]
+        while len(picked) < q_lim and any(by[k] for k in order):
+            for k in order:
+                if len(picked) >= q_lim:
+                    break
+                if by[k]:
+                    picked.append(by[k].pop(0))
+        specs = picked
+        print(
+            f"[*] 池监督: DEBUG query limit → 处理 query 数={len(specs)} "
+            f"(KGATAX_DEBUG_QUERY_LIMIT / KGATAX_DEBUG_LIMIT)",
+            flush=True,
+        )
+
+    print(
+        f"[*] 池监督: 金标映射来源={gold_src}，条目={len(gold_map)}，"
+        f"INJECT_MISSING_GOLD={inject_miss}，weak_sample_weight={weak_w}",
+        flush=True,
+    )
+
+    by_split: Dict[str, List[Dict[str, Any]]] = {"train": [], "dev": [], "test": []}
+    rw = int(recall_workers or 0)
+    results_by_qid: Dict[str, Optional[Dict[str, Any]]] = {}
+
+    if rw >= 2:
+        gold_specs_parallel = [
+            {
+                "query_id": s["query_id"],
+                "securityId": s["securityId"],
+                "query_text": s["query_text"],
+            }
+            for s in specs
+        ]
+        print(
+            f"[*] 池监督多进程召回: workers={min(rw, cpu_count() or 1)}，queries={len(specs)}",
+            flush=True,
+        )
+        results_by_qid = parallel_gold_recall_for_specs(gold_specs_parallel, rw)
+    else:
+        rs = generator._ensure_recall_system()
+        for s in tqdm(specs, desc="Pool-supervised recall"):
+            jid = str(s["securityId"])
+            if jid not in generator.job_id_to_idx:
+                print(
+                    f"[WARN] 池监督 query_id={s['query_id']} securityId={jid} 不在 JOB_MAP，跳过召回。",
+                    flush=True,
+                )
+                results_by_qid[s["query_id"]] = None
+                continue
+            results_by_qid[s["query_id"]] = rs.execute(
+                s["query_text"], domain_id=None, is_training=True
+            )
+
+    gold_recall_hit = 0
+    gold_recall_miss = 0
+    forced_gold_injection_count = 0
+    training_pool_total = 0
+    gold_sample_total = 0
+    label_source_counts: Counter = Counter()
+    label_grade_counts: Counter = Counter()
+    weak_label_type_counts: Counter = Counter()
+    sample_w_gold: List[float] = []
+    sample_w_weak: List[float] = []
+    per_query_stats: List[Dict[str, Any]] = []
+
+    for s in tqdm(specs, desc="Pool-supervised build"):
+        qid = str(s["query_id"])
+        sp_name = str(s["split_name"])
+        rec = results_by_qid.get(qid)
+        pool = rec.get("candidate_pool") if rec else None
+        records = generator._select_training_pool_records(pool) if pool else []
+        training_pool_total += len(records)
+
+        if rec is None or pool is None:
+            print(
+                f"[WARN] 池监督 query_id={qid} 无有效召回；仅处理金标注入（若有）。",
+                flush=True,
+            )
+
+        sidecar_list = (rec or {}).get("kgatax_sidecar_rows") or []
+        side_by_aid = {
+            str(x.get("author_id")): x
+            for x in sidecar_list
+            if x.get("author_id") is not None
+        }
+
+        security_id = str(s["securityId"])
+        jd_text = str(s.get("jd_text") or "")
+        gsub = s["gold_rows"]
+
+        gold_aids_set = {
+            str(r["author_id"])
+            for _, r in gsub.iterrows()
+            if not _is_nullish(r.get("gold_label"))
+        }
+        pool_aids = {str(getattr(r, "author_id", "")) for r in records}
+        pool_aids.discard("")
+
+        gold_in_pool = gold_aids_set & pool_aids
+        gold_not_in_pool = gold_aids_set - pool_aids
+        gold_recall_hit += len(gold_in_pool)
+        gold_recall_miss += len(gold_not_in_pool)
+
+        name_by_aid: Dict[str, Optional[str]] = {}
+        for _, grow in gsub.iterrows():
+            aid_g = str(grow["author_id"])
+            nm = grow.get("author_name")
+            if not _is_nullish(nm):
+                name_by_aid[aid_g] = str(nm)
+            elif aid_g not in name_by_aid:
+                name_by_aid[aid_g] = None
+
+        weak_count = 0
+        rows_out: List[Dict[str, Any]] = []
+
+        for r in records:
+            aid = str(r.author_id)
+            key = (qid, aid)
+            ginfo = gold_map.get(key)
+
+            if ginfo is not None:
+                label_grade = int(ginfo["gold_label"])
+                label_source = "gold"
+                sample_weight = GOLD_SAMPLE_WEIGHT
+                train_y = train_y_from_grade(label_grade)
+                weak_label_type: Optional[str] = None
+                gold_sample_total += 1
+                sample_w_gold.append(sample_weight)
+            else:
+                wg, wtype = infer_weak_label(r)
+                weak_label_type = wtype
+                if wg is None:
+                    label_grade = None
+                    label_source = "unlabeled"
+                    sample_weight = 0.0
+                    train_y = 0
+                else:
+                    label_source = "weak"
+                    label_grade = wg
+                    sample_weight = weak_w
+                    train_y = train_y_from_grade(wg)
+                    weak_count += 1
+                    sample_w_weak.append(sample_weight)
+
+            gmeta = gold_map.get((qid, aid))
+            row_d = _training_pool_supervised_row_from_record(
+                split_name=sp_name,
+                query_id=qid,
+                security_id=security_id,
+                jd_text=jd_text,
+                record=r,
+                label_grade=label_grade,
+                train_y=train_y,
+                label_source=label_source,
+                sample_weight=sample_weight,
+                recall_hit=1,
+                forced_gold_injection=0,
+                weak_label_type=weak_label_type,
+            )
+            if gmeta is not None:
+                row_d["gold_label_level"] = gmeta.get("label_level")
+                row_d["gold_note"] = gmeta.get("note")
+            sc = side_by_aid.get(aid)
+            if sc is not None:
+                row_d["kgatax_sidecar"] = sc
+
+            label_source_counts[label_source] += 1
+            if label_grade is not None:
+                label_grade_counts[int(label_grade)] += 1
+            if label_source in ("weak", "unlabeled"):
+                weak_label_type_counts[str(weak_label_type or "unlabeled")] += 1
+            rows_out.append(row_d)
+
+        if inject_miss:
+            for aid in sorted(gold_not_in_pool):
+                key = (qid, aid)
+                ginfo = gold_map.get(key)
+                if ginfo is None:
+                    continue
+                label_grade = int(ginfo["gold_label"])
+                train_y = train_y_from_grade(label_grade)
+                row_d = _injected_gold_training_row(
+                    split_name=sp_name,
+                    query_id=qid,
+                    security_id=security_id,
+                    jd_text=jd_text,
+                    author_id=aid,
+                    author_name=name_by_aid.get(aid),
+                    label_grade=label_grade,
+                    train_y=train_y,
+                    gold_meta=ginfo,
+                )
+                rows_out.append(row_d)
+                forced_gold_injection_count += 1
+                gold_sample_total += 1
+                sample_w_gold.append(GOLD_SAMPLE_WEIGHT)
+                label_source_counts["gold"] += 1
+                label_grade_counts[label_grade] += 1
+
+        by_split[sp_name].extend(rows_out)
+        per_query_stats.append(
+            {
+                "query_id": qid,
+                "training_pool_count": len(records),
+                "gold_count": len(gold_aids_set),
+                "gold_hit": len(gold_in_pool),
+                "gold_miss": len(gold_not_in_pool),
+                "weak_count": weak_count,
+            }
+        )
+
+    out_names = {
+        "train": os.path.join(out_dir, "train_pool_supervised.jsonl"),
+        "dev": os.path.join(out_dir, "dev_pool_supervised.jsonl"),
+        "test": os.path.join(out_dir, "test_pool_supervised.jsonl"),
+    }
+    for split_k, path in out_names.items():
+        with open(path, "w", encoding="utf-8") as wf:
+            for obj in by_split[split_k]:
+                wf.write(json.dumps(obj, ensure_ascii=False, default=str) + "\n")
+
+    def _summ_weights(xs: List[float]) -> Dict[str, Any]:
+        if not xs:
+            return {"count": 0, "min": None, "max": None, "mean": None}
+        return {
+            "count": len(xs),
+            "min": float(min(xs)),
+            "max": float(max(xs)),
+            "mean": float(sum(xs) / len(xs)),
+        }
+
+    train_queries = {str(s["query_id"]) for s in specs if s["split_name"] == "train"}
+    test_queries = {str(s["query_id"]) for s in specs if s["split_name"] == "test"}
+    train_sample_count = len(by_split["train"])
+    test_gold_sample_count = sum(
+        1
+        for o in by_split["test"]
+        if str(o.get("label_source")) == "gold"
+    )
+
+    print("\n" + "=" * 60, flush=True)
+    print("[池监督 JSONL] 统计汇总", flush=True)
+    print("=" * 60, flush=True)
+    print(f"  query_count (已处理): {len(specs)}", flush=True)
+    print(f"  training_pool_total (行基数合计): {training_pool_total}", flush=True)
+    print(f"  gold_sample_total (金标样本行): {gold_sample_total}", flush=True)
+    print(f"  gold_recall_hit (金标作者 ∩ 训练池): {gold_recall_hit}", flush=True)
+    print(f"  gold_recall_miss (金标作者 \\ 训练池): {gold_recall_miss}", flush=True)
+    print(f"  forced_gold_injection_count: {forced_gold_injection_count}", flush=True)
+    print(f"  label_source_counts: {dict(label_source_counts)}", flush=True)
+    print(f"  label_grade_counts: {dict(label_grade_counts)}", flush=True)
+    print(f"  weak_label_type_counts: {dict(weak_label_type_counts)}", flush=True)
+    print(f"  sample_weight_summary: gold={_summ_weights(sample_w_gold)} weak={_summ_weights(sample_w_weak)}", flush=True)
+    print(f"  train_query_count: {len(train_queries)}", flush=True)
+    print(f"  test_query_count: {len(test_queries)}", flush=True)
+    print(f"  train_sample_count: {train_sample_count}", flush=True)
+    print(f"  test_gold_sample_count (评估锚点): {test_gold_sample_count}", flush=True)
+    print("  --- per query (前 20 条) ---", flush=True)
+    for row in per_query_stats[:20]:
+        print(f"    {row}", flush=True)
+    if len(per_query_stats) > 20:
+        print(f"    ... 其余 {len(per_query_stats) - 20} 条省略", flush=True)
+    print("=" * 60 + "\n", flush=True)
+
+    return {
+        "gold_map_source": gold_src,
+        "query_count": len(specs),
+        "training_pool_total": training_pool_total,
+        "gold_sample_total": gold_sample_total,
+        "gold_recall_hit": gold_recall_hit,
+        "gold_recall_miss": gold_recall_miss,
+        "forced_gold_injection_count": forced_gold_injection_count,
+        "label_source_counts": dict(label_source_counts),
+        "label_grade_counts": dict(label_grade_counts),
+        "weak_label_type_counts": dict(weak_label_type_counts),
+        "sample_weight_summary": {
+            "gold": _summ_weights(sample_w_gold),
+            "weak": _summ_weights(sample_w_weak),
+        },
+        "train_query_count": len(train_queries),
+        "test_query_count": len(test_queries),
+        "train_sample_count": train_sample_count,
+        "test_gold_sample_count": test_gold_sample_count,
+        "per_query_stats": per_query_stats,
+        "paths": out_names,
+        "by_split_line_counts": {k: len(v) for k, v in by_split.items()},
     }
 
 
@@ -563,6 +1105,51 @@ class KGATAXTrainingGenerator:
             self.recall_system.l_path.verbose = False
         return self.recall_system
 
+    def _select_training_pool_records(self, pool: Any) -> List[Any]:
+        """与 ch04 一致：训练入口优先使用 training_pool_records。"""
+        if pool is None:
+            return []
+        tpr = getattr(pool, "training_pool_records", None) or []
+        if tpr:
+            return list(tpr)
+        cr = getattr(pool, "candidate_records", None) or []
+        if not cr:
+            return []
+        return list(cr)[:100]
+
+    def _training_pool_min_for_build(self) -> int:
+        """默认至少 100 人再写分层样本；调试模式下可降为 1（环境变量覆盖）。"""
+        if int(os.environ.get("KGATAX_DEBUG_LIMIT", "0") or "0") > 0:
+            return int(os.environ.get("KGATAX_TRAINING_MIN_POOL", "1") or "1")
+        return int(os.environ.get("KGATAX_TRAINING_MIN_POOL", "100") or "100")
+
+    def _log_kgatax_sidecar_alignment(
+        self,
+        job_raw_id: str,
+        training_records: List[Any],
+        recall_results: Dict[str, Any],
+    ) -> None:
+        """核对 execute 返回的 kgatax_sidecar_rows 是否覆盖 training_pool 作者（不静默）。"""
+        t_ids = {str(getattr(r, "author_id", "")) for r in training_records}
+        t_ids.discard("")
+        sidecar = recall_results.get("kgatax_sidecar_rows") or []
+        sc_ids = {str(row.get("author_id")) for row in sidecar if row.get("author_id") is not None}
+        missing_ct = len(t_ids - sc_ids)
+        matched_ct = len(t_ids & sc_ids)
+        print(
+            f"[KGATAX sidecar] job={job_raw_id} training_pool_count={len(training_records)} "
+            f"training_unique_author_ids={len(t_ids)} sidecar_rows_count={len(sidecar)} "
+            f"matched_sidecar_author_count={matched_ct} missing_sidecar_author_count={missing_ct}",
+            flush=True,
+        )
+        if missing_ct > 0 and t_ids:
+            sample = sorted(t_ids - sc_ids)[:15]
+            print(
+                f"[KGATAX sidecar] 警告: {missing_ct} 个 training_pool 作者未出现在 kgatax_sidecar_rows "
+                f"（示例 author_id: {sample}）",
+                flush=True,
+            )
+
     def get_user_id(self, raw_id):
         raw_id = str(raw_id)
         if raw_id not in self.user_to_int:
@@ -589,6 +1176,16 @@ class KGATAXTrainingGenerator:
         print(f"\n>>> 任务 1: 生成混合排名精排数据（候选池入口 + 分层正负样本 + 四分支导出）...")
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
+
+        debug_lim = int(os.environ.get("KGATAX_DEBUG_LIMIT", "0") or "0")
+        if debug_lim > 0:
+            ts = max(1, debug_lim - 1)
+            train_size = min(train_size, ts)
+            test_size = min(test_size, max(1, debug_lim - train_size))
+            print(
+                f"[*] KGATAX_DEBUG_LIMIT={debug_lim} → train_size={train_size} test_size={test_size}",
+                flush=True,
+            )
 
         all_jobs = conn.execute("SELECT securityId, job_name, description, skills, domain_ids FROM jobs").fetchall()
         sampled = random.sample(all_jobs, min(len(all_jobs), train_size + test_size))
@@ -705,13 +1302,23 @@ class KGATAXTrainingGenerator:
             return None, None
 
         pool = recall_results.get("candidate_pool")
-        records = getattr(pool, "candidate_records", None) if pool else None
+        records = self._select_training_pool_records(pool)
+        min_need = self._training_pool_min_for_build()
 
-        if records and len(records) >= 100:
+        if records and len(records) >= min_need:
+            self._log_kgatax_sidecar_alignment(job_raw_id, records, recall_results)
             line, aux = self._build_from_candidate_pool(job_raw_id, records)
             return line, aux
-        # 回退：使用 final_top_500，保持原四级梯度逻辑
-        candidates = recall_results.get("final_top_500", [])
+
+        if records:
+            print(
+                f"[KGATAX] job={job_raw_id} training_pool 仅 {len(records)} 人 "
+                f"< min={min_need}，跳过 candidate_pool 入口，尝试末级兼容。",
+                flush=True,
+            )
+
+        # 末级兼容：final_top_500 / final_top_200（deprecated，与展示池同源；非正式训练入口）
+        candidates = recall_results.get("final_top_500", []) or recall_results.get("final_top_200", [])
         if len(candidates) < 100:
             return None, None
 
@@ -900,7 +1507,25 @@ class KGATAXTrainingGenerator:
             (getattr(r, "label_core_term_count", 0) or 0) / 10.0,
             float(getattr(r, "label_best_term_score") or 0.0),
         ]
-        return {"recall": recall, "author_aux": author_aux, "interaction": interaction}
+        return {
+            "recall": recall,
+            "author_aux": author_aux,
+            "interaction": interaction,
+            "pool_meta": {
+                "candidate_trust_tier": str(getattr(record, "candidate_trust_tier", "") or ""),
+                "bucket_type": (getattr(record, "bucket_type", "") or "").strip() or "Z",
+                "risk_flags": list(getattr(record, "risk_flags", None) or []),
+                "sampleability_flags": list(getattr(record, "sampleability_flags", None) or []),
+                "from_vector": bool(getattr(record, "from_vector", False)),
+                "from_label": bool(getattr(record, "from_label", False)),
+                "from_collab": bool(getattr(record, "from_collab", False)),
+                "path_count": int(getattr(record, "path_count", 0) or 0),
+                "candidate_pool_score": float(getattr(record, "candidate_pool_score", None) or 0.0),
+                "vector_rank": getattr(record, "vector_rank", None),
+                "label_rank": getattr(record, "label_rank", None),
+                "collab_rank": getattr(record, "collab_rank", None),
+            },
+        }
 
     def generate_kg_topology(self, sampled_job_ids: list):
         """
@@ -989,6 +1614,14 @@ if __name__ == "__main__":
     gen = KGATAXTrainingGenerator()
     # 多进程召回：设置环境变量 KGATAX_RECALL_WORKERS=4（或传参扩展）；0=顺序
     _rw = int(os.environ.get("KGATAX_RECALL_WORKERS", "0") or "0")
+    _debug_skip_topo = os.environ.get("KGATAX_DEBUG_SKIP_TOPOLOGY", "").strip() in ("1", "true", "True", "yes", "YES")
+    _debug_skip_gold = os.environ.get("KGATAX_DEBUG_SKIP_GOLD", "").strip() in ("1", "true", "True", "yes", "YES")
+    _skip_pool_sup = os.environ.get("KGATAX_DEBUG_SKIP_POOL_SUPERVISED", "").strip() in (
+        "1", "true", "True", "yes", "YES",
+    )
+    _legacy_gold_jsonl = os.environ.get("KGATAX_LEGACY_GOLD_JSONL", "").strip() in (
+        "1", "true", "True", "yes", "YES",
+    )
 
     # 第一步：锁定全局 ID 偏移量 (从 Neo4j 读取全量岗位)
     print("\n[*] 正在从 Neo4j 锁定全局 ID 偏移量 (执行人口普查)...")
@@ -1020,35 +1653,75 @@ if __name__ == "__main__":
     _test_lines_n = _count_nonempty_lines(_test_txt)
 
     # 第三步：执行全量拓扑收割
-    gen.generate_kg_topology(sampled_job_ids=trained_anchors)
+    if _debug_skip_topo:
+        print("[*] KGATAX_DEBUG_SKIP_TOPOLOGY 已设置：跳过 generate_kg_topology（仅验收训练数据生成）", flush=True)
+    else:
+        gen.generate_kg_topology(sampled_job_ids=trained_anchors)
 
-    # 第四步：金标监督增强 JSONL（不改变 train.txt / test.txt）
-    _gold_stats = generate_gold_supervised_exports(gen, recall_workers=_rw)
+    # 第四步：池监督 JSONL（training_pool + 金标覆盖 + 弱标签）；旧版 train_gold_supervised 需 LEGACY 开关
+    _pool_stats: Dict[str, Any] = {}
+    if _skip_pool_sup:
+        print("[*] KGATAX_DEBUG_SKIP_POOL_SUPERVISED：跳过池监督 JSONL", flush=True)
+    else:
+        _pool_stats = generate_training_pool_supervised_exports(gen, recall_workers=_rw)
+
+    if _legacy_gold_jsonl and not _debug_skip_gold:
+        _gold_stats = generate_gold_supervised_exports(gen, recall_workers=_rw)
+    else:
+        if _debug_skip_gold:
+            print(
+                "[*] KGATAX_DEBUG_SKIP_GOLD：跳过旧版 train_gold_supervised 等导出（主口径为 *_pool_supervised.jsonl）",
+                flush=True,
+            )
+        _gold_stats = {
+            "query_counts": {},
+            "line_counts": {},
+            "gold_label_dist": {},
+            "stats_split": {},
+        }
 
     from src.infrastructure.database.kgat_ax.pipeline_state import write_stage_done
 
-    write_stage_done(1)
+    if not _debug_skip_topo:
+        write_stage_done(1)
+    else:
+        print("[*] 未写入 pipeline_stage1.done（调试跳过拓扑时避免误标阶段完成）", flush=True)
 
     print("\n" + "=" * 60)
     print("[汇总] 阶段 1 数据产出")
     print("=" * 60)
     print(f"  [旧主链] train.txt 样本行数: {_train_lines_n}")
     print(f"  [旧主链] test.txt  样本行数: {_test_lines_n}")
-    print("  [金标增强] 各 split query 数 (train/dev/test): "
+    if _pool_stats:
+        print(
+            "  [池监督] JSONL 行数 train/dev/test: "
+            f"{_pool_stats.get('by_split_line_counts', {}).get('train', 0)} / "
+            f"{_pool_stats.get('by_split_line_counts', {}).get('dev', 0)} / "
+            f"{_pool_stats.get('by_split_line_counts', {}).get('test', 0)}",
+            flush=True,
+        )
+        print(
+            f"  [池监督] gold_recall_hit / miss / injection: "
+            f"{_pool_stats.get('gold_recall_hit', 0)} / "
+            f"{_pool_stats.get('gold_recall_miss', 0)} / "
+            f"{_pool_stats.get('forced_gold_injection_count', 0)}",
+            flush=True,
+        )
+    print("  [旧版金标 JSONL] 各 split query 数 (train/dev/test): "
           f"{_gold_stats['query_counts'].get('train', 0)} / "
           f"{_gold_stats['query_counts'].get('dev', 0)} / "
           f"{_gold_stats['query_counts'].get('test', 0)}")
-    print("  [金标增强] 各 split JSONL 行数: "
+    print("  [旧版金标 JSONL] 各 split 行数: "
           f"train={_gold_stats['line_counts'].get('train', 0)}, "
           f"dev={_gold_stats['line_counts'].get('dev', 0)}, "
           f"test={_gold_stats['line_counts'].get('test', 0)}")
     for sk in ("train", "dev", "test"):
         dist = _gold_stats["gold_label_dist"].get(sk, {})
-        print(f"  [金标增强] split={sk} gold_label 分布: {dist}")
+        print(f"  [旧版金标 JSONL] split={sk} gold_label 分布: {dist}")
     for sk in ("train", "dev", "test"):
         st = _gold_stats["stats_split"].get(sk, {})
         print(
-            f"  [金标增强] split={sk} 召回命中金标作者数(累计): {st.get('hits', 0)} | "
+            f"  [旧版金标 JSONL] split={sk} 召回命中金标作者数(累计): {st.get('hits', 0)} | "
             f"未覆盖金标作者数(累计): {st.get('missed', 0)}"
         )
     print("=" * 60 + "\n")

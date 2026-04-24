@@ -53,7 +53,8 @@ def run_single_label_debug(
     db = getattr(l_path, "last_debug_info", None) or {}
 
     if verbose:
-        print("\n" + "🔍 [深度诊断流水线]" + "-" * 98)
+        # Windows 默认控制台编码可能为 GBK；避免输出 emoji 导致编码异常
+        print("\n" + "[深度诊断流水线]" + "-" * 100)
         domains = db.get("active_domains", [])
         domain_str = " | ".join(domains) if domains else "未限制"
         print(f"【Step 1: 领域探测】目标领域: [{domain_str}] 置信度: {db.get('dominance')}")

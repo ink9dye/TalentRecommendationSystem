@@ -942,6 +942,65 @@ Stage2 的输出在 Stage3 被 **按词（概念 ID）跨锚点合并**：同一
 
 **阶段定位**：Stage3 是 **跨锚裁决与接口契约**——把 Stage2 的「局部合理」提升为「整份 JD 全局可解释」；**论文层只认本阶段（或明确回退路径）给出的用词**。
 
+##### （近期迭代记录）Stage3/Stage4 边界：主线保留与选词补位（Step 1/Step 2）
+
+本小节用于同步一次真实调试回合的**修改、结构边界、过程与思路**，便于后续复现与继续迭代。该回合的真实症状是：
+
+- Stage1 主锚能立住（如：运动控制/机器人运动控制/路径规划/仿真），但在 **Stage3→Stage4 的 paper 选词**时：
+  - 规划线与仿真线（例如 `pathfinding` / `simulation`）常被挤出（`paper_term_quota_cutoff`）
+  - 对象词（例如 `robotic arm`）更容易穿透进入 `final_term_ids_for_paper`（常见 `stage4_prep_fallback_min_fill`）
+
+**边界约束（必须遵守）**：
+
+- 不用硬编码词表白名单（不写具体词名特判）
+- 不改 Stage1 大逻辑
+- 不碰 Stage5
+- Step 1 先补观测；Step 2 只改 Stage4 prep 的选词方式，不改分数本体、不改过滤/配额本体
+
+###### Step 0：一键复现入口（label_path_run.py）
+
+为保证每一步都能独立验证，本仓库新增了“零交互”运行入口：
+
+- `src/core/recall/label_path_run.py`：等价于交互式 CLI 的“领域=0（跳过显式领域）+ 详细打印=y + 默认 JD”
+
+运行命令（Windows / PowerShell 推荐，避免中文乱码）：
+
+```bash
+$env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'; $env:LABEL_PATH_VERBOSE='1'
+.venv\Scripts\python.exe -u src/core/recall/label_path_run.py
+```
+
+###### Step 1：只补观测（不改逻辑）
+
+目标：让日志能**直接回答**“哪些词进了 paper 词表、哪些没进、为什么”，并对关键 term 逐行解释。
+
+新增/补齐的观测点：
+
+- **Stage3 候选 term 表**（按 `final_weight` 降序）与 **Stage4 选词 gate 表**（含 `is_selected_for_paper` / `not_selected_reason` / `paper_gate_reason`）
+  - 位置：`src/core/recall/label_path.py`（Stage3 后、进入 Stage4 前的诊断打印）
+- **Stage3 候选记录的只读诊断字段**（写入 `tag_purity_debug`，不参与打分）
+  - 位置：`src/core/recall/label_pipeline/stage3_term_filtering.py`
+  - 字段示例：`local_role`、`source_type`、`stage3_bucket`
+
+`not_selected_reason` 的口径（用于定位“挤出”发生在何处）：
+
+- `below_stage3_cutoff`：Stage3 侧门槛未过（非 quota）
+- `paper_term_quota_cutoff`：通过 Stage3/进入 paper 候选后，被 quota/竞争挤出
+- `risky_side_block`：Stage4 prep 明确硬挡（侧翼风险）
+- `readiness_insufficient`：Stage4 prep readiness 相关闸门不足（`prep_readiness_insufficient_*`）
+
+###### Step 2：只改 Stage4 prep 的选词方式（不改分数/过滤/配额）
+
+目标：在 `max_terms` 名额有限时，使第三个名额更倾向补齐“控制 + 规划 + 仿真”的主线覆盖，而不是继续被同轴（control-family）或对象词占用。
+
+改动位置（仅 Stage4 prep 选词）：
+
+- `src/core/recall/label_pipeline/stage4_prep_bridge.py`
+  - 关注段落：B 段 greedy fill（`candidates_fill` / `while len(selected) < max_terms`）与 `fallback_min_fill`
+  - 思想：当候选分差不大时，优先补未覆盖的 `parent_anchor`（结构字段），避免第三槽继续被同轴词（例如 motion controller）占走
+
+> 当前仓库状态：已观察到对象词穿透（如 `robotic arm`）可以被部分压制，但“规划/仿真主线是否能稳定补位进入 `final_term_ids_for_paper`”仍需继续迭代；以 `label_path_run.py` 输出的两张结构化表为准做下一轮优化。
+
 ##### Stage4：论文层召回与证据打分
 
 **输入**：Stage3 给出的词汇集合、每词分数与检索角色、JD 原文与领域上下文等。
@@ -2669,7 +2728,7 @@ KGAT-AX 不单独工作，而是放在总召回之后：
 
 **2.5 取 Top 100 并组装结果**
 
-- 对 `final_fusion_scores` 做 `topk(100)`；对每个 Top 100 内的候选人：用 `active_candidates[original_idx]` 得到原始作者 ID，从 SQLite 拉基础学术指标（`_fetch_sqlite_stats`）；调用 **RankExplainer.explain(raw_aid, real_job_ids)** 得到代表作、推荐理由、合作者、匹配类型等；拼成一条结果（rank、author_id、name、score、representative_work、recommendation_reason、metrics、collaboration、details 等）。
+- 对 `final_fusion_scores` 做 `topk(100)`；对每个 Top 100 内的候选人：用 `active_candidates[original_idx]` 得到原始作者 ID，从 SQLite 拉基础学术指标（`_fetch_sqlite_stats`）；调用 **`RankExplainer.explain(author_id=raw_aid, job_raw_ids=real_job_ids, candidate_record=..., candidate_evidence_rows=...)`** 得到代表作、推荐理由、合作者、匹配类型等（解释器会优先使用候选池证据，缺失时才走图谱兜底）；拼成一条结果（rank、author_id、name、score、representative_work、recommendation_reason、metrics、collaboration、details 等）。
 - **考虑**：最终展示的 `score` 是融合分；details 里保留 **`kgat_score`（实为 `kgat_norm`）与 `recall_score`（实为 `pool_norm`，候选池分归一化）** 便于分析与调试；若启用稳定项则另有 `rule_stability`。
 
 ---
@@ -2697,7 +2756,13 @@ KGAT-AX 不单独工作，而是放在总召回之后：
 
 ### 4. RankExplainer.explain：解释链与设计考虑
 
-**4.1 多跳路径查询（主路径）**
+**4.0 与候选池对齐（优先路径）**
+
+- **目的**：在三路召回已经构建 `CandidatePool`（含 `candidate_records` 与 `candidate_evidence_rows`）的前提下，解释模块应**优先复用候选池证据**，保证“被召回的原因/证据”与“展示给用户的理由”一致，避免每人解释时重复查图。
+- **实现**：当 `ranking_engine` 调用 `RankExplainer.explain()` 时传入 `candidate_record` 与过滤后的 `candidate_evidence_rows`，解释器先从 `candidate_record.vector_evidence.top_papers`（或 evidence_rows 的 vector/label/collab evidence）里挑选一篇代表作作为输出的 `work_id/title`；并仅对这篇代表作计算一次 KGAT 注意力权重作为 `model_confidence`。
+- **考虑**：候选池侧已经保留“来源路径 + 证据明细”，解释层优先消费它们，能显著提升**一致性**与**性能**；只有当候选池证据缺失/不可用时才进入图谱兜底。
+
+**4.1 多跳路径查询（图谱兜底）**
 
 - **目的**：找到「岗位要求的技能词 →（可选）语义相似词 → 该作者写过且命中这些词的论文」的路径，作为可解释证据。
 - **实现**：从当前请求的 Job 出发，沿 `REQUIRE_SKILL` 到 `v1:Vocabulary`，并过滤过于泛化的词；`OPTIONAL MATCH (v1)-[r:SIMILAR_TO]-(v2)` 且 `r.score > 0.7`，得到与岗位技能强相似的学术词 `target_v`，没有则用 `v1`；再 `(target_v)<-HAS_TOPIC-(w:Work)<-AUTHORED-(a:Author)`，限制到当前被解释的作者；顺带拉取发表来源与合作者（最多 2 人）；对每条路径标记 `match_type`：若 `v1 = target_v` 为 `exact`，否则为 `semantic`；按 `match_type` 排序并 LIMIT 15。
@@ -2712,11 +2777,11 @@ KGAT-AX 不单独工作，而是放在总召回之后：
 
 - 若主路径和 Fuzzy 都没有结果，返回 `_generate_fallback_response()`：通用文案（如「全息领域匹配」「多篇核心领域产出」及概括性总结），避免前端没有理由可展示。
 
-**4.4 用 KGAT 注意力选「证据论文」**
+**4.4 用 KGAT 注意力给代表作打置信（候选池优先 / 图谱兜底共用）**
 
-- **目的**：同一作者可能有多条路径（多篇论文），选「模型最认可」的一篇作为代表作。
-- **实现**：对当前作者和每条路径上的 work 节点，用 `model.update_attention_batch` 算 AUTHORED 关系上的注意力权重，赋给每条路径的 `att_weight`；按 `(match_type == 'fallback', -att_weight)` 排序，优先非 fallback，再按注意力从高到低取第一条作为 `best_path`。
-- **考虑**：把「图结构证据」和「模型置信度」结合：路径存在且注意力高，说明既有图谱依据又符合模型学到的关系强度。
+- **目的**：将“代表作证据”与“模型置信”同时给出：候选池能提供代表作，注意力仅作为**置信摘要**；图谱兜底路径命中多篇时，注意力仍可用于选代表作。
+- **实现**：候选池路径下，对选中的单篇代表作计算一次 `model.update_attention_batch`，得到注意力权重作为 `model_confidence`；图谱兜底路径下，仍可对多条路径计算 `att_weight` 并选 `best_path`。
+- **考虑**：候选池优先时避免“为了选证据而再跑一次检索”；同时保留注意力作为轻量可解释的置信度信号。
 
 **4.5 动态总结文案**
 
@@ -2738,7 +2803,7 @@ KGAT-AX 不单独工作，而是放在总召回之后：
 | **多锚点平均** | 用 3 个语义最近岗位的嵌入平均作为「理想人选」，平滑单岗位噪声。 |
 | **局部嵌入 + AX** | 只对锚点+候选人算嵌入并注入 AX，保证「语义为主、学术微调」，且推理不扫全图。 |
 | **三路融合** | `kgat_norm`、`pool_norm`（候选池分）、`stab_norm`（rule_stability）Min-Max 后按 **0.2 / 0.6 / 0.2** 加权（无候选池记录时 `pool_norm` 退化为线性名次序）。 |
-| **解释三层** | 主路径(精确/语义) → Fuzzy 匹配 → Fallback 通用句，保证总有理由可展示。 |
+| **解释层级** | 候选池证据优先 →（证据缺失时）图谱主路径(精确/语义) → Fuzzy 匹配 → Fallback 通用句，保证总有理由可展示且尽量与召回一致。 |
 | **SIMILAR_TO > 0.7** | 解释时只用强相似边，避免证据链语义漂移。 |
 | **注意力选论文** | 多篇命中时用 KGAT 注意力选一篇作为代表作，兼顾图谱证据与模型置信度。 |
 
@@ -2875,8 +2940,8 @@ KGAT-AX 不单独工作，而是放在总召回之后：
     - 在 `execute_rank(real_job_ids, candidate_raw_ids, filter_domain)` 中：
       1. 可选执行领域并集过滤（通过 `DomainProcessor.has_intersect` 对作者论文领域做交集判断）；
       2. 使用 `RankScorer` 计算 KGAT 分数；
-      3. 生成「召回顺序分」并进行归一化，与 KGAT 分数按 0.4 / 0.6 权重融合；
-      4. 选取 Top 100，查询作者基础学术指标，并调用 `RankExplainer` 生成推荐理由与代表作；
+      3. 归一化融合：`kgat_norm`、`pool_norm`（候选池分）与 `stab_norm`（rule_stability）按 **0.2 / 0.6 / 0.2** 加权（无候选池记录时 `pool_norm` 退化为线性序）；
+      4. 选取 Top 100，查询作者基础学术指标，并调用 `RankExplainer`（优先候选池证据，必要时图谱兜底）生成推荐理由与代表作；
       5. 组装为前端友好的结构化结果。
 
 - **`src/core/ranking/rank_scorer.py`**  
@@ -2887,9 +2952,10 @@ KGAT-AX 不单独工作，而是放在总召回之后：
     - 打印诊断信息（分数区间 / 极差等）。
 
 - **`src/core/ranking/rank_explainer.py`**  
-  - `RankExplainer` 将 Neo4j 图谱信息与 KGAT 注意力结合，生成可读的推荐解释：
-    - 优先沿 `Job-REQUIRE_SKILL-Vocabulary-SIMILAR_TO-Vocabulary-HAS_TOPIC-Work-AUTHORED-Author` 路径寻找证据链；
-    - 为每条路径计算注意力权重，选出最有说服力的论文与技能匹配；
+  - `RankExplainer` 以 **CandidatePool 证据优先** 的方式生成可读的推荐解释，并在必要时使用 Neo4j 兜底：
+    - 优先从 `candidate_record` / `candidate_evidence_rows` 选择代表作与来源摘要，保证解释与召回一致；
+    - 当候选池证据缺失/不可用时，才沿 `Job-REQUIRE_SKILL-Vocabulary-SIMILAR_TO-Vocabulary-HAS_TOPIC-Work-AUTHORED-Author` 路径寻找证据链作为兜底；
+    - 对选定的代表作（候选池或图谱路径）计算注意力权重作为 `model_confidence`，并在图谱多路径场景下可用于选取最有说服力的论文与技能匹配；
     - 拼接多模板中文解释文案，包含技能对齐、代表作、发表平台、合作伙伴等信息；
     - 提供 Fallback 逻辑，确保在图谱欠完备时也能返回合理解释。
 

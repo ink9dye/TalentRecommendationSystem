@@ -1826,6 +1826,257 @@ class LabelRecallPath:
                 print(f"  {i} {tid} | {term!r} | {st} | {rr} | {pp!r} | {sc:.3f}")
             if len(final_term_ids_for_paper) > 30:
                 print(f"  ... 共 {len(final_term_ids_for_paper)} 条")
+
+            # ---集中诊断：解释每个候选 term 为何进入/未进入 final_term_ids_for_paper（不改逻辑，仅打印）---
+            try:
+                _selected_set = {int(x) for x in (final_term_ids_for_paper or [])}
+            except Exception:
+                _selected_set = set()
+
+            # Reuse legacy debug rows if present (term_scoring already writes this list).
+            _debug_rows = {}
+            for _row in (getattr(self, "_last_tag_purity_debug", None) or getattr(self.debug_info, "tag_purity_debug", None) or []):
+                if isinstance(_row, dict) and _row.get("tid") is not None:
+                    _debug_rows[str(_row.get("tid"))] = _row
+
+            # Mirror existing fallback selector conditions (for logging only).
+            SELECT_TAG_PURITY_MIN = float(getattr(self, "SELECT_TAG_PURITY_MIN", 0.40) or 0.40)
+            SELECT_SEMANTIC_MIN = float(getattr(self, "SELECT_SEMANTIC_MIN", 0.38) or 0.38)
+            SELECT_CTX_ONLY_CAP = int(getattr(self, "SELECT_CTX_ONLY_CAP", 5) or 5)
+            SELECT_MIN_PAPER_COUNT = int(getattr(self, "SELECT_MIN_PAPER_COUNT", 3) or 3)
+
+            _ranked_tids = sorted(
+                (score_map or {}).keys(),
+                key=lambda t: float((score_map or {}).get(t, 0.0) or 0.0),
+                reverse=True,
+            )
+
+            def _src_type(tid_s: str) -> str:
+                v = (term_source_map or {}).get(tid_s) or (_debug_rows.get(tid_s, {}) or {}).get("source") or (_debug_rows.get(tid_s, {}) or {}).get("origin") or ""
+                return str(v or "").strip() or "-"
+
+            def _infer_not_selected_reason(tid_s: str, rank_idx: int, ctx_only_used_before: int) -> str:
+                if int(tid_s) in _selected_set:
+                    return ""
+                row = _debug_rows.get(tid_s, {}) if isinstance(_debug_rows.get(tid_s, {}), dict) else {}
+                weight = float((score_map or {}).get(tid_s, 0.0) or 0.0)
+                if weight <= 0.0:
+                    return "below_stage3_cutoff"
+                has_legacy = (row.get("raw_tag_purity") is not None or row.get("capped_tag_purity") is not None)
+                if has_legacy:
+                    tag_purity = float(row.get("capped_tag_purity") or row.get("raw_tag_purity") or 0.0)
+                    if tag_purity and tag_purity < SELECT_TAG_PURITY_MIN:
+                        return "below_stage3_cutoff"
+                    cos_sim = float(row.get("cos_sim") or 0.0)
+                    anchor_sim = float(row.get("task_anchor_sim") or row.get("anchor_sim") or 0.0)
+                    sim_val = max(cos_sim, anchor_sim)
+                    if sim_val and sim_val < SELECT_SEMANTIC_MIN:
+                        return "below_stage3_cutoff"
+                degree_w = int(row.get("degree_w") or 0)
+                if degree_w < SELECT_MIN_PAPER_COUNT:
+                    return "below_stage3_cutoff"
+                source = str(row.get("source") or row.get("origin") or "").strip().lower()
+                if source == "ctx_only" and ctx_only_used_before >= SELECT_CTX_ONLY_CAP:
+                    return "paper_term_quota_cutoff"
+                # If passed all gates but still not selected, it's by quota tail.
+                return "paper_term_quota_cutoff"
+
+            print("\n" + "-" * 80)
+            print("[Paper term selection diagnosis] (final_term_ids_for_paper gate)")
+            print(f"candidates={len(_ranked_tids)} selected={len(_selected_set)} paper_terms_path={bool(paper_terms)}")
+            print(
+                "  term/tid | source_type | anchor_role | stage2_process_mode | final_weight | main_role | main_role(parent_primary) | "
+                "is_selected_for_paper | not_selected_reason"
+            )
+            _ctx_only_used = 0
+            for _rank, _tid_s in enumerate(_ranked_tids, 1):
+                _row = _debug_rows.get(str(_tid_s), {}) if isinstance(_debug_rows.get(str(_tid_s), {}), dict) else {}
+                term = str(term_map.get(str(_tid_s), "") or "")
+                st = _src_type(str(_tid_s))
+                anchor_role = str((_row.get("anchor_role") or "-"))[:6]
+                stage2_mode = str((_row.get("stage2_process_mode") or "-"))[:18]
+                fw = float((score_map or {}).get(str(_tid_s), 0.0) or 0.0)
+                main_role = str((term_role_map or {}).get(str(_tid_s)) or _row.get("main_role") or _row.get("term_role") or "-")[:14]
+                pp = str((parent_primary_map or {}).get(str(_tid_s)) or _row.get("parent_primary") or "-")[:28]
+                is_sel = (int(_tid_s) in _selected_set) if str(_tid_s).isdigit() else (str(_tid_s) in {str(x) for x in _selected_set})
+                reason = "" if is_sel else _infer_not_selected_reason(str(_tid_s), _rank, _ctx_only_used)
+                src_low = str(_row.get("source") or _row.get("origin") or "").strip().lower()
+                if (not is_sel) and src_low == "ctx_only":
+                    # simulate selector's ctx_only counter for logging; selected terms consume quota first
+                    pass
+                if is_sel and src_low == "ctx_only":
+                    _ctx_only_used += 1
+                print(
+                    "  %r(%s) | %s | %s | %s | %.6f | %s | %s | %s | %s"
+                    % (
+                        term[:40],
+                        str(_tid_s),
+                        str(st)[:28],
+                        anchor_role,
+                        stage2_mode,
+                        fw,
+                        main_role,
+                        pp,
+                        "1" if is_sel else "0",
+                        (reason or "-")[:24],
+                    )
+                )
+            print("-" * 80 + "\n")
+
+            # --- Step1: 结构化观测补齐（不改逻辑）---
+            try:
+                # Stage4 prep 的逐词 gate reason（若无则空）
+                _paper_gate_reason_by_tid: Dict[str, str] = {}
+                if paper_terms:
+                    for _r in paper_terms:
+                        if not isinstance(_r, dict) or _r.get("tid") is None:
+                            continue
+                        _tid_s = str(int(_r["tid"]))
+                        _rr = (
+                            _r.get("primary_reject_reason")
+                            or _r.get("paper_reject_reason")
+                            or _r.get("paper_cutoff_reason")
+                            or _r.get("select_reason")
+                            or ""
+                        )
+                        _paper_gate_reason_by_tid[_tid_s] = str(_rr or "")
+
+                def _normalize_not_selected_reason(
+                    tid_s: str, selector_reason: str, paper_gate_reason: str
+                ) -> str:
+                    """
+                    将「未入 paper」的原因做成四选一分类：
+                      - below_stage3_cutoff
+                      - paper_term_quota_cutoff
+                      - risky_side_block
+                      - readiness_insufficient
+                    仅用于日志，不参与任何排序/过滤。
+                    """
+                    pr = (paper_gate_reason or "").strip()
+                    if pr == "risky_side_block":
+                        return "risky_side_block"
+                    if pr.startswith("prep_readiness_insufficient"):
+                        return "readiness_insufficient"
+                    sr = (selector_reason or "").strip()
+                    if sr == "below_stage3_cutoff":
+                        return "below_stage3_cutoff"
+                    # 其余均视为配额/竞争落选（包括 stage4_prep 未入选）
+                    return "paper_term_quota_cutoff"
+
+                def _local_role_of(tid_s: str) -> str:
+                    row = _debug_rows.get(tid_s, {}) if isinstance(_debug_rows.get(tid_s, {}), dict) else {}
+                    lr = row.get("local_role")
+                    return (str(lr or "") or "-")[:18]
+
+                def _parent_anchor_of(tid_s: str) -> str:
+                    v = (parent_anchor_map or {}).get(tid_s) or (_debug_rows.get(tid_s, {}) or {}).get("parent_anchor") or ""
+                    return str(v or "-")[:40]
+
+                def _parent_primary_of(tid_s: str) -> str:
+                    v = (parent_primary_map or {}).get(tid_s) or (_debug_rows.get(tid_s, {}) or {}).get("parent_primary") or ""
+                    return str(v or "-")[:40]
+
+                def _source_type_of(tid_s: str) -> str:
+                    v = (term_source_map or {}).get(tid_s) or (_debug_rows.get(tid_s, {}) or {}).get("source_type") or (_debug_rows.get(tid_s, {}) or {}).get("source") or (_debug_rows.get(tid_s, {}) or {}).get("origin") or ""
+                    return str(v or "-")[:18]
+
+                # 结构化表 1：Stage3 候选 term 表（按 final_weight 降序）
+                print("\n" + "-" * 80)
+                print("[Step1/观测] Stage3 候选 term 表（按 final_weight 降序；仅日志，不改逻辑）")
+                print("-" * 80)
+                print(
+                    "rk | term(tid) | source_type | parent_anchor | parent_primary | local_role | final_weight"
+                )
+                for _rk, _tid_s in enumerate(_ranked_tids, 1):
+                    _term = str(term_map.get(str(_tid_s), "") or "")[:40]
+                    _src = _source_type_of(str(_tid_s))
+                    _pa = _parent_anchor_of(str(_tid_s))
+                    _pp = _parent_primary_of(str(_tid_s))
+                    _lr = _local_role_of(str(_tid_s))
+                    _fw = float((score_map or {}).get(str(_tid_s), 0.0) or 0.0)
+                    print(
+                        f"{_rk:>2} | {_term!r}({_tid_s}) | {_src:18} | {_pa:18} | {_pp:18} | {_lr:10} | {_fw:.6f}"
+                    )
+
+                # 结构化表 2：Stage4 选词 gate 表（同一集合，补齐 is_selected/not_selected_reason）
+                print("\n" + "-" * 80)
+                print("[Step1/观测] Stage4 选词 gate 表（逐词解释入选/落选原因；仅日志，不改逻辑）")
+                print("-" * 80)
+                print(
+                    "rk | term(tid) | source_type | parent_anchor | parent_primary | local_role | final_weight | "
+                    "is_selected_for_paper | not_selected_reason | paper_gate_reason"
+                )
+                _ctx_only_used = 0
+                for _rk, _tid_s in enumerate(_ranked_tids, 1):
+                    tid_s = str(_tid_s)
+                    _term = str(term_map.get(tid_s, "") or "")[:40]
+                    _src = _source_type_of(tid_s)
+                    _pa = _parent_anchor_of(tid_s)
+                    _pp = _parent_primary_of(tid_s)
+                    _lr = _local_role_of(tid_s)
+                    _fw = float((score_map or {}).get(tid_s, 0.0) or 0.0)
+                    _is_sel = int(tid_s) in _selected_set if tid_s.isdigit() else False
+                    _sel_reason = "" if _is_sel else _infer_not_selected_reason(tid_s, _rk, _ctx_only_used)
+                    _paper_gate_reason = _paper_gate_reason_by_tid.get(tid_s, "")
+                    _ns = "" if _is_sel else _normalize_not_selected_reason(tid_s, _sel_reason, _paper_gate_reason)
+                    src_low = str((_debug_rows.get(tid_s, {}) or {}).get("source") or (_debug_rows.get(tid_s, {}) or {}).get("origin") or "").strip().lower()
+                    if _is_sel and src_low == "ctx_only":
+                        _ctx_only_used += 1
+                    print(
+                        f"{_rk:>2} | {_term!r}({tid_s}) | {_src:18} | {_pa:18} | {_pp:18} | {_lr:10} | {_fw:.6f} | "
+                        f"{'1' if _is_sel else '0':^20} | {(_ns or '-'):22} | {(_paper_gate_reason or '-'):24}"
+                    )
+
+                # 强制解释：指定 term 逐行输出（若出现多 tid 则逐条输出）
+                _focus_terms = [
+                    "pathfinding",
+                    "simulation",
+                    "robotic arm",
+                    "robot hand",
+                    "robotic hand",
+                    "motion control",
+                    "robot control",
+                ]
+                _term_to_tids: Dict[str, List[str]] = {}
+                for _tid_s in _ranked_tids:
+                    tid_s = str(_tid_s)
+                    t = (term_map.get(tid_s) or "").strip()
+                    if not t:
+                        continue
+                    _term_to_tids.setdefault(t.lower(), []).append(tid_s)
+
+                print("\n" + "-" * 80)
+                print("[Step1/观测] Focus terms 强制逐行解释（仅日志，不改逻辑）")
+                print("-" * 80)
+                print(
+                    "term(tid) | source_type | parent_anchor | parent_primary | local_role | final_weight | "
+                    "is_selected_for_paper | not_selected_reason | paper_gate_reason"
+                )
+                for _ft in _focus_terms:
+                    tids = _term_to_tids.get(_ft.lower(), [])
+                    if not tids:
+                        print(f"  {_ft!r}(-) | - | - | - | - | 0.000000 | 0 | below_stage3_cutoff | -")
+                        continue
+                    for tid_s in tids:
+                        _term = str(term_map.get(tid_s, "") or "")[:40]
+                        _src = _source_type_of(tid_s)
+                        _pa = _parent_anchor_of(tid_s)
+                        _pp = _parent_primary_of(tid_s)
+                        _lr = _local_role_of(tid_s)
+                        _fw = float((score_map or {}).get(tid_s, 0.0) or 0.0)
+                        _is_sel = int(tid_s) in _selected_set if tid_s.isdigit() else False
+                        # selector_reason for focus lines: reuse same helper with ctx_only_used=0 (纯观测；不模拟配额序列)
+                        _sel_reason = "" if _is_sel else _infer_not_selected_reason(tid_s, 0, 0)
+                        _paper_gate_reason = _paper_gate_reason_by_tid.get(tid_s, "")
+                        _ns = "" if _is_sel else _normalize_not_selected_reason(tid_s, _sel_reason, _paper_gate_reason)
+                        print(
+                            f"  {_term!r}({tid_s}) | {_src:18} | {_pa:18} | {_pp:18} | {_lr:10} | {_fw:.6f} | "
+                            f"{'1' if _is_sel else '0':^20} | {(_ns or '-'):22} | {(_paper_gate_reason or '-'):24}"
+                        )
+                print("-" * 80 + "\n")
+            except Exception as _e:
+                # 仅观测打印失败不影响主流程
+                print(f"[Step1/观测] 结构化表打印失败: {_e}")
         # 将闭环信息提前挂到 debug_1，供 stage5_author_rank 复用/补全
         filter_closed_loop = debug_1.get("filter_closed_loop") or {}
         filter_closed_loop["final_term_ids_for_paper"] = final_term_ids_for_paper

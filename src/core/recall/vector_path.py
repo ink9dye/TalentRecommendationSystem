@@ -18,7 +18,19 @@ import numpy as np
 
 
 
-from config import ABSTRACT_INDEX_PATH, ABSTRACT_MAP_PATH, DB_PATH, JOB_INDEX_PATH, JOB_MAP_PATH
+try:
+    from config import ABSTRACT_INDEX_PATH, ABSTRACT_MAP_PATH, DB_PATH, JOB_INDEX_PATH, JOB_MAP_PATH
+except Exception:
+    # 兼容某些环境下 `config` 被第三方同名包遮蔽：将项目根目录提前到 sys.path
+    import os
+    import sys
+
+    _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    if _ROOT not in sys.path:
+        sys.path.insert(0, _ROOT)
+    if "config" in sys.modules:
+        del sys.modules["config"]
+    from config import ABSTRACT_INDEX_PATH, ABSTRACT_MAP_PATH, DB_PATH, JOB_INDEX_PATH, JOB_MAP_PATH
 
 from src.utils.domain_utils import DomainProcessor
 
@@ -855,6 +867,548 @@ def _summarize_author_vector_evidence(paper_items: List[Dict[str, Any]]) -> Dict
     }
 
 
+def _safe_join_text_parts(parts: List[Any]) -> str:
+
+    out: List[str] = []
+
+    for p in parts:
+
+        if not p:
+
+            continue
+
+        if isinstance(p, str):
+
+            s = p.strip()
+
+            if s:
+
+                out.append(s)
+
+            continue
+
+        if isinstance(p, (list, tuple)):
+
+            for x in p:
+
+                if isinstance(x, str):
+
+                    sx = x.strip()
+
+                    if sx:
+
+                        out.append(sx)
+
+                elif x is not None:
+
+                    sx = str(x).strip()
+
+                    if sx:
+
+                        out.append(sx)
+
+            continue
+
+        if isinstance(p, dict):
+
+            for k in ("name", "display_name", "keyword", "term", "text", "label", "value"):
+
+                v = p.get(k)
+
+                if isinstance(v, str):
+
+                    sv = v.strip()
+
+                    if sv:
+
+                        out.append(sv)
+
+            continue
+
+        s = str(p).strip()
+
+        if s:
+
+            out.append(s)
+
+    return " ".join(out)
+
+
+def _build_vector_job_axis_diagnostics(evidence_papers: List[Dict[str, Any]]) -> Dict[str, Any]:
+
+    """
+
+    只读诊断：从 evidence_papers 的已有字段中拼文本，做轻量 job-axis 命中与风险标记。
+
+    注意：不参与任何打分/排序/过滤。
+
+    """
+
+    papers = evidence_papers or []
+
+    titles: List[str] = []
+
+    text_parts: List[Any] = []
+
+
+
+    for p in papers:
+
+        if not isinstance(p, dict):
+
+            continue
+
+        t = (p.get("title") or "").strip()
+
+        if t:
+
+            titles.append(t)
+
+        for k in ("title", "abstract", "summary", "concepts", "keywords", "terms", "tags", "fields"):
+
+            if k in p and p.get(k) is not None:
+
+                text_parts.append(p.get(k))
+
+
+
+    blob = _safe_join_text_parts(text_parts).lower()
+
+
+
+    axis_rules: List[Tuple[str, List[str]]] = [
+
+        (
+
+            "robotics",
+
+            [
+
+                "robot",
+
+                "robotic",
+
+                "robotics",
+
+                "manipulator",
+
+                "mobile robot",
+
+                "robot arm",
+
+                "humanoid",
+
+                "legged robot",
+
+                "autonomous robot",
+
+            ],
+
+        ),
+
+        (
+
+            "control",
+
+            [
+
+                "control",
+
+                "controller",
+
+                "control law",
+
+                "motion control",
+
+                "real-time control",
+
+                "feedback control",
+
+                "optimal control",
+
+            ],
+
+        ),
+
+        (
+
+            "dynamics_kinematics",
+
+            [
+
+                "kinematic",
+
+                "kinematics",
+
+                "dynamic",
+
+                "dynamics",
+
+                "inverse kinematics",
+
+                "forward kinematics",
+
+                "rigid body",
+
+                "multibody",
+
+            ],
+
+        ),
+
+        (
+
+            "planning_trajectory",
+
+            [
+
+                "planning",
+
+                "path planning",
+
+                "motion planning",
+
+                "trajectory",
+
+                "trajectory optimization",
+
+                "collision avoidance",
+
+                "rrt",
+
+                "prm",
+
+                "chomp",
+
+            ],
+
+        ),
+
+        (
+
+            "optimization_optimal_control",
+
+            [
+
+                "optimization",
+
+                "optimal control",
+
+                "mpc",
+
+                "ilqr",
+
+                "ddp",
+
+                "model predictive control",
+
+            ],
+
+        ),
+
+        (
+
+            "simulation_sim2real",
+
+            [
+
+                "simulation",
+
+                "simulator",
+
+                "sim-to-real",
+
+                "sim2real",
+
+                "gazebo",
+
+                "mujoco",
+
+                "isaac sim",
+
+                "digital twin",
+
+            ],
+
+        ),
+
+        (
+
+            "manipulation_locomotion",
+
+            [
+
+                "manipulation",
+
+                "grasping",
+
+                "dexterous",
+
+                "locomotion",
+
+                "walking",
+
+                "rolling locomotion",
+
+                "bimanual",
+
+            ],
+
+        ),
+
+        (
+
+            "reinforcement_learning",
+
+            [
+
+                "reinforcement learning",
+
+                "deep reinforcement learning",
+
+                " rl ",
+
+                "policy learning",
+
+                "visuomotor",
+
+            ],
+
+        ),
+
+        (
+
+            "estimation_state",
+
+            [
+
+                "state estimation",
+
+                "observer",
+
+                "kalman",
+
+                "localization",
+
+                "estimation",
+
+            ],
+
+        ),
+
+        (
+
+            "engineering_implementation",
+
+            [
+
+                "ros",
+
+                "ros2",
+
+                "moveit",
+
+                "pinocchio",
+
+                "drake",
+
+                "ocs2",
+
+                "c++",
+
+                "python",
+
+                "real-time system",
+
+            ],
+
+        ),
+
+    ]
+
+
+
+    axis_hits: List[str] = []
+
+    padded_blob = f" {blob} "
+
+    for axis, keys in axis_rules:
+
+        hit = False
+
+        for kw in keys:
+
+            if kw == " rl ":
+
+                if " rl " in padded_blob:
+
+                    hit = True
+
+                    break
+
+                continue
+
+            if kw in blob:
+
+                hit = True
+
+                break
+
+        if hit:
+
+            axis_hits.append(axis)
+
+
+
+    scores: List[float] = []
+
+    for p in papers:
+
+        if not isinstance(p, dict):
+
+            continue
+
+        s = p.get("score_clause_aware")
+
+        if s is None:
+
+            s = p.get("score_hybrid")
+
+        if s is None:
+
+            s = p.get("score_dense")
+
+        try:
+
+            scores.append(float(s or 0.0))
+
+        except Exception:
+
+            scores.append(0.0)
+
+
+
+    denom = float(sum(scores))
+
+    dominance = float((max(scores) / denom) if denom > 1e-12 and scores else 0.0)
+
+
+
+    axis_count = int(len(axis_hits))
+
+    risk_flags: List[str] = []
+
+    if axis_count == 0:
+
+        risk_flags.append("weak_job_axis_coverage")
+
+    elif axis_count == 1:
+
+        risk_flags.append("thin_job_axis_coverage")
+
+
+
+    if dominance >= 0.80:
+
+        risk_flags.append("single_paper_dominated")
+
+
+
+    top1_title = (titles[0] if titles else "")
+
+    top1_l = top1_title.lower()
+
+    off_context_phrases = [
+
+        "solar habitat",
+
+        "space habitat",
+
+        "renewable energy habitat",
+
+        "genome-wide association",
+
+        "bayesian mixed model",
+
+        "association power",
+
+        "augmented reality",
+
+        "medical robotics",
+
+        "human-machine interface",
+
+        "engineering optimization theory",
+
+        "applied numerical methods",
+
+    ]
+
+    strong_axes = {"robotics", "control", "planning_trajectory", "dynamics_kinematics", "manipulation_locomotion"}
+
+    has_strong_axis = any(a in strong_axes for a in axis_hits)
+
+    if axis_count <= 1 and top1_l:
+
+        for ph in off_context_phrases:
+
+            if ph in top1_l and not has_strong_axis:
+
+                risk_flags.append("possible_off_context_dense_match")
+
+                break
+
+
+
+    generic_book_patterns = [
+
+        r"\\bintroduction to\\b",
+
+        r"\\btextbook\\b",
+
+        r"\\bhandbook\\b",
+
+        r"\\btheory and practice\\b",
+
+        r"\\bapplied numerical methods\\b",
+
+        r"\\bengineering optimization\\b",
+
+    ]
+
+    if top1_l:
+
+        for pat in generic_book_patterns:
+
+            if re.search(pat, top1_l):
+
+                risk_flags.append("generic_method_or_book")
+
+                break
+
+
+
+    top_titles = [t for t in (tt.strip() for tt in titles[:3]) if t]
+
+
+
+    return {
+
+        "vector_job_axis_hits": axis_hits,
+
+        "vector_job_axis_count": axis_count,
+
+        "vector_single_paper_dominance": float(dominance),
+
+        "vector_risk_flags": risk_flags,
+
+        "vector_top_evidence_titles": top_titles,
+
+        "vector_source_work_count": int(len(papers)),
+
+    }
+
+
 
 def _faiss_dist_to_similarity(index: Any, x: float) -> float:
 
@@ -1370,6 +1924,7 @@ class VectorPath:
             summary = _summarize_author_vector_evidence(papers)
 
             item["vector_evidence"] = {"top_papers": papers, "summary": summary}
+            item.update(_build_vector_job_axis_diagnostics(papers))
 
             total_evidence_papers += len(papers)
 
@@ -1478,6 +2033,21 @@ class VectorPath:
         if verbose:
 
             print(f"[VectorPath] query_bundle: {qb_summary}")
+            try:
+                clauses = query_bundle.get("clause_queries") or []
+                kept = query_bundle.get("clause_queries_kept") or clauses
+                removed = query_bundle.get("clause_queries_removed") or []
+                comp = (query_bundle.get("compressed_query") or "")
+                task = (query_bundle.get("task_focused_query") or "")
+                method = (query_bundle.get("method_focused_query") or "")
+                print(
+                    "[VectorPath] query_bundle_detail: "
+                    f"clauses={len(clauses)} kept={len(kept)} removed={len(removed)} "
+                    f"compressed_len={len(comp)} task_len={len(task)} method_len={len(method)} "
+                    f"branches_used={query_vector_types_used if 'query_vector_types_used' in locals() else None}"
+                )
+            except Exception:
+                pass
 
 
 
@@ -1651,6 +2221,10 @@ class VectorPath:
 
                     f"branches_used={query_vector_types_used}"
 
+                )
+                print(
+                    f"[VectorPath] clause_summary: selected={len(selected_clause_queries)} "
+                    f"clause_merged_papers={clause_merged_paper_count}"
                 )
 
                 prev_titles = []
@@ -2243,11 +2817,19 @@ class VectorPath:
 
             ]
 
+            if verbose:
+                before_diag_top20_author_ids = [str(x.get("author_id")) for x in meta_list[:20]]
+
             ev_dbg = self._attach_vector_evidence_to_meta_list(meta_list, agg_result, merged_records, meta_dict)
 
             self._last_debug.update(ev_dbg)
 
             if verbose:
+                after_diag_top20_author_ids = [str(x.get("author_id")) for x in meta_list[:20]]
+                same = before_diag_top20_author_ids == after_diag_top20_author_ids
+                print(f"[VectorPath] diag_order_check: top20_same={same}")
+                print(f"[VectorPath] before_diag_top20_author_ids={before_diag_top20_author_ids}")
+                print(f"[VectorPath] after_diag_top20_author_ids={after_diag_top20_author_ids}")
 
                 st = ev_dbg.get("author_evidence_stats") or {}
 
@@ -2309,6 +2891,50 @@ class VectorPath:
 
                     work_meta = {r[0]: {"title": r[1], "year": r[2]} for r in rows}
 
+                meta_by_aid = {str(x.get("author_id")): x for x in meta_list if x.get("author_id") is not None}
+
+                # Step 1.5: 非 Top20 指定标题诊断检查（只在当前 recall 集合内查找）
+                try:
+                    wanted_titles = [
+                        "A Mathematical Introduction to Robotic Manipulation",
+                        "Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware",
+                        "Learning to Walk Via Deep Reinforcement Learning",
+                        "Rolling Locomotion of Cable-Driven Soft Spherical Tensegrity Robots",
+                    ]
+                    current_wids = list(dict.fromkeys((raw_work_ids or []) + (filtered_work_ids or [])))
+                    wid_to_title: Dict[str, str] = {}
+                    for wid, meta in (meta_dict or {}).items():
+                        wid_to_title[str(wid)] = str((meta or {}).get("title") or "")
+                    missing = [w for w in current_wids if str(w) not in wid_to_title]
+                    if missing:
+                        for off in range(0, len(missing), _SQLITE_MAX_VARS_PER_QUERY):
+                            batch = missing[off : off + _SQLITE_MAX_VARS_PER_QUERY]
+                            ph = ",".join(["?"] * len(batch))
+                            rows = conn.execute(
+                                f"SELECT work_id, title FROM works WHERE work_id IN ({ph})",
+                                batch,
+                            ).fetchall()
+                            for wid, t in rows:
+                                wid_to_title[str(wid)] = str(t or "")
+
+                    print("[VectorPath] title_axis_diagnostics_check:")
+                    for wt in wanted_titles:
+                        found_wid = None
+                        for wid, t in wid_to_title.items():
+                            if t and t.strip().lower() == wt.strip().lower():
+                                found_wid = wid
+                                break
+                        if not found_wid:
+                            print(f"    - {wt}: NOT_FOUND_IN_CURRENT_RECALL")
+                            continue
+                        diag = _build_vector_job_axis_diagnostics([{"title": wid_to_title.get(found_wid, "")}])
+                        print(
+                            f"    - {wt}: FOUND wid={found_wid} axis_hits={diag.get('vector_job_axis_hits')} "
+                            f"axis_count={diag.get('vector_job_axis_count')} risk_flags={diag.get('vector_risk_flags')}"
+                        )
+                except Exception:
+                    pass
+
 
 
                 self._last_debug.update(
@@ -2334,6 +2960,14 @@ class VectorPath:
                                 "author_id": aid,
 
                                 "author_score": float(a_score),
+                                "vector_job_axis_hits": (meta_by_aid.get(str(aid), {}) or {}).get("vector_job_axis_hits", []),
+                                "vector_job_axis_count": int((meta_by_aid.get(str(aid), {}) or {}).get("vector_job_axis_count", 0) or 0),
+                                "vector_single_paper_dominance": float(
+                                    (meta_by_aid.get(str(aid), {}) or {}).get("vector_single_paper_dominance", 0.0) or 0.0
+                                ),
+                                "vector_risk_flags": (meta_by_aid.get(str(aid), {}) or {}).get("vector_risk_flags", []),
+                                "vector_top_evidence_titles": (meta_by_aid.get(str(aid), {}) or {}).get("vector_top_evidence_titles", []),
+                                "vector_source_work_count": int((meta_by_aid.get(str(aid), {}) or {}).get("vector_source_work_count", 0) or 0),
 
                                 "top3_works": [
 
@@ -2471,7 +3105,7 @@ if __name__ == "__main__":
 
     print("\n" + "=" * 115)
 
-    print("🚀 向量路 (Vector Path) 独立语义召回测试")
+    print("向量路 (Vector Path) 独立语义召回测试")
 
     print("-" * 115)
 
@@ -2500,6 +3134,38 @@ if __name__ == "__main__":
             if not user_input or user_input.lower() == "q":
 
                 break
+
+            # 容错：部分 Windows 控制台/管道输入可能引入不可编码代理字符，导致 tokenizer 报类型错误
+            raw_len = len(user_input)
+            raw_head = user_input[:80]
+            raw_tail = user_input[-80:] if len(user_input) > 80 else user_input
+            try:
+                user_input = user_input.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
+            except Exception:
+                user_input = str(user_input)
+            cleaned_len = len(user_input)
+            cleaned_head = user_input[:80]
+            cleaned_tail = user_input[-80:] if len(user_input) > 80 else user_input
+
+            print(f"[Main Debug] domain_choice={domain_choice}")
+            print(f"[Main Debug] jd_len_raw={raw_len} jd_len_cleaned={cleaned_len}")
+            print(f"[Main Debug] jd_head_raw={raw_head}")
+            print(f"[Main Debug] jd_tail_raw={raw_tail}")
+            print(f"[Main Debug] jd_head_cleaned={cleaned_head}")
+            print(f"[Main Debug] jd_tail_cleaned={cleaned_tail}")
+
+            try:
+                import os as _os
+                from config import SBERT_DIR as _SBERT_DIR
+
+                print(f"[Main Debug] cwd={_os.getcwd()}")
+                print(f"[Main Debug] vector_path_file={__file__}")
+                print(f"[Main Debug] sqlite_db_path={DB_PATH}")
+                print(f"[Main Debug] faiss_abstract_index={ABSTRACT_INDEX_PATH}")
+                print(f"[Main Debug] faiss_job_index={JOB_INDEX_PATH}")
+                print(f"[Main Debug] sbert_dir={_SBERT_DIR}")
+            except Exception:
+                pass
 
 
 
@@ -2576,6 +3242,22 @@ if __name__ == "__main__":
                     a_score = item["author_score"]
 
                     print(f"#{i:<3} {aid} | author_score={a_score:.6f}")
+
+                    axis_hits = item.get("vector_job_axis_hits") or []
+                    axis_count = int(item.get("vector_job_axis_count") or 0)
+                    dominance = float(item.get("vector_single_paper_dominance") or 0.0)
+                    risk_flags = item.get("vector_risk_flags") or []
+                    top_titles = item.get("vector_top_evidence_titles") or []
+
+                    print(f"    axis_hits={axis_hits}")
+                    print(f"    axis_count={axis_count} | single_paper_dominance={dominance:.2f} | risk_flags={risk_flags}")
+                    print("    top_evidence_titles=[")
+                    for tt in top_titles[:3]:
+                        tts = (tt or "").strip()
+                        if len(tts) > 120:
+                            tts = tts[:117] + "..."
+                        print(f'        "{tts}",')
+                    print("    ]")
 
                     for w in item.get("top3_works", []):
 

@@ -2680,6 +2680,10 @@ def _write_term_maps(
     entry = {
         "tid": rec.get("tid"),
         "term": rec.get("term"),
+        # 仅观测：Stage3 输入/聚合标签（不参与打分与过滤）
+        "local_role": rec.get("local_role"),
+        "source_type": rec.get("source_type") or rec.get("candidate_source") or rec.get("source") or rec.get("origin"),
+        "stage3_bucket": rec.get("stage3_bucket"),
         "term_role": rec.get("term_role"),
         "identity_score": rec.get("identity_score"),
         "quality_score": rec.get("quality_score"),

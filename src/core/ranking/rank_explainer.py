@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 import random
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class RankExplainer:
@@ -27,8 +27,37 @@ class RankExplainer:
     ):
         """
         深度推理逻辑：多锚点拓扑探测 + 发表平台提取 + 合作伙伴收割。
-        若传入 candidate_record / candidate_evidence_rows，则补充四段式证据链（召回来源、主题匹配、学术实力、模型置信）。
+        若传入 candidate_record / candidate_evidence_rows：
+        - 优先使用候选池中已有证据（vector_evidence / label_evidence / collab_evidence 等）生成代表作与解释，保证与召回一致；
+        - 仅在证据缺失/不可用时，才触发 Neo4j 多跳检索作为兜底。
         """
+        # 0) 候选池证据优先：从 candidate_record / candidate_evidence_rows 中挑选代表作
+        pool_rows = self._filter_evidence_rows_for_author(author_id, candidate_evidence_rows or [])
+        chosen_work = self._select_representative_work_from_pool(candidate_record, pool_rows)
+        if chosen_work is not None:
+            wid = chosen_work.get("wid")
+            title = chosen_work.get("title") or "候选池代表作"
+            # 对单篇代表作计算注意力权重作为 model_confidence（不再为“找证据”而额外跑 Neo4j 多跳）
+            att_w = self._safe_attention_weight_for_work(author_id, wid) if wid else 0.0
+            out = {
+                "matched_skill": chosen_work.get("matched_skill") or "候选池证据一致性",
+                "key_evidence_work": title,
+                "work_id": wid,
+                "work_url": (f"https://openalex.org/{wid}" if wid else None),
+                "source": chosen_work.get("source") or "候选池证据",
+                "collaborators": chosen_work.get("collaborators"),
+                "match_type": chosen_work.get("match_type") or "pool_evidence",
+                "model_confidence": round(float(att_w or 0.0), 4),
+                "summary": "",
+            }
+            out["evidence_chain"] = self._build_four_segment_evidence_from_pool(
+                candidate_record, pool_rows, chosen_work, att_w
+            )
+            out["summary"] = out["evidence_chain"].get("full_summary") or self._build_pool_summary_fallback(
+                candidate_record, chosen_work, att_w
+            )
+            return out
+
         norm_author_id = str(author_id).strip().lower()
         h_int = self.raw_to_int.get(f"a_{norm_author_id}", 0)
 
@@ -118,11 +147,227 @@ class RankExplainer:
             "summary": summary,
         }
         if candidate_record is not None or (candidate_evidence_rows and len(candidate_evidence_rows) > 0):
-            out["evidence_chain"] = self._build_four_segment_evidence(
-                best_path, candidate_record, candidate_evidence_rows or []
-            )
+            out["evidence_chain"] = self._build_four_segment_evidence(best_path, candidate_record, candidate_evidence_rows or [])
             out["summary"] = out["evidence_chain"].get("full_summary", summary)
         return out
+
+    def _filter_evidence_rows_for_author(
+        self, author_id: str, rows: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        aid = str(author_id).strip().lower()
+        out: List[Dict[str, Any]] = []
+        for r in rows or []:
+            if not isinstance(r, dict):
+                continue
+            ra = str(r.get("author_id") or "").strip().lower()
+            if not ra or ra != aid:
+                continue
+            out.append(r)
+        return out
+
+    def _select_representative_work_from_pool(
+        self, record: Optional[Any], evidence_rows: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        从候选池证据中选一篇代表作。
+        目标：解释与召回一致；尽量不触发 Neo4j 查询。
+        """
+        # 优先：CandidateRecord.vector_evidence.top_papers（结构最稳定、且含 wid/title/score）
+        vec_ev = getattr(record, "vector_evidence", None) if record is not None else None
+        chosen = self._pick_from_vector_evidence(vec_ev)
+        if chosen is not None:
+            return chosen
+
+        # 其次：evidence_rows 中 path=vector/label/collab 的 evidence（尽量从中拼出 wid/title）
+        for prefer in ("vector", "label", "collab"):
+            for row in evidence_rows or []:
+                if str(row.get("path") or "").strip().lower() != prefer:
+                    continue
+                ev = row.get("evidence")
+                # vector evidence 与 CandidateRecord 同结构
+                if prefer == "vector":
+                    chosen = self._pick_from_vector_evidence(ev)
+                    if chosen is not None:
+                        return chosen
+                # label/collab：结构不稳定，只做极保守尝试
+                chosen = self._pick_from_generic_evidence(ev, match_type=f"{prefer}_pool_evidence")
+                if chosen is not None:
+                    return chosen
+        return None
+
+    def _pick_from_vector_evidence(self, vector_evidence: Any) -> Optional[Dict[str, Any]]:
+        if not vector_evidence or not isinstance(vector_evidence, dict):
+            return None
+        top_papers = vector_evidence.get("top_papers") or []
+        if not isinstance(top_papers, list) or not top_papers:
+            return None
+
+        def _paper_score(p: Dict[str, Any]) -> float:
+            try:
+                return float(p.get("score_clause_aware") or p.get("score_hybrid") or p.get("score_dense") or 0.0)
+            except Exception:
+                return 0.0
+
+        best = None
+        best_s = -1.0
+        for p in top_papers:
+            if not isinstance(p, dict):
+                continue
+            wid = p.get("wid")
+            title = (p.get("title") or "").strip()
+            if not wid or not title:
+                continue
+            s = _paper_score(p)
+            if s > best_s:
+                best_s = s
+                best = p
+        if best is None:
+            return None
+        return {
+            "wid": best.get("wid"),
+            "title": best.get("title"),
+            "source": "向量路 evidence",
+            "collaborators": None,
+            "match_type": "vector_pool_evidence",
+            "matched_skill": "向量语义命中",
+        }
+
+    def _pick_from_generic_evidence(self, evidence: Any, match_type: str) -> Optional[Dict[str, Any]]:
+        """
+        保守解析：尽量从 evidence 中抽到 {wid,title}。
+        仅用于 label/collab 的弱兜底，避免强行猜结构导致误导。
+        """
+        if not evidence:
+            return None
+        if isinstance(evidence, dict):
+            # 常见：{"work_id":..,"title":..} 或 {"wid":..,"title":..}
+            wid = evidence.get("wid") or evidence.get("work_id")
+            title = evidence.get("title")
+            if wid and title:
+                return {
+                    "wid": wid,
+                    "title": title,
+                    "source": "候选池证据",
+                    "collaborators": None,
+                    "match_type": match_type,
+                    "matched_skill": "候选池证据命中",
+                }
+            # 常见：{"top_papers":[...]}（兼容 vector_evidence 形式）
+            if "top_papers" in evidence:
+                return self._pick_from_vector_evidence(evidence)
+        if isinstance(evidence, list):
+            # list[dict] 中尝试找第一条具备 wid/title 的项
+            for item in evidence:
+                if not isinstance(item, dict):
+                    continue
+                wid = item.get("wid") or item.get("work_id")
+                title = item.get("title")
+                if wid and title:
+                    return {
+                        "wid": wid,
+                        "title": title,
+                        "source": "候选池证据",
+                        "collaborators": None,
+                        "match_type": match_type,
+                        "matched_skill": "候选池证据命中",
+                    }
+        return None
+
+    def _safe_attention_weight_for_work(self, author_id: str, work_id: Any) -> float:
+        try:
+            norm_author_id = str(author_id).strip().lower()
+            h_int = self.raw_to_int.get(f"a_{norm_author_id}", 0)
+            wid = str(work_id).strip().lower()
+            t_int = self.raw_to_int.get(f"w_{wid}", 0)
+            if h_int == 0 or t_int == 0:
+                return 0.0
+            h_list = torch.LongTensor([h_int]).to(self.device)
+            t_list = torch.LongTensor([t_int]).to(self.device)
+            r_list = torch.LongTensor([self.REL_AUTHORED]).to(self.device)
+            with torch.no_grad():
+                s = self.model.update_attention_batch(h_list, t_list, r_list).squeeze()
+                return float(s.item())
+        except Exception:
+            return 0.0
+
+    def _build_four_segment_evidence_from_pool(
+        self,
+        record: Optional[Any],
+        evidence_rows: List[Dict[str, Any]],
+        chosen_work: Dict[str, Any],
+        att_weight: float,
+    ) -> Dict[str, str]:
+        """
+        四段式证据链（对齐候选池）：召回来源摘要、主题匹配摘要、学术实力摘要、模型置信摘要。
+        与 _build_four_segment_evidence 的区别：主题匹配段不强依赖 Neo4j 的 req_skill/match_skill。
+        """
+        seg1 = "召回来源："
+        if record:
+            paths = []
+            if getattr(record, "from_vector", False):
+                paths.append("向量语义")
+            if getattr(record, "from_label", False):
+                paths.append("标签路径")
+            if getattr(record, "from_collab", False):
+                paths.append("协作网络")
+            path_count = getattr(record, "path_count", 0) or 0
+            seg1 += "、".join(paths) if paths else "多路召回"
+            if path_count > 1:
+                seg1 += f"；多路命中（{path_count} 条路径）。"
+            else:
+                seg1 += "。"
+            dom = getattr(record, "dominant_recall_path", None) or ""
+            if dom:
+                seg1 += f" 主导来源：{dom}。"
+        else:
+            seg1 += "来自多路召回融合。"
+        if evidence_rows:
+            seg1 += " 证据路径：" + "；".join([e.get("path", "") for e in evidence_rows[:5] if isinstance(e, dict)]) + "。"
+
+        seg2 = "主题匹配："
+        title = str(chosen_work.get("title") or "").strip()
+        wid = chosen_work.get("wid")
+        if title:
+            seg2 += f"候选池证据显示其代表作《{title}》与岗位语义需求高度相关"
+            if wid:
+                seg2 += f"（OpenAlex: {wid}）"
+            seg2 += "。"
+        else:
+            seg2 += "候选池证据显示其研究主题与岗位语义需求高度相关。"
+
+        seg3 = "学术实力："
+        if record:
+            h = getattr(record, "h_index", None)
+            works = getattr(record, "works_count", None)
+            cited = getattr(record, "cited_by_count", None)
+            recent = getattr(record, "recent_works_count", None)
+            seg3 += f"H-index {h or '-'}，总论文 {works or '-'}，总引用 {cited or '-'}"
+            if recent is not None:
+                seg3 += f"，近年产出 {recent} 篇"
+            seg3 += "。"
+        else:
+            seg3 += "详见作者学术指标。"
+
+        seg4 = "模型置信："
+        seg4 += f"KGAT-AX 对代表作的注意力权重 {float(att_weight or 0.0):.4f}；"
+        seg4 += "解释优先与候选池证据对齐，必要时才触发图谱兜底。"
+
+        full = " ".join([seg1, seg2, seg3, seg4])
+        return {
+            "recall_source": seg1,
+            "topic_match": seg2,
+            "academic_strength": seg3,
+            "model_confidence": seg4,
+            "full_summary": full,
+        }
+
+    def _build_pool_summary_fallback(
+        self, record: Optional[Any], chosen_work: Dict[str, Any], att_weight: float
+    ) -> str:
+        title = str(chosen_work.get("title") or "").strip()
+        if title:
+            return f"候选池证据一致：代表作《{title}》与岗位语义需求匹配，模型注意力权重 {float(att_weight or 0.0):.4f}。"
+        return f"候选池证据一致：该作者与岗位语义需求匹配，模型注意力权重 {float(att_weight or 0.0):.4f}。"
     def _build_four_segment_evidence(
         self,
         best_path: Dict[str, Any],

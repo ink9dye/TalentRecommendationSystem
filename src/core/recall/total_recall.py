@@ -11,6 +11,7 @@ import time
 import faiss
 import os
 import copy
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -70,6 +71,136 @@ DISPLAY_POOL_TOP_N = 50
 # 分桶配额（多路一致优先）
 BUCKET_QUOTAS = {"A": 80, "B": 30, "C": 60, "D": 20, "E": 20, "F": 10}
 
+# Step 1：candidate_trust_tier 的计算 helper（仅计算与写入；不改召回算法 / 不改 candidate_pool_score / 不改 training pool 分桶）
+_TRUST_SERIOUS_VECTOR_RISK = {
+    "single_paper_dominated",
+    "thin_job_axis_coverage",
+    "weak_job_axis_coverage",
+    "possible_off_context_dense_match",
+    "off_context_dense_match",
+}
+
+
+def _get_bool(rec: CandidateRecord, name: str) -> bool:
+    return bool(getattr(rec, name, False))
+
+
+def get_risk_flags(rec: CandidateRecord) -> set:
+    flags = set(getattr(rec, "risk_flags", []) or [])
+    ve = getattr(rec, "vector_evidence", None)
+    if isinstance(ve, dict):
+        flags |= set(ve.get("vector_risk_flags", []) or [])
+    vrf = getattr(rec, "vector_risk_flags", None)
+    if isinstance(vrf, (list, tuple, set)):
+        flags |= set(vrf)
+    return flags
+
+
+def has_serious_vector_risk(rec: CandidateRecord) -> bool:
+    return bool(get_risk_flags(rec) & _TRUST_SERIOUS_VECTOR_RISK)
+
+
+def is_strong_consensus(rec: CandidateRecord) -> bool:
+    v = _get_bool(rec, "from_vector")
+    l = _get_bool(rec, "from_label")
+    c = _get_bool(rec, "from_collab")
+    # 三路共识，最高可信
+    if v and l and c:
+        return True
+    # V+L：语义召回与标签证据互相验证，但过滤严重向量风险
+    if v and l and not has_serious_vector_risk(rec):
+        return True
+    # L+C：必须要求标签路本身较强
+    if l and c and is_strong_label_hit(rec):
+        return True
+    return False
+
+
+def is_weak_consensus(rec: CandidateRecord) -> bool:
+    v = _get_bool(rec, "from_vector")
+    l = _get_bool(rec, "from_label")
+    c = _get_bool(rec, "from_collab")
+    # V+C 没有 L，只能算弱共识
+    if v and c and not l:
+        return True
+    # L+C 但标签不强，只能算弱共识
+    if l and c and not is_strong_label_hit(rec):
+        return True
+    # V+L 但存在严重向量风险，不给 strong_consensus
+    if v and l and has_serious_vector_risk(rec):
+        return True
+    return False
+
+
+def is_strong_label_hit(rec: CandidateRecord) -> bool:
+    if not _get_bool(rec, "from_label"):
+        return False
+    label_rank = getattr(rec, "label_rank", None)
+    label_score = getattr(rec, "label_score_raw", None)
+    try:
+        if label_rank is not None and int(label_rank) <= 30:
+            return True
+    except (TypeError, ValueError):
+        pass
+    try:
+        if label_score is not None and float(label_score) >= 0.65:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
+def _get_vector_evidence_paper_count(rec: CandidateRecord) -> int:
+    ve = getattr(rec, "vector_evidence", None)
+    if isinstance(ve, dict):
+        papers = ve.get("top_papers") or ve.get("papers") or []
+        if isinstance(papers, (list, tuple)):
+            return int(len(papers))
+    summ = extract_vector_evidence_summary(ve)
+    try:
+        return int(summ.get("vector_evidence_top_paper_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def is_strong_vector_hit(rec: CandidateRecord) -> bool:
+    if not _get_bool(rec, "from_vector"):
+        return False
+    if has_serious_vector_risk(rec):
+        return False
+    paper_count = _get_vector_evidence_paper_count(rec)
+    axis_count = getattr(rec, "vector_job_axis_count", None)
+    domc = getattr(rec, "domain_consistency", None)
+    try:
+        if axis_count is not None:
+            return int(paper_count) >= 2 and int(axis_count) >= 2
+    except (TypeError, ValueError):
+        pass
+    try:
+        if domc is not None:
+            return int(paper_count) >= 2 and float(domc) >= 0.7
+    except (TypeError, ValueError):
+        pass
+    return int(paper_count) >= 2
+
+
+def compute_candidate_trust_tier(rec: CandidateRecord) -> str:
+    if is_strong_consensus(rec):
+        return "strong_consensus"
+    if is_strong_label_hit(rec):
+        return "strong_label"
+    if is_strong_vector_hit(rec):
+        return "strong_vector"
+    if is_weak_consensus(rec):
+        return "weak_consensus"
+    if _get_bool(rec, "from_vector") and has_serious_vector_risk(rec):
+        return "risky_vector"
+    if _get_bool(rec, "from_label"):
+        return "weak_label"
+    if _get_bool(rec, "from_vector"):
+        return "weak_vector"
+    return "other"
+
 
 def _ensure_meta_list(result: Any, path_tag: str) -> List[Dict[str, Any]]:
     """
@@ -118,7 +249,15 @@ class TotalRecallSystem:
         self.l_path = LabelRecallPath(recall_limit=k_label, silent=True)
         self.c_path = CollaborativeRecallPath(recall_limit=k_collab)
         self.executor = ThreadPoolExecutor(max_workers=3)
-        self.domain_detector = DomainDetector(self.l_path)
+        # 优先使用「Job 空间」做领域探测（更稳、更快），避免复用 Label 路 Stage1 导致额外噪声/耦合。
+        # 若资源缺失，DomainDetector 内部仍会回退到 auto_label_path。
+        self.domain_detector = DomainDetector(
+            label_path=self.l_path,
+            graph=getattr(self.l_path, "graph", None),
+            job_index=getattr(self.l_path, "job_index", None),
+            job_id_map=getattr(self.l_path, "job_id_map", None),
+            total_job_count=float(getattr(self.l_path, "total_job_count", 0) or 0) or None,
+        )
         # Step8：默认开启来源门控，比 Step7 更保守、可解释；单次 execute 可覆盖
         self.vector_evidence_bonus_config = (
             vector_evidence_bonus_config
@@ -165,10 +304,20 @@ class TotalRecallSystem:
             aid = str(m.get("author_id"))
             if aid not in by_id:
                 by_id[aid] = CandidateRecord(author_id=aid)
-            by_id[aid].from_vector = True
-            by_id[aid].vector_rank = m.get("vector_rank") or rank + 1
-            by_id[aid].vector_score_raw = m.get("vector_score_raw")
-            by_id[aid].vector_evidence = m.get("vector_evidence")
+            rec = by_id[aid]
+            rec.from_vector = True
+            rec.vector_rank = m.get("vector_rank") or rank + 1
+            rec.vector_score_raw = m.get("vector_score_raw")
+            rec.vector_evidence = m.get("vector_evidence")
+            # 仅用于 Step1 的 candidate_trust_tier 计算（不改变召回算法与打分）
+            try:
+                if m.get("vector_job_axis_count") is not None:
+                    setattr(rec, "vector_job_axis_count", int(m.get("vector_job_axis_count") or 0))
+            except (TypeError, ValueError):
+                pass
+            vrf = m.get("vector_risk_flags")
+            if isinstance(vrf, (list, tuple)):
+                setattr(rec, "vector_risk_flags", list(vrf))
         for rank, m in enumerate(l_meta):
             aid = str(m.get("author_id"))
             if aid not in by_id:
@@ -210,6 +359,7 @@ class TotalRecallSystem:
         目标：为 base candidate layer 提供一个轻量、可解释、不过度裁决的合成分，用于“粗排序”与 tie-break。
         - 保留 RRF 作为主体（来源共识/多路命中倾向）；
         - 仅保留弱 multi-path / pair bonus 与轻量 label_hint / vector_evidence_bonus 做校准；
+        - 主排序字典序：**多路共识（≥2 路）> 标签路强单路 > 向量路强单路 > 其余**；同层内再按 candidate_pool_score 降序；
         - 该分数不是最终精排分、不是训练标签、也不替 KGAT-AX 做排序裁决。
         """
         cfg = bonus_cfg if bonus_cfg is not None else self.vector_evidence_bonus_config
@@ -244,6 +394,7 @@ class TotalRecallSystem:
             r.vector_evidence_bonus = ev_bonus
             r.candidate_pool_score = prior_score + ev_bonus
             r.dominant_recall_path = infer_dominant_path(r)
+        # Step1 本步不改融合排序：仍按 candidate_pool_score 降序
         records.sort(key=lambda x: x.candidate_pool_score, reverse=True)
         return records
 
@@ -565,16 +716,34 @@ class TotalRecallSystem:
             faiss.normalize_L2(query_vec)
 
         # 传入 query_text 以便向量路构建完整 vector_evidence（Step5）；不改变三路职责与主排序
+        # 关键：VectorPath 会对输入向量做 in-place normalize/reshape（np.asarray 可能共享底层内存）。
+        # 若与 Label 路并发共享同一 query_vec，会导致标签路收到被串改的向量，从而严重退化（如 l_raw 仅个位数）。
+        # 因此这里对每一路显式传入副本，保证线程安全与结果稳定。
+        qv_for_vector = query_vec.copy()
+        # 关键：LabelRecallPath 在调试脚本中是用自身 QueryEncoder 编码 JD 的；
+        # 总召回若把带 domain prompt 的 query_vec 直接传入，可能与标签路的 Stage1/Stage2 假设不一致，导致召回显著变少。
+        # 因此 Label 路使用“原始 JD 文本”重新编码得到的向量（与 label_path_run.py 对齐）。
+        qv_for_label = None
+        try:
+            enc = getattr(self.l_path, "_query_encoder", None)
+            if enc is not None and query_text:
+                qv_for_label, _ = enc.encode(query_text)
+                if qv_for_label is not None:
+                    faiss.normalize_L2(qv_for_label)
+        except Exception:
+            qv_for_label = None
+        if qv_for_label is None:
+            qv_for_label = query_vec.copy()
         future_v = self.executor.submit(
             self.v_path.recall,
-            query_vec,
+            qv_for_vector,
             target_domains=vector_domains,
             verbose=False,
             query_text=query_text,
         )
         future_l = self.executor.submit(
             self.l_path.recall,
-            query_vec,
+            qv_for_label.copy(),
             domain_id=user_domain,
             query_text=query_text,
             semantic_query_text=query_text,
@@ -603,6 +772,22 @@ class TotalRecallSystem:
         self._enrich_candidate_features(records, active_domains, query_text)
         records = self._apply_hard_filters(records, summary)
         self._assign_buckets(records, summary)
+        # Step1：在 bucket_type 已就绪后写入 candidate_trust_tier（不改打分/不改分桶/不改弱标签）
+        tier_counts = {
+            "strong_consensus": 0,
+            "strong_label": 0,
+            "strong_vector": 0,
+            "weak_consensus": 0,
+            "weak_label": 0,
+            "weak_vector": 0,
+            "risky_vector": 0,
+            "other": 0,
+        }
+        for rec in records:
+            t = compute_candidate_trust_tier(rec)
+            rec.candidate_trust_tier = t
+            tier_counts[t] = int(tier_counts.get(t, 0) or 0) + 1
+        summary.candidate_trust_tier_counts = dict(tier_counts)
         # 候选中间层：三路合并 + 打分 + enrich + 硬过滤 + 分桶之后，尚未做分桶配额截断
         base_records = records
         for r in base_records:
@@ -610,9 +795,15 @@ class TotalRecallSystem:
             r.pool_role = "base"
         # Step3：软标记统计（仅统计保留下来的候选中间层成员）
         summary.soft_flagged_count = sum(1 for r in base_records if getattr(r, "risk_flags", None))
-        # Step5：训练池正式分叉（轻量补位策略，服务训练样本构造；不追求榜单观感）
-        training_records = self._build_training_pool_records(base_records, top_n=TRAINING_POOL_TOP_N)
-        # 展示池：沿用既有 bucket_quota_truncate 实现，仅将截断上限改为 DISPLAY_POOL_TOP_N
+
+        # 规模约束（候选池的两路视图）：
+        # - base_records：全量合并后的候选中间层（便于统计/诊断与证据回放）
+        # - training_records：训练池视图（默认 top100），用于离线样本构造与精排入口规模控制
+        # - display_records：展示池视图（默认 top50），用于在线展示与解释入口控量
+        final_records = self._build_training_pool_records(base_records, top_n=TRAINING_POOL_TOP_N)
+        training_records = final_records
+        # 展示池从 base_records 派生：按来源桶配额截断后再取 topN
+        # （training pool 与 display pool 均为候选池视图，不互相作为“必须子集”的约束）
         display_records = bucket_quota_truncate(base_records, BUCKET_QUOTAS, DISPLAY_POOL_TOP_N)
         # Step2：同一作者可能同时出现在 training 与 display；为避免 pool_role 单字段被覆盖，这里为不同池视角构造轻量副本
         training_records_view = [copy.copy(r) for r in training_records]
@@ -630,6 +821,8 @@ class TotalRecallSystem:
         summary.base_pool_size = len(base_records)
         summary.training_pool_size = len(training_records)
         summary.display_pool_size = len(display_records)
+        # “最终池”对齐精排入口（<=100），避免被 base_records 规模误导
+        summary.final_pool_size = len(training_records)
 
         # Step6/8：池内审计；范围对齐「训练池 ∪ 展示池」涉及记录，避免仅扫 display 导致统计过窄
         audit_records = list(training_records)
@@ -682,9 +875,11 @@ class TotalRecallSystem:
             flush=True,
         )
 
-        kgatax_rows = [build_kgatax_feature_row(r) for r in base_records]
+        # 导出与下游使用以“精排入口池（<=100）”为准，避免无意义放大样本规模
+        export_records = training_records
+        kgatax_rows = [build_kgatax_feature_row(r) for r in export_records]
         evidence_rows = []
-        for r in base_records:
+        for r in export_records:
             if r.vector_evidence:
                 evidence_rows.append({"author_id": r.author_id, "path": "vector", "evidence": r.vector_evidence})
             if r.label_evidence:
@@ -695,7 +890,7 @@ class TotalRecallSystem:
         pool = CandidatePool(
             query_text=query_text,
             applied_domains=applied_domain_str,
-            candidate_records=base_records,
+            candidate_records=export_records,
             training_pool_records=training_records_view,
             display_pool_records=display_records_view,
             candidate_evidence_rows=evidence_rows,
@@ -707,7 +902,7 @@ class TotalRecallSystem:
         # deprecated / compatibility only：与 display_pool_top_50 同源，不代表真实 200/500 规模
         compat_display_ids = display_pool_top_50
         rank_map = {}
-        for r in base_records:
+        for r in export_records:
             rank_map[r.author_id] = {
                 "v": r.vector_rank if r.vector_rank is not None else "-",
                 "l": r.label_rank if r.label_rank is not None else "-",
@@ -842,12 +1037,48 @@ if __name__ == "__main__":
             pool = results.get("candidate_pool")
             if pool and pool.pool_debug_summary:
                 s = pool.pool_debug_summary
-                print(f"\n[候选池统计] 去重后={s.after_dedup_count} 硬过滤掉={s.hard_filtered_count} 最终={s.final_pool_size} A={s.bucket_a_count} B={s.bucket_b_count} C={s.bucket_c_count} D={s.bucket_d_count}")
+                print(
+                    f"\n[候选池统计] 去重后={s.after_dedup_count} 硬过滤掉={s.hard_filtered_count} 最终={s.final_pool_size} "
+                    f"A={s.bucket_a_count} B={s.bucket_b_count} C={s.bucket_c_count} "
+                    f"D={s.bucket_d_count} E={s.bucket_e_count} F={s.bucket_f_count}"
+                )
+                if getattr(s, "candidate_trust_tier_counts", None):
+                    print(f"[candidate_trust_tier_counts] {s.candidate_trust_tier_counts}")
+                print(f"[training_pool_size] {s.training_pool_size}  [display_pool_size] {s.display_pool_size}")
+
+            # 展示：自动领域探测结果（当用户未显式指定领域时尤为重要）
+            try:
+                applied = results.get("applied_domains")
+                dbg = (results.get("details") or {}).get("domain_debug") or results.get("details", {}).get("domain_debug")
+                # domain_debug 实际挂在返回顶层 "details" 外的 "domain_debug"，此处兼容两种
+                if dbg is None:
+                    dbg = results.get("domain_debug")
+                if applied:
+                    print(f"[领域探测] applied_domains={applied} source={(dbg or {}).get('source') if isinstance(dbg, dict) else None}")
+                    if isinstance(dbg, dict):
+                        aset = dbg.get("active_set")
+                        if aset is not None:
+                            print(f"[领域探测] active_set={aset}")
+            except Exception:
+                pass
 
             print(f"\n[召回报告] 耗时: {results['total_ms']:.2f}ms | V={results['details']['v_cost']:.1f}ms L={results['details']['l_cost']:.1f}ms C={results['details']['cost_c']:.1f}ms")
             print("-" * 115)
             print(f"{'综合排名':<6} | {'作者 ID':<10} | {'各路名次 (V/L/C)':<15} | {'知识图谱核心作 (权重)'}")
             print("-" * 115)
+
+            # Top20 tier 诊断表（不改变排序；仅用于观察 tier 分布与风险）
+            print("\n[Top20 trust tier]")
+            print("author_id | V/L/C rank | candidate_trust_tier | candidate_pool_score | risk_flags")
+            for r in (pool.candidate_records[:20] if pool else []):
+                rm = rank_map.get(r.author_id, {'v': '-', 'l': '-', 'c': '-'})
+                v_rank = str(rm['v']) if rm.get('v') != '-' else "-"
+                l_rank = str(rm['l']) if rm.get('l') != '-' else "-"
+                c_rank = str(rm['c']) if rm.get('c') != '-' else "-"
+                rf = sorted(list(get_risk_flags(r)))[:8]
+                print(
+                    f"{r.author_id} | V:{v_rank} L:{l_rank} C:{c_rank} | {getattr(r, 'candidate_trust_tier', '')} | {getattr(r, 'candidate_pool_score', 0.0):.6f} | {rf}"
+                )
 
             for rank, aid in enumerate(candidates[:50], 1):
                 rm = rank_map.get(aid, {'v': '-', 'l': '-', 'c': '-'})
@@ -858,6 +1089,8 @@ if __name__ == "__main__":
                 works = system._get_author_works(aid, top_n=1)
                 if works:
                     work_title = works[0]['title']
+                    if isinstance(work_title, str):
+                        work_title = work_title.replace("\xa0", " ")
                     if len(work_title) > 60:
                         work_title = work_title[:57] + "..."
                     info = f"《{work_title}》({works[0]['weight']:.3f})"
@@ -867,6 +1100,43 @@ if __name__ == "__main__":
 
             print("-" * 115)
             print(f"[*] 已召回 {len(candidates)} 名候选人，上方显示前 50 名综合最优解。")
+
+    except EOFError:
+        # 非交互式运行（如自动化 smoke test）时 stdin 可能为空：给一个默认 JD 跑通主链路。
+        domain_choice = "0"
+        user_input = "机器人运动控制 轨迹规划 MPC 强化学习 状态估计 SLAM 仿真到实机"
+        print(f"\n[*] 检测到非交互式输入，使用默认测试 JD：{user_input}", flush=True)
+
+        try:
+            results = system.execute(user_input, domain_id=domain_choice)
+        except Exception:
+            print("[!] 默认 smoke test 执行失败：", flush=True)
+            traceback.print_exc()
+            raise
+        print("[*] smoke test execute() 已返回。", flush=True)
+        pool = results.get("candidate_pool")
+        if pool is None:
+            print(f"[!] smoke test 未返回 candidate_pool，keys={list(results.keys())!r}", flush=True)
+        s = pool.pool_debug_summary if pool else None
+        if s:
+            print(
+                f"\n[候选池统计] 去重后={s.after_dedup_count} 硬过滤掉={s.hard_filtered_count} 最终={s.final_pool_size} "
+                f"A={s.bucket_a_count} B={s.bucket_b_count} C={s.bucket_c_count} "
+                f"D={s.bucket_d_count} E={s.bucket_e_count} F={s.bucket_f_count}"
+            , flush=True)
+            if getattr(s, "candidate_trust_tier_counts", None):
+                print(f"[candidate_trust_tier_counts] {s.candidate_trust_tier_counts}", flush=True)
+            print(f"[training_pool_size] {s.training_pool_size}  [display_pool_size] {s.display_pool_size}", flush=True)
+
+        # 保留 Top20 trust tier 诊断输出（不影响排序）
+        if pool:
+            print("\n[Top20 trust tier]")
+            print("author_id | candidate_trust_tier | candidate_pool_score | risk_flags")
+            for r in (pool.candidate_records[:20] if pool else []):
+                rf = sorted(list(get_risk_flags(r)))[:8]
+                print(
+                    f"{r.author_id} | {getattr(r, 'candidate_trust_tier', '')} | {getattr(r, 'candidate_pool_score', 0.0):.6f} | {rf}"
+                , flush=True)
 
     except KeyboardInterrupt:
         print("\n[!] 系统安全退出。")
