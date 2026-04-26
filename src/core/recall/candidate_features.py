@@ -17,13 +17,18 @@ from config import DB_PATH
 def extract_terms_from_label_evidence(label_evidence: Any) -> List[Dict[str, Any]]:
     """
     从 label_evidence 中提取词项列表，每项含 bucket（core/support/risky）与 score。
+    允许可选字段 term（用于解释展示）。
     若证据为 None 或格式不符，返回 []。
     """
     if label_evidence is None:
         return []
     if isinstance(label_evidence, list):
         return [
-            {"bucket": (x.get("bucket") or "support"), "score": float(x.get("score") or 0.0)}
+            {
+                "term": x.get("term"),
+                "bucket": (x.get("bucket") or "support"),
+                "score": float(x.get("score") or 0.0),
+            }
             for x in label_evidence
             if isinstance(x, dict)
         ]
@@ -31,7 +36,11 @@ def extract_terms_from_label_evidence(label_evidence: Any) -> List[Dict[str, Any
         terms = label_evidence.get("terms") or label_evidence.get("term_list")
         if isinstance(terms, list):
             return [
-                {"bucket": (x.get("bucket") or "support"), "score": float(x.get("score") or 0.0)}
+                {
+                    "term": x.get("term"),
+                    "bucket": (x.get("bucket") or "support"),
+                    "score": float(x.get("score") or 0.0),
+                }
                 for x in terms
                 if isinstance(x, dict)
             ]

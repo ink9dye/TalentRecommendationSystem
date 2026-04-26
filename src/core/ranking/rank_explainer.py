@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import random
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -24,6 +25,7 @@ class RankExplainer:
         job_raw_ids: list,
         candidate_record: Optional[Any] = None,
         candidate_evidence_rows: Optional[List[Dict[str, Any]]] = None,
+        query_text: Optional[str] = None,
     ):
         """
         深度推理逻辑：多锚点拓扑探测 + 发表平台提取 + 合作伙伴收割。
@@ -39,6 +41,8 @@ class RankExplainer:
             title = chosen_work.get("title") or "候选池代表作"
             # 对单篇代表作计算注意力权重作为 model_confidence（不再为“找证据”而额外跑 Neo4j 多跳）
             att_w = self._safe_attention_weight_for_work(author_id, wid) if wid else 0.0
+            # 仍补充精排侧图谱证据：用于说明“为何精排把他排前”（与召回证据互补）
+            kg_best = self._try_graph_evidence_best_path(author_id, job_raw_ids)
             out = {
                 "matched_skill": chosen_work.get("matched_skill") or "候选池证据一致性",
                 "key_evidence_work": title,
@@ -51,10 +55,19 @@ class RankExplainer:
                 "summary": "",
             }
             out["evidence_chain"] = self._build_four_segment_evidence_from_pool(
-                candidate_record, pool_rows, chosen_work, att_w
+                candidate_record,
+                pool_rows,
+                chosen_work,
+                att_w,
+                query_text=query_text,
+                kg_best_path=kg_best,
             )
             out["summary"] = out["evidence_chain"].get("full_summary") or self._build_pool_summary_fallback(
-                candidate_record, chosen_work, att_w
+                candidate_record,
+                chosen_work,
+                att_w,
+                query_text=query_text,
+                kg_best_path=kg_best,
             )
             return out
 
@@ -133,7 +146,13 @@ class RankExplainer:
         best_path = sorted(paths, key=lambda x: (x['match_type'] == 'fallback', -x['att_weight']))[0]
 
         # 6. 动态生成总结文本
-        summary = self._build_dynamic_summary(best_path)
+        # 默认 summary/full_summary 走更“推荐说明”的风格（不暴露内部字段）
+        summary = self._build_user_facing_summary(
+            record=candidate_record,
+            chosen_work={"title": best_path.get("title"), "wid": best_path.get("wid")},
+            kg_best_path=best_path,
+            query_text=None,
+        )
 
         out = {
             "matched_skill": best_path['req_skill'],
@@ -296,78 +315,475 @@ class RankExplainer:
         evidence_rows: List[Dict[str, Any]],
         chosen_work: Dict[str, Any],
         att_weight: float,
+        query_text: Optional[str] = None,
+        kg_best_path: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, str]:
         """
         四段式证据链（对齐候选池）：召回来源摘要、主题匹配摘要、学术实力摘要、模型置信摘要。
         与 _build_four_segment_evidence 的区别：主题匹配段不强依赖 Neo4j 的 req_skill/match_skill。
         """
-        seg1 = "召回来源："
-        if record:
-            paths = []
-            if getattr(record, "from_vector", False):
-                paths.append("向量语义")
-            if getattr(record, "from_label", False):
-                paths.append("标签路径")
-            if getattr(record, "from_collab", False):
-                paths.append("协作网络")
-            path_count = getattr(record, "path_count", 0) or 0
-            seg1 += "、".join(paths) if paths else "多路召回"
-            if path_count > 1:
-                seg1 += f"；多路命中（{path_count} 条路径）。"
-            else:
-                seg1 += "。"
-            dom = getattr(record, "dominant_recall_path", None) or ""
-            if dom:
-                seg1 += f" 主导来源：{dom}。"
-        else:
-            seg1 += "来自多路召回融合。"
-        if evidence_rows:
-            seg1 += " 证据路径：" + "；".join([e.get("path", "") for e in evidence_rows[:5] if isinstance(e, dict)]) + "。"
+        # 1) 用户可读 summary/full_summary（默认前端展示用）
+        display_summary = self._build_user_facing_summary(
+            record=record,
+            chosen_work=chosen_work,
+            kg_best_path=kg_best_path,
+            query_text=query_text,
+        )
 
-        seg2 = "主题匹配："
-        title = str(chosen_work.get("title") or "").strip()
-        wid = chosen_work.get("wid")
-        if title:
-            seg2 += f"候选池证据显示其代表作《{title}》与岗位语义需求高度相关"
-            if wid:
-                seg2 += f"（OpenAlex: {wid}）"
-            seg2 += "。"
-        else:
-            seg2 += "候选池证据显示其研究主题与岗位语义需求高度相关。"
+        # 2) 分段（仍保留原 key，供前端兼容；分段也必须是用户可读文本）
+        seg_recall = self._build_user_facing_segment_recall(record)
+        seg_topic = self._build_user_facing_segment_paper_and_path(record, chosen_work, kg_best_path)
+        seg_profile = self._build_user_facing_segment_profile(record)
+        seg_model = self._build_user_facing_segment_model(record)
 
-        seg3 = "学术实力："
-        if record:
-            h = getattr(record, "h_index", None)
-            works = getattr(record, "works_count", None)
-            cited = getattr(record, "cited_by_count", None)
-            recent = getattr(record, "recent_works_count", None)
-            seg3 += f"H-index {h or '-'}，总论文 {works or '-'}，总引用 {cited or '-'}"
-            if recent is not None:
-                seg3 += f"，近年产出 {recent} 篇"
-            seg3 += "。"
-        else:
-            seg3 += "详见作者学术指标。"
+        # 3) 调试摘要（不进入默认 display_summary/full_summary）
+        debug_summary = self._build_debug_summary(
+            record=record,
+            chosen_work=chosen_work,
+            kg_best_path=kg_best_path,
+            query_text=query_text,
+            att_weight=att_weight,
+        )
 
-        seg4 = "模型置信："
-        seg4 += f"KGAT-AX 对代表作的注意力权重 {float(att_weight or 0.0):.4f}；"
-        seg4 += "解释优先与候选池证据对齐，必要时才触发图谱兜底。"
+        # 4) 可选 bullets（前端若要做卡片式展示，可直接用）
+        evidence_bullets = self._build_user_facing_evidence_bullets(
+            record=record, chosen_work=chosen_work, kg_best_path=kg_best_path
+        )
 
-        full = " ".join([seg1, seg2, seg3, seg4])
         return {
-            "recall_source": seg1,
-            "topic_match": seg2,
-            "academic_strength": seg3,
-            "model_confidence": seg4,
-            "full_summary": full,
+            "recall_source": seg_recall,
+            "topic_match": seg_topic,
+            "academic_strength": seg_profile,
+            "model_confidence": seg_model,
+            "full_summary": display_summary,
+            # 新增字段（不破坏旧前端）
+            "display_summary": display_summary,
+            "debug_summary": debug_summary,
+            "evidence_bullets": evidence_bullets,
         }
 
     def _build_pool_summary_fallback(
-        self, record: Optional[Any], chosen_work: Dict[str, Any], att_weight: float
+        self,
+        record: Optional[Any],
+        chosen_work: Dict[str, Any],
+        att_weight: float,
+        query_text: Optional[str] = None,
+        kg_best_path: Optional[Dict[str, Any]] = None,
     ) -> str:
-        title = str(chosen_work.get("title") or "").strip()
-        if title:
-            return f"候选池证据一致：代表作《{title}》与岗位语义需求匹配，模型注意力权重 {float(att_weight or 0.0):.4f}。"
-        return f"候选池证据一致：该作者与岗位语义需求匹配，模型注意力权重 {float(att_weight or 0.0):.4f}。"
+        # fallback 也必须走“用户可读”逻辑，避免出现 KGAT 注意力、内部字段等调试信息
+        return self._build_user_facing_summary(
+            record=record,
+            chosen_work=chosen_work,
+            kg_best_path=kg_best_path,
+            query_text=query_text,
+        )
+
+    # ---------------------------------------------------------------------
+    # User-facing summary helpers (no internal/debug fields)
+    # ---------------------------------------------------------------------
+
+    def _build_user_facing_summary(
+        self,
+        record: Optional[Any],
+        chosen_work: Dict[str, Any],
+        kg_best_path: Optional[Dict[str, Any]] = None,
+        query_text: Optional[str] = None,
+    ) -> str:
+        """
+        生成默认展示的自然语言推荐理由（面向用户，不暴露内部调试字段/数值）。
+        结构：
+        - 推荐原因（为何值得看）
+        - 代表论文证据（代表作与方向关系）
+        - 作者画像（H-index、相关论文、近5年论文）
+        - 可选谨慎句（论文少/近年少/相关度一般）
+        """
+        from_v = bool(getattr(record, "from_vector", False)) if record else False
+        from_l = bool(getattr(record, "from_label", False)) if record else False
+        from_c = bool(getattr(record, "from_collab", False)) if record else False
+
+        title = str((chosen_work or {}).get("title") or "").strip() or "代表作"
+
+        # 概念词：优先 label_evidence core，其次 matched_skill，再次图谱 match_skill
+        core_terms = self._extract_core_terms(record, max_n=3)
+        if not core_terms:
+            ms = str((chosen_work or {}).get("matched_skill") or "").strip()
+            if ms and ms not in ("候选池证据一致性", "向量语义命中", "候选池证据命中", "候选池证据一致"):
+                core_terms = [ms]
+        if not core_terms:
+            try:
+                msk = str((kg_best_path or {}).get("match_skill") or "").strip()
+                if msk:
+                    core_terms = [msk]
+            except Exception:
+                core_terms = []
+        concept_phrase = "、".join(core_terms[:3]) if core_terms else "岗位技术方向"
+
+        # 相关度档位（仅用于措辞，不展示“代表论文相关度：xx”字段）
+        band = self._vector_best_paper_score_band(record)
+
+        # 推荐原因句
+        if from_v and from_l:
+            s1 = (
+                "该作者同时被语义检索和概念标签路径命中，说明其论文内容与岗位描述在文本语义和技术概念上都有交集。"
+            )
+        elif from_v:
+            s1 = "该作者主要由语义检索召回，代表论文与岗位文本存在一定语义相似性。"
+        elif from_l:
+            s1 = f"该作者主要由概念标签路径召回，系统在其论文证据中发现与「{concept_phrase}」相关的技术线索。"
+        elif from_c:
+            s1 = "该作者主要由协作网络召回，说明其与当前方向的相关作者群体存在合作关联。"
+        else:
+            s1 = "系统在候选池中发现该作者与岗位需求存在一定关联，建议进一步查看其代表作与研究方向。"
+
+        # 代表论文证据句（不放 OpenAlex id）
+        if band in ("medium", "low"):
+            rel_phrase = "存在一定相关性"
+        else:
+            rel_phrase = "相关"
+        s2 = f"其代表作《{title}》与「{concept_phrase}」方向{rel_phrase}，可作为该作者与岗位技术需求关联的主要证据。"
+
+        # 作者画像句
+        h = getattr(record, "h_index", None) if record else None
+        works = getattr(record, "works_count", None) if record else None
+        recent = getattr(record, "recent_works_count", None) if record else None
+        h_s = "-" if h in (None, "") else str(h)
+        w_s = "-" if works in (None, "") else str(works)
+        r_s = "-" if recent in (None, "") else str(recent)
+        s3 = f"作者画像显示：H-index 为 {h_s}，相关论文 {w_s} 篇，近 5 年相关论文 {r_s} 篇。"
+
+        # 谨慎句（可选）
+        caution = self._build_caution_sentence(
+            works=works, recent=recent, band=band, from_vector=from_v, from_label=from_l
+        )
+
+        # 若 band 较低/中等，用更保守的首句收尾（但不写“中等/较低”）
+        if caution:
+            return " ".join([s1, s2, s3, caution])
+        return " ".join([s1, s2, s3])
+
+    def _build_user_facing_segment_recall(self, record: Optional[Any]) -> str:
+        from_v = bool(getattr(record, "from_vector", False)) if record else False
+        from_l = bool(getattr(record, "from_label", False)) if record else False
+        from_c = bool(getattr(record, "from_collab", False)) if record else False
+        if from_v and from_l:
+            return "该作者同时被语义检索和概念标签路径命中，证据来源相对稳定。"
+        if from_v:
+            return "该作者由语义检索召回，说明其代表论文与岗位文本存在一定语义相似性。"
+        if from_l:
+            return "该作者由概念标签路径召回，说明其研究概念与岗位技术线索存在交集。"
+        if from_c:
+            return "该作者由协作网络召回，说明其与相关作者群体存在合作关联。"
+        return "该作者在候选池中被筛选出来，建议进一步查看其代表作与研究方向。"
+
+    def _build_user_facing_segment_paper_and_path(
+        self,
+        record: Optional[Any],
+        chosen_work: Dict[str, Any],
+        kg_best_path: Optional[Dict[str, Any]],
+    ) -> str:
+        title = str((chosen_work or {}).get("title") or "").strip() or "代表作"
+        core_terms = self._extract_core_terms(record, max_n=3)
+        if not core_terms:
+            try:
+                msk = str((kg_best_path or {}).get("match_skill") or "").strip()
+                if msk:
+                    core_terms = [msk]
+            except Exception:
+                core_terms = []
+        concept_phrase = "、".join(core_terms[:3]) if core_terms else "岗位技术方向"
+        return f"代表作《{title}》与「{concept_phrase}」方向相关，可作为该作者与岗位技术需求关联的主要证据。"
+
+    def _build_user_facing_segment_profile(self, record: Optional[Any]) -> str:
+        h = getattr(record, "h_index", None) if record else None
+        works = getattr(record, "works_count", None) if record else None
+        recent = getattr(record, "recent_works_count", None) if record else None
+        h_s = "-" if h in (None, "") else str(h)
+        w_s = "-" if works in (None, "") else str(works)
+        r_s = "-" if recent in (None, "") else str(recent)
+        return f"作者画像显示：H-index 为 {h_s}，相关论文 {w_s} 篇，近 5 年相关论文 {r_s} 篇。"
+
+    def _build_user_facing_segment_model(self, record: Optional[Any]) -> str:
+        # 不输出 KGAT 注意力等内部数值；用更“结果导向”的表述
+        if record is not None and (getattr(record, "from_vector", False) or getattr(record, "from_label", False) or getattr(record, "from_collab", False)):
+            return "精排阶段将该候选保留在当前排序结果中，说明图结构与候选池证据没有明显冲突。"
+        return "精排阶段未发现与候选池证据明显冲突的信号。"
+
+    def _build_user_facing_evidence_bullets(
+        self,
+        record: Optional[Any],
+        chosen_work: Dict[str, Any],
+        kg_best_path: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        out: List[str] = []
+        try:
+            title = str((chosen_work or {}).get("title") or "").strip()
+            if title:
+                out.append(f"代表作：《{title}》")
+        except Exception:
+            pass
+        try:
+            core = self._extract_core_terms(record, max_n=3)
+            if core:
+                out.append("命中核心概念：" + "、".join(core))
+        except Exception:
+            pass
+        try:
+            if isinstance(kg_best_path, dict):
+                req = str(kg_best_path.get("req_skill") or "").strip()
+                msk = str(kg_best_path.get("match_skill") or "").strip()
+                if req and msk:
+                    out.append(f"技术线索：{req} → {msk}")
+        except Exception:
+            pass
+        return out
+
+    def _extract_core_terms(self, record: Optional[Any], max_n: int = 3) -> List[str]:
+        if record is None:
+            return []
+        lab = getattr(record, "label_evidence", None)
+        terms = []
+        if isinstance(lab, dict):
+            terms = lab.get("terms") or lab.get("term_list") or []
+        elif isinstance(lab, list):
+            terms = lab
+        out: List[str] = []
+        if isinstance(terms, list):
+            for t in terms:
+                if not isinstance(t, dict):
+                    continue
+                if (t.get("bucket") or "").strip().lower() != "core":
+                    continue
+                nm = str(t.get("term") or "").strip()
+                if not nm:
+                    continue
+                if nm not in out:
+                    out.append(nm)
+                if len(out) >= int(max_n):
+                    break
+        return out
+
+    def _vector_best_paper_score_band(self, record: Optional[Any]) -> str:
+        """
+        将 best_paper_score 映射为档位，仅用于措辞（不直接暴露给用户）。
+        return: "high" | "medium" | "low" | ""
+        """
+        try:
+            vec = getattr(record, "vector_evidence", None) if record is not None else None
+            if not isinstance(vec, dict):
+                return ""
+            summ = vec.get("summary") or {}
+            best = summ.get("best_paper_score")
+            if best is None:
+                return ""
+            b = float(best)
+            if b >= 0.72:
+                return "high"
+            if b >= 0.55:
+                return "medium"
+            return "low"
+        except Exception:
+            return ""
+
+    def _build_caution_sentence(
+        self,
+        *,
+        works: Any,
+        recent: Any,
+        band: str,
+        from_vector: bool,
+        from_label: bool,
+    ) -> str:
+        parts: List[str] = []
+        try:
+            if recent is not None and int(recent) == 0:
+                parts.append("不过，近 5 年相关论文数量较少，需进一步确认近期活跃度。")
+        except Exception:
+            pass
+        try:
+            if works is not None and float(works) <= 1:
+                parts.append("其相关论文数量有限，建议结合论文内容进一步人工核验。")
+        except Exception:
+            pass
+        if band in ("medium", "low"):
+            # 避免“高度匹配”措辞
+            parts.append("整体上可作为候选补充关注，建议结合岗位细节进一步核验。")
+        if (from_vector and from_label) and not parts:
+            # 稳定性描述（不过度夸大）
+            parts.append("由于同时命中语义与概念证据，证据来源相对稳定。")
+        # 只取一句，避免冗长
+        return parts[0] if parts else ""
+
+    # ---------------------------------------------------------------------
+    # Debug helpers (can include internal fields)
+    # ---------------------------------------------------------------------
+
+    def _build_debug_summary(
+        self,
+        *,
+        record: Optional[Any],
+        chosen_work: Dict[str, Any],
+        kg_best_path: Optional[Dict[str, Any]],
+        query_text: Optional[str],
+        att_weight: float,
+    ) -> str:
+        """
+        内部排障用摘要：允许包含召回来源、dominant_recall_path、query_type_coverage、
+        best_paper_score 档位、核心概念、KGAT 注意力、图谱路径等。
+        注意：不得并入默认 display_summary/full_summary。
+        """
+        parts: List[str] = []
+        try:
+            if record is not None:
+                src = []
+                if getattr(record, "from_vector", False):
+                    src.append("vector")
+                if getattr(record, "from_label", False):
+                    src.append("label")
+                if getattr(record, "from_collab", False):
+                    src.append("collab")
+                parts.append("sources=" + "+".join(src) if src else "sources=none")
+                dom = getattr(record, "dominant_recall_path", None)
+                if dom:
+                    parts.append(f"dominant={dom}")
+        except Exception:
+            pass
+        try:
+            vec = getattr(record, "vector_evidence", None) if record is not None else None
+            if isinstance(vec, dict):
+                summ = vec.get("summary") or {}
+                qcov = summ.get("query_type_coverage") or []
+                if qcov:
+                    parts.append("query_type_coverage=" + ",".join([str(x) for x in qcov[:6]]))
+                best = summ.get("best_paper_score")
+                if best is not None:
+                    parts.append(f"best_paper_score={float(best):.4f}")
+                    band = self._vector_best_paper_score_band(record)
+                    if band:
+                        parts.append(f"best_paper_band={band}")
+        except Exception:
+            pass
+        try:
+            core = self._extract_core_terms(record, max_n=3)
+            if core:
+                parts.append("core_terms=" + ",".join(core))
+        except Exception:
+            pass
+        try:
+            title = str((chosen_work or {}).get("title") or "").strip()
+            wid = (chosen_work or {}).get("wid")
+            if title:
+                parts.append(f"rep_title={title[:80]}")
+            if wid:
+                parts.append(f"rep_wid={wid}")
+        except Exception:
+            pass
+        try:
+            if isinstance(kg_best_path, dict):
+                req = kg_best_path.get("req_skill")
+                msk = kg_best_path.get("match_skill")
+                mt = kg_best_path.get("match_type")
+                if req and msk:
+                    parts.append(f"graph_path={req}->{msk}({mt})")
+        except Exception:
+            pass
+        try:
+            parts.append(f"kgat_attention={float(att_weight or 0.0):.4f}")
+        except Exception:
+            pass
+        return " | ".join(parts) if parts else ""
+
+    def _try_graph_evidence_best_path(
+        self, author_id: str, job_raw_ids: list
+    ) -> Optional[Dict[str, Any]]:
+        """
+        在“候选池证据可用”的前提下，补一条精排侧图谱路径证据（轻量）。
+        目的：回答“精排为什么认为他更匹配”，与召回证据互补。
+        """
+        if not getattr(self, "graph", None) or not job_raw_ids:
+            return None
+        try:
+            q = """
+            MATCH (j:Job) WHERE j.id IN $jids OR j.securityId IN $jids
+            MATCH (j)-[:REQUIRE_SKILL]->(v1:Vocabulary)
+            WHERE NOT v1.term IN ['computer science', 'mathematics', 'engineering', 'physics', 'technology', '领域专家']
+            OPTIONAL MATCH (v1)-[r:SIMILAR_TO]-(v2:Vocabulary)
+            WHERE r.score > 0.7
+            WITH v1, COALESCE(v2, v1) as target_v
+            MATCH (target_v)<-[:HAS_TOPIC]-(w:Work)<-[:AUTHORED]-(a:Author {id: $aid})
+            RETURN v1.term as req_skill,
+                   target_v.term as match_skill,
+                   w.title as title,
+                   w.id as wid,
+                   (CASE WHEN v1 = target_v THEN 'exact' ELSE 'semantic' END) as match_type
+            ORDER BY match_type ASC
+            LIMIT 5
+            """
+            rows = self.graph.run(q, jids=job_raw_ids, aid=str(author_id)).data()
+            if not rows:
+                return None
+            # 选第一条即可（exact 优先，其次 semantic）
+            r0 = rows[0] if isinstance(rows, list) else None
+            return r0 if isinstance(r0, dict) else None
+        except Exception:
+            return None
+
+    def _extract_query_keywords(self, text: str, top_k: int = 6) -> List[str]:
+        """
+        轻量关键词抽取：不依赖外部模型，尽量从 query_text 中抽到可展示的词。
+        - 英文：按词切分，去停用词，保留较长 token
+        - 中文：按连续汉字片段切分，保留长度>=2
+        """
+        if not text:
+            return []
+        t = text.strip()
+        if not t:
+            return []
+        # 统一小写仅用于英文匹配；中文保持原样即可
+        low = t.lower()
+        stop = {
+            "the", "and", "or", "to", "of", "in", "for", "with", "on", "at", "by", "from",
+            "a", "an", "as", "is", "are", "be", "this", "that", "it", "we", "you", "our",
+            "岗位", "需求", "负责", "要求", "需要", "优先", "相关", "经验", "能力", "方向", "项目",
+        }
+        tokens: List[str] = []
+        # 英文/数字/连字符 token
+        for w in re.findall(r"[a-zA-Z][a-zA-Z0-9\-_/]{1,}", low):
+            w2 = w.strip("-_/")
+            if len(w2) < 4:
+                continue
+            if w2 in stop:
+                continue
+            tokens.append(w2)
+        # 中文片段
+        for s in re.findall(r"[\u4e00-\u9fff]{2,}", t):
+            if s in stop:
+                continue
+            tokens.append(s)
+        if not tokens:
+            return []
+        freq: Dict[str, int] = {}
+        for w in tokens:
+            freq[w] = freq.get(w, 0) + 1
+        ranked = sorted(freq.items(), key=lambda x: (-x[1], -len(x[0]), x[0]))
+        return [w for w, _ in ranked[: max(1, int(top_k))]]
+
+    def _match_keywords_in_title(self, keywords: List[str], title: str, top_k: int = 4) -> List[str]:
+        if not keywords or not title:
+            return []
+        tlow = title.lower()
+        hits: List[str] = []
+        for kw in keywords:
+            if not kw:
+                continue
+            if re.search(r"[\u4e00-\u9fff]", kw):
+                if kw in title:
+                    hits.append(kw)
+            else:
+                if kw.lower() in tlow:
+                    hits.append(kw)
+            if len(hits) >= top_k:
+                break
+        return hits
     def _build_four_segment_evidence(
         self,
         best_path: Dict[str, Any],
@@ -419,11 +835,10 @@ class RankExplainer:
         else:
             seg3 += "详见作者学术指标。"
 
-        seg4 = "模型置信："
-        att = best_path.get("att_weight", 0)
-        seg4 += f"KGAT-AX 对代表作的注意力权重 {att:.4f}；"
-        seg4 += "排序结果与候选池证据一致。"
+        # 默认展示不暴露 KGAT 注意力等内部数值
+        seg4 = "精排阶段将该候选保留在当前排序结果中，说明图结构证据与召回证据没有明显冲突。"
 
+        # full_summary 也保持用户可读，不拼接内部字段
         full = " ".join([seg1, seg2, seg3, seg4])
         return {
             "recall_source": seg1,

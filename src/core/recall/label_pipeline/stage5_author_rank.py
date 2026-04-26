@@ -2526,6 +2526,42 @@ def run_stage5(
         {"author_id": str(a.get("aid")), **(author_structure_audit.get(str(a.get("aid")), {}) or {})}
         for a in scored_authors[:50]
     ]
+
+    # --- StepX：为解释层导出每位作者的 top 命中标签词（core/support） ---
+    author_top_terms: Dict[str, List[Dict[str, Any]]] = {}
+    try:
+        for a in scored_authors[: min(120, len(scored_authors))]:
+            aid = str(a.get("aid") or "")
+            atc = author_term_contrib.get(aid, {}) or {}
+            contribs = sorted(
+                ((str(tid_s), float(v)) for tid_s, v in atc.items() if float(v or 0.0) > 0),
+                key=lambda kv: kv[1],
+                reverse=True,
+            )[:6]
+            if not contribs:
+                continue
+            total = sum(v for _, v in contribs) or 1e-12
+            rows: List[Dict[str, Any]] = []
+            for tid_s, v in contribs:
+                term = term_map.get(tid_s) or ""
+                if not term and tid_s.isdigit():
+                    term = term_map.get(str(int(tid_s))) or ""
+                rr = _retrieval_role_for_paper_term(debug_1 or {}, tid_s)
+                bucket = "core" if rr == "paper_primary" else "support"
+                rows.append(
+                    {
+                        "term": term or tid_s,
+                        "tid": tid_s,
+                        "bucket": bucket,
+                        "role": rr,
+                        "score": float(v),
+                        "share": float(v / total) if total > 0 else 0.0,
+                    }
+                )
+            if rows:
+                author_top_terms[aid] = rows
+    except Exception:
+        author_top_terms = {}
     recall.last_debug_info = {
         "active_domains": [str(d) for d in sorted(active_domain_set)],
         "dominance": float(dominance),
@@ -2547,6 +2583,7 @@ def run_stage5(
         "stage5_authorship_weighting": authorship_w_stats,
         "stage5_sub_ms": stage5_sub_ms,
         "stage5_supply_chain_audit": stage5_supply_chain_audit,
+        "author_top_terms": author_top_terms,
     }
     if debug_1 and debug_1.get("stage1_sub_ms") is not None:
         recall.last_debug_info["stage1_sub_ms"] = debug_1["stage1_sub_ms"]

@@ -28,6 +28,8 @@ class CollaborativeRecallPath:
         start_time = time.time()
         deadline = start_time + timeout
         aggregated_results = {}
+        # target_id -> seed_id -> raw_score（未时间加权），用于解释“与谁协作”
+        edges_by_target = defaultdict(dict)
 
         # 将种子转为 set，确保在循环内过滤时的极速响应
         seed_set = set(seed_author_ids)
@@ -50,10 +52,10 @@ class CollaborativeRecallPath:
 
                 # 利用 build_collaborative_index.py 构建的双向覆盖索引进行 Index-Only Scan
                 query = f"""
-                    SELECT aid2 as target_id, score FROM scholar_collaboration 
+                    SELECT aid2 as target_id, aid1 as seed_id, score FROM scholar_collaboration
                     WHERE aid1 IN ({placeholders})
                     UNION ALL
-                    SELECT aid1 as target_id, score FROM scholar_collaboration 
+                    SELECT aid1 as target_id, aid2 as seed_id, score FROM scholar_collaboration
                     WHERE aid2 IN ({placeholders})
                 """
 
@@ -62,11 +64,17 @@ class CollaborativeRecallPath:
                 rows = cursor.fetchall()
 
                 # 原生元组迭代：比 pd.iterrows() 快数十倍
-                for tid, s in rows:
+                for tid, sid, s in rows:
                     if tid in seed_set:
                         continue
                     # 字典累加
                     aggregated_results[tid] = aggregated_results.get(tid, 0) + s
+                    try:
+                        prev = edges_by_target[tid].get(sid, 0.0)
+                        if float(s) > float(prev):
+                            edges_by_target[tid][sid] = float(s)
+                    except Exception:
+                        pass
 
         finally:
             conn.close()
@@ -75,7 +83,8 @@ class CollaborativeRecallPath:
             duration = (time.time() - start_time) * 1000
             return [], duration
 
-        # ---- 作者层时间特征：对协作得分进行活跃度 + 动量加权 ----
+        # ---- 协作者姓名：用于 evidence 输出（只查少量 top seeds）----
+        # 先拿 top candidates，再按其 edges 反查 seed names
         candidate_ids = list(aggregated_results.keys())
 
         # 从主学术库中拉取作者的论文年份
@@ -106,12 +115,48 @@ class CollaborativeRecallPath:
         # 排序并返回得分最高的候选人；返回 meta 列表供总召回候选池使用
         sorted_res = sorted(aggregated_results.items(), key=lambda x: x[1], reverse=True)[: self.recall_limit]
         duration = (time.time() - start_time) * 1000
+
+        # 为 top candidates 组装 collab_evidence：列出与之协作最紧密的 1~2 位种子作者
+        top_candidate_ids = [aid for aid, _ in sorted_res[: min(120, len(sorted_res))]]
+        seed_ids_needed = set()
+        top_seed_by_target = {}
+        for tid in top_candidate_ids:
+            m = edges_by_target.get(tid) or {}
+            if not m:
+                continue
+            top2 = sorted(m.items(), key=lambda x: float(x[1]), reverse=True)[:2]
+            top_seed_by_target[tid] = top2
+            for sid, _s in top2:
+                seed_ids_needed.add(str(sid))
+
+        seed_name_map = {}
+        if seed_ids_needed:
+            main_conn2 = sqlite3.connect(DB_PATH)
+            try:
+                ph2 = ",".join(["?"] * len(seed_ids_needed))
+                rows2 = main_conn2.execute(
+                    f"SELECT author_id, name FROM authors WHERE author_id IN ({ph2})",
+                    list(seed_ids_needed),
+                ).fetchall()
+                seed_name_map = {str(aid): nm for aid, nm in rows2}
+            finally:
+                main_conn2.close()
+
         meta_list = [
             {
                 "author_id": str(aid),
                 "collab_score_raw": float(score),
                 "collab_rank": i + 1,
-                "collab_evidence": None,
+                "collab_evidence": {
+                    "top_collaborators": [
+                        {
+                            "author_id": str(sid),
+                            "name": seed_name_map.get(str(sid)),
+                            "score": float(sv),
+                        }
+                        for sid, sv in (top_seed_by_target.get(aid) or [])
+                    ]
+                } if (top_seed_by_target.get(aid) or None) else None,
             }
             for i, (aid, score) in enumerate(sorted_res)
         ]

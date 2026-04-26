@@ -141,8 +141,23 @@ class TotalCore:
 
     def _get_silent_logger(self):
         class S:
-            def info(self, m): pass
-            def error(self, m): print(f"Error: {m}")
+            def info(self, msg, *args, **kwargs):
+                return None
+
+            def warning(self, msg, *args, **kwargs):
+                return None
+
+            def debug(self, msg, *args, **kwargs):
+                return None
+
+            def error(self, msg, *args, **kwargs):
+                # 保留错误输出，便于在静默模式下仍能看到关键异常信息
+                if args:
+                    try:
+                        msg = msg % args
+                    except Exception:
+                        msg = f"{msg} | args={args}"
+                print(f"Error: {msg}")
         return S()
 
 

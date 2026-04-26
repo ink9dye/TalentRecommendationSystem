@@ -150,6 +150,8 @@ class RankingEngine:
                 exp_kw["candidate_record"] = rec
             if evidence_rows is not None:
                 exp_kw["candidate_evidence_rows"] = [e for e in evidence_rows if e.get("author_id") == raw_aid]
+            if candidate_pool is not None:
+                exp_kw["query_text"] = getattr(candidate_pool, "query_text", "") or ""
             exp_data = self.explainer.explain(**exp_kw)
 
             details = {

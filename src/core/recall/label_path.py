@@ -2195,12 +2195,20 @@ class LabelRecallPath:
         _emit_label_pipeline_checkpoints(checkpoints, debug_1, effective_verbose)
 
         author_list = (author_ids or [])[: self.recall_limit]
+        # 从 Stage5 导出的 per-author top_terms 构造 label_evidence，供候选池解释与特征消费
+        author_top_terms = {}
+        if isinstance(last_debug_info, dict):
+            author_top_terms = last_debug_info.get("author_top_terms") or {}
         meta_list = [
             {
                 "author_id": str(aid),
                 "label_rank": i + 1,
                 "label_score_raw": None,
-                "label_evidence": None,
+                "label_evidence": (
+                    {"terms": author_top_terms.get(str(aid), [])}
+                    if author_top_terms.get(str(aid))
+                    else None
+                ),
             }
             for i, aid in enumerate(author_list)
         ]
