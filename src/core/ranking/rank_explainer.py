@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 import random
@@ -700,6 +701,15 @@ class RankExplainer:
         目的：回答“精排为什么认为他更匹配”，与召回证据互补。
         """
         if not getattr(self, "graph", None) or not job_raw_ids:
+            return None
+        # 批量评估时可设 RANKING_EXPLAIN_SKIP_NEO4J=1：跳过 Cypher，避免 Neo4j 慢/瞬态错拖死整条；
+        # 不影响候选池与 KGAT 前向，仅少一段「精排侧图谱补证」说明。
+        if (os.environ.get("RANKING_EXPLAIN_SKIP_NEO4J") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
             return None
         try:
             q = """

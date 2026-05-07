@@ -53,7 +53,7 @@ def parse_nfm_args():
     parser.add_argument('--Ks', nargs='?', default='[20, 40, 60, 80, 100]',
                         help='Calculate metric@K when evaluating.')
 
-    args = parser.parse_args()
+    args, _unknown = parser.parse_known_args()
 
     save_dir = 'trained_model/NFM/{}/{}_embed-dim{}_{}_lr{}_pretrain{}/'.format(
         args.data_name, args.model_type, args.embed_dim,

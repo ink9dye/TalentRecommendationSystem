@@ -90,7 +90,9 @@ def parse_kgat_args():
     parser.add_argument('--Ks', nargs='?', default='[20,50]',
                         help='Calculate metric@K when evaluating.')
 
-    args = parser.parse_args()
+    # 作为库被其它脚本 import/调用时，外层脚本可能带有无关命令行参数；
+    # 为避免在 import-time/库调用中因“未知参数”直接退出，这里使用 parse_known_args 忽略未知参数。
+    args, _unknown = parser.parse_known_args()
 
     # 自动生成存储目录名，确保存储路径唯一
     save_dir = 'trained_model/KGAT/{}/embed-dim{}_relation-dim{}_{}_{}_{}_lr{}_pretrain{}/'.format(
