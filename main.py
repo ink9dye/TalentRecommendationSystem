@@ -9,7 +9,7 @@ def main():
         "streamlit",
         "run",
         "src/interface/app.py",
-        "--server.port=8501",  # 你可以固定端口
+        "--server.port=8501",
         "--server.address=127.0.0.1"
     ]
 
