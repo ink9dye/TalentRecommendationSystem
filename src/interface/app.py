@@ -101,39 +101,18 @@ def format_score(value):
         return s if s else "-"
 
 
-def clean_published_at(value):
-    if value is None:
+def format_publication_source(representative_work: dict) -> str:
+    """发表平台：优先 representative_work.source，兼容旧字段 published_at。"""
+    if not isinstance(representative_work, dict):
         return "未知"
-
-    s = str(value).strip()
-    if not s:
-        return "未知"
-
-    normalized = s.lower().replace("-", "_").replace(" ", "_")
-
-    bad_values = {
-        "evidence",
-        "vector_evidence",
-        "label_evidence",
-        "collab_evidence",
-        "vector_pool_evidence",
-        "label_pool_evidence",
-        "collab_pool_evidence",
-        "pool_evidence",
-        "unknown",
-        "none",
-        "null",
-        "-",
-        "—",
-    }
-
-    if normalized in bad_values:
-        return "未知"
-
-    if "evidence" in normalized:
-        return "未知"
-
-    return s
+    for key in ("source", "published_at"):
+        value = representative_work.get(key)
+        if value is None:
+            continue
+        s = str(value).strip()
+        if s:
+            return s
+    return "未知"
 
 
 _RANKING_BOILERPLATE_PHRASES = (
@@ -158,6 +137,7 @@ def clean_recommendation_reason(value):
     return s if s else None
 
 
+# True：展示「查看详细信息」及召回分/精排分等排序信号
 _SHOW_DEBUG_EXPANDER = False
 
 
@@ -182,6 +162,15 @@ def render_debug_expander(item, query_domain_pattern=None):
         st.text(str(item.get("author_id", "")))
 
         d = _safe_details(item)
+        st.markdown("**排序信号**")
+        s1, s2 = st.columns(2)
+        s1.markdown(f"召回分：{format_score(d.get('recall_score'))}")
+        s2.markdown(f"精排分：{format_score(d.get('kgat_score'))}")
+        if d.get("rule_stability") is not None:
+            st.markdown(f"稳定项：{format_score(d.get('rule_stability'))}")
+        if d.get("candidate_pool_score") is not None:
+            st.markdown(f"候选池原始分：{format_score(d.get('candidate_pool_score'))}")
+
         st.markdown("**details**")
         if d:
             st.json(d)
@@ -225,9 +214,6 @@ def render_author_card(item, list_index: int, query_domain_pattern=None):
             rank = list_index + 1
     name = item.get("name") or "未知作者"
     score_str = format_score(item.get("score"))
-    details = _safe_details(item)
-    recall_s = format_score(details.get("recall_score"))
-    kgat_s = format_score(details.get("kgat_score"))
 
     reason = clean_recommendation_reason(item.get("recommendation_reason"))
     if reason is None or not str(reason).strip():
@@ -243,7 +229,7 @@ def render_author_card(item, list_index: int, query_domain_pattern=None):
         else "未知论文"
     )
     link = rw.get("link")
-    published = clean_published_at(rw.get("published_at"))
+    publication_source = format_publication_source(rw)
 
     m = _safe_metrics(item)
     name_safe = html.escape(str(name))
@@ -262,18 +248,13 @@ def render_author_card(item, list_index: int, query_domain_pattern=None):
         st.markdown(title_display)
         if link:
             st.markdown(f"[OpenAlex]({link})")
-        st.caption(f"发表平台：{published}")
+        st.caption(f"发表平台：{publication_source}")
 
         st.markdown('<div class="trs-section">作者画像</div>', unsafe_allow_html=True)
         c1, c2, c3 = st.columns(3)
         c1.markdown(f"H-index：{m.get('h_index', '—')}")
         c2.markdown(f"论文数：{m.get('total_papers', '—')}")
         c3.markdown(f"引用量：{m.get('citations', '—')}")
-
-        st.markdown('<div class="trs-section">排序信号</div>', unsafe_allow_html=True)
-        s1, s2 = st.columns(2)
-        s1.markdown(f"召回分：{recall_s}")
-        s2.markdown(f"精排分：{kgat_s}")
 
         if _SHOW_DEBUG_EXPANDER:
             render_debug_expander(item, query_domain_pattern=query_domain_pattern)

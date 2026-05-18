@@ -173,7 +173,7 @@ class RankingEngine:
                     "work_id": exp_data.get("work_id"),
                     "title": exp_data.get("key_evidence_work"),
                     "link": exp_data.get("work_url"),
-                    "published_at": exp_data.get("source"),
+                    "source": exp_data.get("source"),
                 },
                 "recommendation_reason": exp_data.get("summary"),
                 "metrics": stats,

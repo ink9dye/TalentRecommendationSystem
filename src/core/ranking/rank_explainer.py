@@ -49,7 +49,10 @@ class RankExplainer:
                 "key_evidence_work": title,
                 "work_id": wid,
                 "work_url": (f"https://openalex.org/{wid}" if wid else None),
-                "source": chosen_work.get("source") or "候选池证据",
+                "source": self._resolve_work_source(
+                    wid,
+                    chosen_work.get("source") or chosen_work.get("source_name"),
+                ),
                 "collaborators": chosen_work.get("collaborators"),
                 "match_type": chosen_work.get("match_type") or "pool_evidence",
                 "model_confidence": round(float(att_w or 0.0), 4),
@@ -171,6 +174,40 @@ class RankExplainer:
             out["summary"] = out["evidence_chain"].get("full_summary", summary)
         return out
 
+    def _lookup_source_name_for_work(self, work_id: Any) -> Optional[str]:
+        """按代表作 work_id 从图谱读取刊物/平台名（PUBLISHED_IN -> Source）。"""
+        wid = str(work_id or "").strip()
+        if not wid or not getattr(self, "graph", None):
+            return None
+        try:
+            rows = self.graph.run(
+                """
+                MATCH (w:Work {id: $wid})-[:PUBLISHED_IN]->(src:Source)
+                RETURN src.name AS name
+                LIMIT 1
+                """,
+                wid=wid,
+            ).data()
+            if rows:
+                name = str(rows[0].get("name") or "").strip()
+                if name:
+                    return name
+        except Exception:
+            pass
+        return None
+
+    def _resolve_work_source(self, work_id: Any, fallback: Optional[str] = None) -> str:
+        resolved = self._lookup_source_name_for_work(work_id)
+        if resolved:
+            return resolved
+        fb = str(fallback or "").strip()
+        if not fb:
+            return "未知"
+        low = fb.lower()
+        if "evidence" in low or fb in ("候选池证据", "向量路 evidence"):
+            return "未知"
+        return fb
+
     def _filter_evidence_rows_for_author(
         self, author_id: str, rows: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
@@ -243,10 +280,14 @@ class RankExplainer:
                 best = p
         if best is None:
             return None
+        wid = best.get("wid")
         return {
-            "wid": best.get("wid"),
+            "wid": wid,
             "title": best.get("title"),
-            "source": "向量路 evidence",
+            "source": self._resolve_work_source(
+                wid,
+                best.get("source") or best.get("source_name"),
+            ),
             "collaborators": None,
             "match_type": "vector_pool_evidence",
             "matched_skill": "向量语义命中",
@@ -267,7 +308,10 @@ class RankExplainer:
                 return {
                     "wid": wid,
                     "title": title,
-                    "source": "候选池证据",
+                    "source": self._resolve_work_source(
+                        wid,
+                        evidence.get("source") or evidence.get("source_name"),
+                    ),
                     "collaborators": None,
                     "match_type": match_type,
                     "matched_skill": "候选池证据命中",
@@ -286,7 +330,10 @@ class RankExplainer:
                     return {
                         "wid": wid,
                         "title": title,
-                        "source": "候选池证据",
+                        "source": self._resolve_work_source(
+                            wid,
+                            item.get("source") or item.get("source_name"),
+                        ),
                         "collaborators": None,
                         "match_type": match_type,
                         "matched_skill": "候选池证据命中",
@@ -344,6 +391,7 @@ class RankExplainer:
             kg_best_path=kg_best_path,
             query_text=query_text,
             att_weight=att_weight,
+            evidence_rows=evidence_rows,
         )
 
         # 4) 可选 bullets（前端若要做卡片式展示，可直接用）
@@ -626,6 +674,7 @@ class RankExplainer:
         kg_best_path: Optional[Dict[str, Any]],
         query_text: Optional[str],
         att_weight: float,
+        evidence_rows: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """
         内部排障用摘要：允许包含召回来源、dominant_recall_path、query_type_coverage、
@@ -646,6 +695,13 @@ class RankExplainer:
                 dom = getattr(record, "dominant_recall_path", None)
                 if dom:
                     parts.append(f"dominant={dom}")
+        except Exception:
+            pass
+        try:
+            if evidence_rows:
+                paths = [str(e.get("path") or "").strip() for e in evidence_rows[:5] if e.get("path")]
+                if paths:
+                    parts.append("evidence_paths=" + ";".join(paths))
         except Exception:
             pass
         try:
@@ -801,61 +857,39 @@ class RankExplainer:
         evidence_rows: List[Dict[str, Any]],
     ) -> Dict[str, str]:
         """
-        四段式证据链（README 6.7）：召回来源摘要、主题匹配摘要、学术实力摘要、模型置信摘要。
+        四段式证据链（README 6.7）：与候选池路径共用用户可读表述，避免「召回来源：标签路径」等内部字段风格。
         """
-        seg1 = "召回来源："
-        if record:
-            paths = []
-            if getattr(record, "from_vector", False):
-                paths.append("向量语义")
-            if getattr(record, "from_label", False):
-                paths.append("标签路径")
-            if getattr(record, "from_collab", False):
-                paths.append("协作网络")
-            path_count = getattr(record, "path_count", 0) or 0
-            seg1 += "、".join(paths) if paths else "多路召回"
-            if path_count > 1:
-                seg1 += f"；多路命中（{path_count} 条路径）。"
-            else:
-                seg1 += "。"
-            dom = getattr(record, "dominant_recall_path", None) or ""
-            if dom:
-                seg1 += f" 主导来源：{dom}。"
-        else:
-            seg1 += "来自多路召回融合。"
-        if evidence_rows:
-            seg1 += " 证据路径：" + "；".join([e.get("path", "") for e in evidence_rows[:5]]) + "。"
-
-        seg2 = "主题匹配："
-        req = best_path.get("req_skill") or "岗位核心技能"
-        match_skill = best_path.get("match_skill") or req
-        seg2 += f"岗位诉求「{req}」与学术词「{match_skill}」对齐；"
-        seg2 += f"关键论文《{best_path.get('title', '')}》建立作者与岗位的匹配路径。"
-
-        seg3 = "学术实力："
-        if record:
-            h = getattr(record, "h_index", None)
-            works = getattr(record, "works_count", None)
-            cited = getattr(record, "cited_by_count", None)
-            recent = getattr(record, "recent_works_count", None)
-            seg3 += f"H-index {h or '-'}，总论文 {works or '-'}，总引用 {cited or '-'}"
-            if recent is not None:
-                seg3 += f"，近年产出 {recent} 篇"
-            seg3 += "。"
-        else:
-            seg3 += "详见作者学术指标。"
-
-        # 默认展示不暴露 KGAT 注意力等内部数值
-        seg4 = "精排阶段将该候选保留在当前排序结果中，说明图结构证据与召回证据没有明显冲突。"
-
-        # full_summary 也保持用户可读，不拼接内部字段
-        full = " ".join([seg1, seg2, seg3, seg4])
+        chosen_work = {
+            "title": best_path.get("title"),
+            "wid": best_path.get("wid"),
+            "matched_skill": best_path.get("match_skill"),
+        }
+        seg_recall = self._build_user_facing_segment_recall(record)
+        seg_topic = self._build_user_facing_segment_paper_and_path(record, chosen_work, best_path)
+        seg_profile = self._build_user_facing_segment_profile(record)
+        seg_model = self._build_user_facing_segment_model(record)
+        display_summary = self._build_user_facing_summary(
+            record=record,
+            chosen_work=chosen_work,
+            kg_best_path=best_path,
+            query_text=None,
+        )
+        debug_summary = self._build_debug_summary(
+            record=record,
+            chosen_work=chosen_work,
+            kg_best_path=best_path,
+            query_text=None,
+            att_weight=float(best_path.get("att_weight") or 0.0),
+            evidence_rows=evidence_rows,
+        )
         return {
-            "recall_source": seg1,
-            "topic_match": seg2,
-            "academic_strength": seg3,
-            "model_confidence": seg4,
-            "full_summary": full,
+            "recall_source": seg_recall,
+            "topic_match": seg_topic,
+            "academic_strength": seg_profile,
+            "model_confidence": seg_model,
+            "full_summary": display_summary,
+            "display_summary": display_summary,
+            "debug_summary": debug_summary,
         }
 
     def _build_dynamic_summary(self, path):
