@@ -1,6 +1,6 @@
 import sqlite3
 import torch
-from typing import List, Optional, Any
+from typing import Any, Dict, List, Optional
 from py2neo import Graph
 from config import DB_PATH
 from config import NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, NEO4J_DATABASE
@@ -164,6 +164,13 @@ class RankingEngine:
             if rec is not None and rec.candidate_pool_score is not None:
                 details["candidate_pool_score"] = round(float(rec.candidate_pool_score), 4)
 
+            from_collab = bool(rec is not None and getattr(rec, "from_collab", False))
+            collab_partners = (
+                self._extract_collab_partners(rec, exp_data.get("collaborators"))
+                if from_collab
+                else []
+            )
+
             results.append({
                 "rank": i + 1,
                 "author_id": raw_aid,
@@ -177,11 +184,54 @@ class RankingEngine:
                 },
                 "recommendation_reason": exp_data.get("summary"),
                 "metrics": stats,
+                "from_collab": from_collab,
                 "collaboration": exp_data.get("collaborators"),
+                "collab_partners": collab_partners,
                 "details": details,
             })
 
         return results
+
+    @staticmethod
+    def _extract_collab_partners(
+        record: Optional[Any], neo4j_collaborators: Any
+    ) -> List[Dict[str, Any]]:
+        """
+        协作路关联作者：优先 collab_evidence.top_collaborators（种子作者），
+        其次 Neo4j 路径返回的论文合著者名单。
+        """
+        partners: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def _add(author_id: Any = None, name: Any = None) -> None:
+            aid = str(author_id or "").strip() or None
+            nm = str(name or "").strip() or None
+            if not aid and not nm:
+                return
+            key = aid if aid else f"name:{nm}"
+            if key in seen:
+                return
+            seen.add(key)
+            display = nm or aid or "未知"
+            partners.append({"author_id": aid, "name": display})
+
+        ev = getattr(record, "collab_evidence", None) if record is not None else None
+        if isinstance(ev, dict):
+            for c in ev.get("top_collaborators") or []:
+                if isinstance(c, dict):
+                    _add(c.get("author_id"), c.get("name"))
+
+        if neo4j_collaborators:
+            if isinstance(neo4j_collaborators, list):
+                for x in neo4j_collaborators:
+                    if isinstance(x, dict):
+                        _add(x.get("author_id") or x.get("id"), x.get("name"))
+                    elif x is not None and str(x).strip():
+                        _add(None, str(x).strip())
+            elif isinstance(neo4j_collaborators, str) and neo4j_collaborators.strip():
+                _add(None, neo4j_collaborators.strip())
+
+        return partners
 
     def _pre_rank(self, records: List[Any], top_n: int = PRE_RANK_MAX) -> List[Any]:
         """

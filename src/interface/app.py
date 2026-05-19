@@ -67,6 +67,35 @@ def _inject_layout_styles():
         }
         .trs-row-head { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; }
         .trs-score { font-size: 0.88rem; color: #222; white-space: nowrap; }
+        .trs-row-head a {
+            color: #1a1a1a;
+            text-decoration: none;
+            font-weight: inherit;
+        }
+        .trs-row-head a:hover {
+            color: #1a5fb4;
+            text-decoration: underline;
+        }
+        .trs-paper-title a {
+            color: #1a5fb4;
+            text-decoration: none;
+            font-weight: 500;
+        }
+        .trs-paper-title a:hover { text-decoration: underline; }
+        .trs-reason-block { margin: 0.15rem 0 0.1rem 0; }
+        .trs-reason-line {
+            font-size: 0.92rem;
+            color: #333;
+            line-height: 1.6;
+            margin: 0 0 0.5rem 0;
+        }
+        .trs-reason-line:last-child { margin-bottom: 0; }
+        .trs-collab-line { font-size: 0.9rem; color: #333; margin-top: 0.25rem; }
+        .trs-collab-line a {
+            color: #1a5fb4;
+            text-decoration: none;
+        }
+        .trs-collab-line a:hover { text-decoration: underline; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -99,6 +128,90 @@ def format_score(value):
     except (TypeError, ValueError):
         s = str(value).strip()
         return s if s else "-"
+
+
+def build_openalex_author_url(author_id) -> str | None:
+    """由 author_id 构造 OpenAlex 作者主页 URL（如 A5120885032）。"""
+    aid = str(author_id or "").strip()
+    if not aid:
+        return None
+    if aid.lower().startswith("http"):
+        return aid
+    if "openalex.org/" in aid.lower():
+        aid = aid.rsplit("/", 1)[-1].strip()
+    return f"https://openalex.org/{aid}"
+
+
+def build_openalex_work_url(representative_work: dict) -> str | None:
+    """优先 representative_work.link，否则用 work_id 拼接 OpenAlex 论文页。"""
+    if not isinstance(representative_work, dict):
+        return None
+    link = representative_work.get("link")
+    if link is not None and str(link).strip():
+        return str(link).strip()
+    work_id = representative_work.get("work_id")
+    if work_id is None or not str(work_id).strip():
+        return None
+    wid = str(work_id).strip()
+    if wid.lower().startswith("http"):
+        return wid
+    if "openalex.org/" in wid.lower():
+        return wid
+    return f"https://openalex.org/{wid}"
+
+
+def collab_partners_from_item(item: dict) -> list:
+    """解析协作路关联作者列表（优先 collab_partners，兼容旧 collaboration 字段）。"""
+    raw = item.get("collab_partners")
+    if isinstance(raw, list) and raw:
+        return [p for p in raw if isinstance(p, dict) and (p.get("name") or p.get("author_id"))]
+
+    if not item.get("from_collab"):
+        return []
+
+    legacy = item.get("collaboration")
+    partners = []
+    if isinstance(legacy, list):
+        for x in legacy:
+            if isinstance(x, dict):
+                partners.append(
+                    {
+                        "author_id": x.get("author_id") or x.get("id"),
+                        "name": x.get("name") or x.get("author_id") or "未知",
+                    }
+                )
+            elif x is not None and str(x).strip():
+                partners.append({"author_id": None, "name": str(x).strip()})
+    elif isinstance(legacy, str) and legacy.strip():
+        partners.append({"author_id": None, "name": legacy.strip()})
+    return partners
+
+
+def build_collab_associates_html(item: dict) -> str | None:
+    """协作路参与时，生成「协作关联」一行 HTML；无合作者信息则返回 None。"""
+    if not item.get("from_collab"):
+        return None
+    partners = collab_partners_from_item(item)
+    if not partners:
+        return None
+
+    parts = []
+    for p in partners:
+        name = html.escape(str(p.get("name") or "未知"))
+        url = build_openalex_author_url(p.get("author_id"))
+        if url:
+            url_safe = html.escape(url, quote=True)
+            parts.append(
+                f'<a href="{url_safe}" target="_blank" rel="noopener noreferrer">{name}</a>'
+            )
+        else:
+            parts.append(name)
+
+    joined = "、".join(parts)
+    return (
+        f'<div class="trs-collab-line">与 {joined} '
+        f"存在协作关系（经协作网络召回）。</div>"
+    )
 
 
 def format_publication_source(representative_work: dict) -> str:
@@ -135,6 +248,41 @@ def clean_recommendation_reason(value):
 
     s = re.sub(r"\s+", " ", s).strip()
     return s if s else None
+
+
+def split_recommendation_reason_lines(text: str) -> list:
+    """
+    将推荐依据按中文句末（。！？）拆成多行，便于前端分段展示。
+    保留句末标点；论文标题中可能含 HTML（如 <sub>2</sub>），不做转义。
+    """
+    s = str(text or "").strip()
+    if not s:
+        return []
+    parts = re.split(r"(?<=[。！？])\s*", s)
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def render_recommendation_reason(reason_text: str) -> None:
+    """推荐依据：按句分行展示。"""
+    if not reason_text or not str(reason_text).strip():
+        st.caption("暂无推荐依据")
+        return
+    if str(reason_text).strip() == "暂无推荐依据":
+        st.caption(reason_text)
+        return
+
+    lines = split_recommendation_reason_lines(str(reason_text))
+    if not lines:
+        st.markdown(str(reason_text))
+        return
+
+    blocks = "".join(
+        f'<p class="trs-reason-line">{line}</p>' for line in lines
+    )
+    st.markdown(
+        f'<div class="trs-reason-block">{blocks}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 # True：展示「查看详细信息」及召回分/精排分等排序信号
@@ -228,27 +376,49 @@ def render_author_card(item, list_index: int, query_domain_pattern=None):
         if title is not None and str(title).strip()
         else "未知论文"
     )
-    link = rw.get("link")
+    work_url = build_openalex_work_url(rw)
+    author_url = build_openalex_author_url(item.get("author_id"))
     publication_source = format_publication_source(rw)
 
     m = _safe_metrics(item)
     name_safe = html.escape(str(name))
+    title_safe = html.escape(title_display)
+
+    if author_url:
+        author_url_safe = html.escape(author_url, quote=True)
+        name_html = (
+            f'<a href="{author_url_safe}" target="_blank" rel="noopener noreferrer">{name_safe}</a>'
+        )
+    else:
+        name_html = name_safe
 
     with st.container(border=True):
         st.markdown(
-            f'<div class="trs-row-head"><span><strong>#{rank}</strong>　{name_safe}</span>'
+            f'<div class="trs-row-head"><span><strong>#{rank}</strong>　{name_html}</span>'
             f'<span class="trs-score">综合分　{score_str}</span></div>',
             unsafe_allow_html=True,
         )
 
         st.markdown('<div class="trs-section">推荐依据</div>', unsafe_allow_html=True)
-        st.markdown(reason_text)
+        render_recommendation_reason(reason_text)
 
         st.markdown('<div class="trs-section">代表论文</div>', unsafe_allow_html=True)
-        st.markdown(title_display)
-        if link:
-            st.markdown(f"[OpenAlex]({link})")
+        if work_url:
+            work_url_safe = html.escape(work_url, quote=True)
+            st.markdown(
+                f'<div class="trs-paper-title">'
+                f'<a href="{work_url_safe}" target="_blank" rel="noopener noreferrer">'
+                f'{title_safe}</a></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(title_display)
         st.caption(f"发表平台：{publication_source}")
+
+        collab_html = build_collab_associates_html(item)
+        if collab_html:
+            st.markdown('<div class="trs-section">协作关联</div>', unsafe_allow_html=True)
+            st.markdown(collab_html, unsafe_allow_html=True)
 
         st.markdown('<div class="trs-section">作者画像</div>', unsafe_allow_html=True)
         c1, c2, c3 = st.columns(3)
